@@ -45,7 +45,7 @@ After a failed action the bot SHALL wait before the next attempt of the same kin
 | Teleport | 10 s | 5 min |
 | Sit | 5 s | 1 min |
 
-The login delay SHALL also apply before logging in again after a session is lost, whatever the cause, and SHALL be reset to its first value only after a session has stayed connected for 5 minutes. Teleport and sit delays SHALL be reset by a success of the same kind. After being unseated, the bot SHALL wait the current sit delay before sitting again, and the sit delay SHALL be reset only after the avatar has stayed seated for 5 minutes.
+The login delay SHALL also apply before logging in again after a session is lost, whatever the cause, and SHALL be reset to its first value only after a session has stayed connected for 5 minutes. The teleport delay SHALL be reset by a successful teleport. After being unseated, the bot SHALL wait the current sit delay before sitting again, and the sit delay SHALL be reset only after the avatar has stayed seated for 5 minutes.
 
 #### Scenario: Grid down for a long time
 - **WHEN** the login server is unreachable for an hour
@@ -100,7 +100,11 @@ On an interrupt or termination signal the bot SHALL stop starting new actions, l
 - **THEN** the process exits with status 0 immediately
 
 ### Requirement: Operator-visible log
-The bot SHALL write a timestamped line to standard error for every action it starts, every action outcome with the reason on failure, every change in connection, region or seated state, and every backoff delay it begins, including its length. It SHALL NOT log individual simulator packets unless verbose logging is requested on the command line.
+The bot SHALL write a timestamped line to standard error for every action it starts, every action outcome with the reason on failure, every change in connection, region or seated state, and every backoff delay it begins, including its length. It SHALL also log the text of every alert message the simulator sends to the avatar, since simulators use these to say why a request was refused or that a region is about to restart. It SHALL NOT log other individual simulator packets unless verbose logging is requested on the command line.
+
+#### Scenario: Simulator refuses a sit with an alert
+- **WHEN** the simulator answers a sit request only with an alert such as "There is no suitable surface to sit on"
+- **THEN** the log contains that alert text before the sit is reported as failed
 
 #### Scenario: Reading the log after a region restart
 - **WHEN** the target region has been restarted and the bot has recovered

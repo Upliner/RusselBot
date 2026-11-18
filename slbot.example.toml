@@ -1,0 +1,22 @@
+# Example config for slbot. Copy to slbot.toml and edit.
+
+# Grid login URL. Leave out for Second Life (Agni):
+#   https://login.agni.lindenlab.com/cgi-bin/login.cgi
+# A local OpenSim standalone listens here by default:
+login_url = "http://127.0.0.1:9000/"
+
+# Avatar name: "First Last", or a single word (the last name is then "Resident").
+user = "Sit Bot"
+
+# Exactly one of `password` or `password_hash`.
+# Generate the hash with `slbot hash` so the plain password is never stored.
+password = "secret"
+# password_hash = "$1$5ebe2294ecd0e0f08eab7690d2a6ee69"
+
+# Where the avatar should be: region name and coordinates inside it.
+# Pick coordinates close to the object, or the sit may fail.
+region = "Target"
+position = [128.0, 128.0, 25.0]
+
+# UUID of the object to sit on.
+object = "00000000-0000-0000-0000-000000000000"

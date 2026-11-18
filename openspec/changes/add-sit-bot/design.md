@@ -4,8 +4,8 @@
 
 See `proposal.md` for motivation. The crate is a "Hello, world!" stub with no dependencies. Protocol knowledge comes from the checkouts under `references/`:
 
-- `references/kokua/scripts/messages/message_template.msg` (template version 2.0) is the authoritative layout of every UDP message.
-- `references/SecondBot/LibreMetaverse/` is a complete client library; `Login.cs`, `NetworkManager.cs`, `Simulator.cs`, `Caps.cs` and `AgentManager.cs` show the login parameters, circuit handshake, event queue and teleport handling.
+- `message_template.msg` from the viewer sources (`scripts/messages/` in the Kokua checkout, template version 2.0) is the authoritative layout of every UDP message.
+- LibreMetaverse (inside the SecondBot checkout) is a complete client library; `Login.cs`, `NetworkManager.cs`, `Simulator.cs`, `Caps.cs` and `AgentManager.cs` show the login parameters, circuit handshake, event queue and teleport handling.
 - `references/opensim/` is the simulator used for testing; `OpenSim/Services/LLLoginService/` and `OpenSim/Region/ClientStack/Linden/UDP/` show the server side.
 
 Findings from those sources that shape the design:
@@ -37,14 +37,16 @@ Findings from those sources that shape the design:
 
 ### D1. Threads and blocking I/O, one state owner
 
-Three threads feed one `std::sync::mpsc` channel of events; the main thread owns all state.
+Per circuit, a UDP reader thread and an event-queue thread feed one `std::sync::mpsc` channel of events, as does the signal handler; the main thread owns all state.
 
 ```
  [udp reader thread] ----+
  [event queue thread] ---+--> mpsc --> [main thread: session state + reconciler]
  [signal handler] -------+                 |-- sends UDP directly (socket is shared, send is thread-safe)
-                                           |-- does login + seed-cap + map lookups as blocking HTTP calls
+                                           |-- does login as a blocking HTTP call
 ```
+
+The event-queue thread makes the seed-capability request itself before it starts polling, so the main thread never blocks on a simulator's HTTP server.
 
 The main loop is `recv_timeout(next_deadline)`: it handles one event or one timer expiry, then runs the reconcile step. Timers (agent update, ack flush, resend, action deadlines, backoff) are plain `Instant`s compared in the loop.
 
@@ -59,11 +61,11 @@ Each message is a small struct with `encode`/`decode` written by hand against `m
 | Direction | Messages |
 |---|---|
 | Out | UseCircuitCode, CompleteAgentMovement, RegionHandshakeReply, AgentThrottle, AgentUpdate, CompletePingCheck, PacketAck, MapNameRequest, TeleportLocationRequest, AgentRequestSit, AgentSit, LogoutRequest |
-| In | RegionHandshake, StartPingCheck, PacketAck, AgentMovementComplete, MapBlockReply, TeleportStart, TeleportProgress, TeleportFailed, TeleportLocal, AvatarSitResponse, ObjectUpdate (prefix only), KickUser, LogoutReply, DisableSimulator |
+| In | RegionHandshake, StartPingCheck, PacketAck, AgentMovementComplete, MapBlockReply, TeleportStart, TeleportProgress, TeleportFailed, TeleportLocal, AvatarSitResponse, ObjectUpdate (prefix only), KickUser, AlertMessage, AgentAlertMessage, LogoutReply, DisableSimulator |
 
 Incoming packets are dispatched on (frequency, number). Unknown numbers are dropped after header processing, so reliable ones still get acked. Decoders only read the fields the bot uses and tolerate trailing data.
 
-*Alternative: generate all ~480 messages from the template in `build.rs`.* Rejected for now: a template parser and code generator are more code than 26 hand-written messages, and nothing else needs the rest. The dispatch table leaves room to switch later.
+*Alternative: generate all ~480 messages from the template in `build.rs`.* Rejected for now: a template parser and code generator are more code than 28 hand-written messages, and nothing else needs the rest. The dispatch table leaves room to switch later.
 
 ### D3. LLUDP layer
 
@@ -77,16 +79,16 @@ Incoming packets are dispatched on (frequency, number). Unknown numbers are drop
 
 ### D4. Circuits are tagged with a generation number
 
-Every circuit gets an increasing generation id when it is opened (login or teleport arrival). Reader threads stamp each event with the generation of the circuit it came from, and the main thread discards events whose generation is not current. This implements "stale simulator traffic is ignored" and prevents a late `DisableSimulator` from the old region from looking like session loss.
+Every circuit gets a generation id when it is opened (login or teleport hand-over), increasing for the life of the process. Each circuit has its own UDP socket; its reader and event-queue threads stamp each event with the circuit's generation, and the session discards events whose generation is not current. This implements "stale simulator traffic is ignored" and prevents a late `DisableSimulator` from the old region, or leftovers from a previous session, from looking like session loss.
 
-During a teleport the old circuit stays current until `TeleportFinish` arrives; then a new circuit and event-queue poller are started for the destination and become current once its handshake completes; the old ones are stopped.
+During a teleport the old circuit stays current until `TeleportFinish` arrives. At that moment the old circuit and poller are stopped and a new circuit and poller for the destination become current immediately. Arrival is reported once the new circuit's handshake completes; if it does not complete within 30 s the session is lost. A `TeleportFinish` the bot did not ask for is followed the same way.
 
 ### D5. Capabilities and event queue
 
-- After each circuit handshake the bot POSTs an LLSD array with `EventQueueGet` to the seed capability and reads back the URL.
+- When a circuit is opened, its event-queue thread POSTs an LLSD array with `EventQueueGet` to the seed capability and reads back the URL; failures are retried under the same 60 s rule as polls.
 - The event-queue thread long-polls that URL, sending the last received `id` as `ack`. HTTP 502 or a timeout means "no events, poll again". HTTP 404 means the session is gone. Other errors are retried after 1 s; 60 s of continuous failure is session loss.
 - Only `TeleportFinish` is acted on. `EnableSimulator`, `EstablishAgentCommunication` and `CrossedRegion` are logged in verbose mode and ignored, since the bot never opens child circuits and never walks across a border.
-- LLSD XML and XML-RPC are parsed with one small XML reader into a simple value enum (map, array, string, integer, uuid, binary, boolean, real); requests are written with string formatting. Binary LLSD is not needed.
+- LLSD XML and XML-RPC are parsed with one small XML reader into a simple value enum (map, array, string, integer, uuid, binary, boolean, real); requests are written with string formatting. Binary LLSD is not needed. `TeleportFinish` carries the simulator IP and region handle as base64 binary, decoded by a small hand-written decoder.
 
 ### D6. Login
 
@@ -118,7 +120,7 @@ The repositioning rule (three failed sits) is expressed inside `decide` as "star
 
 ### D9. Seated detection without scene tracking
 
-Seated-on-target is set when `AvatarSitResponse.SitObject.ID` equals the configured UUID and the bot has sent `AgentSit`, and is confirmed or cleared by the avatar's own `ObjectUpdate`: the block whose `FullID` equals the agent id carries `ParentID`, non-zero when seated and zero when standing. Only the fixed-layout prefix of each `ObjectData` block is decoded up to `ParentID`; the variable-length tail is skipped using its length prefixes to reach the next block. `ObjectUpdateCompressed`, `ObjectUpdateCached` and terse updates are ignored, since simulators send avatars as full updates when the parent changes.
+Seated-on-target requires that `AvatarSitResponse.SitObject.ID` equalled the configured UUID (the bot answers it with `AgentSit` when a sit is in progress), and is confirmed or cleared by the avatar's own `ObjectUpdate`: the block whose `FullID` equals the agent id carries `ParentID`, non-zero when seated and zero when standing. Only the fixed-layout prefix of each `ObjectData` block is decoded up to `ParentID`; the variable-length tail is skipped using its length prefixes to reach the next block. `ObjectUpdateCompressed`, `ObjectUpdateCached` and terse updates are ignored, since simulators send avatars as full updates when the parent changes.
 
 A non-zero `ParentID` without a preceding sit response for the target (the avatar was seated somewhere else) counts as not seated on target; the next sit request moves it.
 
@@ -136,6 +138,7 @@ A non-zero `ParentID` without a preceding sit response for the target (the avata
  src/udp/messages.rs message structs
  src/udp/circuit.rs  sequence numbers, ack queue, resend queue, liveness
  src/caps.rs         seed capability, event-queue thread
+ src/net.rs          per-circuit UDP socket, reader and event-queue threads behind the session's `Net` trait
  src/session.rs      circuits by generation, handshake, teleport handoff, sit, seat tracking
  src/reconciler.rs   Observed, Memory, decide()
  src/backoff.rs      doubling delay with bounds and reset rule
@@ -151,7 +154,7 @@ Dependencies: `ureq` with rustls (HTTP/HTTPS), `roxmltree` (XML parsing), `md-5`
 
 ### D12. Test rig
 
-`references/opensim` is a symlink to a checkout outside this repository and is left untouched. The rig is a local clone of it at `test-rig/opensim/` (git-ignored), built there in standalone mode with SQLite, HTTP on `127.0.0.1:9000`, and two regions "Home" and "Target" in `bin/Regions/Regions.ini`. The rig's `OpenSim.ini`, `Regions.ini` and a setup script are tracked under `test-rig/config/` and copied into the clone. A bot user is created on the console; the seat prim is rezzed once from a viewer and its UUID copied into the bot config. The setup steps and the failure-injection checklist live in `docs/test-rig.md`.
+`references/opensim` is a symlink to a checkout outside this repository and is left untouched. The rig is a local clone of it at `test-rig/opensim/` (git-ignored), built there in standalone mode with SQLite, HTTP on `127.0.0.1:9000`, and two regions "Home" and "Target" in `bin/Regions/Regions.ini`. The rig's `OpenSim.ini`, `Regions.ini` and a setup script are tracked under `test-rig/config/` and copied into the clone. A bot user is created on the console; the seat prim is rezzed by `test-rig/rezprim.py` (a small script that logs in as the estate owner and sends one ObjectAdd) or from a viewer, and its UUID copied into the bot config. `setup.sh` derives `OpenSim.ini` and `StandaloneCommon.ini` from OpenSim's shipped examples instead of tracking full copies; only `Regions.ini` is tracked. The setup steps and the failure-injection checklist live in `docs/test-rig.md`.
 
 Protocol code that does not need a simulator (zerocoding, header and ack parsing, message encode/decode, XML, login reply classification, config validation, `decide`) is covered by `cargo test`.
 
@@ -167,5 +170,5 @@ Protocol code that does not need a simulator (zerocoding, header and ack parsing
 
 ## Open Questions
 
-- Exact `AgentThrottle` values and draw distance: start with LibreMetaverse's minimums and tune on the rig; affects traffic volume only.
-- Whether OpenSim honours `uri:` start locations in this checkout's standalone configuration; if not, the teleport path covers it and nothing else changes.
+- Password length on Second Life: official viewers have historically hashed only the first 16 characters of a password for Second Life logins. `hash` and the config hash the whole password, which is what the spec says and what OpenSim expects. To be settled in the Second Life verification pass.
+- `AgentThrottle` values and draw distance are first guesses that work on OpenSim (the avatar's own object update arrives within a second); they may need tuning for Second Life. Affects traffic volume only.
