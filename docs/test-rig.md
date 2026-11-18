@@ -92,6 +92,30 @@ Console commands are typed on the OpenSim console. The console command
 | 14 | `kill -9` the OpenSim process while the bot is seated | Session loss no later than 60 s after the kill | Pass: `nothing received from the simulator for 60 s`, exactly 60 s after the kill |
 | 15 | `alert-user Sit Bot hello`, then `alert hello` | `simulator alert: /hello` (OpenSim adds the slash), then `simulator alert: hello`; the bot stays seated | Pass |
 
+## Chat and IM logging
+
+`test-rig/talk.py` logs in as `Rig Owner` four metres from the bot and talks
+to it: four lines of local chat (say, whisper, shout, and one containing a
+tab, a line break and a backslash), one instant message, and one line from a
+prim it rezzes with the simulator's default script. Run the bot with
+`log_chat` and `log_im` set, wait for `seated`, then run the helper.
+
+| # | Inject | Expected | Result (2026-11-18, OpenSim 9d00a55552) |
+|---|---|---|---|
+| 16 | `talk.py` with `log_chat = "chat.tsv"` and `log_im = "im.tsv"` | One standard-error line and one row per message; chat only in `chat.tsv`, the IM only in `im.tsv`; header row first; seven fields per row | Pass: 5 chat rows, 1 IM row, kinds `say`, `whisper`, `shout`, `im` |
+| 17 | The avatar lines of 16 | `avatar_name` and `display_name` filled, object columns empty | Pass: `Rig Owner` in both (OpenSim's display name is the avatar name) |
+| 18 | The scripted prim's line of 16 | Owner in the avatar columns, `Object` and the prim's UUID in the object columns | Pass |
+| 19 | The line `one<TAB>two<LF>three \ four` of 16 | One row whose text is `one\ttwo\nthree \\ four`; one line on standard error | Pass |
+| 20 | Ctrl-C the bot while `talk.py` is still talking | Every chat message the bot received before the signal is in `chat.tsv`; exit status 0 | Pass at three different moments: 2, 3 and 3 messages received, logged and written |
+| 21 | `fetch_offline_im` absent, then `true`, with `--verbose` | No `RetrieveInstantMessages` sent; then exactly one, after entering the region, and the bot sits as usual | Pass |
+| 22 | Start with `log_im` in a directory that does not exist | Error naming `log_im`, exit status 2, no login attempt | Pass |
+
+Not covered on this rig: an instant message from a script (`llInstantMessage`;
+the helper cannot upload a script of its own), and delivery of stored offline
+IMs (OpenSim keeps them only with a MySQL/PostgreSQL store or an external
+service, neither of which the rig has). Both were checked on Second Life
+instead.
+
 Seen in a viewer as well: the avatar seated on the prim in `Target`. Not covered on this rig:
 a region that stays offline while the
 rest of the grid is up, and anything specific to Second Life.

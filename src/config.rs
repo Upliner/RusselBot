@@ -3,7 +3,7 @@
 use md5::{Digest, Md5};
 use serde::Deserialize;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub const DEFAULT_LOGIN_URL: &str = "https://login.agni.lindenlab.com/cgi-bin/login.cgi";
@@ -19,6 +19,11 @@ pub struct Config {
     pub region: String,
     pub position: [f32; 3],
     pub object: Uuid,
+    /// TSV file for local chat, if any.
+    pub log_chat: Option<PathBuf>,
+    /// TSV file for instant messages, if any.
+    pub log_im: Option<PathBuf>,
+    pub fetch_offline_im: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -40,6 +45,10 @@ struct Raw {
     region: Option<String>,
     position: Option<Vec<f64>>,
     object: Option<String>,
+    // Kept untyped so that a wrong type is reported with the key's name.
+    log_chat: Option<toml::Value>,
+    log_im: Option<toml::Value>,
+    fetch_offline_im: Option<toml::Value>,
 }
 
 /// Hashes a plain password into the form grids accept: `$1$` + MD5 hex.
@@ -64,6 +73,14 @@ fn err<T>(msg: impl Into<String>) -> Result<T, ConfigError> {
 
 fn required<T>(value: Option<T>, key: &str) -> Result<T, ConfigError> {
     value.ok_or_else(|| ConfigError(format!("`{key}` is required")))
+}
+
+fn log_path(value: Option<toml::Value>, key: &str) -> Result<Option<PathBuf>, ConfigError> {
+    match value {
+        None => Ok(None),
+        Some(toml::Value::String(path)) if !path.is_empty() => Ok(Some(PathBuf::from(path))),
+        Some(_) => err(format!("`{key}` must be a non-empty file path")),
+    }
 }
 
 impl Config {
@@ -130,6 +147,14 @@ impl Config {
         let object = Uuid::parse_str(object.trim())
             .map_err(|_| ConfigError("`object` is not a valid UUID".to_string()))?;
 
+        let log_chat = log_path(raw.log_chat, "log_chat")?;
+        let log_im = log_path(raw.log_im, "log_im")?;
+        let fetch_offline_im = match raw.fetch_offline_im {
+            None => false,
+            Some(toml::Value::Boolean(on)) => on,
+            Some(_) => return err("`fetch_offline_im` must be true or false"),
+        };
+
         Ok(Config {
             login_url,
             first_name,
@@ -138,6 +163,9 @@ impl Config {
             region,
             position,
             object,
+            log_chat,
+            log_im,
+            fetch_offline_im,
         })
     }
 }
@@ -248,6 +276,30 @@ mod tests {
     }
 
     #[test]
+    fn message_logging_is_off_by_default() {
+        let cfg = Config::parse(&base()).unwrap();
+        assert_eq!((cfg.log_chat, cfg.log_im, cfg.fetch_offline_im), (None, None, false));
+    }
+
+    #[test]
+    fn accepts_message_logging_keys() {
+        let text = base() + "log_chat = \"chat.tsv\"\nlog_im = \"/var/log/im.tsv\"\nfetch_offline_im = true\n";
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(cfg.log_chat, Some(PathBuf::from("chat.tsv")));
+        assert_eq!(cfg.log_im, Some(PathBuf::from("/var/log/im.tsv")));
+        assert!(cfg.fetch_offline_im);
+    }
+
+    #[test]
+    fn rejects_bad_message_logging_keys() {
+        for key in ["log_chat", "log_im"] {
+            assert!(rejected(&(base() + &format!("{key} = \"\"\n"))).contains(&format!("`{key}`")));
+            assert!(rejected(&(base() + &format!("{key} = 5\n"))).contains(&format!("`{key}`")));
+        }
+        assert!(rejected(&(base() + "fetch_offline_im = \"yes\"\n")).contains("`fetch_offline_im`"));
+    }
+
+    #[test]
     fn rejects_invalid_toml() {
         assert!(Config::parse("user = ").is_err());
     }
@@ -256,5 +308,20 @@ mod tests {
     fn example_file_is_valid() {
         let cfg = Config::parse(include_str!("../slbot.example.toml")).unwrap();
         assert_eq!(cfg.login_url, "http://127.0.0.1:9000/");
+    }
+
+    #[test]
+    fn example_file_is_valid_with_its_optional_keys_enabled() {
+        let text = include_str!("../slbot.example.toml");
+        let mut enabled = text.to_string();
+        for key in ["log_chat", "log_im", "fetch_offline_im"] {
+            let commented = format!("# {key} = ");
+            assert!(text.contains(&commented), "{key} is not in the example");
+            enabled = enabled.replace(&commented, &format!("{key} = "));
+        }
+        let cfg = Config::parse(&enabled).unwrap();
+        assert_eq!(cfg.log_chat, Some(PathBuf::from("chat.tsv")));
+        assert_eq!(cfg.log_im, Some(PathBuf::from("im.tsv")));
+        assert!(cfg.fetch_offline_im);
     }
 }

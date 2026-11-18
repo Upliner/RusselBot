@@ -6,6 +6,8 @@ mod caps;
 mod config;
 mod log;
 mod login;
+mod msglog;
+mod names;
 mod net;
 mod reconciler;
 mod session;
@@ -18,14 +20,16 @@ mod xml;
 
 use config::Config;
 use login::Outcome;
+use msglog::{Channel, Logs, Recorder};
+use names::Lookup;
 use net::{Event, RealNet};
 use reconciler::{Action, Decision, Reconciler};
 use session::{Session, SessionEvent};
 use std::io::{BufRead, IsTerminal};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const EXIT_OK: i32 = 0;
 const EXIT_FATAL: i32 = 1;
@@ -131,6 +135,13 @@ struct Bot {
     /// from a dropped session can never be mistaken for the current one's.
     next_generation: u64,
     stopping: bool,
+    /// Chat and instant messages waiting for their names.
+    recorder: Recorder,
+    logs: Logs,
+    name_lookups: Sender<Lookup>,
+    /// The current simulator's display-name service: not heard of yet
+    /// (`None`), absent (`Some(None)`) or its URL.
+    names_url: Option<Option<String>>,
 }
 
 /// What the main loop should do after handling something.
@@ -159,17 +170,23 @@ impl Bot {
                 );
                 self.reconciler.login_accepted();
                 let net = RealNet::new(self.events.clone());
-                let session = Session::new(net, &info, cfg.object, self.next_generation, now);
+                let session = Session::new(net, &info, cfg.object, cfg.fetch_offline_im, self.next_generation, now);
                 self.session = Some(session);
             }
             Outcome::NeedsOperator(failure) => {
-                info!("login needs the operator ({}): {}", failure.reason, failure.message);
+                info!(
+                    "login needs the operator ({}): {}",
+                    failure.reason, failure.message
+                );
                 self.reconciler.login_needs_operator(&failure);
             }
             Outcome::Refused(failure) => {
                 info!("login refused ({}): {}", failure.reason, failure.message);
                 if let Some(delay) = self.reconciler.login_refused(&failure, now) {
-                    info!("next login in {}, asking for the last location", seconds(delay));
+                    info!(
+                        "next login in {}, asking for the last location",
+                        seconds(delay)
+                    );
                 }
             }
             Outcome::Temporary(failure) => {
@@ -184,6 +201,43 @@ impl Bot {
         if let Some(session) = self.session.take() {
             self.next_generation = session.generation() + 1;
         }
+        self.names_url = None;
+    }
+
+    fn record(&mut self, channel: Channel, message: session::Message, now: Instant) {
+        let received = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        self.recorder.push(channel, message, received, now);
+    }
+
+    /// Sends pending name lookups on their way and writes the messages
+    /// whose names are settled.
+    fn service_messages(&mut self) {
+        if self.recorder.has_lookups() {
+            match &self.names_url {
+                // The simulator has not said yet; the messages wait.
+                None => {}
+                Some(None) => {
+                    let ids = self.recorder.take_lookups();
+                    self.recorder.lookup_failed(&ids);
+                }
+                Some(Some(url)) => {
+                    let lookup = Lookup { url: url.clone(), ids: self.recorder.take_lookups() };
+                    if let Err(unsent) = self.name_lookups.send(lookup) {
+                        self.recorder.lookup_failed(&unsent.0.ids);
+                    }
+                }
+            }
+        }
+        for record in self.recorder.flush(Instant::now()) {
+            self.logs.write(&record);
+        }
+    }
+
+    /// Writes every message still waiting for names; for use on the way out.
+    fn flush_messages(&mut self) {
+        for record in self.recorder.flush_all(Instant::now()) {
+            self.logs.write(&record);
+        }
     }
 
     fn apply(&mut self, event: SessionEvent, now: Instant) -> Flow {
@@ -191,7 +245,11 @@ impl Bot {
         match event {
             SessionEvent::RegionEntered(name) => {
                 rec.region_entered(&name, now);
-                let target = if rec.in_target_region() { "the target region" } else { "not the target region" };
+                let target = if rec.in_target_region() {
+                    "the target region"
+                } else {
+                    "not the target region"
+                };
                 info!("connected, in region \"{name}\" ({target})");
             }
             SessionEvent::Lost(reason) => {
@@ -221,9 +279,20 @@ impl Bot {
             }
             SessionEvent::TeleportFailed(reason) => {
                 let delay = rec.teleport_failed(now);
-                info!("teleport failed: {reason}; next attempt in {}", seconds(delay));
+                info!(
+                    "teleport failed: {reason}; next attempt in {}",
+                    seconds(delay)
+                );
             }
             SessionEvent::Alert(message) => info!("simulator alert: {message}"),
+            SessionEvent::Chat(message) => self.record(Channel::Chat, message, now),
+            SessionEvent::InstantMessage(message) => self.record(Channel::Im, message, now),
+            SessionEvent::DisplayNamesUrl(url) => {
+                if url.is_none() {
+                    debug!("the simulator has no display-name service");
+                }
+                self.names_url = Some(url);
+            }
             SessionEvent::LoggedOut => {
                 info!("logged out");
                 return Flow::Exit(EXIT_OK);
@@ -235,7 +304,9 @@ impl Bot {
     /// Runs timers and applies whatever the session has to report.
     fn service_session(&mut self) -> Flow {
         let now = Instant::now();
-        let Some(session) = &mut self.session else { return Flow::Continue };
+        let Some(session) = &mut self.session else {
+            return Flow::Continue;
+        };
         session.tick(now);
         for event in session.take_events() {
             if let Flow::Exit(code) = self.apply(event, now) {
@@ -304,6 +375,8 @@ impl Bot {
             (Event::Caps { generation, event }, Some(session)) => {
                 session.handle_caps(generation, event, now)
             }
+            (Event::Names { found, missing }, _) => self.recorder.names_resolved(found, missing, now),
+            (Event::NamesFailed(ids), _) => self.recorder.lookup_failed(&ids),
             // Left over from a session that is already gone.
             (_, None) => {}
         }
@@ -319,9 +392,22 @@ fn run_bot(config_path: &Path) -> i32 {
             return EXIT_CONFIG;
         }
     };
+    // Before anything touches the network: a log that cannot be written is
+    // a config error.
+    let logs = match Logs::open(config.log_chat.as_deref(), config.log_im.as_deref()) {
+        Ok(logs) => logs,
+        Err(e) => {
+            eprintln!("slbot: {}: `{}`: {}", config_path.display(), e.key, e.message);
+            return EXIT_CONFIG;
+        }
+    };
     let (events, incoming) = mpsc::channel();
     install_signal_handler(events.clone());
     let mut bot = Bot {
+        recorder: Recorder::default(),
+        logs,
+        name_lookups: names::spawn(events.clone()),
+        names_url: None,
         reconciler: Reconciler::new(&config.region),
         config,
         session: None,
@@ -330,11 +416,17 @@ fn run_bot(config_path: &Path) -> i32 {
         next_generation: 1,
         stopping: false,
     };
+    let code = run_loop(&mut bot, &incoming);
+    bot.flush_messages();
+    code
+}
 
+fn run_loop(bot: &mut Bot, incoming: &Receiver<Event>) -> i32 {
     loop {
         if let Flow::Exit(code) = bot.service_session() {
             return code;
         }
+        bot.service_messages();
         let mut wake = Instant::now() + IDLE_WAIT;
         if !bot.stopping {
             match bot.reconcile() {
@@ -345,6 +437,9 @@ fn run_bot(config_path: &Path) -> i32 {
         }
         if let Some(session) = &bot.session {
             wake = wake.min(session.next_deadline());
+        }
+        if let Some(deadline) = bot.recorder.next_deadline() {
+            wake = wake.min(deadline);
         }
         match incoming.recv_timeout(wake.saturating_duration_since(Instant::now())) {
             Ok(event) => {

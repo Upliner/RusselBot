@@ -23,6 +23,7 @@ pub const TELEPORT_FAILED: MessageId = low(74);
 pub const AGENT_THROTTLE: MessageId = low(81);
 pub const ALERT_MESSAGE: MessageId = low(134);
 pub const AGENT_ALERT_MESSAGE: MessageId = low(135);
+pub const CHAT_FROM_SIMULATOR: MessageId = low(139);
 pub const REGION_HANDSHAKE: MessageId = low(148);
 pub const REGION_HANDSHAKE_REPLY: MessageId = low(149);
 pub const DISABLE_SIMULATOR: MessageId = low(152);
@@ -31,6 +32,8 @@ pub const COMPLETE_AGENT_MOVEMENT: MessageId = low(249);
 pub const AGENT_MOVEMENT_COMPLETE: MessageId = low(250);
 pub const LOGOUT_REQUEST: MessageId = low(252);
 pub const LOGOUT_REPLY: MessageId = low(253);
+pub const IMPROVED_INSTANT_MESSAGE: MessageId = low(254);
+pub const RETRIEVE_INSTANT_MESSAGES: MessageId = low(255);
 pub const MAP_NAME_REQUEST: MessageId = low(408);
 pub const MAP_BLOCK_REPLY: MessageId = low(409);
 pub const PACKET_ACK: MessageId = 0xFFFF_FFFB;
@@ -48,7 +51,6 @@ pub const COARSE_LOCATION_UPDATE: MessageId = medium(6);
 pub const ATTACHED_SOUND: MessageId = medium(13);
 pub const VIEWER_EFFECT: MessageId = medium(17);
 pub const HEALTH_MESSAGE: MessageId = low(138);
-pub const CHAT_FROM_SIMULATOR: MessageId = low(139);
 pub const SIM_STATS: MessageId = low(140);
 pub const SIMULATOR_VIEWER_TIME_MESSAGE: MessageId = low(150);
 pub const AVATAR_APPEARANCE: MessageId = low(158);
@@ -87,6 +89,8 @@ pub fn name(id: MessageId) -> String {
         AGENT_MOVEMENT_COMPLETE => "AgentMovementComplete",
         LOGOUT_REQUEST => "LogoutRequest",
         LOGOUT_REPLY => "LogoutReply",
+        IMPROVED_INSTANT_MESSAGE => "ImprovedInstantMessage",
+        RETRIEVE_INSTANT_MESSAGES => "RetrieveInstantMessages",
         MAP_NAME_REQUEST => "MapNameRequest",
         MAP_BLOCK_REPLY => "MapBlockReply",
         PACKET_ACK => "PacketAck",
@@ -239,6 +243,11 @@ pub fn logout_request(agent: &Agent) -> Outgoing {
     Writer::agent(agent).finish(LOGOUT_REQUEST, false)
 }
 
+/// RetrieveInstantMessages, Low 255: asks for the IMs stored while offline.
+pub fn retrieve_instant_messages(agent: &Agent) -> Outgoing {
+    Writer::agent(agent).finish(RETRIEVE_INSTANT_MESSAGES, false)
+}
+
 /// MapNameRequest, Low 408.
 pub fn map_name_request(agent: &Agent, name: &str) -> Outgoing {
     let mut text = name.as_bytes()[..name.len().min(254)].to_vec();
@@ -374,6 +383,32 @@ pub enum Incoming {
     KickUser { reason: String },
     /// Text the simulator wants shown to the user.
     Alert { message: String },
+    /// Local chat, including typing notifications (empty text).
+    Chat {
+        from_name: String,
+        /// The speaking avatar or object.
+        source_id: Uuid,
+        /// The object's owner; the avatar itself for avatar chat.
+        owner_id: Uuid,
+        source_type: u8,
+        chat_type: u8,
+        /// -1 not audible, 0 barely, 1 fully.
+        audible: i8,
+        text: String,
+    },
+    InstantMessage {
+        /// The sending avatar; for an object's IM, the object's owner.
+        from_agent: Uuid,
+        from_name: String,
+        dialog: u8,
+        /// Meaning depends on `dialog`; the object for an object's IM.
+        id: Uuid,
+        /// The message was stored while the avatar was offline.
+        offline: bool,
+        /// When a stored message was sent, in seconds since the Unix epoch.
+        timestamp: u32,
+        text: String,
+    },
     LogoutReply,
     DisableSimulator,
     /// A message the bot has no use for.
@@ -453,6 +488,43 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
         AGENT_ALERT_MESSAGE => {
             r.skip(16 + 1)?;
             Incoming::Alert { message: text(r.variable1()?) }
+        }
+        // ChatFromSimulator, Low 139: FromName Variable 1, SourceID, OwnerID,
+        // SourceType U8, ChatType U8, Audible U8, Position, Message Variable 2.
+        CHAT_FROM_SIMULATOR => {
+            let from_name = text(r.variable1()?);
+            let (source_id, owner_id) = (r.uuid()?, r.uuid()?);
+            let (source_type, chat_type, audible) = (r.u8()?, r.u8()?, r.u8()? as i8);
+            r.skip(12)?;
+            Incoming::Chat {
+                from_name,
+                source_id,
+                owner_id,
+                source_type,
+                chat_type,
+                audible,
+                text: text(r.variable2()?),
+            }
+        }
+        // ImprovedInstantMessage, Low 254: AgentID, SessionID, FromGroup BOOL,
+        // ToAgentID, ParentEstateID U32, RegionID, Position, Offline U8,
+        // Dialog U8, ID, Timestamp U32, FromAgentName Variable 1,
+        // Message Variable 2, BinaryBucket Variable 2, ...
+        IMPROVED_INSTANT_MESSAGE => {
+            let from_agent = r.uuid()?;
+            r.skip(16 + 1 + 16 + 4 + 16 + 12)?;
+            let (offline, dialog) = (r.u8()? != 0, r.u8()?);
+            let (id, timestamp) = (r.uuid()?, r.u32()?);
+            let from_name = text(r.variable1()?);
+            Incoming::InstantMessage {
+                from_agent,
+                from_name,
+                dialog,
+                id,
+                offline,
+                timestamp,
+                text: text(r.variable2()?),
+            }
         }
         LOGOUT_REPLY => Incoming::LogoutReply,
         DISABLE_SIMULATOR => Incoming::DisableSimulator,
@@ -585,6 +657,52 @@ pub mod testing {
         let mut body = vec![0; 4 + 2 + 32];
         body.extend((reason.len() as u16).to_le_bytes());
         body.extend(reason.as_bytes());
+        body
+    }
+
+    fn string2(text: &str) -> Vec<u8> {
+        let mut out = (text.len() as u16 + 1).to_le_bytes().to_vec();
+        out.extend(text.as_bytes());
+        out.push(0);
+        out
+    }
+
+    /// `source` is (SourceID, OwnerID, SourceType).
+    pub fn chat_from_simulator(
+        from_name: &str,
+        source: (Uuid, Uuid, u8),
+        chat_type: u8,
+        audible: i8,
+        message: &str,
+    ) -> Vec<u8> {
+        let mut body = string1(from_name);
+        body.extend(source.0.as_bytes());
+        body.extend(source.1.as_bytes());
+        body.extend([source.2, chat_type, audible as u8]);
+        body.extend(vector([1.0, 2.0, 3.0]));
+        body.extend(string2(message));
+        body
+    }
+
+    /// `stored` is the Timestamp of a message kept while offline.
+    pub fn improved_instant_message(
+        from_agent: Uuid,
+        from_name: &str,
+        dialog: u8,
+        id: Uuid,
+        stored: Option<u32>,
+        message: &str,
+    ) -> Vec<u8> {
+        let mut body = from_agent.as_bytes().to_vec();
+        body.extend([0; 16 + 1 + 16 + 4 + 16 + 12]); // SessionID .. Position
+        body.extend([u8::from(stored.is_some()), dialog]);
+        body.extend(id.as_bytes());
+        body.extend(stored.unwrap_or(0).to_le_bytes());
+        body.extend(string1(from_name));
+        body.extend(string2(message));
+        body.extend([1, 0, 0]); // BinaryBucket
+        body.extend([0; 4]); // EstateID
+        body.push(0); // MetaData block count
         body
     }
 
@@ -805,6 +923,70 @@ mod tests {
         assert_eq!(decode(low(134), &alert_message("No suitable surface")), Ok(alert));
         let alert = Incoming::Alert { message: "Region restarting".into() };
         assert_eq!(decode(low(135), &agent_alert_message("Region restarting")), Ok(alert));
+    }
+
+    #[test]
+    fn encodes_retrieve_instant_messages() {
+        let msg = retrieve_instant_messages(&agent());
+        assert_eq!((msg.id, msg.zerocoded, msg.body), (low(255), false, agent_prefix()));
+    }
+
+    #[test]
+    fn decodes_chat_from_simulator() {
+        let (avatar, object, owner) =
+            (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
+        assert_eq!(
+            decode(low(139), &chat_from_simulator("Jane Doe", (avatar, avatar, 1), 1, 1, "hello")),
+            Ok(Incoming::Chat {
+                from_name: "Jane Doe".into(),
+                source_id: avatar,
+                owner_id: avatar,
+                source_type: 1,
+                chat_type: 1,
+                audible: 1,
+                text: "hello".into(),
+            })
+        );
+        let body = chat_from_simulator("Clock", (object, owner, 2), 2, -1, "tick\ntock");
+        assert_eq!(
+            decode(low(139), &body),
+            Ok(Incoming::Chat {
+                from_name: "Clock".into(),
+                source_id: object,
+                owner_id: owner,
+                source_type: 2,
+                chat_type: 2,
+                audible: -1,
+                text: "tick\ntock".into(),
+            })
+        );
+        assert_eq!(decode(low(139), &body[..body.len() - 1]), Err(DecodeError));
+    }
+
+    #[test]
+    fn decodes_improved_instant_message() {
+        let (sender, session, object) =
+            (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
+        let im = |dialog, id, offline, timestamp, from_name: &str, text: &str| Incoming::InstantMessage {
+            from_agent: sender,
+            from_name: from_name.into(),
+            dialog,
+            id,
+            offline,
+            timestamp,
+            text: text.into(),
+        };
+        assert_eq!(
+            decode(low(254), &improved_instant_message(sender, "Jane Doe", 0, session, None, "hi")),
+            Ok(im(0, session, false, 0, "Jane Doe", "hi"))
+        );
+        assert_eq!(
+            decode(low(254), &improved_instant_message(sender, "Clock", 19, object, None, "done")),
+            Ok(im(19, object, false, 0, "Clock", "done"))
+        );
+        let body = improved_instant_message(sender, "Jane Doe", 0, session, Some(1_700_000_000), "later");
+        assert_eq!(decode(low(254), &body), Ok(im(0, session, true, 1_700_000_000, "Jane Doe", "later")));
+        assert_eq!(decode(low(254), &body[..80]), Err(DecodeError));
     }
 
     #[test]

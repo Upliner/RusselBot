@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const EVENT_QUEUE: &str = "EventQueueGet";
+const DISPLAY_NAMES: &str = "GetDisplayNames";
 /// Continuous failure for this long means the session is gone.
 pub const FAILURE_LIMIT: Duration = Duration::from_secs(60);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -44,17 +45,29 @@ pub enum CapsEvent {
     Event(EqEvent),
     /// The simulator no longer knows the session, or cannot be reached.
     Gone(String),
+    /// The simulator's display-name lookup URL, or that it has none. Sent
+    /// once, when the seed capability has answered.
+    DisplayNames(Option<String>),
+}
+
+/// The capabilities the bot uses, from the seed capability's reply.
+#[derive(Debug, PartialEq)]
+pub struct Seed {
+    pub event_queue: String,
+    pub display_names: Option<String>,
 }
 
 pub fn seed_request() -> String {
-    xml::write_llsd(&Value::Array(vec![Value::Str(EVENT_QUEUE.to_string())]))
+    let names = [EVENT_QUEUE, DISPLAY_NAMES].map(|name| Value::Str(name.to_string()));
+    xml::write_llsd(&Value::Array(names.to_vec()))
 }
 
-pub fn parse_seed_reply(body: &str) -> Result<String, String> {
+pub fn parse_seed_reply(body: &str) -> Result<Seed, String> {
     let reply = xml::parse_llsd(body).map_err(|e| e.to_string())?;
-    match reply.str_field(EVENT_QUEUE) {
-        Some(url) if !url.is_empty() => Ok(url.to_string()),
-        _ => Err("simulator offers no EventQueueGet capability".to_string()),
+    let url = |name| reply.str_field(name).filter(|url| !url.is_empty()).map(str::to_string);
+    match url(EVENT_QUEUE) {
+        Some(event_queue) => Ok(Seed { event_queue, display_names: url(DISPLAY_NAMES) }),
+        None => Err("simulator offers no EventQueueGet capability".to_string()),
     }
 }
 
@@ -151,7 +164,7 @@ fn poll(agent: &ureq::Agent, url: &str, ack: Option<i64>) -> PollResult {
     }
 }
 
-fn fetch_event_queue_url(agent: &ureq::Agent, seed_capability: &str) -> Result<String, String> {
+fn fetch_seed(agent: &ureq::Agent, seed_capability: &str) -> Result<Seed, String> {
     match post(agent, seed_capability, &seed_request()) {
         Ok((200, body)) => parse_seed_reply(&body),
         Ok((status, _)) => Err(format!("seed capability answered HTTP {status}")),
@@ -171,9 +184,12 @@ pub fn run(seed_capability: &str, stop: &AtomicBool, mut emit: impl FnMut(CapsEv
     while !stop.load(Ordering::Relaxed) {
         let started = Instant::now();
         let failure = match &queue_url {
-            None => match fetch_event_queue_url(&agent, seed_capability) {
-                Ok(url) => {
-                    queue_url = Some(url);
+            None => match fetch_seed(&agent, seed_capability) {
+                Ok(seed) => {
+                    queue_url = Some(seed.event_queue);
+                    if !emit(CapsEvent::DisplayNames(seed.display_names)) {
+                        return;
+                    }
                     None
                 }
                 Err(e) => Some(e),
@@ -245,14 +261,24 @@ mod tests {
 
     #[test]
     fn seed_request_asks_for_the_event_queue() {
-        assert!(seed_request().ends_with("<llsd><array><string>EventQueueGet</string></array></llsd>"));
+        assert!(seed_request().ends_with(
+            "<llsd><array><string>EventQueueGet</string><string>GetDisplayNames</string></array></llsd>"
+        ));
     }
 
     #[test]
     fn parses_seed_reply() {
         let body = "<llsd><map><key>EventQueueGet</key>\
                     <string>http://127.0.0.1:9000/CAPS/EQG/abc/</string></map></llsd>";
-        assert_eq!(parse_seed_reply(body).unwrap(), "http://127.0.0.1:9000/CAPS/EQG/abc/");
+        let seed = parse_seed_reply(body).unwrap();
+        assert_eq!(seed.event_queue, "http://127.0.0.1:9000/CAPS/EQG/abc/");
+        assert_eq!(seed.display_names, None);
+        let body = body.replace(
+            "</map>",
+            "<key>GetDisplayNames</key><string>http://127.0.0.1:9000/CAPS/names/</string></map>",
+        );
+        let seed = parse_seed_reply(&body).unwrap();
+        assert_eq!(seed.display_names.as_deref(), Some("http://127.0.0.1:9000/CAPS/names/"));
         assert!(parse_seed_reply("<llsd><map></map></llsd>").is_err());
         assert!(parse_seed_reply("oops").is_err());
     }

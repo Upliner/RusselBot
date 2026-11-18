@@ -3,6 +3,7 @@
 //! channel with events stamped with the circuit's generation.
 
 use crate::caps::{self, CapsEvent};
+use crate::names::Names;
 use crate::session::Net;
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -12,6 +13,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use uuid::Uuid;
 
 /// How often a blocked reader thread checks whether it should stop.
 const READ_TIMEOUT: Duration = Duration::from_secs(1);
@@ -20,6 +22,11 @@ const MAX_DATAGRAM: usize = 65_536;
 pub enum Event {
     Datagram { generation: u64, data: Vec<u8> },
     Caps { generation: u64, event: CapsEvent },
+    /// The answer to a name lookup: the avatars found, and the ids the grid
+    /// does not know as avatars.
+    Names { found: Vec<(Uuid, Names)>, missing: Vec<Uuid> },
+    /// A name lookup that got no answer.
+    NamesFailed(Vec<Uuid>),
     /// The operator asked the bot to stop.
     Signal,
 }

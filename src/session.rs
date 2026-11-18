@@ -60,6 +60,56 @@ pub enum SessionEvent {
     /// Text the simulator sent for the user to read, such as why a sit was
     /// refused or that the region is about to restart.
     Alert(String),
+    /// Local chat the avatar heard.
+    Chat(Message),
+    /// An instant message sent to the avatar.
+    InstantMessage(Message),
+    /// Where the current simulator answers display-name lookups, if it does.
+    DisplayNamesUrl(Option<String>),
+}
+
+/// A chat or instant message as the simulator delivered it; the names that
+/// are not part of the message are looked up later.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Message {
+    /// `say`, `shout`, ... for chat; `im` or `object` for instant messages.
+    pub kind: String,
+    pub source: Source,
+    /// When a message stored while the avatar was offline was sent, in
+    /// seconds since the Unix epoch.
+    pub sent_at: Option<u32>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Source {
+    Avatar { id: Uuid, name: String },
+    /// `id` is missing when the simulator does not say which object it was.
+    Object { id: Option<Uuid>, name: String, owner: Uuid },
+    /// The grid itself.
+    System { name: String },
+}
+
+const CHAT_SOURCE_AGENT: u8 = 1;
+const CHAT_SOURCE_OBJECT: u8 = 2;
+const CHAT_TYPE_START_TYPING: u8 = 4;
+const CHAT_TYPE_STOP_TYPING: u8 = 5;
+const CHAT_NOT_AUDIBLE: i8 = -1;
+const IM_NOTHING_SPECIAL: u8 = 0;
+const IM_FROM_TASK: u8 = 19;
+
+fn chat_kind(chat_type: u8) -> String {
+    let kind = match chat_type {
+        0 => "whisper",
+        1 => "say",
+        2 => "shout",
+        6 => "debug",
+        7 => "region",
+        8 => "owner",
+        9 => "direct",
+        other => return format!("type-{other}"),
+    };
+    kind.to_string()
 }
 
 struct Sim {
@@ -103,6 +153,8 @@ pub struct Session<N: Net> {
     sit_deadline: Option<Instant>,
     teleport: Option<Teleport>,
     logout_deadline: Option<Instant>,
+    /// Ask for the IMs stored while offline, once, on entering the first region.
+    fetch_offline_im: bool,
     lost: bool,
     events: Vec<SessionEvent>,
 }
@@ -110,7 +162,14 @@ pub struct Session<N: Net> {
 impl<N: Net> Session<N> {
     /// `generation` numbers this session's first circuit; later circuits
     /// count up from it.
-    pub fn new(net: N, info: &SessionInfo, target_object: Uuid, generation: u64, now: Instant) -> Session<N> {
+    pub fn new(
+        net: N,
+        info: &SessionInfo,
+        target_object: Uuid,
+        fetch_offline_im: bool,
+        generation: u64,
+        now: Instant,
+    ) -> Session<N> {
         let mut session = Session {
             net,
             agent: Agent { agent_id: info.agent_id, session_id: info.session_id },
@@ -124,6 +183,7 @@ impl<N: Net> Session<N> {
             sit_deadline: None,
             teleport: None,
             logout_deadline: None,
+            fetch_offline_im,
             lost: false,
             events: Vec::new(),
         };
@@ -297,6 +357,7 @@ impl<N: Net> Session<N> {
             CapsEvent::Gone(reason) => self.lose(reason),
             CapsEvent::Event(EqEvent::TeleportFinish(finish)) => self.hand_over(finish, now),
             CapsEvent::Event(EqEvent::Other(name)) => crate::debug!("event queue: ignoring {name}"),
+            CapsEvent::DisplayNames(url) => self.events.push(SessionEvent::DisplayNamesUrl(url)),
         }
     }
 
@@ -373,6 +434,36 @@ impl<N: Net> Session<N> {
             }
             Incoming::KickUser { reason } => self.lose(format!("kicked: {reason}")),
             Incoming::Alert { message } => self.events.push(SessionEvent::Alert(message)),
+            Incoming::Chat { from_name, source_id, owner_id, source_type, chat_type, audible, text } => {
+                let typing = matches!(chat_type, CHAT_TYPE_START_TYPING | CHAT_TYPE_STOP_TYPING);
+                if typing || text.is_empty() || audible == CHAT_NOT_AUDIBLE {
+                    return;
+                }
+                let source = match source_type {
+                    CHAT_SOURCE_AGENT => Source::Avatar { id: source_id, name: from_name },
+                    CHAT_SOURCE_OBJECT => {
+                        Source::Object { id: Some(source_id), name: from_name, owner: owner_id }
+                    }
+                    _ => Source::System { name: from_name },
+                };
+                let kind = chat_kind(chat_type);
+                self.events.push(SessionEvent::Chat(Message { kind, source, sent_at: None, text }));
+            }
+            Incoming::InstantMessage { from_agent, from_name, dialog, id, offline, timestamp, text } => {
+                let (kind, source) = match dialog {
+                    IM_NOTHING_SPECIAL if from_agent.is_nil() => ("im", Source::System { name: from_name }),
+                    IM_NOTHING_SPECIAL => ("im", Source::Avatar { id: from_agent, name: from_name }),
+                    // The sender is the object's owner and the id is the object.
+                    IM_FROM_TASK => {
+                        let id = (!id.is_nil()).then_some(id);
+                        ("object", Source::Object { id, name: from_name, owner: from_agent })
+                    }
+                    other => return crate::debug!("ignoring instant message with dialog {other}"),
+                };
+                let sent_at = (offline && timestamp != 0).then_some(timestamp);
+                let message = Message { kind: kind.to_string(), source, sent_at, text };
+                self.events.push(SessionEvent::InstantMessage(message));
+            }
             Incoming::LogoutReply => {
                 if self.logout_deadline.take().is_some() {
                     self.events.push(SessionEvent::LoggedOut);
@@ -393,6 +484,9 @@ impl<N: Net> Session<N> {
             self.sim.entered = true;
             self.sim.next_agent_update = now;
             self.events.push(SessionEvent::RegionEntered(name));
+            if std::mem::take(&mut self.fetch_offline_im) {
+                self.send(messages::retrieve_instant_messages(&self.agent), true, now);
+            }
         }
     }
 
@@ -507,6 +601,10 @@ mod tests {
 
     impl Rig {
         fn new() -> Rig {
+            Rig::with_offline_im(false)
+        }
+
+        fn with_offline_im(fetch_offline_im: bool) -> Rig {
             let net = FakeNet::default();
             let info = SessionInfo {
                 agent_id: agent_id(),
@@ -516,7 +614,7 @@ mod tests {
                 seed_capability: "http://127.0.0.1:9000/CAPS/seed/".to_string(),
             };
             let now = Instant::now();
-            let session = Session::new(net.clone(), &info, target(), 1, now);
+            let session = Session::new(net.clone(), &info, target(), fetch_offline_im, 1, now);
             Rig { session, net, now, sequence: 0 }
         }
 
@@ -1132,5 +1230,161 @@ mod tests {
         rig.session.handle_caps(1, finish(), rig.now);
         rig.advance(secs(30));
         assert!(matches!(&rig.events()[..], [SessionEvent::Lost(_)]));
+    }
+
+    // ------------------------------------------------------ chat and IMs
+
+    fn avatar(name: &str) -> Source {
+        Source::Avatar { id: Uuid::from_bytes([0x77; 16]), name: name.into() }
+    }
+
+    fn message(kind: &str, source: Source, text: &str) -> Message {
+        Message { kind: kind.into(), source, sent_at: None, text: text.into() }
+    }
+
+    impl Rig {
+        fn chat(&mut self, source_type: u8, chat_type: u8, audible: i8, text: &str) {
+            let ids = (Uuid::from_bytes([0x77; 16]), Uuid::from_bytes([0x88; 16]), source_type);
+            let body = wire::chat_from_simulator("Speaker", ids, chat_type, audible, text);
+            self.receive(messages::CHAT_FROM_SIMULATOR, &body);
+        }
+
+        fn im(&mut self, from: Uuid, dialog: u8, id: Uuid, stored: Option<u32>, text: &str) {
+            let body = wire::improved_instant_message(from, "Sender", dialog, id, stored, text);
+            self.receive(messages::IMPROVED_INSTANT_MESSAGE, &body);
+        }
+
+        /// How many RetrieveInstantMessages were sent since the last call to `sent`.
+        fn offline_requests(&mut self) -> usize {
+            self.sent_ids().iter().filter(|id| **id == messages::RETRIEVE_INSTANT_MESSAGES).count()
+        }
+    }
+
+    #[test]
+    fn chat_is_reported_with_its_kind() {
+        let mut rig = Rig::entered();
+        let kinds = [(0, "whisper"), (1, "say"), (2, "shout"), (6, "debug"), (7, "region"), (8, "owner"), (9, "direct")];
+        for (chat_type, kind) in kinds {
+            rig.chat(1, chat_type, 1, "hello");
+            assert_eq!(rig.events(), [SessionEvent::Chat(message(kind, avatar("Speaker"), "hello"))]);
+        }
+        rig.chat(1, 42, 1, "hello");
+        assert_eq!(rig.events(), [SessionEvent::Chat(message("type-42", avatar("Speaker"), "hello"))]);
+        // Barely audible chat is still chat.
+        rig.chat(1, 1, 0, "far away");
+        assert_eq!(rig.events(), [SessionEvent::Chat(message("say", avatar("Speaker"), "far away"))]);
+    }
+
+    #[test]
+    fn chat_from_objects_and_the_grid_keeps_its_source() {
+        let mut rig = Rig::entered();
+        rig.chat(2, 1, 1, "tick");
+        let object = Source::Object {
+            id: Some(Uuid::from_bytes([0x77; 16])),
+            name: "Speaker".into(),
+            owner: Uuid::from_bytes([0x88; 16]),
+        };
+        assert_eq!(rig.events(), [SessionEvent::Chat(message("say", object, "tick"))]);
+        rig.chat(0, 1, 1, "notice");
+        let system = Source::System { name: "Speaker".into() };
+        assert_eq!(rig.events(), [SessionEvent::Chat(message("say", system, "notice"))]);
+    }
+
+    #[test]
+    fn typing_empty_and_inaudible_chat_is_dropped() {
+        let mut rig = Rig::entered();
+        rig.chat(1, 4, 1, "");
+        rig.chat(1, 5, 1, "");
+        rig.chat(1, 4, 1, "typing with text");
+        rig.chat(1, 1, 1, "");
+        rig.chat(1, 1, -1, "muffled");
+        assert_eq!(rig.events(), []);
+    }
+
+    #[test]
+    fn instant_messages_from_avatars_and_objects_are_reported() {
+        let mut rig = Rig::entered();
+        let (sender, object) = (Uuid::from_bytes([0x77; 16]), Uuid::from_bytes([0x99; 16]));
+        rig.im(sender, 0, Uuid::from_bytes([0x66; 16]), None, "are you there?");
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::InstantMessage(message("im", avatar("Sender"), "are you there?"))]
+        );
+
+        rig.im(sender, 19, object, None, "done");
+        let source = Source::Object { id: Some(object), name: "Sender".into(), owner: sender };
+        assert_eq!(rig.events(), [SessionEvent::InstantMessage(message("object", source, "done"))]);
+
+        // An older region does not say which object it was.
+        rig.im(sender, 19, Uuid::nil(), None, "done");
+        let source = Source::Object { id: None, name: "Sender".into(), owner: sender };
+        assert_eq!(rig.events(), [SessionEvent::InstantMessage(message("object", source, "done"))]);
+
+        rig.im(Uuid::nil(), 0, Uuid::nil(), None, "maintenance");
+        let source = Source::System { name: "Sender".into() };
+        assert_eq!(rig.events(), [SessionEvent::InstantMessage(message("im", source, "maintenance"))]);
+    }
+
+    #[test]
+    fn stored_instant_messages_carry_the_time_they_were_sent() {
+        let mut rig = Rig::entered();
+        rig.im(Uuid::from_bytes([0x77; 16]), 0, Uuid::nil(), Some(1_700_000_000), "earlier");
+        let mut expected = message("im", avatar("Sender"), "earlier");
+        expected.sent_at = Some(1_700_000_000);
+        assert_eq!(rig.events(), [SessionEvent::InstantMessage(expected)]);
+    }
+
+    #[test]
+    fn other_instant_message_traffic_is_dropped() {
+        let mut rig = Rig::entered();
+        // Inventory offer, group notice, session message, auto response, typing.
+        for dialog in [4, 32, 17, 20, 41, 42] {
+            rig.im(Uuid::from_bytes([0x77; 16]), dialog, Uuid::nil(), None, "x");
+        }
+        assert_eq!(rig.events(), []);
+    }
+
+    #[test]
+    fn offline_messages_are_requested_once_per_session_when_enabled() {
+        let mut rig = Rig::with_offline_im(true);
+        assert_eq!(rig.offline_requests(), 0, "not before the region is entered");
+        rig.receive(messages::REGION_HANDSHAKE, &wire::region_handshake("Home"));
+        let body = wire::agent_movement_complete(&rig.agent(), [1.0, 2.0, 3.0], HOME_HANDLE);
+        rig.receive(messages::AGENT_MOVEMENT_COMPLETE, &body);
+        let sent = rig.sent();
+        let request: Vec<_> = sent.iter().filter(|p| p.id == messages::RETRIEVE_INSTANT_MESSAGES).collect();
+        assert_eq!(request.len(), 1);
+        assert!(request[0].is_reliable());
+        rig.ack_all();
+
+        // Not again in the next region.
+        rig.session.handle_caps(1, finish(), rig.now);
+        rig.receive(messages::REGION_HANDSHAKE, &wire::region_handshake("Target"));
+        let body = wire::agent_movement_complete(&rig.agent(), [1.0, 2.0, 3.0], HOME_HANDLE);
+        rig.receive(messages::AGENT_MOVEMENT_COMPLETE, &body);
+        assert_eq!(rig.offline_requests(), 0);
+    }
+
+    #[test]
+    fn offline_messages_are_not_requested_by_default() {
+        let mut rig = Rig::new();
+        rig.receive(messages::REGION_HANDSHAKE, &wire::region_handshake("Home"));
+        let body = wire::agent_movement_complete(&rig.agent(), [1.0, 2.0, 3.0], HOME_HANDLE);
+        rig.receive(messages::AGENT_MOVEMENT_COMPLETE, &body);
+        assert_eq!(rig.offline_requests(), 0);
+    }
+
+    #[test]
+    fn display_names_url_is_passed_on_for_the_current_circuit_only() {
+        let mut rig = Rig::entered();
+        let url = Some("http://127.0.0.1:9000/CAPS/names/".to_string());
+        rig.session.handle_caps(1, CapsEvent::DisplayNames(url.clone()), rig.now);
+        rig.session.handle_caps(1, CapsEvent::DisplayNames(None), rig.now);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::DisplayNamesUrl(url.clone()), SessionEvent::DisplayNamesUrl(None)]
+        );
+        rig.session.handle_caps(7, CapsEvent::DisplayNames(url), rig.now);
+        assert_eq!(rig.events(), []);
     }
 }

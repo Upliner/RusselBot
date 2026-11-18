@@ -18,8 +18,11 @@ It requires one single config file to run with following parameters:
 
 Verified by unit tests and against a local OpenSim, including kicks, region
 restarts, simulator outages and being unseated or teleported away; see
-`docs/test-rig.md` for the rig and the results. Second Life is not verified
-yet. Multi-factor login is not supported: an account that has it enabled
+`docs/test-rig.md` for the rig and the results. Chat and IM logging is
+verified there too, except IMs from scripts and delivery of offline IMs,
+which the rig cannot produce. On Second Life, checked by hand on 2026-11-18:
+login, sitting, logging of chat and IMs from avatars and from objects, and
+fetching offline IMs (delivered with the time they were sent). Multi-factor login is not supported: an account that has it enabled
 makes the bot exit with an error.
 
 ## Build
@@ -68,6 +71,9 @@ One TOML file; see `slbot.example.toml`.
 | `region` | yes | Target region name |
 | `position` | yes | `[x, y, z]` inside the region; pick a spot close to the object |
 | `object` | yes | UUID of the object to sit on |
+| `log_chat` | no | File that receives local chat, see [Chat and IM logs](#chat-and-im-logs) |
+| `log_im` | no | File that receives instant messages |
+| `fetch_offline_im` | no | `true` to also fetch IMs stored while the avatar was offline. Default: `false` |
 
 To keep the plain password out of the file:
 
@@ -77,6 +83,38 @@ printf 'secret\n' | target/release/slbot hash
 ```
 
 Put the printed value in `password_hash` and leave `password` out.
+
+## Chat and IM logs
+
+The bot reads local chat the avatar hears and instant messages sent to it,
+from avatars and from objects, and writes each one to standard error. It
+never answers. Group chat, offers, invitations and typing notifications are
+not recorded.
+
+With `log_chat` and/or `log_im` set, each message is also appended to that
+file as one tab-separated line (UTF-8). The file is created when missing and
+gets a header line when it is empty; relative paths are relative to the
+directory the bot is started in. A file that cannot be opened makes the bot
+exit with status 2 before it logs in.
+
+| Column | Content |
+|---|---|
+| `time` | UTC, `YYYY-MM-DDTHH:MM:SSZ`: when the bot received the message, or when it was sent for an IM stored offline |
+| `kind` | Chat: `whisper`, `say`, `shout`, `region`, `owner`, `direct`, `debug`. IM: `im` (from an avatar), `object` (from a script) |
+| `avatar_name` | The speaker; for an object, its owner |
+| `display_name` | That avatar's display name |
+| `object_name` | The object's name; empty for an avatar |
+| `object_uuid` | The object's UUID; empty for an avatar |
+| `text` | The message |
+
+Inside a field, tab, line feed, carriage return and backslash are written as
+`\t`, `\n`, `\r` and `\\`. Display names and owners' names are looked up on
+the grid; a name the grid does not supply within 5 seconds is left empty, as
+are the owner columns of a group-owned object.
+
+`fetch_offline_im = true` makes the bot ask, after each login, for the IMs
+stored while the avatar was offline. Fetching removes them from the grid: a
+viewer logging in as this avatar afterwards will not see them.
 
 The bot logs in with `agree_to_tos` set, so it accepts a grid's terms of
 service on the account's behalf, including changed terms, without showing

@@ -20,3 +20,14 @@ position = [128.0, 128.0, 25.0]
 
 # UUID of the object to sit on.
 object = "00000000-0000-0000-0000-000000000000"
+
+# Optional: record what the avatar hears and is told. Every message is also
+# written to standard error. The files are tab-separated, appended to, and
+# created when missing; relative paths are relative to the working directory.
+# log_chat = "chat.tsv"
+# log_im = "im.tsv"
+
+# Optional: after each login, also fetch instant messages that were stored
+# while the avatar was offline. This removes them from the grid, so a viewer
+# logging in as this avatar later will not see them. Off by default.
+# fetch_offline_im = true
