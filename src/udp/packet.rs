@@ -21,6 +21,10 @@ pub const fn high(n: u8) -> MessageId {
     n as u32
 }
 
+pub const fn medium(n: u8) -> MessageId {
+    0xFF00 | n as u32
+}
+
 pub const fn low(n: u16) -> MessageId {
     0xFFFF_0000 | n as u32
 }

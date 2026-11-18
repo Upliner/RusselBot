@@ -2,7 +2,7 @@
 //! `message_template.msg` (template version 2.0). Body fields are
 //! little-endian; strings are `Variable 1` with a trailing NUL.
 
-use super::packet::{high, low, MessageId};
+use super::packet::{high, low, medium, MessageId};
 use std::fmt;
 use uuid::Uuid;
 
@@ -34,6 +34,29 @@ pub const LOGOUT_REPLY: MessageId = low(253);
 pub const MAP_NAME_REQUEST: MessageId = low(408);
 pub const MAP_BLOCK_REPLY: MessageId = low(409);
 pub const PACKET_ACK: MessageId = 0xFFFF_FFFB;
+
+// Messages a real simulator sends that the bot ignores; listed so verbose
+// logging can name them.
+pub const LAYER_DATA: MessageId = high(11);
+pub const OBJECT_UPDATE_CACHED: MessageId = high(14);
+pub const IMPROVED_TERSE_OBJECT_UPDATE: MessageId = high(15);
+pub const KILL_OBJECT: MessageId = high(16);
+pub const AVATAR_ANIMATION: MessageId = high(20);
+pub const CAMERA_CONSTRAINT: MessageId = high(22);
+pub const SOUND_TRIGGER: MessageId = high(29);
+pub const COARSE_LOCATION_UPDATE: MessageId = medium(6);
+pub const ATTACHED_SOUND: MessageId = medium(13);
+pub const VIEWER_EFFECT: MessageId = medium(17);
+pub const HEALTH_MESSAGE: MessageId = low(138);
+pub const CHAT_FROM_SIMULATOR: MessageId = low(139);
+pub const SIM_STATS: MessageId = low(140);
+pub const SIMULATOR_VIEWER_TIME_MESSAGE: MessageId = low(150);
+pub const AVATAR_APPEARANCE: MessageId = low(158);
+pub const SCRIPT_CONTROL_CHANGE: MessageId = low(189);
+pub const SCRIPT_DIALOG: MessageId = low(190);
+pub const PARCEL_OVERLAY: MessageId = low(196);
+pub const ONLINE_NOTIFICATION: MessageId = low(322);
+pub const AGENT_DATA_UPDATE: MessageId = low(387);
 
 pub type Vector3 = [f32; 3];
 
@@ -67,6 +90,26 @@ pub fn name(id: MessageId) -> String {
         MAP_NAME_REQUEST => "MapNameRequest",
         MAP_BLOCK_REPLY => "MapBlockReply",
         PACKET_ACK => "PacketAck",
+        LAYER_DATA => "LayerData",
+        OBJECT_UPDATE_CACHED => "ObjectUpdateCached",
+        IMPROVED_TERSE_OBJECT_UPDATE => "ImprovedTerseObjectUpdate",
+        KILL_OBJECT => "KillObject",
+        AVATAR_ANIMATION => "AvatarAnimation",
+        CAMERA_CONSTRAINT => "CameraConstraint",
+        SOUND_TRIGGER => "SoundTrigger",
+        COARSE_LOCATION_UPDATE => "CoarseLocationUpdate",
+        ATTACHED_SOUND => "AttachedSound",
+        VIEWER_EFFECT => "ViewerEffect",
+        HEALTH_MESSAGE => "HealthMessage",
+        CHAT_FROM_SIMULATOR => "ChatFromSimulator",
+        SIM_STATS => "SimStats",
+        SIMULATOR_VIEWER_TIME_MESSAGE => "SimulatorViewerTimeMessage",
+        AVATAR_APPEARANCE => "AvatarAppearance",
+        SCRIPT_CONTROL_CHANGE => "ScriptControlChange",
+        SCRIPT_DIALOG => "ScriptDialog",
+        PARCEL_OVERLAY => "ParcelOverlay",
+        ONLINE_NOTIFICATION => "OnlineNotification",
+        AGENT_DATA_UPDATE => "AgentDataUpdate",
         0..=0xFE => return format!("High {id}"),
         0xFF00..=0xFFFE => return format!("Medium {}", id & 0xFF),
         _ => return format!("Low {}", id & 0xFFFF),
