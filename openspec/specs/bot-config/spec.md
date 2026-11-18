@@ -18,6 +18,11 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `region` | yes | Target region name |
 | `position` | yes | Target coordinates inside the region, as an array of three numbers `[x, y, z]` |
 | `object` | yes | UUID of the object to sit on |
+| `log_chat` | no | Path of the TSV file that receives local chat; no chat file is written when absent |
+| `log_im` | no | Path of the TSV file that receives instant messages; no IM file is written when absent |
+| `fetch_offline_im` | no | Boolean; when true the bot fetches instant messages stored while the avatar was offline. Defaults to false |
+
+A relative `log_chat` or `log_im` path SHALL be taken relative to the directory the bot was started in.
 
 #### Scenario: Minimal config for Second Life
 - **WHEN** the config contains `user`, `password_hash`, `region`, `position` and `object` and no `login_url`
@@ -31,8 +36,16 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 - **WHEN** `user` is a single word such as `sitbot`
 - **THEN** the bot logs in with first name `sitbot` and last name `Resident`
 
+#### Scenario: No logging keys
+- **WHEN** the config contains none of `log_chat`, `log_im` and `fetch_offline_im`
+- **THEN** the bot starts, writes no log file and does not fetch offline instant messages
+
+#### Scenario: Chat log configured
+- **WHEN** the config contains `log_chat = "chat.tsv"`
+- **THEN** the bot creates `chat.tsv` in the directory it was started in if it does not exist, and appends chat rows to it
+
 ### Requirement: Config validation before any network activity
-The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, an `object` that is not a UUID, a `login_url` that is not an `http` or `https` URL, and a `position` that is not three finite numbers. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
+The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, an `object` that is not a UUID, a `login_url` that is not an `http` or `https` URL, a `position` that is not three finite numbers, a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, and a `fetch_offline_im` that is not a boolean. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
 
 #### Scenario: Both password forms given
 - **WHEN** the config contains both `password` and `password_hash`
@@ -45,6 +58,14 @@ The bot SHALL validate the whole config before contacting any server. It SHALL r
 #### Scenario: Unknown key
 - **WHEN** the config contains a key the bot does not define, such as `regoin`
 - **THEN** the bot prints an error naming that key and exits with status 2
+
+#### Scenario: Log file cannot be opened
+- **WHEN** `log_im` names a file in a directory that does not exist
+- **THEN** the bot prints an error naming `log_im` and the reason, and exits with status 2 without contacting the login server
+
+#### Scenario: Empty log path
+- **WHEN** `log_chat` is an empty string
+- **THEN** the bot prints an error naming `log_chat` and exits with status 2
 
 ### Requirement: Password hash subcommand
 The bot SHALL provide a `hash` subcommand that reads a password from standard input and prints the corresponding hash on standard output as `$1$` followed by the 32 lowercase hexadecimal digits of the MD5 digest of the password. The password SHALL NOT be accepted as a command-line argument. When standard input is a terminal the password SHALL NOT be echoed. A trailing line ending SHALL NOT be part of the hashed password. An empty password SHALL be rejected with a non-zero exit status.
