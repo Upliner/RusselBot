@@ -3,4 +3,6 @@
 /test-rig/opensim/
 /russelbot.toml
 /real-sl.toml
+/sl.toml
 *.tsv
+*.log
