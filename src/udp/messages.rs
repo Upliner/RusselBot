@@ -15,11 +15,14 @@ pub const AGENT_SIT: MessageId = high(7);
 pub const OBJECT_UPDATE: MessageId = high(12);
 pub const AVATAR_SIT_RESPONSE: MessageId = high(21);
 pub const USE_CIRCUIT_CODE: MessageId = low(3);
+pub const AVATAR_PICKER_REQUEST: MessageId = low(26);
+pub const AVATAR_PICKER_REPLY: MessageId = low(28);
 pub const TELEPORT_LOCATION_REQUEST: MessageId = low(63);
 pub const TELEPORT_LOCAL: MessageId = low(64);
 pub const TELEPORT_PROGRESS: MessageId = low(66);
 pub const TELEPORT_START: MessageId = low(73);
 pub const TELEPORT_FAILED: MessageId = low(74);
+pub const CHAT_FROM_VIEWER: MessageId = low(80);
 pub const AGENT_THROTTLE: MessageId = low(81);
 pub const ALERT_MESSAGE: MessageId = low(134);
 pub const AGENT_ALERT_MESSAGE: MessageId = low(135);
@@ -73,11 +76,14 @@ pub fn name(id: MessageId) -> String {
         OBJECT_UPDATE => "ObjectUpdate",
         AVATAR_SIT_RESPONSE => "AvatarSitResponse",
         USE_CIRCUIT_CODE => "UseCircuitCode",
+        AVATAR_PICKER_REQUEST => "AvatarPickerRequest",
+        AVATAR_PICKER_REPLY => "AvatarPickerReply",
         TELEPORT_LOCATION_REQUEST => "TeleportLocationRequest",
         TELEPORT_LOCAL => "TeleportLocal",
         TELEPORT_PROGRESS => "TeleportProgress",
         TELEPORT_START => "TeleportStart",
         TELEPORT_FAILED => "TeleportFailed",
+        CHAT_FROM_VIEWER => "ChatFromViewer",
         AGENT_THROTTLE => "AgentThrottle",
         ALERT_MESSAGE => "AlertMessage",
         AGENT_ALERT_MESSAGE => "AgentAlertMessage",
@@ -137,6 +143,17 @@ pub struct Agent {
     pub session_id: Uuid,
 }
 
+/// The longest chat or instant-message text a simulator takes, in bytes,
+/// not counting the trailing NUL.
+pub const MAX_TEXT: usize = 1023;
+
+/// The first `limit` bytes of `text`, then a NUL.
+fn terminated(text: &str, limit: usize) -> Vec<u8> {
+    let mut data = text.as_bytes()[..text.len().min(limit)].to_vec();
+    data.push(0);
+    data
+}
+
 #[derive(Default)]
 struct Writer(Vec<u8>);
 
@@ -156,6 +173,10 @@ impl Writer {
         self.0.extend(v.to_le_bytes());
         self
     }
+    fn i32(mut self, v: i32) -> Self {
+        self.0.extend(v.to_le_bytes());
+        self
+    }
     fn f32(mut self, v: f32) -> Self {
         self.0.extend(v.to_le_bytes());
         self
@@ -172,6 +193,20 @@ impl Writer {
         self.0.push(data.len() as u8);
         self.0.extend(data);
         self
+    }
+    /// `Variable 2`: two length bytes, then the data.
+    fn variable2(mut self, data: &[u8]) -> Self {
+        self.0.extend((data.len() as u16).to_le_bytes());
+        self.0.extend(data);
+        self
+    }
+    /// Text with its trailing NUL, as `Variable 1`; cut to what fits.
+    fn text1(self, text: &str) -> Self {
+        self.variable1(&terminated(text, 254))
+    }
+    /// Text with its trailing NUL, as `Variable 2`; cut to what fits.
+    fn text2(self, text: &str) -> Self {
+        self.variable2(&terminated(text, MAX_TEXT))
     }
     fn finish(self, id: MessageId, zerocoded: bool) -> Outgoing {
         Outgoing { id, zerocoded, body: self.0 }
@@ -250,13 +285,11 @@ pub fn retrieve_instant_messages(agent: &Agent) -> Outgoing {
 
 /// MapNameRequest, Low 408.
 pub fn map_name_request(agent: &Agent, name: &str) -> Outgoing {
-    let mut text = name.as_bytes()[..name.len().min(254)].to_vec();
-    text.push(0);
     Writer::agent(agent)
         .u32(0) // Flags
         .u32(0) // EstateID, filled in on the simulator
         .u8(0) // Godlike, filled in on the simulator
-        .variable1(&text)
+        .text1(name)
         .finish(MAP_NAME_REQUEST, false)
 }
 
@@ -280,6 +313,41 @@ pub fn agent_request_sit(agent: &Agent, target: Uuid) -> Outgoing {
 /// AgentSit, High 7.
 pub fn agent_sit(agent: &Agent) -> Outgoing {
     Writer::agent(agent).finish(AGENT_SIT, false)
+}
+
+/// ChatFromViewer, Low 80, Zerocoded: Message Variable 2, Type U8,
+/// Channel S32. `chat_type` is 0 whisper, 1 say, 2 shout.
+pub fn chat_from_viewer(agent: &Agent, text: &str, chat_type: u8, channel: i32) -> Outgoing {
+    Writer::agent(agent).text2(text).u8(chat_type).i32(channel).finish(CHAT_FROM_VIEWER, true)
+}
+
+/// ImprovedInstantMessage, Low 254, Zerocoded: a plain instant message from
+/// the agent to another avatar. The conversation id is the two agent ids
+/// combined, which is how viewers pair a reply with the message.
+pub fn instant_message(agent: &Agent, from_name: &str, to: Uuid, position: Vector3, text: &str) -> Outgoing {
+    let conversation = Uuid::from_u128(agent.agent_id.as_u128() ^ to.as_u128());
+    Writer::agent(agent)
+        .u8(0) // FromGroup
+        .uuid(to)
+        .u32(0) // ParentEstateID, filled in on the simulator
+        .uuid(Uuid::nil()) // RegionID, filled in on the simulator
+        .vector3(position)
+        .u8(0) // Offline
+        .u8(0) // Dialog: nothing special
+        .uuid(conversation)
+        .u32(0) // Timestamp
+        .text1(from_name)
+        .text2(text)
+        .variable2(&[0]) // BinaryBucket
+        .u32(0) // EstateBlock
+        .u8(0) // MetaData block count
+        .finish(IMPROVED_INSTANT_MESSAGE, true)
+}
+
+/// AvatarPickerRequest, Low 26: QueryID LLUUID, Name Variable 1. Asks for
+/// the avatars whose names match `name`.
+pub fn avatar_picker_request(agent: &Agent, query: Uuid, name: &str) -> Outgoing {
+    Writer::agent(agent).uuid(query).text1(name).finish(AVATAR_PICKER_REQUEST, false)
 }
 
 // ---------------------------------------------------------------- incoming
@@ -409,6 +477,9 @@ pub enum Incoming {
         timestamp: u32,
         text: String,
     },
+    /// The answer to an avatar search: the avatars found, as id and
+    /// `First Last`.
+    AvatarPickerReply { query: Uuid, avatars: Vec<(Uuid, String)> },
     LogoutReply,
     DisableSimulator,
     /// A message the bot has no use for.
@@ -525,6 +596,20 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
                 timestamp,
                 text: text(r.variable2()?),
             }
+        }
+        // AvatarPickerReply, Low 28: AgentID, QueryID, then Data Variable
+        // { AvatarID, FirstName Variable 1, LastName Variable 1 }.
+        AVATAR_PICKER_REPLY => {
+            r.skip(16)?;
+            let query = r.uuid()?;
+            let count = r.u8()?;
+            let mut avatars = Vec::with_capacity(usize::from(count));
+            for _ in 0..count {
+                let id = r.uuid()?;
+                let (first, last) = (text(r.variable1()?), text(r.variable1()?));
+                avatars.push((id, format!("{first} {last}").trim().to_string()));
+            }
+            Incoming::AvatarPickerReply { query, avatars }
         }
         LOGOUT_REPLY => Incoming::LogoutReply,
         DISABLE_SIMULATOR => Incoming::DisableSimulator,
@@ -706,6 +791,18 @@ pub mod testing {
         body
     }
 
+    pub fn avatar_picker_reply(query: Uuid, avatars: &[(Uuid, &str, &str)]) -> Vec<u8> {
+        let mut body = vec![0; 16]; // AgentID
+        body.extend(query.as_bytes());
+        body.push(avatars.len() as u8);
+        for (id, first, last) in avatars {
+            body.extend(id.as_bytes());
+            body.extend(string1(first));
+            body.extend(string1(last));
+        }
+        body
+    }
+
     /// Blocks are (FullID, ParentID); variable fields get assorted lengths so
     /// a wrong skip misaligns the next block.
     pub fn object_update(objects: &[(Uuid, u32)]) -> Vec<u8> {
@@ -818,6 +915,69 @@ mod tests {
         let msg = map_name_request(&agent(), "Target");
         assert_eq!(msg.id, low(408));
         assert_eq!(msg.body, [agent_prefix(), vec![0; 9], vec![7], b"Target\0".to_vec()].concat());
+    }
+
+    #[test]
+    fn encodes_chat_from_viewer() {
+        let msg = chat_from_viewer(&agent(), "hi", 2, 0x0102_0304);
+        assert_eq!((msg.id, msg.zerocoded), (low(80), true));
+        assert_eq!(msg.body, [agent_prefix(), vec![3, 0], b"hi\0".to_vec(), vec![2, 4, 3, 2, 1]].concat());
+    }
+
+    #[test]
+    fn encodes_instant_message() {
+        let to = Uuid::from_bytes([0x0F; 16]);
+        let msg = instant_message(&agent(), "Sit Bot", to, [1.0, 2.0, 3.0], "hello");
+        assert_eq!((msg.id, msg.zerocoded), (low(254), true));
+        let expected = [
+            agent_prefix(),
+            vec![0],       // FromGroup
+            vec![0x0F; 16], // ToAgentID
+            vec![0; 4 + 16], // ParentEstateID, RegionID
+            [1.0f32, 2.0, 3.0].iter().flat_map(|f| f.to_le_bytes()).collect(),
+            vec![0, 0],            // Offline, Dialog
+            vec![0xA1 ^ 0x0F; 16], // ID
+            vec![0; 4],            // Timestamp
+            vec![8],
+            b"Sit Bot\0".to_vec(),
+            vec![6, 0],
+            b"hello\0".to_vec(),
+            vec![1, 0, 0],       // BinaryBucket
+            vec![0, 0, 0, 0, 0], // EstateID, MetaData block count
+        ]
+        .concat();
+        assert_eq!(msg.body, expected);
+        // What goes out is what the decoder reads as an incoming message.
+        let Ok(Incoming::InstantMessage { from_agent, from_name, dialog, text, .. }) = decode(msg.id, &msg.body)
+        else {
+            panic!("not an instant message")
+        };
+        assert_eq!((from_agent, from_name.as_str(), dialog, text.as_str()), (agent().agent_id, "Sit Bot", 0, "hello"));
+    }
+
+    #[test]
+    fn encodes_avatar_picker_request() {
+        let query = Uuid::from_bytes([0x33; 16]);
+        let msg = avatar_picker_request(&agent(), query, "jane doe");
+        assert_eq!((msg.id, msg.zerocoded), (low(26), false));
+        assert_eq!(msg.body, [agent_prefix(), vec![0x33; 16], vec![9], b"jane doe\0".to_vec()].concat());
+    }
+
+    #[test]
+    fn decodes_avatar_picker_reply() {
+        let query = Uuid::from_bytes([0x33; 16]);
+        let (jane, other) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]));
+        let body = avatar_picker_reply(query, &[(jane, "Jane", "Doe"), (other, "Jane", "Doester")]);
+        assert_eq!(
+            decode(low(28), &body),
+            Ok(Incoming::AvatarPickerReply {
+                query,
+                avatars: vec![(jane, "Jane Doe".to_string()), (other, "Jane Doester".to_string())],
+            })
+        );
+        assert_eq!(decode(low(28), &body[..body.len() - 1]), Err(DecodeError));
+        let none = avatar_picker_reply(query, &[]);
+        assert_eq!(decode(low(28), &none), Ok(Incoming::AvatarPickerReply { query, avatars: vec![] }));
     }
 
     #[test]

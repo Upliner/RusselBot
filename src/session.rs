@@ -28,6 +28,8 @@ const AGENT_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 const THROTTLES: [f32; 7] = [20_000.0, 0.0, 0.0, 0.0, 30_000.0, 0.0, 10_000.0];
 /// A short draw distance keeps the simulator from streaming the whole scene.
 const DRAW_DISTANCE: f32 = 32.0;
+/// Why the session will not send a message for the operator right now.
+pub const NOT_CONNECTED: &str = "the avatar is not connected to a region";
 /// MapBlockReply marks "no such region" with this access level.
 const ACCESS_NONEXISTENT: u8 = 255;
 
@@ -66,13 +68,20 @@ pub enum SessionEvent {
     InstantMessage(Message),
     /// Where the current simulator answers display-name lookups, if it does.
     DisplayNamesUrl(Option<String>),
+    /// Where the current simulator answers avatar searches over HTTP, if it
+    /// does.
+    AvatarSearchUrl(Option<String>),
+    /// The answer to `find_avatar`: the avatars the grid offers for the
+    /// name, as id and `First Last`.
+    AvatarsFound { query: Uuid, avatars: Vec<(Uuid, String)> },
 }
 
 /// A chat or instant message as the simulator delivered it; the names that
 /// are not part of the message are looked up later.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
-    /// `say`, `shout`, ... for chat; `im` or `object` for instant messages.
+    /// `say`, `shout`, ... for chat; `im` or `object` for instant messages
+    /// received and `im_out` for one sent.
     pub kind: String,
     pub source: Source,
     /// When a message stored while the avatar was offline was sent, in
@@ -140,6 +149,8 @@ struct Teleport {
 pub struct Session<N: Net> {
     net: N,
     agent: Agent,
+    /// `First Last`, the name instant messages are sent under.
+    agent_name: String,
     circuit_code: u32,
     target_object: Uuid,
     sim: Sim,
@@ -165,6 +176,7 @@ impl<N: Net> Session<N> {
     pub fn new(
         net: N,
         info: &SessionInfo,
+        agent_name: &str,
         target_object: Uuid,
         fetch_offline_im: bool,
         generation: u64,
@@ -173,6 +185,7 @@ impl<N: Net> Session<N> {
         let mut session = Session {
             net,
             agent: Agent { agent_id: info.agent_id, session_id: info.session_id },
+            agent_name: agent_name.to_string(),
             circuit_code: info.circuit_code,
             target_object,
             sim: Sim::new(0, now),
@@ -286,6 +299,41 @@ impl<N: Net> Session<N> {
         self.send(messages::logout_request(&self.agent), true, now);
     }
 
+    /// Whether the avatar is where it can talk: in a region, and not on its
+    /// way out of it.
+    pub fn present(&self) -> Result<(), String> {
+        let here = self.sim.entered && !self.lost && self.teleport.is_none() && self.logout_deadline.is_none();
+        if here {
+            Ok(())
+        } else {
+            Err(NOT_CONNECTED.to_string())
+        }
+    }
+
+    /// Says `text` in local chat. `chat_type` is 0 whisper, 1 say, 2 shout.
+    pub fn say(&mut self, channel: i32, chat_type: u8, text: &str, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::chat_from_viewer(&self.agent, text, chat_type, channel), true, now);
+        Ok(())
+    }
+
+    /// Sends the avatar `to` an instant message.
+    pub fn instant_message(&mut self, to: Uuid, text: &str, now: Instant) -> Result<(), String> {
+        self.present()?;
+        let position = self.sim.position.unwrap_or_default();
+        let message = messages::instant_message(&self.agent, &self.agent_name, to, position, text);
+        self.send(message, true, now);
+        Ok(())
+    }
+
+    /// Asks the grid which avatars go by `name`. Ends in `AvatarsFound` with
+    /// the same `query`, if the grid answers.
+    pub fn find_avatar(&mut self, query: Uuid, name: &str, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::avatar_picker_request(&self.agent, query, name), true, now);
+        Ok(())
+    }
+
     // ------------------------------------------------------------- timers
 
     pub fn tick(&mut self, now: Instant) {
@@ -358,6 +406,7 @@ impl<N: Net> Session<N> {
             CapsEvent::Event(EqEvent::TeleportFinish(finish)) => self.hand_over(finish, now),
             CapsEvent::Event(EqEvent::Other(name)) => crate::debug!("event queue: ignoring {name}"),
             CapsEvent::DisplayNames(url) => self.events.push(SessionEvent::DisplayNamesUrl(url)),
+            CapsEvent::AvatarSearch(url) => self.events.push(SessionEvent::AvatarSearchUrl(url)),
         }
     }
 
@@ -463,6 +512,9 @@ impl<N: Net> Session<N> {
                 let sent_at = (offline && timestamp != 0).then_some(timestamp);
                 let message = Message { kind: kind.to_string(), source, sent_at, text };
                 self.events.push(SessionEvent::InstantMessage(message));
+            }
+            Incoming::AvatarPickerReply { query, avatars } => {
+                self.events.push(SessionEvent::AvatarsFound { query, avatars });
             }
             Incoming::LogoutReply => {
                 if self.logout_deadline.take().is_some() {
@@ -614,7 +666,7 @@ mod tests {
                 seed_capability: "http://127.0.0.1:9000/CAPS/seed/".to_string(),
             };
             let now = Instant::now();
-            let session = Session::new(net.clone(), &info, target(), fetch_offline_im, 1, now);
+            let session = Session::new(net.clone(), &info, "Sit Bot", target(), fetch_offline_im, 1, now);
             Rig { session, net, now, sequence: 0 }
         }
 
@@ -1384,7 +1436,74 @@ mod tests {
             rig.events(),
             [SessionEvent::DisplayNamesUrl(url.clone()), SessionEvent::DisplayNamesUrl(None)]
         );
-        rig.session.handle_caps(7, CapsEvent::DisplayNames(url), rig.now);
+        rig.session.handle_caps(7, CapsEvent::DisplayNames(url.clone()), rig.now);
         assert_eq!(rig.events(), []);
+        // The avatar search URL travels the same way.
+        rig.session.handle_caps(1, CapsEvent::AvatarSearch(url.clone()), rig.now);
+        assert_eq!(rig.events(), [SessionEvent::AvatarSearchUrl(url.clone())]);
+        rig.session.handle_caps(7, CapsEvent::AvatarSearch(url), rig.now);
+        assert_eq!(rig.events(), []);
+    }
+
+    // ------------------------------------------------- messages on command
+
+    #[test]
+    fn says_and_sends_instant_messages_once_in_a_region() {
+        let mut rig = Rig::entered();
+        let to = Uuid::from_bytes([0x0F; 16]);
+        assert_eq!(rig.session.say(1, 2, "test message", rig.now), Ok(()));
+        assert_eq!(rig.session.instant_message(to, "hello", rig.now), Ok(()));
+        let sent = rig.sent();
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().all(Packet::is_reliable));
+        let expected = messages::chat_from_viewer(&rig.agent(), "test message", 2, 1);
+        assert_eq!((sent[0].id, &sent[0].body), (messages::CHAT_FROM_VIEWER, &expected.body));
+        // The message carries the avatar's name and where it stands.
+        let expected = messages::instant_message(&rig.agent(), "Sit Bot", to, [10.0, 20.0, 30.0], "hello");
+        assert_eq!((sent[1].id, &sent[1].body), (messages::IMPROVED_INSTANT_MESSAGE, &expected.body));
+    }
+
+    #[test]
+    fn avatar_search_is_sent_and_its_answer_reported() {
+        let mut rig = Rig::entered();
+        let query = Uuid::from_bytes([0x33; 16]);
+        assert_eq!(rig.session.find_avatar(query, "jane doe", rig.now), Ok(()));
+        let sent = rig.sent();
+        assert_eq!(sent[0].id, messages::AVATAR_PICKER_REQUEST);
+        assert!(sent[0].body.ends_with(b"\x09jane doe\0"));
+
+        let jane = Uuid::from_bytes([1; 16]);
+        rig.receive(messages::AVATAR_PICKER_REPLY, &wire::avatar_picker_reply(query, &[(jane, "Jane", "Doe")]));
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::AvatarsFound { query, avatars: vec![(jane, "Jane Doe".to_string())] }]
+        );
+    }
+
+    #[test]
+    fn nothing_is_sent_on_command_outside_a_region() {
+        let to = Uuid::from_bytes([0x0F; 16]);
+        let refused = |rig: &mut Rig| {
+            let now = rig.now;
+            assert_eq!(rig.session.say(0, 1, "hello", now), Err(NOT_CONNECTED.to_string()));
+            assert_eq!(rig.session.instant_message(to, "hello", now), Err(NOT_CONNECTED.to_string()));
+            assert_eq!(rig.session.find_avatar(to, "jane doe", now), Err(NOT_CONNECTED.to_string()));
+            let chatty = [messages::CHAT_FROM_VIEWER, messages::IMPROVED_INSTANT_MESSAGE, messages::AVATAR_PICKER_REQUEST];
+            assert!(rig.sent_ids().iter().all(|id| !chatty.contains(id)));
+        };
+        // Before the handshake is done.
+        refused(&mut Rig::new());
+        // While a teleport is under way.
+        let mut rig = Rig::entered();
+        start_teleport(&mut rig);
+        refused(&mut rig);
+        // While logging out.
+        let mut rig = Rig::entered();
+        rig.session.start_logout(rig.now);
+        refused(&mut rig);
+        // After the session is lost.
+        let mut rig = Rig::entered();
+        rig.receive(messages::KICK_USER, &wire::kick_user("bye"));
+        refused(&mut rig);
     }
 }

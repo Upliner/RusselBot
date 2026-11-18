@@ -3,6 +3,7 @@
 //! channel with events stamped with the circuit's generation.
 
 use crate::caps::{self, CapsEvent};
+use crate::control::{Request, Response};
 use crate::names::Names;
 use crate::session::Net;
 use std::collections::HashMap;
@@ -27,6 +28,13 @@ pub enum Event {
     Names { found: Vec<(Uuid, Names)>, missing: Vec<Uuid> },
     /// A name lookup that got no answer.
     NamesFailed(Vec<Uuid>),
+    /// The answer to an avatar search over HTTP: the avatars found, as id
+    /// and `First Last`.
+    AvatarsFound { query: Uuid, avatars: Vec<(Uuid, String)> },
+    /// An avatar search that got no answer, and why.
+    AvatarSearchFailed { query: Uuid, reason: String },
+    /// A command from the control socket, to be answered on `reply`.
+    Control { request: Request, reply: Sender<Response> },
     /// The operator asked the bot to stop.
     Signal,
 }

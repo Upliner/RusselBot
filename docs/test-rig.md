@@ -116,6 +116,36 @@ IMs (OpenSim keeps them only with a MySQL/PostgreSQL store or an external
 service, neither of which the rig has). Both were checked on Second Life
 instead.
 
+## Control socket
+
+`test-rig/listen.py` logs in as `Rig Owner` four metres from the bot, prints
+the local chat it hears and the instant messages it gets, and answers each
+instant message with `pong: <text>`. Run the bot with `socket = true`,
+`log_chat` and `log_im` set and `--verbose`, wait for `seated`, start the
+helper, then use `rslbot ctl`.
+
+| # | Inject | Expected | Result (2026-11-18, OpenSim 9d00a55552) |
+|---|---|---|---|
+| 23 | `ctl say hello there`, `/shout over here`, `/whisper psst`, `/me waves`, `-v is not an option here` | Status 0; the helper hears each with its volume; one `control: said ...` line and one `chat` row each | Pass |
+| 24 | `ctl say /1 test message`, then `ctl say //second on one` | Status 0; `control: said on channel 1: ...` twice; a `ChatFromViewer` sent for each; nothing heard by the helper and no `chat` row | Pass. What a script listening on channel 1 receives was not observed: the rig has no such script |
+| 25 | `ctl say /5` | `there is no text to send`, status 1, nothing sent | Pass |
+| 26 | `ctl im "Rig Owner" are you there?`, then `ctl im rig.owner second message` | `sent to Rig Owner <uuid>`, status 0; the helper gets both in one conversation (id = both agent ids combined); one name lookup for the two | Pass, both ways of looking a name up: through the `AvatarPickerSearch` capability, which the bot uses when the simulator offers it (OpenSim does), and through `AvatarPickerRequest`, checked with a build that did not ask for the capability |
+| 27 | The helper's `pong` answers to 26 | `im.tsv` has each `im_out` row followed by its `im` row, all with `Rig Owner` in the avatar columns | Pass |
+| 28 | `ctl im "Nobody Here" hello`, `ctl im Rig hello` | `the grid knows no avatar named ...`, status 1, no instant message, no row | Pass (`Rig` alone would be `Rig Resident`) |
+| 29 | `ctl im <the bot's own UUID> note to self` | `sent to <uuid>`, status 0; an `im_out` row with the name filled in by the lookup | Pass |
+| 30 | `ctl dance`, `ctl im "Rig Owner"`, `ctl` | `unknown command`, `takes 2 arguments`, status 1; usage and status 2 for the last | Pass |
+| 31 | `kick user Sit Bot bye`, then `ctl say ...` and `ctl im ...` before the next login | `the avatar is not connected to a region`, status 1; nothing said after the bot is back | Pass; `ctl say` works again after the re-login |
+| 32 | Start a second bot with the same socket | It exits with status 2 naming `socket`; the first keeps answering | Pass |
+| 33 | Ctrl-C the bot, then `ctl say ...` | The socket file is gone; `cannot reach the bot at <path>`, status 1 | Pass |
+| 34 | `RUSSELBOT_SOCK` in a directory that does not exist; no `HOME` and no `RUSSELBOT_SOCK`; `socket = "yes"` | Error naming `socket`, status 2, no login attempt | Pass, all three |
+| 35 | No `socket` key | No socket file is created | Pass |
+
+Not covered: Windows, where the socket is TCP. On Second Life, looking a
+name up through `AvatarPickerRequest` found nobody (2026-11-18, an avatar
+that had just messaged the bot); the capability is what viewers use there,
+and with the bot using it too, `ctl im` by name reached that avatar
+(checked by hand, 2026-11-19).
+
 Seen in a viewer as well: the avatar seated on the prim in `Target`. Not covered on this rig:
 a region that stays offline while the
 rest of the grid is up, and anything specific to Second Life.

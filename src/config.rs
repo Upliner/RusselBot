@@ -24,6 +24,8 @@ pub struct Config {
     /// TSV file for instant messages, if any.
     pub log_im: Option<PathBuf>,
     pub fetch_offline_im: bool,
+    /// Listen on the control socket.
+    pub socket: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -49,6 +51,7 @@ struct Raw {
     log_chat: Option<toml::Value>,
     log_im: Option<toml::Value>,
     fetch_offline_im: Option<toml::Value>,
+    socket: Option<toml::Value>,
 }
 
 /// Hashes a plain password into the form grids accept: `$1$` + MD5 hex.
@@ -73,6 +76,14 @@ fn err<T>(msg: impl Into<String>) -> Result<T, ConfigError> {
 
 fn required<T>(value: Option<T>, key: &str) -> Result<T, ConfigError> {
     value.ok_or_else(|| ConfigError(format!("`{key}` is required")))
+}
+
+fn flag(value: Option<toml::Value>, key: &str) -> Result<bool, ConfigError> {
+    match value {
+        None => Ok(false),
+        Some(toml::Value::Boolean(on)) => Ok(on),
+        Some(_) => err(format!("`{key}` must be true or false")),
+    }
 }
 
 fn log_path(value: Option<toml::Value>, key: &str) -> Result<Option<PathBuf>, ConfigError> {
@@ -149,11 +160,8 @@ impl Config {
 
         let log_chat = log_path(raw.log_chat, "log_chat")?;
         let log_im = log_path(raw.log_im, "log_im")?;
-        let fetch_offline_im = match raw.fetch_offline_im {
-            None => false,
-            Some(toml::Value::Boolean(on)) => on,
-            Some(_) => return err("`fetch_offline_im` must be true or false"),
-        };
+        let fetch_offline_im = flag(raw.fetch_offline_im, "fetch_offline_im")?;
+        let socket = flag(raw.socket, "socket")?;
 
         Ok(Config {
             login_url,
@@ -166,6 +174,7 @@ impl Config {
             log_chat,
             log_im,
             fetch_offline_im,
+            socket,
         })
     }
 }
@@ -288,6 +297,14 @@ mod tests {
         assert_eq!(cfg.log_chat, Some(PathBuf::from("chat.tsv")));
         assert_eq!(cfg.log_im, Some(PathBuf::from("/var/log/im.tsv")));
         assert!(cfg.fetch_offline_im);
+    }
+
+    #[test]
+    fn control_socket_is_off_unless_enabled() {
+        assert!(!Config::parse(&base()).unwrap().socket);
+        assert!(!Config::parse(&(base() + "socket = false\n")).unwrap().socket);
+        assert!(Config::parse(&(base() + "socket = true\n")).unwrap().socket);
+        assert!(rejected(&(base() + "socket = \"yes\"\n")).contains("`socket`"));
     }
 
     #[test]

@@ -3,7 +3,10 @@
 
 mod backoff;
 mod caps;
+mod commands;
 mod config;
+mod control;
+mod escape;
 mod log;
 mod login;
 mod msglog;
@@ -18,10 +21,11 @@ mod udp {
 }
 mod xml;
 
+use commands::{Commands, Grid, SentIm};
 use config::Config;
 use login::Outcome;
 use msglog::{Channel, Logs, Recorder};
-use names::Lookup;
+use names::{Lookup, Search};
 use net::{Event, RealNet};
 use reconciler::{Action, Decision, Reconciler};
 use session::{Session, SessionEvent};
@@ -30,6 +34,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 const EXIT_OK: i32 = 0;
 const EXIT_FATAL: i32 = 1;
@@ -42,10 +47,12 @@ const IDLE_WAIT: Duration = Duration::from_secs(60);
 const USAGE: &str = "\
 Usage: rslbot [--verbose] [CONFIG]
        rslbot hash
+       rslbot ctl COMMAND [ARGUMENT...]
 
 Runs the bot from CONFIG (default: russelbot.toml).
 `rslbot hash` reads a password from standard input and prints the value to
 put in the config as `password_hash`.
+`rslbot ctl` sends a command to a running bot; see `rslbot ctl --help`.
 
 Options:
   -v, --verbose   also log individual simulator packets
@@ -55,7 +62,19 @@ fn main() {
     std::process::exit(run_cli(std::env::args().skip(1).collect()));
 }
 
+/// The arguments of a `ctl` invocation. Everything after `ctl` belongs to
+/// the command, whatever it looks like.
+fn ctl_arguments(args: &[String]) -> Option<&[String]> {
+    match args.split_first() {
+        Some((first, rest)) if first == "ctl" => Some(rest),
+        _ => None,
+    }
+}
+
 fn run_cli(args: Vec<String>) -> i32 {
+    if let Some(command) = ctl_arguments(&args) {
+        return control::client(command, control::address(), &mut std::io::stdout(), &mut std::io::stderr());
+    }
     let mut positional = Vec::new();
     for arg in &args {
         match arg.as_str() {
@@ -142,6 +161,37 @@ struct Bot {
     /// The current simulator's display-name service: not heard of yet
     /// (`None`), absent (`Some(None)`) or its URL.
     names_url: Option<Option<String>>,
+    /// Commands from the control socket.
+    commands: Commands,
+    avatar_searches: Sender<Search>,
+    /// The current simulator's avatar search service, if it has one.
+    search_url: Option<String>,
+}
+
+/// The session as commands see it. A simulator with an avatar search
+/// service is asked there, as viewers do; the older simulator message is
+/// for the ones without.
+struct Live<'a> {
+    session: &'a mut Session<RealNet>,
+    search_url: Option<&'a str>,
+    avatar_searches: &'a Sender<Search>,
+}
+
+impl Grid for Live<'_> {
+    fn say(&mut self, channel: i32, chat_type: u8, text: &str, now: Instant) -> Result<(), String> {
+        self.session.say(channel, chat_type, text, now)
+    }
+    fn instant_message(&mut self, to: Uuid, text: &str, now: Instant) -> Result<(), String> {
+        self.session.instant_message(to, text, now)
+    }
+    fn find_avatar(&mut self, query: Uuid, name: &str, now: Instant) -> Result<(), String> {
+        let Some(url) = self.search_url else {
+            return self.session.find_avatar(query, name, now);
+        };
+        self.session.present()?;
+        let search = Search { url: url.to_string(), query, name: name.to_string() };
+        self.avatar_searches.send(search).map_err(|_| "the avatar search is not running".to_string())
+    }
 }
 
 /// What the main loop should do after handling something.
@@ -170,7 +220,9 @@ impl Bot {
                 );
                 self.reconciler.login_accepted();
                 let net = RealNet::new(self.events.clone());
-                let session = Session::new(net, &info, cfg.object, cfg.fetch_offline_im, self.next_generation, now);
+                let name = format!("{} {}", cfg.first_name, cfg.last_name);
+                let session =
+                    Session::new(net, &info, &name, cfg.object, cfg.fetch_offline_im, self.next_generation, now);
                 self.session = Some(session);
             }
             Outcome::NeedsOperator(failure) => {
@@ -202,6 +254,27 @@ impl Bot {
             self.next_generation = session.generation() + 1;
         }
         self.names_url = None;
+        self.search_url = None;
+        self.commands.session_lost();
+    }
+
+    /// The grid answered an avatar search: the messages waiting for it go out.
+    fn avatars_found(&mut self, query: Uuid, avatars: &[(Uuid, String)], now: Instant) {
+        let mut live = self.session.as_mut().map(|session| Live {
+            session,
+            search_url: self.search_url.as_deref(),
+            avatar_searches: &self.avatar_searches,
+        });
+        for sent in self.commands.avatars_found(query, avatars, live.as_mut(), now) {
+            self.record_sent(sent, now);
+        }
+    }
+
+    /// Puts an instant message the bot sent into the message log.
+    fn record_sent(&mut self, sent: SentIm, now: Instant) {
+        let source = session::Source::Avatar { id: sent.to, name: sent.name };
+        let message = session::Message { kind: "im_out".to_string(), source, sent_at: None, text: sent.text };
+        self.record(Channel::Im, message, now);
     }
 
     fn record(&mut self, channel: Channel, message: session::Message, now: Instant) {
@@ -293,6 +366,13 @@ impl Bot {
                 }
                 self.names_url = Some(url);
             }
+            SessionEvent::AvatarSearchUrl(url) => {
+                if url.is_none() {
+                    debug!("the simulator has no avatar search service");
+                }
+                self.search_url = url;
+            }
+            SessionEvent::AvatarsFound { query, avatars } => self.avatars_found(query, &avatars, now),
             SessionEvent::LoggedOut => {
                 info!("logged out");
                 return Flow::Exit(EXIT_OK);
@@ -369,6 +449,18 @@ impl Bot {
         let now = Instant::now();
         match (event, &mut self.session) {
             (Event::Signal, _) => return self.stop(),
+            (Event::Control { request, reply }, session) => {
+                let mut live = session.as_mut().map(|session| Live {
+                    session,
+                    search_url: self.search_url.as_deref(),
+                    avatar_searches: &self.avatar_searches,
+                });
+                if let Some(sent) = self.commands.handle(request, reply, live.as_mut(), now) {
+                    self.record_sent(sent, now);
+                }
+            }
+            (Event::AvatarsFound { query, avatars }, _) => self.avatars_found(query, &avatars, now),
+            (Event::AvatarSearchFailed { query, reason }, _) => self.commands.lookup_failed(query, &reason),
             (Event::Datagram { generation, data }, Some(session)) => {
                 session.handle_datagram(generation, &data, now)
             }
@@ -402,12 +494,27 @@ fn run_bot(config_path: &Path) -> i32 {
         }
     };
     let (events, incoming) = mpsc::channel();
+    // Held until the bot is done: dropping it removes the socket file.
+    let _control = if config.socket {
+        match control::address().and_then(|address| control::listen(&address, events.clone())) {
+            Ok(server) => Some(server),
+            Err(e) => {
+                eprintln!("rslbot: {}: `socket`: {e}", config_path.display());
+                return EXIT_CONFIG;
+            }
+        }
+    } else {
+        None
+    };
     install_signal_handler(events.clone());
     let mut bot = Bot {
         recorder: Recorder::default(),
         logs,
         name_lookups: names::spawn(events.clone()),
         names_url: None,
+        commands: Commands::default(),
+        avatar_searches: names::spawn_search(events.clone()),
+        search_url: None,
         reconciler: Reconciler::new(&config.region),
         config,
         session: None,
@@ -426,6 +533,7 @@ fn run_loop(bot: &mut Bot, incoming: &Receiver<Event>) -> i32 {
         if let Flow::Exit(code) = bot.service_session() {
             return code;
         }
+        bot.commands.tick(Instant::now());
         bot.service_messages();
         let mut wake = Instant::now() + IDLE_WAIT;
         if !bot.stopping {
@@ -441,6 +549,9 @@ fn run_loop(bot: &mut Bot, incoming: &Receiver<Event>) -> i32 {
         if let Some(deadline) = bot.recorder.next_deadline() {
             wake = wake.min(deadline);
         }
+        if let Some(deadline) = bot.commands.next_deadline() {
+            wake = wake.min(deadline);
+        }
         match incoming.recv_timeout(wake.saturating_duration_since(Instant::now())) {
             Ok(event) => {
                 if let Flow::Exit(code) = bot.handle(event) {
@@ -451,5 +562,30 @@ fn run_loop(bot: &mut Bot, incoming: &Receiver<Event>) -> i32 {
             // Cannot happen while `bot` holds a sender.
             Err(RecvTimeoutError::Disconnected) => return EXIT_FATAL,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| word.to_string()).collect()
+    }
+
+    #[test]
+    fn everything_after_ctl_belongs_to_the_command() {
+        let args = strings(&["ctl", "say", "-v", "/1", "x", "--help"]);
+        assert_eq!(ctl_arguments(&args), Some(&args[1..]));
+        assert_eq!(ctl_arguments(&strings(&["ctl"])), Some(&[][..]));
+        // Only as the first argument.
+        assert_eq!(ctl_arguments(&strings(&["-v", "ctl", "say", "x"])), None);
+        assert_eq!(ctl_arguments(&strings(&["bot.toml"])), None);
+        assert_eq!(ctl_arguments(&[]), None);
+    }
+
+    #[test]
+    fn ctl_without_a_command_is_a_usage_error() {
+        assert_eq!(run_cli(strings(&["ctl"])), EXIT_CONFIG);
     }
 }

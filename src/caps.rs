@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 const EVENT_QUEUE: &str = "EventQueueGet";
 const DISPLAY_NAMES: &str = "GetDisplayNames";
+const AVATAR_SEARCH: &str = "AvatarPickerSearch";
 /// Continuous failure for this long means the session is gone.
 pub const FAILURE_LIMIT: Duration = Duration::from_secs(60);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -48,6 +49,9 @@ pub enum CapsEvent {
     /// The simulator's display-name lookup URL, or that it has none. Sent
     /// once, when the seed capability has answered.
     DisplayNames(Option<String>),
+    /// The simulator's avatar search URL, or that it has none. Sent once,
+    /// after `DisplayNames`.
+    AvatarSearch(Option<String>),
 }
 
 /// The capabilities the bot uses, from the seed capability's reply.
@@ -55,10 +59,11 @@ pub enum CapsEvent {
 pub struct Seed {
     pub event_queue: String,
     pub display_names: Option<String>,
+    pub avatar_search: Option<String>,
 }
 
 pub fn seed_request() -> String {
-    let names = [EVENT_QUEUE, DISPLAY_NAMES].map(|name| Value::Str(name.to_string()));
+    let names = [EVENT_QUEUE, DISPLAY_NAMES, AVATAR_SEARCH].map(|name| Value::Str(name.to_string()));
     xml::write_llsd(&Value::Array(names.to_vec()))
 }
 
@@ -66,7 +71,9 @@ pub fn parse_seed_reply(body: &str) -> Result<Seed, String> {
     let reply = xml::parse_llsd(body).map_err(|e| e.to_string())?;
     let url = |name| reply.str_field(name).filter(|url| !url.is_empty()).map(str::to_string);
     match url(EVENT_QUEUE) {
-        Some(event_queue) => Ok(Seed { event_queue, display_names: url(DISPLAY_NAMES) }),
+        Some(event_queue) => {
+            Ok(Seed { event_queue, display_names: url(DISPLAY_NAMES), avatar_search: url(AVATAR_SEARCH) })
+        }
         None => Err("simulator offers no EventQueueGet capability".to_string()),
     }
 }
@@ -187,7 +194,9 @@ pub fn run(seed_capability: &str, stop: &AtomicBool, mut emit: impl FnMut(CapsEv
             None => match fetch_seed(&agent, seed_capability) {
                 Ok(seed) => {
                     queue_url = Some(seed.event_queue);
-                    if !emit(CapsEvent::DisplayNames(seed.display_names)) {
+                    if !emit(CapsEvent::DisplayNames(seed.display_names))
+                        || !emit(CapsEvent::AvatarSearch(seed.avatar_search))
+                    {
                         return;
                     }
                     None
@@ -262,7 +271,8 @@ mod tests {
     #[test]
     fn seed_request_asks_for_the_event_queue() {
         assert!(seed_request().ends_with(
-            "<llsd><array><string>EventQueueGet</string><string>GetDisplayNames</string></array></llsd>"
+            "<llsd><array><string>EventQueueGet</string><string>GetDisplayNames</string>\
+             <string>AvatarPickerSearch</string></array></llsd>"
         ));
     }
 

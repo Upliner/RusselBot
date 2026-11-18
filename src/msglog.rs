@@ -2,6 +2,7 @@
 //! until the names that go with it are known (or given up on), and the
 //! standard-error line and TSV row it is then written as.
 
+use crate::escape::escape;
 use crate::log::format_timestamp;
 use crate::names::Names;
 use crate::session::{Message, Source};
@@ -136,7 +137,9 @@ impl Recorder {
         let names = entry.needs.and_then(|id| self.cached(id, now).cloned().flatten());
         let (legacy, display) = names.map(|n| (n.legacy, n.display)).unwrap_or_default();
         let (avatar_name, object_name, object_uuid) = match entry.message.source {
-            // The simulator names the speaker itself.
+            // The simulator names the speaker itself; the recipient of an
+            // IM sent by UUID is known by the looked-up name only.
+            Source::Avatar { name, .. } if name.is_empty() => (legacy, String::new(), None),
             Source::Avatar { name, .. } | Source::System { name } => (name, String::new(), None),
             Source::Object { id, name, .. } => (legacy, name, id),
         };
@@ -176,20 +179,6 @@ impl Recorder {
 }
 
 // ------------------------------------------------------------------ output
-
-fn escape(field: &str) -> String {
-    let mut out = String::with_capacity(field.len());
-    for c in field.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            other => out.push(other),
-        }
-    }
-    out
-}
 
 fn line(fields: [&str; 7]) -> String {
     fields.map(escape).join("\t") + "\n"
@@ -394,6 +383,64 @@ mod tests {
         rec.names_resolved(vec![(id(1), jane())], vec![], now);
         assert_eq!(rec.flush(now), [record("Jane Doe", "JD", "hello")]);
         assert_eq!(rec.next_deadline(), None);
+    }
+
+    // ----------------------------------------------- instant messages sent
+
+    fn sent(to: u8, name: &str, text: &str) -> Message {
+        let source = Source::Avatar { id: id(to), name: name.into() };
+        Message { kind: "im_out".into(), source, sent_at: None, text: text.into() }
+    }
+
+    fn im_record(kind: &str, avatar: &str, display: &str, text: &str) -> Record {
+        Record { channel: Channel::Im, kind: kind.into(), ..record(avatar, display, text) }
+    }
+
+    #[test]
+    fn sent_instant_message_carries_the_recipients_names() {
+        let now = Instant::now();
+        let mut rec = Recorder::default();
+        rec.push(Channel::Im, sent(1, "Jane Doe", "are you there?"), T0, now);
+        assert_eq!(rec.take_lookups(), [id(1)]);
+        rec.names_resolved(vec![(id(1), jane())], vec![], now);
+        let records = rec.flush(now);
+        assert_eq!(records, [im_record("im_out", "Jane Doe", "JD", "are you there?")]);
+        assert_eq!(records[0].row(), "2026-11-18T17:04:23Z\tim_out\tJane Doe\tJD\t\t\tare you there?\n");
+        assert_eq!(records[0].log_line(), "im [im_out] Jane Doe (JD): are you there?");
+    }
+
+    #[test]
+    fn sent_instant_message_to_a_uuid_takes_its_name_from_the_lookup() {
+        let now = Instant::now();
+        let mut rec = Recorder::default();
+        rec.push(Channel::Im, sent(1, "", "hello"), T0, now);
+        assert_eq!(rec.take_lookups(), [id(1)]);
+        rec.names_resolved(vec![(id(1), jane())], vec![], now);
+        assert_eq!(rec.flush(now), [im_record("im_out", "Jane Doe", "JD", "hello")]);
+
+        // A recipient the grid cannot name still gets its row.
+        rec.push(Channel::Im, sent(2, "", "anyone?"), T0, now);
+        assert_eq!(rec.take_lookups(), [id(2)]);
+        assert_eq!(rec.flush(now + NAME_WAIT - Duration::from_millis(1)), []);
+        let records = rec.flush(now + NAME_WAIT);
+        assert_eq!(records, [im_record("im_out", "", "", "anyone?")]);
+        assert_eq!(records[0].row(), "2026-11-18T17:04:23Z\tim_out\t\t\t\t\tanyone?\n");
+    }
+
+    #[test]
+    fn a_reply_is_recorded_after_the_message_it_answers() {
+        let now = Instant::now();
+        let mut rec = Recorder::default();
+        rec.push(Channel::Im, sent(1, "Jane Doe", "are you there?"), T0, now);
+        let reply = Message { kind: "im".into(), ..said(1, "Jane Doe", "yes") };
+        rec.push(Channel::Im, reply, T0 + 2, now);
+        assert_eq!(rec.take_lookups(), [id(1)], "one lookup serves both");
+        rec.names_resolved(vec![(id(1), jane())], vec![], now);
+        let expected = [
+            im_record("im_out", "Jane Doe", "JD", "are you there?"),
+            Record { time: T0 + 2, ..im_record("im", "Jane Doe", "JD", "yes") },
+        ];
+        assert_eq!(rec.flush(now), expected);
     }
 
     #[test]

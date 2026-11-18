@@ -31,3 +31,9 @@ object = "00000000-0000-0000-0000-000000000000"
 # while the avatar was offline. This removes them from the grid, so a viewer
 # logging in as this avatar later will not see them. Off by default.
 # fetch_offline_im = true
+
+# Optional: listen on a local control socket, so that `rslbot ctl say ...` and
+# `rslbot ctl im ...` can make the avatar talk while the bot runs. The socket
+# is ~/russelbot-ctl (127.0.0.1:47115 on Windows) unless the environment
+# variable RUSSELBOT_SOCK names another. Off by default.
+# socket = true

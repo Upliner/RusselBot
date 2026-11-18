@@ -105,6 +105,58 @@ fn run(lookups: Receiver<Lookup>, events: Sender<Event>) {
     }
 }
 
+/// A request to the search worker: which avatars go by `name`, asked of
+/// the simulator's `AvatarPickerSearch` capability at `url`.
+#[derive(Debug, PartialEq)]
+pub struct Search {
+    pub url: String,
+    pub query: Uuid,
+    pub name: String,
+}
+
+/// The search URL for `name`. The service matches user names and display
+/// names alike; up to a hundred come back.
+pub fn search_url(capability: &str, name: &str) -> String {
+    let mut url = capability.to_string();
+    if !url.ends_with('/') {
+        url.push('/');
+    }
+    url.push_str("?page_size=100&names=");
+    for byte in name.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => url.push(char::from(byte)),
+            other => url.push_str(&format!("%{other:02X}")),
+        }
+    }
+    url
+}
+
+/// Search worker thread body: answers every search with
+/// `Event::AvatarsFound` or `Event::AvatarSearchFailed`.
+fn run_searches(searches: Receiver<Search>, events: Sender<Event>) {
+    let agent = caps::http_agent(TIMEOUT);
+    for Search { url, query, name } in searches {
+        let event = match fetch(&agent, &search_url(&url, &name)) {
+            Ok((found, _)) => {
+                let avatars = found.into_iter().map(|(id, names)| (id, names.legacy)).collect();
+                Event::AvatarsFound { query, avatars }
+            }
+            Err(reason) => Event::AvatarSearchFailed { query, reason },
+        };
+        if events.send(event).is_err() {
+            return;
+        }
+    }
+}
+
+/// Starts the search worker; searches sent to the returned channel are
+/// answered on `events`.
+pub fn spawn_search(events: Sender<Event>) -> Sender<Search> {
+    let (sender, searches) = mpsc::channel();
+    thread::spawn(move || run_searches(searches, events));
+    sender
+}
+
 /// Starts the worker; lookups sent to the returned channel are answered on
 /// `events`.
 pub fn spawn(events: Sender<Event>) -> Sender<Lookup> {
@@ -224,6 +276,64 @@ mod tests {
             panic!("no NamesFailed event")
         };
         assert_eq!(ids, [uuid(JANE)]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn builds_the_search_url() {
+        assert_eq!(
+            search_url("http://sim/CAPS/search", "jane doe"),
+            "http://sim/CAPS/search/?page_size=100&names=jane%20doe"
+        );
+        assert_eq!(
+            search_url("http://sim/CAPS/search/", "a&b=ё"),
+            "http://sim/CAPS/search/?page_size=100&names=a%26b%3D%D1%91"
+        );
+    }
+
+    #[test]
+    fn search_worker_answers_over_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/CAPS/search", listener.local_addr().unwrap());
+        let body = reply();
+        let server = serve_once(
+            listener,
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/llsd+xml\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        let (events, incoming) = mpsc::channel();
+        let searches = spawn_search(events);
+        let query = Uuid::from_bytes([3; 16]);
+        searches.send(Search { url, query, name: "jane doe".into() }).unwrap();
+        let Ok(Event::AvatarsFound { query: answered, avatars }) = incoming.recv_timeout(Duration::from_secs(10))
+        else {
+            panic!("no AvatarsFound event")
+        };
+        assert_eq!((answered, avatars), (query, vec![(uuid(JANE), "Jane Doe".to_string())]));
+        let request_line = server.join().unwrap();
+        assert!(request_line.starts_with("GET /CAPS/search/?page_size=100&names=jane%20doe "), "{request_line}");
+    }
+
+    #[test]
+    fn search_worker_reports_a_failed_search() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/CAPS/search", listener.local_addr().unwrap());
+        let server = serve_once(
+            listener,
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+        );
+        let (events, incoming) = mpsc::channel();
+        let searches = spawn_search(events);
+        let query = Uuid::from_bytes([3; 16]);
+        searches.send(Search { url, query, name: "jane doe".into() }).unwrap();
+        let Ok(Event::AvatarSearchFailed { query: answered, reason }) = incoming.recv_timeout(Duration::from_secs(10))
+        else {
+            panic!("no AvatarSearchFailed event")
+        };
+        assert_eq!((answered, reason.as_str()), (query, "HTTP 400"));
         server.join().unwrap();
     }
 }
