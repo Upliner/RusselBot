@@ -18,7 +18,7 @@ The bot SHALL be able to sit the avatar on the object whose UUID is configured a
 - **THEN** the attempt is reported as failed within 15 seconds and the avatar stays connected
 
 ### Requirement: Track the seated state
-While connected, the bot SHALL track whether the avatar is seated on the target object. The state SHALL be one of: unknown (not yet learned since entering the region), not seated, or seated on the target. The avatar SHALL be considered seated on the target only when the simulator has confirmed a sit on the target object and has not since reported the avatar as standing. The state SHALL return to unknown whenever the avatar enters a region or the session is lost.
+While connected, the bot SHALL track whether the avatar is seated on the target object. The state SHALL be one of: unknown (not yet learned since entering the region), not seated, or seated on the target. The avatar SHALL be considered seated on the target only when the simulator has confirmed a sit on the target object and has not since reported the avatar as standing. The simulator's answer to the bot's own sit request SHALL count as that confirmation even when it names another prim of the target's linkset; a sit the bot did not request SHALL count only when it names the target object itself. The state SHALL return to unknown whenever the avatar enters a region or the session is lost.
 
 #### Scenario: Unseated by a script
 - **WHEN** the avatar is seated on the target and a script in the object unseats it

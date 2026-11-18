@@ -93,7 +93,8 @@ pub struct Session<N: Net> {
     circuit_code: u32,
     target_object: Uuid,
     sim: Sim,
-    /// The simulator confirmed a sit on the target since the avatar last stood up.
+    /// The simulator confirmed a sit on the target since the avatar last stood
+    /// up: it answered our sit request, or named the target unprompted.
     sat_on_target: bool,
     /// Local id of what the avatar sits on, from its own object updates.
     own_parent: Option<u32>,
@@ -340,10 +341,19 @@ impl<N: Net> Session<N> {
                 }
             }
             Incoming::AvatarSitResponse { object, autopilot } => {
-                self.sat_on_target = object == self.target_object;
-                if self.sat_on_target && self.sit_deadline.is_some() {
-                    crate::debug!("sit accepted (autopilot: {autopilot})");
+                // The response names the prim the simulator seated the avatar
+                // on, which may be another prim of the target's linkset (the
+                // one with the sit target, or the root). While a sit is in
+                // progress it answers our request, whatever it names.
+                if self.sit_deadline.is_some() {
+                    self.sat_on_target = true;
+                    crate::debug!("sit accepted on {object} (autopilot: {autopilot})");
                     self.send(messages::agent_sit(&self.agent), true, now);
+                } else {
+                    self.sat_on_target = object == self.target_object;
+                    if !self.sat_on_target {
+                        crate::debug!("unrequested sit on {object}, not the target");
+                    }
                 }
                 self.update_seat();
             }
@@ -353,6 +363,9 @@ impl<N: Net> Session<N> {
                     let stood_up = object.parent_id == 0 && self.own_parent.is_some_and(|p| p != 0);
                     if stood_up {
                         self.sat_on_target = false;
+                    }
+                    if self.own_parent != Some(object.parent_id) {
+                        crate::debug!("own avatar's parent is now {}", object.parent_id);
                     }
                     self.own_parent = Some(object.parent_id);
                     self.update_seat();
@@ -914,12 +927,22 @@ mod tests {
     }
 
     #[test]
-    fn sitting_on_a_different_object_is_not_seated_on_target() {
+    fn sit_response_naming_another_prim_of_the_linkset_confirms_the_sit() {
         let mut rig = Rig::entered();
         rig.session.start_sit(rig.now);
         rig.sent();
+        // The simulator answers with the prim it chose, not the one requested.
         rig.sit_response(Uuid::from_bytes([0xEE; 16]));
-        assert_eq!(rig.sent_ids(), [], "no AgentSit for someone else's seat");
+        assert_eq!(rig.sent_ids(), [messages::AGENT_SIT]);
+        rig.own_update(555);
+        assert_eq!(rig.events(), [SessionEvent::Seated]);
+    }
+
+    #[test]
+    fn forced_sit_on_a_different_object_is_not_seated_on_target() {
+        let mut rig = Rig::entered();
+        rig.sit_response(Uuid::from_bytes([0xEE; 16]));
+        assert_eq!(rig.sent_ids(), [], "no AgentSit without a sit in progress");
         rig.own_update(555);
         assert_eq!(rig.events(), [SessionEvent::Standing]);
     }
