@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds and configures a local OpenSim standalone for testing slbot.
+# Builds and configures a local OpenSim standalone for testing RusselBot.
 # The simulator lives in test-rig/opensim (git-ignored); the source checkout
 # it is cloned from is left untouched. Safe to run again: it only does the
 # steps that are still missing, and never overwrites an existing OpenSim.ini.

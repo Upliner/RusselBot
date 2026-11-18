@@ -6,7 +6,7 @@ use md5::{Digest, Md5};
 use std::net::{IpAddr, SocketAddr};
 use uuid::Uuid;
 
-pub const CHANNEL: &str = "SLBot-rs";
+pub const CHANNEL: &str = "RusselBot";
 const MAX_REDIRECTS: usize = 5;
 
 /// Where the login asks the grid to place the avatar.
@@ -81,8 +81,8 @@ pub fn request_xml(cfg: &Config, start: Start) -> String {
             ("channel", str(CHANNEL)),
             ("version", str(env!("CARGO_PKG_VERSION"))),
             ("platform", str("Lnx")),
-            ("mac", Value::Str(md5_hex(&format!("slbot-mac:{identity}")))),
-            ("id0", Value::Str(md5_hex(&format!("slbot-id0:{identity}")))),
+            ("mac", Value::Str(md5_hex(&format!("rslbot-mac:{identity}")))),
+            ("id0", Value::Str(md5_hex(&format!("rslbot-id0:{identity}")))),
             ("agree_to_tos", Value::Bool(true)),
             ("read_critical", Value::Bool(true)),
             ("options", Value::Array(Vec::new())),
@@ -247,7 +247,7 @@ mod tests {
         assert_eq!(value("last"), "<string>Bot</string>");
         assert_eq!(value("passwd"), "<string>$1$5ebe2294ecd0e0f08eab7690d2a6ee69</string>");
         assert_eq!(value("start"), "<string>uri:Target Region&amp;128&amp;61&amp;25</string>");
-        assert_eq!(value("channel"), "<string>SLBot-rs</string>");
+        assert_eq!(value("channel"), "<string>RusselBot</string>");
         assert_eq!(value("agree_to_tos"), "<boolean>1</boolean>");
         assert!(!xml.contains("secret"));
     }

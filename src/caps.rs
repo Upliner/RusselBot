@@ -19,7 +19,7 @@ pub fn http_agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
-        .user_agent(concat!("SLBot-rs/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("RusselBot/", env!("CARGO_PKG_VERSION")))
         .build()
         .into()
 }

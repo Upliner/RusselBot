@@ -1,6 +1,6 @@
 # Local OpenSim test rig
 
-slbot is verified against a local OpenSimulator standalone with two regions:
+RusselBot is verified against a local OpenSimulator standalone with two regions:
 
 ```
  OpenSim standalone (SQLite, http://127.0.0.1:9000)
@@ -58,11 +58,11 @@ echo 'show regions' > /tmp/sim.in
    or log in with a viewer as `Rig Owner` / `rigowner` (login URI
    `http://127.0.0.1:9000/`), rez a prim in `Target` and copy its UUID
    (Build > Edit > General > Copy Keys).
-3. Create `slbot.toml` from `slbot.example.toml`: keep `login_url`, `user` and
+3. Create `russelbot.toml` from `russelbot.example.toml`: keep `login_url`, `user` and
    `password`, set `object` to the UUID and `position` to a spot next to the
    prim (`[128.0, 128.0, 25.0]` for the helper's prim).
 
-Run the bot with `cargo run -- slbot.toml`. Add `--verbose` to see every
+Run the bot with `cargo run -- russelbot.toml`. Add `--verbose` to see every
 message name it receives and sends.
 
 OpenSim seats an avatar on a prim from any distance in the region, so the

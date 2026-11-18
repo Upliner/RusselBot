@@ -1,18 +1,12 @@
-A simple lightweight bot software for Second Life and OpenSimulator.
-Lightweight replacement for .NET/Mono bot software.
+RusselBot is a lightweight bot software for Second Life and OpenSimulator written in Rust,
+replacement for heavy .NET/Mono bots. Requires just a few MBs of memory which makes it possible
+to run even on cheapest VPS machines without requiring to run heavy Mono runtime.
 
 First version follows only one single simple scenario:
 * Connect to the grid, connect to the region
 * If current region is not the target region, issue teleport command to the target destination
 * Issue "sit" command on a target object.
 * Keep the avatar alive, respond all necessary server queries to keep it online.
-
-It requires one single config file to run with following parameters:
-* Grid URL (Second Life Agni by default)
-* User name
-* Password or password hash if grid can sign in by hash. In case of hash we need a separate tool for hash generation
-* Region name and coordinates for teleport command
-* UUID of the object to sit on
 
 ## Status
 
@@ -30,17 +24,17 @@ makes the bot exit with an error.
 Needs Rust 1.100 (pinned in `rust-toolchain.toml`; rustup picks it up).
 
 ```sh
-cargo build --release      # binary: target/release/slbot
+cargo build --release      # binary: target/release/rslbot
 cargo test
 ```
 
 ## Run
 
 ```sh
-cp slbot.example.toml slbot.toml   # then edit it
-target/release/slbot               # reads ./slbot.toml
-target/release/slbot path/to/other.toml
-target/release/slbot --verbose     # also log every simulator message
+cp russelbot.example.toml russelbot.toml   # then edit it
+target/release/rslbot               # reads ./russelbot.toml
+target/release/rslbot path/to/other.toml
+target/release/rslbot --verbose     # also log every simulator message
 ```
 
 The bot keeps working towards "logged in, in the target region, seated on
@@ -60,14 +54,14 @@ immediately.
 
 ## Config
 
-One TOML file; see `slbot.example.toml`.
+One TOML file; see `russelbot.example.toml`.
 
 | Key | Required | Meaning |
 |---|---|---|
 | `login_url` | no | Grid login URL. Default: `https://login.agni.lindenlab.com/cgi-bin/login.cgi` (Second Life) |
 | `user` | yes | `First Last`, or a single word (last name `Resident`) |
 | `password` | one of the two | Plain password |
-| `password_hash` | one of the two | Output of `slbot hash` |
+| `password_hash` | one of the two | Output of `rslbot hash` |
 | `region` | yes | Target region name |
 | `position` | yes | `[x, y, z]` inside the region; pick a spot close to the object |
 | `object` | yes | UUID of the object to sit on |
@@ -78,8 +72,8 @@ One TOML file; see `slbot.example.toml`.
 To keep the plain password out of the file:
 
 ```sh
-target/release/slbot hash          # type the password; prints $1$...
-printf 'secret\n' | target/release/slbot hash
+target/release/rslbot hash          # type the password; prints $1$...
+printf 'secret\n' | target/release/rslbot hash
 ```
 
 Put the printed value in `password_hash` and leave `password` out.

@@ -7,7 +7,7 @@ Defines the single configuration file the bot runs from, how it is validated, an
 ## Requirements
 
 ### Requirement: Single TOML config file
-The bot SHALL read all of its settings from one TOML file. The file path SHALL be taken from the first command-line argument and SHALL default to `slbot.toml` in the current directory when no argument is given. The file SHALL support these keys:
+The bot SHALL read all of its settings from one TOML file. The file path SHALL be taken from the first command-line argument and SHALL default to `russelbot.toml` in the current directory when no argument is given. The file SHALL support these keys:
 
 | Key | Required | Meaning |
 |---|---|---|
@@ -30,7 +30,7 @@ A relative `log_chat` or `log_im` path SHALL be taken relative to the directory 
 
 #### Scenario: Config path from the command line
 - **WHEN** the bot is started with a file path as its first argument
-- **THEN** it reads that file and not `slbot.toml`
+- **THEN** it reads that file and not `russelbot.toml`
 
 #### Scenario: Single-word user name
 - **WHEN** `user` is a single word such as `sitbot`

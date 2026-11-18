@@ -1,5 +1,6 @@
 /target
 /references
 /test-rig/opensim/
-/slbot.toml
+/russelbot.toml
 /real-sl.toml
+*.tsv

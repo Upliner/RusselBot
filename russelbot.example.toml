@@ -1,4 +1,4 @@
-# Example config for slbot. Copy to slbot.toml and edit.
+# Example config for RusselBot. Copy to russelbot.toml and edit.
 
 # Grid login URL. Leave out for Second Life (Agni):
 #   https://login.agni.lindenlab.com/cgi-bin/login.cgi
@@ -9,7 +9,7 @@ login_url = "http://127.0.0.1:9000/"
 user = "Sit Bot"
 
 # Exactly one of `password` or `password_hash`.
-# Generate the hash with `slbot hash` so the plain password is never stored.
+# Generate the hash with `rslbot hash` so the plain password is never stored.
 password = "secret"
 # password_hash = "$1$5ebe2294ecd0e0f08eab7690d2a6ee69"
 

@@ -1,4 +1,4 @@
-//! slbot: logs an avatar in to a Second Life or OpenSimulator grid, gets it
+//! rslbot: logs an avatar in to a Second Life or OpenSimulator grid, gets it
 //! to a target region, sits it on a target object and keeps it there.
 
 mod backoff;
@@ -40,11 +40,11 @@ const LOGIN_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const IDLE_WAIT: Duration = Duration::from_secs(60);
 
 const USAGE: &str = "\
-Usage: slbot [--verbose] [CONFIG]
-       slbot hash
+Usage: rslbot [--verbose] [CONFIG]
+       rslbot hash
 
-Runs the bot from CONFIG (default: slbot.toml).
-`slbot hash` reads a password from standard input and prints the value to
+Runs the bot from CONFIG (default: russelbot.toml).
+`rslbot hash` reads a password from standard input and prints the value to
 put in the config as `password_hash`.
 
 Options:
@@ -65,7 +65,7 @@ fn run_cli(args: Vec<String>) -> i32 {
                 return EXIT_OK;
             }
             option if option.starts_with('-') => {
-                eprintln!("slbot: unknown option {option}\n\n{USAGE}");
+                eprintln!("rslbot: unknown option {option}\n\n{USAGE}");
                 return EXIT_CONFIG;
             }
             _ => positional.push(arg.as_str()),
@@ -76,7 +76,7 @@ fn run_cli(args: Vec<String>) -> i32 {
         ["hash"] => hash_command(),
         [path] => run_bot(Path::new(path)),
         _ => {
-            eprintln!("slbot: too many arguments\n\n{USAGE}");
+            eprintln!("rslbot: too many arguments\n\n{USAGE}");
             EXIT_CONFIG
         }
     }
@@ -94,14 +94,14 @@ fn hash_command() -> i32 {
     let password = match password {
         Ok(password) => password,
         Err(e) => {
-            eprintln!("slbot: cannot read the password: {e}");
+            eprintln!("rslbot: cannot read the password: {e}");
             return EXIT_FATAL;
         }
     };
     let password = password.strip_suffix('\n').unwrap_or(&password);
     let password = password.strip_suffix('\r').unwrap_or(password);
     if password.is_empty() {
-        eprintln!("slbot: the password is empty");
+        eprintln!("rslbot: the password is empty");
         return EXIT_FATAL;
     }
     println!("{}", config::hash_password(password));
@@ -388,7 +388,7 @@ fn run_bot(config_path: &Path) -> i32 {
     let config = match Config::load(config_path) {
         Ok(config) => config,
         Err(e) => {
-            eprintln!("slbot: {e}");
+            eprintln!("rslbot: {e}");
             return EXIT_CONFIG;
         }
     };
@@ -397,7 +397,7 @@ fn run_bot(config_path: &Path) -> i32 {
     let logs = match Logs::open(config.log_chat.as_deref(), config.log_im.as_deref()) {
         Ok(logs) => logs,
         Err(e) => {
-            eprintln!("slbot: {}: `{}`: {}", config_path.display(), e.key, e.message);
+            eprintln!("rslbot: {}: `{}`: {}", config_path.display(), e.key, e.message);
             return EXIT_CONFIG;
         }
     };

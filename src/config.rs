@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub const DEFAULT_LOGIN_URL: &str = "https://login.agni.lindenlab.com/cgi-bin/login.cgi";
-pub const DEFAULT_CONFIG_PATH: &str = "slbot.toml";
+pub const DEFAULT_CONFIG_PATH: &str = "russelbot.toml";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -125,7 +125,7 @@ impl Config {
                 if !is_password_hash(&hash) {
                     return err(
                         "`password_hash` must be `$1$` followed by 32 lowercase hex digits, \
-                         as printed by `slbot hash`",
+                         as printed by `rslbot hash`",
                     );
                 }
                 hash
@@ -306,13 +306,13 @@ mod tests {
 
     #[test]
     fn example_file_is_valid() {
-        let cfg = Config::parse(include_str!("../slbot.example.toml")).unwrap();
+        let cfg = Config::parse(include_str!("../russelbot.example.toml")).unwrap();
         assert_eq!(cfg.login_url, "http://127.0.0.1:9000/");
     }
 
     #[test]
     fn example_file_is_valid_with_its_optional_keys_enabled() {
-        let text = include_str!("../slbot.example.toml");
+        let text = include_str!("../russelbot.example.toml");
         let mut enabled = text.to_string();
         for key in ["log_chat", "log_im", "fetch_offline_im"] {
             let commented = format!("# {key} = ");
