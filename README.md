@@ -9,7 +9,9 @@ Left alone, the bot follows one simple scenario:
 * Keep the avatar alive, respond all necessary server queries to keep it online.
 
 Through its [control socket](#control-socket) it can also be told to talk,
-stand, sit elsewhere, teleport, exchange teleport offers and touch objects.
+stand, sit elsewhere, teleport, exchange teleport offers and touch objects,
+and to use what the avatar owns: list its inventory, attach and detach
+objects, play animations and sounds, and (on Second Life) change clothing.
 
 ## Status
 
@@ -27,6 +29,20 @@ on Windows. On Second Life, checked by hand on 2026-11-18:
 login, sitting, logging of chat and IMs from avatars and from objects, and
 fetching offline IMs (delivered with the time they were sent). Multi-factor login is not supported: an account that has it enabled
 makes the bot exit with an error.
+
+The inventory commands (`inventory`, `attach`, `wear` for objects, `detach`,
+`anim`, `sound`) are verified by unit tests and on the local OpenSim. None of
+them has been tried on Second Life yet. That matters most for two things.
+Whether the bot learns what is attached to its avatar there is unverified:
+it reads that from the object descriptions the simulator sends by itself,
+and Second Life may send them in a form or at a time the bot does not see,
+in which case `inventory -a`, `detach BODY PART` and the confirmation of
+`attach` and `detach` would not work there. And the clothing commands
+(`wear` and `unwear` of clothing and body parts) and the keeping of the
+Current Outfit folder work through services only Second Life has; what the
+bot sends to them is taken from viewer source and covered by unit tests
+against replies written from that source, and has never met the real
+service.
 
 ## Build
 
@@ -224,6 +240,9 @@ target/release/rslbot ctl tp 128 128 25 Blue Lagoon
 target/release/rslbot ctl status
 target/release/rslbot ctl persist                   # stay here, like this
 target/release/rslbot ctl home
+target/release/rslbot ctl inventory "Bot gear"      # what the avatar owns there
+target/release/rslbot ctl attach "Bot gear/Radio" left hand
+target/release/rslbot ctl anim play "Bot gear/Dance"
 ```
 
 | Command | Does |
@@ -239,6 +258,12 @@ target/release/rslbot ctl home
 | `accepttp AVATAR` | Accept a teleport offer the avatar has sent, and go |
 | `sendtp AVATAR [MESSAGE...]` | Offer the avatar a teleport to the bot |
 | `touch UUID` | Click that object once |
+| `inventory [-a] [-n] [FOLDER]` | List the avatar's inventory: everything, or what is under `FOLDER`. See [Inventory](#inventory) |
+| `attach ITEM [BODY PART...]` | Attach an object from the inventory, to the named attachment point or else to the one it was last on. See [Attachments](#attachments) |
+| `wear ITEM` | For an object, the same as `attach ITEM`. For clothing or a body part, put it on; only where the grid makes the avatar's appearance. See [Clothing](#clothing) |
+| `detach WHAT...`, `unwear WHAT...` | Take off an item, everything on a body part, or all clothing of one kind (two names for the same command) |
+| `anim play ITEM`, `anim stop ITEM` | Start or stop an animation from the inventory. See [Animations and sounds](#animations-and-sounds) |
+| `sound ITEM` | Play a sound from the inventory once, where the avatar is |
 | `persist [LOCATION] [SIT]` | Hold a place from now on: return to `LOCATION` whenever the avatar is in another region, and sit as `SIT` says. Without arguments: where the avatar is and how it sits now. See [Holding a place](#holding-a-place) |
 | `home` | The same as `persist last last`: hold the place last persisted again, or the configured one when nothing was persisted |
 | `status` | Print where the avatar is |
@@ -278,8 +303,9 @@ kick or an outage (at the avatar's last location), but it no longer
 teleports or sits by itself. `persist` and `home` switch holding on, and
 the bot acts at once. `home` is not the avatar's home location: it is the place the bot
 held last. Manual mode ends with the bot process too; a restarted bot
-starts from its config. `sendtp`, `touch` and the talking commands leave
-the mode alone.
+starts from its config. `sendtp`, `touch`, the talking commands and the
+inventory commands (`inventory`, `attach`, `wear`, `detach`, `anim`,
+`sound`) leave the mode alone.
 
 ### Holding a place
 
@@ -415,12 +441,199 @@ One request is made regardless of all this: each time the avatar becomes
 seated on an object, the bot asks the simulator about that one object, to
 know where the avatar is.
 
+### Inventory
+
+```sh
+target/release/rslbot ctl inventory                    # all of My Inventory
+target/release/rslbot ctl inventory "Bot gear"         # everything under that folder
+target/release/rslbot ctl inventory -n Clothing        # its direct children only
+target/release/rslbot ctl inventory -a                 # what is attached now
+```
+
+`inventory [-a] [-n] [FOLDER]` prints one line for each entry under
+`FOLDER`, or under My Inventory when none is given, with five fields
+separated by tabs and no header:
+
+```
+b14608d3-f78e-4bf5-adde-d27c3c286c04	object	Left Hand	attached	Bot gear/Radio
+```
+
+| Field | Is |
+|---|---|
+| 1 | The entry's UUID |
+| 2 | Its type: `folder`, `object`, `clothing`, `bodypart`, `animation`, `sound`, `gesture`, `texture`, `notecard`, `script`, `landmark`, `callingcard`, `link` (a link to another item or folder), or `other` |
+| 3 | For an object, the attachment point it is on now, or else the one it was last on, or `-` when the inventory records none (OpenSimulator's does not: there the point shows only while the object is attached). For clothing and body parts, the kind (`shirt`, `skin`, ...). `-` for everything else |
+| 4 | `attached` when the item is attached to the avatar now, else `-` |
+| 5 | Its path from the top of My Inventory, with a `/` at the end for a folder |
+
+The lines are in the order of their paths. `-n` (or `--no-recurse`) lists
+only what is directly in the folder; without it, everything below is listed
+too. `-a` (or `--attached`) keeps only the items attached to the avatar now.
+The flags can stand before or after the folder. A folder with nothing to
+list prints nothing, with exit status 0. The folder itself is not listed,
+and neither is the Library: My Inventory is the only tree these commands
+see.
+
+`ITEM` and `FOLDER` are always one argument, in one of two forms:
+
+* a UUID, as `inventory` prints it in the first field;
+* a path from the top of My Inventory, such as `"Bot gear/Radio"`: names
+  separated by `/`. Quote a path with spaces. Names have to match exactly,
+  letter case included.
+
+In a path, `\/` is a `/` inside a name and `\\` is a backslash; `inventory`
+prints paths that way, along with `\t`, `\n` and `\r` for a tab and line
+breaks in a name, and reads them back the same. A `/` at the start or end
+of a path is ignored, which is how to name something that would otherwise
+be read differently: `/-n` is a folder called `-n`, and `detach /Chest`
+means an item called `Chest`, not the body part. When two entries in one
+folder have the same name, a path through them is refused and the error
+lists their UUIDs, which always work. A link stands for the item it points
+to: `attach "Outfits/Work/Radio"` attaches the item the link leads to. The
+last name of a path means an item for every command but `inventory`, where
+it means a folder, so an item and a folder with one name do not get in each
+other's way.
+
+Nothing is kept: every command asks the grid for the folders it needs, one
+folder for each name of a path, and a bot that is never given one of these
+commands asks the grid nothing about the inventory. A change made with a
+viewer is seen by the next command. A folder given by UUID is looked for
+from the top of My Inventory, to print the paths, so on a large inventory a
+path is the quicker way to name one.
+
+The grid has 50 seconds to answer everything one command needs. A whole
+inventory of many thousands of items may not be listed in that time, and
+the error then says to name a folder; `inventory -a` looks through the same
+folders and has the same limit. The simulator's inventory service is
+needed: on a grid without it the commands say so.
+
+### Attachments
+
+```sh
+target/release/rslbot ctl attach "Bot gear/Radio" left hand
+target/release/rslbot ctl detach "Bot gear/Radio"
+target/release/rslbot ctl attach "Bot gear/Radio"      # where it was last
+target/release/rslbot ctl detach left hand             # everything on that point
+target/release/rslbot ctl wear "Bot gear/Radio"        # an object: the same as attach
+```
+
+`attach ITEM [BODY PART...]` attaches an object to the named attachment
+point. Without one the simulator puts it where the inventory says it was
+attached last, and chooses for itself when the inventory records nothing.
+The command answers with the item and the point once the simulator shows
+the object on the avatar, or with an error after 15 seconds. Nothing is
+taken off to make room: several objects can share a point, so repeating an
+`attach` with other items piles them up; `inventory -a` shows what is on
+and `detach BODY PART` clears a point. An item that is attached already is
+refused, with the point it is on. `wear ITEM` on an object does exactly what
+`attach ITEM` does.
+
+`detach WHAT...` (or `unwear`, the same command) takes off, in this order
+of reading: the item with that UUID; everything attached to that body part;
+all clothing of that kind (see [Clothing](#clothing)); the item at that
+path. It answers with what was detached once the simulator shows the
+objects gone, or with an error after 15 seconds; taking everything off a
+point is answered once, naming each item.
+
+`BODY PART` is the name viewers show for an attachment point, in any letter
+case, with `HUD ` in front for the points of the heads-up display, or the
+point's number from 1 to 127. Its words need no quotes:
+
+| | | | |
+|---|---|---|---|
+| 1 `Chest` | 2 `Skull` | 3 `Left Shoulder` | 4 `Right Shoulder` |
+| 5 `Left Hand` | 6 `Right Hand` | 7 `Left Foot` | 8 `Right Foot` |
+| 9 `Spine` | 10 `Pelvis` | 11 `Mouth` | 12 `Chin` |
+| 13 `Left Ear` | 14 `Right Ear` | 15 `Left Eyeball` | 16 `Right Eyeball` |
+| 17 `Nose` | 18 `R Upper Arm` | 19 `R Forearm` | 20 `L Upper Arm` |
+| 21 `L Forearm` | 22 `Right Hip` | 23 `R Upper Leg` | 24 `R Lower Leg` |
+| 25 `Left Hip` | 26 `L Upper Leg` | 27 `L Lower Leg` | 28 `Stomach` |
+| 29 `Left Pec` | 30 `Right Pec` | 31 `HUD Center 2` | 32 `HUD Top Right` |
+| 33 `HUD Top` | 34 `HUD Top Left` | 35 `HUD Center` | 36 `HUD Bottom Left` |
+| 37 `HUD Bottom` | 38 `HUD Bottom Right` | 39 `Neck` | 40 `Avatar Center` |
+| 41 `Left Ring Finger` | 42 `Right Ring Finger` | 43 `Tail Base` | 44 `Tail Tip` |
+| 45 `Left Wing` | 46 `Right Wing` | 47 `Jaw` | 48 `Alt Left Ear` |
+| 49 `Alt Right Ear` | 50 `Alt Left Eye` | 51 `Alt Right Eye` | 52 `Tongue` |
+| 53 `Groin` | 54 `Left Hind Foot` | 55 `Right Hind Foot` | |
+
+A point without a name is printed as its number.
+
+The bot knows what is attached from what the simulator tells it about the
+objects on the avatar, which it does without being asked; nothing is sent
+to find out. So the bot also knows of things attached before it started, or
+attached and detached by a script, and notes on standard error whatever
+comes or goes without a command of its own. After a teleport to another
+region or a new login it learns it again from the new simulator, which may
+take a moment. Whether Second Life tells the bot enough for this is not
+verified yet (see [Status](#status)).
+
+None of these commands moves the avatar or changes whether the bot is
+holding its place.
+
+### Clothing
+
+Second Life makes an avatar's appearance on its servers from the avatar's
+Current Outfit folder. There, `wear ITEM` puts on a piece of clothing or a
+body part by adding it to that folder and asking the grid for the new
+appearance, and `unwear` takes clothing off the same way:
+
+| Command | Does |
+|---|---|
+| `wear "Clothing/Blue shirt"` | Adds the shirt to what the avatar wears; nothing is taken off |
+| `wear "Body Parts/Tanned skin"` | Replaces the skin: an avatar wears exactly one shape, skin, hair and eyes |
+| `unwear "Clothing/Blue shirt"` | Takes that piece off |
+| `unwear shirt` | Takes off every piece of that kind: `shirt`, `pants`, `shoes`, `socks`, `jacket`, `gloves`, `undershirt`, `underpants`, `skirt`, `alpha`, `tattoo`, `physics`, `universal` |
+
+They answer when the grid has accepted the new outfit. When it refuses, the
+bot puts the folder back as it was and prints the grid's reason; should
+that fail too, the error says the folder now differs from what the avatar
+wears, and `unwear` or a viewer puts it right. A body part cannot be taken
+off, only replaced: `unwear skin` and `unwear` of a body part item are
+refused.
+
+On the same grid the bot also notes in the Current Outfit folder what its
+`attach`, `wear` and `detach` commands attached and detached, as viewers
+do, so that a viewer logging in to the account later finds the avatar as
+the bot left it. That happens after the command has answered; if the grid
+refuses it, a line on standard error says so and the attachment itself is
+not affected.
+
+OpenSimulator has no such service: it expects the viewer to paint the
+avatar's skin and clothing into textures and upload them, which the bot
+cannot do. There `wear` and `unwear` of clothing and body parts fail with
+`this grid makes the avatar's appearance in the viewer, which the bot
+cannot do; ...`, and the Current Outfit folder is left alone. Objects are
+not affected: `attach`, `wear` on an object and `detach` work on both.
+
+All of this section is untested on Second Life; see [Status](#status).
+
+### Animations and sounds
+
+```sh
+target/release/rslbot ctl anim play "Bot gear/Dance"
+target/release/rslbot ctl anim stop "Bot gear/Dance"
+target/release/rslbot ctl sound "Bot gear/Bell"
+```
+
+`anim play ITEM` starts an animation from the inventory on the avatar, on
+top of whatever else it is playing, and `anim stop ITEM` stops it; stopping
+one that is not playing is not an error. `sound ITEM` plays a sound from
+the inventory once, at full volume, where the avatar is, for those nearby
+to hear. All three answer as soon as the request has been handed to the
+simulator connection. `ITEM` has to be in My Inventory: an animation or
+sound cannot be played by its asset's UUID, and the built-in animations
+have no names here.
+
+An animation plays until it is stopped, ends by itself, or the session
+ends. The bot does not remember it: after a kick or an outage it logs in
+again without starting the animation again.
+
 ### Exit status and limits
 
 | Exit status of `rslbot ctl` | Meaning |
 |---|---|
 | 0 | Done: the message was handed to the simulator, the avatar arrived, sat, and so on. For `im`, `requesttp` and `sendtp` this does not mean the other avatar is online, has read it or agreed |
-| 1 | The bot refused or the action failed, and the reason is printed: not in a region right now, unknown avatar or region, no answer to a name lookup within 10 s, a sit not confirmed within 15 s, a teleport without outcome after 60 s, an unknown object, a seat known to be in another region than the location to persist, a bad argument, an unknown command. Or no bot is listening on the socket |
+| 1 | The bot refused or the action failed, and the reason is printed: not in a region right now, unknown avatar or region, no answer to a name lookup within 10 s, a sit not confirmed within 15 s, a teleport without outcome after 60 s, an unknown object, a seat known to be in another region than the location to persist, an inventory item or folder that was not found or is of the wrong type, an inventory that did not answer within 50 s, an attach or detach the simulator did not show within 15 s, clothing on a grid without the outfit service, a bad argument, an unknown command. Or no bot is listening on the socket |
 | 2 | No command given |
 
 A command is carried out at once or not at all: one sent while the bot is

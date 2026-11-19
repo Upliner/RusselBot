@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 const EVENT_QUEUE: &str = "EventQueueGet";
 const DISPLAY_NAMES: &str = "GetDisplayNames";
 const AVATAR_SEARCH: &str = "AvatarPickerSearch";
+const FETCH_DESCENDENTS: &str = "FetchInventoryDescendents2";
+const FETCH_ITEMS: &str = "FetchInventory2";
+const INVENTORY_API: &str = "InventoryAPIv3";
+const UPDATE_APPEARANCE: &str = "UpdateAvatarAppearance";
 /// Continuous failure for this long means the session is gone.
 pub const FAILURE_LIMIT: Duration = Duration::from_secs(60);
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -52,6 +56,31 @@ pub enum CapsEvent {
     /// The simulator's avatar search URL, or that it has none. Sent once,
     /// after `DisplayNames`.
     AvatarSearch(Option<String>),
+    /// The simulator's inventory services, as far as it has them. Sent
+    /// once, after `AvatarSearch`.
+    Inventory(InventoryUrls),
+}
+
+/// Where the simulator answers for the inventory; each may be missing.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct InventoryUrls {
+    /// `FetchInventoryDescendents2`: the contents of folders.
+    pub descendents: Option<String>,
+    /// `FetchInventory2`: items by id.
+    pub items: Option<String>,
+    /// `InventoryAPIv3`: changes to the inventory, used for the links in
+    /// the Current Outfit folder.
+    pub api: Option<String>,
+    /// `UpdateAvatarAppearance`: makes the avatar's look from that folder.
+    pub appearance: Option<String>,
+}
+
+impl InventoryUrls {
+    /// Whether the simulator makes the avatar's appearance on the server,
+    /// which is what clothing needs.
+    pub fn outfit_service(&self) -> bool {
+        self.api.is_some() && self.appearance.is_some()
+    }
 }
 
 /// The capabilities the bot uses, from the seed capability's reply.
@@ -60,10 +89,20 @@ pub struct Seed {
     pub event_queue: String,
     pub display_names: Option<String>,
     pub avatar_search: Option<String>,
+    pub inventory: InventoryUrls,
 }
 
 pub fn seed_request() -> String {
-    let names = [EVENT_QUEUE, DISPLAY_NAMES, AVATAR_SEARCH].map(|name| Value::Str(name.to_string()));
+    let names = [
+        EVENT_QUEUE,
+        DISPLAY_NAMES,
+        AVATAR_SEARCH,
+        FETCH_DESCENDENTS,
+        FETCH_ITEMS,
+        INVENTORY_API,
+        UPDATE_APPEARANCE,
+    ]
+    .map(|name| Value::Str(name.to_string()));
     xml::write_llsd(&Value::Array(names.to_vec()))
 }
 
@@ -75,6 +114,12 @@ pub fn parse_seed_reply(body: &str) -> Result<Seed, String> {
             event_queue,
             display_names: url(DISPLAY_NAMES),
             avatar_search: url(AVATAR_SEARCH),
+            inventory: InventoryUrls {
+                descendents: url(FETCH_DESCENDENTS),
+                items: url(FETCH_ITEMS),
+                api: url(INVENTORY_API),
+                appearance: url(UPDATE_APPEARANCE),
+            },
         }),
         None => Err("simulator offers no EventQueueGet capability".to_string()),
     }
@@ -196,8 +241,15 @@ pub fn run(seed_capability: &str, stop: &AtomicBool, mut emit: impl FnMut(CapsEv
             None => match fetch_seed(&agent, seed_capability) {
                 Ok(seed) => {
                     queue_url = Some(seed.event_queue);
-                    if !emit(CapsEvent::DisplayNames(seed.display_names)) || !emit(CapsEvent::AvatarSearch(seed.avatar_search)) {
-                        return;
+                    let found = [
+                        CapsEvent::DisplayNames(seed.display_names),
+                        CapsEvent::AvatarSearch(seed.avatar_search),
+                        CapsEvent::Inventory(seed.inventory),
+                    ];
+                    for event in found {
+                        if !emit(event) {
+                            return;
+                        }
                     }
                     None
                 }
@@ -272,8 +324,51 @@ mod tests {
     fn seed_request_asks_for_the_event_queue() {
         assert!(seed_request().ends_with(
             "<llsd><array><string>EventQueueGet</string><string>GetDisplayNames</string>\
-             <string>AvatarPickerSearch</string></array></llsd>"
+             <string>AvatarPickerSearch</string><string>FetchInventoryDescendents2</string>\
+             <string>FetchInventory2</string><string>InventoryAPIv3</string>\
+             <string>UpdateAvatarAppearance</string></array></llsd>"
         ));
+    }
+
+    #[test]
+    fn seed_reply_may_carry_the_inventory_services() {
+        let entry = |name: &str| format!("<key>{name}</key><string>http://sim/CAPS/{name}/</string>");
+        let reply = |names: &[&str]| {
+            let entries: String = names.iter().map(|name| entry(name)).collect();
+            format!("<llsd><map>{}{entries}</map></llsd>", entry("EventQueueGet"))
+        };
+        let url = |name: &str| Some(format!("http://sim/CAPS/{name}/"));
+
+        // None of them: a simulator without an inventory service.
+        let seed = parse_seed_reply(&reply(&[])).unwrap();
+        assert_eq!(seed.inventory, InventoryUrls::default());
+        assert!(!seed.inventory.outfit_service());
+
+        // The two that read, as on OpenSimulator.
+        let seed = parse_seed_reply(&reply(&["FetchInventoryDescendents2", "FetchInventory2"])).unwrap();
+        assert_eq!(seed.inventory.descendents, url("FetchInventoryDescendents2"));
+        assert_eq!(seed.inventory.items, url("FetchInventory2"));
+        assert_eq!((&seed.inventory.api, &seed.inventory.appearance), (&None, &None));
+        assert!(!seed.inventory.outfit_service());
+
+        // All four, as on Second Life.
+        let all = [
+            "FetchInventoryDescendents2",
+            "FetchInventory2",
+            "InventoryAPIv3",
+            "UpdateAvatarAppearance",
+        ];
+        let seed = parse_seed_reply(&reply(&all)).unwrap();
+        assert_eq!(seed.inventory.api, url("InventoryAPIv3"));
+        assert_eq!(seed.inventory.appearance, url("UpdateAvatarAppearance"));
+        assert!(seed.inventory.outfit_service());
+        // One of the two alone is no outfit service.
+        let seed = parse_seed_reply(&reply(&["InventoryAPIv3"])).unwrap();
+        assert!(!seed.inventory.outfit_service());
+        // An empty URL is no URL.
+        let empty = "<llsd><map><key>EventQueueGet</key><string>http://sim/eq</string>\
+                     <key>FetchInventory2</key><string></string></map></llsd>";
+        assert_eq!(parse_seed_reply(empty).unwrap().inventory.items, None);
     }
 
     #[test]

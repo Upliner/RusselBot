@@ -44,6 +44,12 @@ Usage: rslbot ctl say MESSAGE...
        rslbot ctl accepttp AVATAR
        rslbot ctl sendtp AVATAR [MESSAGE...]
        rslbot ctl touch UUID
+       rslbot ctl inventory [-a] [-n] [FOLDER]
+       rslbot ctl attach ITEM [BODY PART...]
+       rslbot ctl wear ITEM
+       rslbot ctl detach | unwear ITEM | BODY PART... | KIND
+       rslbot ctl anim play | stop ITEM
+       rslbot ctl sound ITEM
        rslbot ctl persist [LOCATION] [SIT]
        rslbot ctl home
        rslbot ctl status
@@ -70,6 +76,24 @@ sitting and standing alone). Either can also be `cur` (where the avatar is
 and what it sits on now; the default), `cfg` (what the config says), `last`
 (what was last persisted) or `last_cmd` (where the last `tp` went, what the
 last `sit` named). `home` is `persist last last`.
+
+`inventory` lists what is under FOLDER, or all of My Inventory: one line
+per entry with its UUID, type, attach or wear point, `attached` or `-`, and
+path, separated by tabs. `-n` (`--no-recurse`) lists the folder's direct
+children only, `-a` (`--attached`) only what is attached to the avatar now.
+ITEM and FOLDER are one argument: a UUID as `inventory` prints it, or a
+path from the top of My Inventory such as \"Objects/Bot gear/Radio\". In a
+path, `\\/` is a `/` inside a name and `\\\\` a backslash; a `/` in front makes
+a path of what would otherwise be read as an option, a UUID or a body part.
+
+`attach` attaches an object to BODY PART (`Left Hand`, `HUD Center`, or a
+number), or without one to the point it was last on. `wear` does the same
+for an object, and puts on clothing or a body part (shape, skin, hair,
+eyes) where the grid makes the avatar's appearance (Second Life). `detach`
+takes off an item, everything on a body part, or all clothing of a KIND
+(`shirt`, `pants`, ...). `anim play` and `anim stop` start and stop an
+animation from the inventory, and `sound` plays a sound from it once. None
+of these moves the avatar.
 
 The socket address is taken from the environment variable RUSSELBOT_SOCK
 when it is set.";
@@ -102,6 +126,25 @@ pub enum Request {
     },
     /// A UUID, still to be read.
     Touch(String),
+    /// `[-a] [-n] [folder]`, still to be read.
+    Inventory(Vec<String>),
+    /// An inventory item and, when given, the words of a body part.
+    Attach {
+        item: String,
+        part: Option<String>,
+    },
+    /// An inventory item, still to be read.
+    Wear(String),
+    /// An inventory item, a body part or a kind of clothing, still to be
+    /// read. `unwear` is the same request.
+    Detach(String),
+    /// `anim play` or `anim stop` and an inventory item.
+    Anim {
+        stop: bool,
+        item: String,
+    },
+    /// An inventory item, still to be read.
+    Sound(String),
     /// A location and a sit state, still to be read; what is left out
     /// stands for `cur`.
     Persist {
@@ -203,6 +246,38 @@ impl Request {
             "touch" => {
                 arguments(1)?;
                 Ok(Request::Touch(fields.remove(0)))
+            }
+            "inventory" => Ok(Request::Inventory(fields)),
+            "attach" => {
+                at_least(1)?;
+                let item = fields.remove(0);
+                // A body part's name may be several words.
+                let part = (!fields.is_empty()).then(|| fields.join(" "));
+                Ok(Request::Attach { item, part })
+            }
+            "wear" => {
+                arguments(1)?;
+                Ok(Request::Wear(fields.remove(0)))
+            }
+            // An item is one argument; the words of a body part are joined.
+            "detach" | "unwear" => {
+                at_least(1)?;
+                Ok(Request::Detach(fields.join(" ")))
+            }
+            "anim" => {
+                let stop = match (fields.first().map(String::as_str), given) {
+                    (Some("play"), 2) => false,
+                    (Some("stop"), 2) => true,
+                    _ => return Err("`anim` takes `play ITEM` or `stop ITEM`; an item path with spaces has to be quoted".to_string()),
+                };
+                Ok(Request::Anim {
+                    stop,
+                    item: fields.remove(1),
+                })
+            }
+            "sound" => {
+                arguments(1)?;
+                Ok(Request::Sound(fields.remove(0)))
             }
             "persist" => {
                 if given > 2 {
@@ -594,6 +669,96 @@ mod tests {
     }
 
     #[test]
+    fn inventory_requests_are_read_from_their_lines() {
+        let text = |s: &str| s.to_string();
+        assert_eq!(Request::decode(b"inventory"), Ok(Request::Inventory(vec![])));
+        assert_eq!(
+            Request::decode(b"inventory\t-a\tObjects/Bot gear\t-n"),
+            Ok(Request::Inventory(vec![text("-a"), text("Objects/Bot gear"), text("-n")]))
+        );
+        assert_eq!(
+            Request::decode(b"attach\tObjects/Radio"),
+            Ok(Request::Attach {
+                item: text("Objects/Radio"),
+                part: None
+            })
+        );
+        // The words after the item are the body part.
+        assert_eq!(
+            Request::decode(b"attach\tObjects/Radio\tleft\thand"),
+            Ok(Request::Attach {
+                item: text("Objects/Radio"),
+                part: Some(text("left hand"))
+            })
+        );
+        assert_eq!(
+            Request::decode(b"attach\tObjects/Radio\t5"),
+            Ok(Request::Attach {
+                item: text("Objects/Radio"),
+                part: Some(text("5"))
+            })
+        );
+        assert_eq!(
+            Request::decode(b"wear\tClothing/Blue shirt"),
+            Ok(Request::Wear(text("Clothing/Blue shirt")))
+        );
+        assert_eq!(
+            Request::decode(b"detach\tObjects/Radio"),
+            Ok(Request::Detach(text("Objects/Radio")))
+        );
+        assert_eq!(Request::decode(b"detach\tleft\thand"), Ok(Request::Detach(text("left hand"))));
+        // `unwear` is `detach` under another name.
+        assert_eq!(Request::decode(b"unwear\tObjects/Radio"), Request::decode(b"detach\tObjects/Radio"));
+        assert_eq!(Request::decode(b"unwear\tshirt"), Ok(Request::Detach(text("shirt"))));
+        assert_eq!(
+            Request::decode(b"anim\tplay\tAnimations/Dance"),
+            Ok(Request::Anim {
+                stop: false,
+                item: text("Animations/Dance")
+            })
+        );
+        assert_eq!(
+            Request::decode(b"anim\tstop\tAnimations/Dance"),
+            Ok(Request::Anim {
+                stop: true,
+                item: text("Animations/Dance")
+            })
+        );
+        assert_eq!(Request::decode(b"sound\tSounds/Bell"), Ok(Request::Sound(text("Sounds/Bell"))));
+        // A path's escapes arrive as the client wrote them.
+        assert_eq!(
+            Request::decode(b"sound\tSounds/Ding\\\\/Dong"),
+            Ok(Request::Sound(text("Sounds/Ding\\/Dong")))
+        );
+    }
+
+    #[test]
+    fn inventory_requests_with_the_wrong_arguments_are_refused() {
+        assert!(Request::decode(b"attach")
+            .unwrap_err()
+            .contains("`attach` takes at least 1 argument"));
+        assert!(Request::decode(b"wear").unwrap_err().contains("`wear` takes 1 argument, not 0"));
+        assert!(Request::decode(b"wear\tBlue\tshirt").unwrap_err().contains("`wear`"));
+        assert!(Request::decode(b"detach").unwrap_err().contains("`detach`"));
+        assert!(Request::decode(b"unwear").unwrap_err().contains("`unwear`"));
+        assert!(Request::decode(b"sound").unwrap_err().contains("`sound`"));
+        assert!(Request::decode(b"sound\ta\tb").unwrap_err().contains("`sound`"));
+        // `anim` is `play` or `stop` and one item, nothing else.
+        for bad in [
+            &b"anim"[..],
+            b"anim\tplay",
+            b"anim\tstop",
+            b"anim\tpause\tAnimations/Dance",
+            b"anim\tplay\tAnimations/Dance\tnow",
+            b"anim\tAnimations/Dance\tplay",
+            b"anim\tPlay\tAnimations/Dance",
+        ] {
+            let reason = Request::decode(bad).unwrap_err();
+            assert!(reason.contains("`play ITEM`") && reason.contains("`stop ITEM`"), "{reason}");
+        }
+    }
+
+    #[test]
     fn bad_requests_are_refused_with_a_reason() {
         assert!(Request::decode(b"dance").unwrap_err().contains("`dance`"));
         assert!(Request::decode(b"dance\twith\tme").unwrap_err().contains("`dance`"));
@@ -643,6 +808,21 @@ mod tests {
             "persist\tBlue Lagoon/128/128/25\tstand\n"
         );
         assert_eq!(request_line(&strings(&["persist"])), "persist\n");
+        // Options and paths go to the bot as they are; a backslash is
+        // escaped for the line and comes out of it again.
+        assert_eq!(
+            request_line(&strings(&["inventory", "-a", "Objects/Bot gear"])),
+            "inventory\t-a\tObjects/Bot gear\n"
+        );
+        let line = request_line(&strings(&["attach", "Objects/Radio\\/TV", "left", "hand"]));
+        assert_eq!(line, "attach\tObjects/Radio\\\\/TV\tleft\thand\n");
+        assert_eq!(
+            Request::decode(line.as_bytes()),
+            Ok(Request::Attach {
+                item: "Objects/Radio\\/TV".into(),
+                part: Some("left hand".into())
+            })
+        );
     }
 
     #[test]

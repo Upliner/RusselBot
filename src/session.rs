@@ -3,12 +3,12 @@
 //! seat tracking. All I/O goes through `Net`, so the logic is testable with
 //! a fake clock and a recording network.
 
-use crate::caps::{CapsEvent, EqEvent, TeleportFinish};
+use crate::caps::{CapsEvent, EqEvent, InventoryUrls, TeleportFinish};
 use crate::login::SessionInfo;
 use crate::persist::{Location, Sitting, World};
 use crate::reconciler::same_region;
 use crate::udp::circuit::Circuit;
-use crate::udp::messages::{self, Agent, Incoming, Outgoing, Transform, Vector3};
+use crate::udp::messages::{self, Agent, AttachItem, Incoming, Outgoing, Transform, Vector3};
 use crate::udp::packet;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -23,6 +23,9 @@ pub const LOGOUT_LIMIT: Duration = Duration::from_secs(5);
 const AGENT_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a touch waits for a scan to turn its object up.
 pub const TOUCH_WAIT: Duration = Duration::from_secs(10);
+/// How long the simulator has to show an object on the avatar after an
+/// attach, or gone from it after a detach.
+pub const ATTACH_LIMIT: Duration = Duration::from_secs(15);
 /// Most objects remembered in one region; more are not learned.
 const MAX_OBJECTS: usize = 50_000;
 /// Most objects remembered as mentioned but not described.
@@ -106,6 +109,24 @@ pub enum SessionEvent {
         query: Uuid,
         avatars: Vec<(Uuid, String)>,
     },
+    /// The current simulator's inventory services, as far as it has them.
+    InventoryUrls(InventoryUrls),
+    /// The simulator shows the object of this inventory item on the avatar,
+    /// on this attachment point.
+    Attached {
+        item: Uuid,
+        point: u8,
+    },
+    /// The object of this inventory item is gone from the avatar; `point`
+    /// is where it was.
+    Detached {
+        item: Uuid,
+        point: u8,
+    },
+    /// An `attach` was not followed by the object within `ATTACH_LIMIT`.
+    AttachFailed(Uuid),
+    /// A `detach` did not make the object go within `ATTACH_LIMIT`.
+    DetachFailed(Uuid),
 }
 
 /// A chat or instant message as the simulator delivered it; the names that
@@ -188,6 +209,18 @@ pub enum Touch {
     Waiting,
 }
 
+/// An object the simulator describes as made from an inventory item and
+/// worn: the root prim of an attachment, on the bot's avatar or another.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Attachment {
+    local_id: u32,
+    /// Region-local id of what it is attached to.
+    parent: u32,
+    point: u8,
+    /// Reported as attached to the bot's own avatar.
+    reported: bool,
+}
+
 fn chat_kind(chat_type: u8) -> String {
     let kind = match chat_type {
         0 => "whisper",
@@ -230,6 +263,14 @@ struct Sim {
     scan_started: Option<Instant>,
     /// Touches waiting for their object to be described, with their deadline.
     wanted: Vec<(Uuid, Instant)>,
+    /// Attachments the simulator has described, by inventory item. One
+    /// counts as attached to the avatar while its parent is `own_local`:
+    /// the avatar's own description may come after its attachments'.
+    attachments: HashMap<Uuid, Attachment>,
+    /// Items an `attach` is waiting to see on the avatar, with the deadline.
+    awaited_attach: Vec<(Uuid, Instant)>,
+    /// Items a `detach` is waiting to see gone, with the deadline.
+    awaited_detach: Vec<(Uuid, Instant)>,
 }
 
 enum TeleportPhase {
@@ -342,6 +383,13 @@ impl<N: Net> Session<N> {
         });
         consider(self.sit_deadline);
         consider(sim.wanted.iter().map(|(_, deadline)| *deadline).min());
+        consider(
+            sim.awaited_attach
+                .iter()
+                .chain(&sim.awaited_detach)
+                .map(|(_, deadline)| *deadline)
+                .min(),
+        );
         consider(self.teleport.as_ref().map(|t| t.deadline));
         consider(self.logout_deadline);
         deadline
@@ -349,6 +397,7 @@ impl<N: Net> Session<N> {
 
     fn open_circuit(&mut self, generation: u64, addr: SocketAddr, seed_capability: &str, now: Instant) {
         self.fail_touches();
+        self.fail_attaches();
         self.sim = Sim::new(generation, now);
         self.seat_confirmed = None;
         self.own_parent = None;
@@ -373,6 +422,7 @@ impl<N: Net> Session<N> {
         if !self.lost {
             self.lost = true;
             self.fail_touches();
+            self.fail_attaches();
             self.net.close(self.sim.generation);
             // A session that ends while logging out has done what was asked;
             // simulators often drop the event queue before confirming.
@@ -663,6 +713,128 @@ impl<N: Net> Session<N> {
         Ok(())
     }
 
+    // -------------------------------------------------------- attachments
+
+    /// The inventory items attached to the avatar now, with their points,
+    /// as far as the simulator has shown them.
+    pub fn attached(&self) -> Vec<(Uuid, u8)> {
+        let own = self.sim.own_local;
+        let worn = self.sim.attachments.iter().filter(|(_, worn)| own == Some(worn.parent));
+        worn.map(|(item, worn)| (*item, worn.point)).collect()
+    }
+
+    /// The simulator described an object that carries an inventory item's
+    /// id: an attachment, on this avatar or on another.
+    fn attachment_described(&mut self, item: Uuid, local_id: u32, parent: u32, point: u8) {
+        let known = self.sim.attachments.get(&item).copied();
+        let reported = known.is_some_and(|known| known.reported && known.parent == parent && known.point == point);
+        let attachment = Attachment {
+            local_id,
+            parent,
+            point,
+            reported,
+        };
+        self.sim.attachments.insert(item, attachment);
+        if let Some(known) = known.filter(|known| known.reported && !reported) {
+            // On another point or another avatar than it was: gone from
+            // where it was first.
+            self.detached(item, known.point);
+        }
+        self.report_attachments();
+    }
+
+    /// Reports the attachments that are on the avatar and were not known
+    /// to be: after one is described, and after the avatar itself is.
+    fn report_attachments(&mut self) {
+        let Some(own) = self.sim.own_local else {
+            return;
+        };
+        let mut found = Vec::new();
+        for (item, worn) in &mut self.sim.attachments {
+            if worn.parent == own && !worn.reported {
+                worn.reported = true;
+                found.push((*item, worn.point));
+            }
+        }
+        for (item, point) in found {
+            self.sim.awaited_attach.retain(|(awaited, _)| *awaited != item);
+            self.events.push(SessionEvent::Attached { item, point });
+        }
+    }
+
+    fn detached(&mut self, item: Uuid, point: u8) {
+        self.sim.awaited_detach.retain(|(awaited, _)| *awaited != item);
+        self.events.push(SessionEvent::Detached { item, point });
+    }
+
+    /// The object with this region-local id is gone.
+    fn attachment_killed(&mut self, local_id: u32) {
+        let gone: Vec<Uuid> = self
+            .sim
+            .attachments
+            .iter()
+            .filter(|(_, worn)| worn.local_id == local_id)
+            .map(|(item, _)| *item)
+            .collect();
+        for item in gone {
+            if let Some(worn) = self.sim.attachments.remove(&item).filter(|worn| worn.reported) {
+                self.detached(item, worn.point);
+            }
+        }
+    }
+
+    fn fail_attaches(&mut self) {
+        for (item, _) in std::mem::take(&mut self.sim.awaited_attach) {
+            self.events.push(SessionEvent::AttachFailed(item));
+        }
+        for (item, _) in std::mem::take(&mut self.sim.awaited_detach) {
+            self.events.push(SessionEvent::DetachFailed(item));
+        }
+    }
+
+    /// Attaches the object of an inventory item to the avatar: to `point`,
+    /// or with 0 where the simulator puts it, which is where it was last.
+    /// Nothing is taken off to make room. Ends in `Attached` for the item
+    /// or, after `ATTACH_LIMIT`, in `AttachFailed`.
+    pub fn attach(&mut self, item: &AttachItem, point: u8, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::rez_single_attachment_from_inv(&self.agent, item, point), true, now);
+        self.sim.awaited_attach.retain(|(awaited, _)| *awaited != item.item_id);
+        self.sim.awaited_attach.push((item.item_id, now + ATTACH_LIMIT));
+        Ok(())
+    }
+
+    /// Detaches the object of an inventory item into the inventory. Ends
+    /// in `Detached` for the item or, after `ATTACH_LIMIT`, in
+    /// `DetachFailed`.
+    pub fn detach(&mut self, item: Uuid, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::detach_attachment_into_inv(&self.agent, item), true, now);
+        self.sim.awaited_detach.retain(|(awaited, _)| *awaited != item);
+        self.sim.awaited_detach.push((item, now + ATTACH_LIMIT));
+        Ok(())
+    }
+
+    // ------------------------------------------------ animations and sounds
+
+    /// Starts or stops an animation on the avatar; `animation` is the
+    /// asset's id.
+    pub fn animate(&mut self, animation: Uuid, start: bool, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::agent_animation(&self.agent, animation, start), true, now);
+        Ok(())
+    }
+
+    /// Plays a sound once where the avatar is, at full volume; `sound` is
+    /// the asset's id.
+    pub fn play_sound(&mut self, sound: Uuid, now: Instant) -> Result<(), String> {
+        self.present()?;
+        let handle = self.sim.region_handle.ok_or(NOT_CONNECTED)?;
+        let position = self.sim.position.unwrap_or_default();
+        self.send(messages::sound_trigger(sound, handle, position, 1.0), true, now);
+        Ok(())
+    }
+
     // ------------------------------------------------------------- timers
 
     pub fn tick(&mut self, now: Instant) {
@@ -691,6 +863,20 @@ impl<N: Net> Session<N> {
         self.sim.wanted = wanted;
         for (object, _) in late {
             self.events.push(SessionEvent::TouchFailed(object));
+        }
+        let (late, awaited) = std::mem::take(&mut self.sim.awaited_attach)
+            .into_iter()
+            .partition(|(_, at)| now >= *at);
+        self.sim.awaited_attach = awaited;
+        for (item, _) in late {
+            self.events.push(SessionEvent::AttachFailed(item));
+        }
+        let (late, awaited) = std::mem::take(&mut self.sim.awaited_detach)
+            .into_iter()
+            .partition(|(_, at)| now >= *at);
+        self.sim.awaited_detach = awaited;
+        for (item, _) in late {
+            self.events.push(SessionEvent::DetachFailed(item));
         }
         if self.sit_deadline.is_some_and(|deadline| now >= deadline) {
             self.sit_deadline = None;
@@ -742,6 +928,7 @@ impl<N: Net> Session<N> {
             CapsEvent::Event(EqEvent::Other(name)) => crate::debug!("event queue: ignoring {name}"),
             CapsEvent::DisplayNames(url) => self.events.push(SessionEvent::DisplayNamesUrl(url)),
             CapsEvent::AvatarSearch(url) => self.events.push(SessionEvent::AvatarSearchUrl(url)),
+            CapsEvent::Inventory(urls) => self.events.push(SessionEvent::InventoryUrls(urls)),
         }
     }
 
@@ -819,6 +1006,9 @@ impl<N: Net> Session<N> {
                         if let Some(transform) = object.transform {
                             self.moved(object.local_id, transform);
                         }
+                        if let Some(item) = object.attach_item {
+                            self.attachment_described(item, object.local_id, object.parent_id, object.attachment_point());
+                        }
                         continue;
                     }
                     let stood_up = object.parent_id == 0 && self.own_parent.is_some_and(|p| p != 0);
@@ -845,6 +1035,7 @@ impl<N: Net> Session<N> {
                     }
                     self.own_parent = Some(object.parent_id);
                     self.sim.own_local = Some(object.local_id);
+                    self.report_attachments();
                     if let Some(transform) = object.transform {
                         self.sim.own_offset = Some(transform.position);
                         self.update_position();
@@ -857,6 +1048,9 @@ impl<N: Net> Session<N> {
                     self.learn(object.full_id, object.local_id, now);
                     if let Some(transform) = object.transform {
                         self.moved(object.local_id, transform);
+                    }
+                    if let Some(worn) = object.attachment {
+                        self.attachment_described(worn.item, object.local_id, worn.parent_id, worn.point);
                     }
                 }
             }
@@ -880,6 +1074,7 @@ impl<N: Net> Session<N> {
                     if let Some(object) = self.sim.local_ids.remove(&local_id) {
                         self.sim.objects.remove(&object);
                     }
+                    self.attachment_killed(local_id);
                 }
             }
             Incoming::KickUser { reason } => self.lose(format!("kicked: {reason}")),
@@ -1094,6 +1289,9 @@ impl Sim {
             undescribed: HashSet::new(),
             scan_started: None,
             wanted: Vec::new(),
+            attachments: HashMap::new(),
+            awaited_attach: Vec::new(),
+            awaited_detach: Vec::new(),
         }
     }
 }
@@ -1191,6 +1389,7 @@ mod tests {
                 circuit_code: 77,
                 sim_addr: "127.0.0.1:9000".parse().unwrap(),
                 seed_capability: "http://127.0.0.1:9000/CAPS/seed/".to_string(),
+                inventory_root: None,
             };
             let now = Instant::now();
             let session = Session::new(net.clone(), &info, "Sit Bot", scan_distance, fetch_offline_im, 1, now);
@@ -2384,6 +2583,7 @@ mod tests {
                 local_id: OWN,
                 parent_id: parent,
                 data,
+                worn: None,
             };
             self.receive(messages::OBJECT_UPDATE, &wire::object_blocks(&[block]));
         }
@@ -2396,6 +2596,7 @@ mod tests {
                 local_id: CHAIR,
                 parent_id: 0,
                 data,
+                worn: None,
             };
             self.receive(messages::OBJECT_UPDATE, &wire::object_blocks(&[block]));
         }
@@ -2592,6 +2793,7 @@ mod tests {
             local_id: OWN,
             parent_id: 0,
             data: vec![0x12; 32],
+            worn: None,
         };
         rig.receive(messages::OBJECT_UPDATE, &wire::object_blocks(&[block]));
         assert_eq!(rig.position(), [100.0, 100.0, 25.0]);
@@ -2601,6 +2803,7 @@ mod tests {
             local_id: OWN,
             parent_id: 0,
             data,
+            worn: None,
         };
         rig.receive(messages::OBJECT_UPDATE, &wire::object_blocks(&[block]));
         assert_eq!(rig.position(), [100.0, 100.0, 25.0]);
@@ -2820,5 +3023,420 @@ mod tests {
         // After its time, an unknown object is refused naming that distance.
         rig.advance(secs(10));
         assert!(rig.session.touch(object(4), rig.now).unwrap_err().contains("64 m"));
+    }
+
+    // -------------------------------------------------------- attachments
+
+    /// The avatar's own region-local id after `Rig::own_update`.
+    const OWN_LOCAL: u32 = 101;
+    const RADIO_LOCAL: u32 = 700;
+
+    fn radio_item() -> Uuid {
+        Uuid::from_bytes([0x17; 16])
+    }
+
+    fn radio_object() -> Uuid {
+        Uuid::from_bytes([0x18; 16])
+    }
+
+    fn radio() -> AttachItem {
+        AttachItem {
+            item_id: radio_item(),
+            owner_id: agent_id(),
+            flags: 0x105,
+            group_mask: 0,
+            everyone_mask: 0x8000,
+            next_owner_mask: 0x0008_2000,
+            name: "Radio".into(),
+            description: "plays".into(),
+        }
+    }
+
+    impl Rig {
+        /// A full update describing an attachment's root prim.
+        fn attachment(&mut self, object: Uuid, local_id: u32, parent: u32, point: u8, item: Uuid) {
+            let block = wire::attachment_block(object, local_id, parent, point, item);
+            self.receive(messages::OBJECT_UPDATE, &wire::object_blocks(&[block]));
+        }
+
+        /// The same in the compressed form.
+        fn attachment_compressed(&mut self, object: Uuid, local_id: u32, parent: u32, point: u8, item: Uuid) {
+            let data = wire::compressed_data(object, local_id, &wire::Compressed::attachment(parent, point, item));
+            let body = wire::object_update_compressed_blocks(&[data]);
+            self.receive(messages::OBJECT_UPDATE_COMPRESSED, &body);
+        }
+
+        /// In a region, standing, with the avatar's own update seen and
+        /// nothing left to report or acknowledge.
+        fn standing() -> Rig {
+            let mut rig = Rig::entered();
+            rig.own_update(0);
+            assert_eq!(rig.events(), [SessionEvent::Standing]);
+            rig.ack_all();
+            rig.sent();
+            rig
+        }
+
+        fn attached(&self) -> Vec<(Uuid, u8)> {
+            let mut attached = self.session.attached();
+            attached.sort();
+            attached
+        }
+    }
+
+    #[test]
+    fn an_attachment_on_the_avatar_is_known_from_its_description() {
+        let mut rig = Rig::standing();
+        assert_eq!(rig.attached(), []);
+        rig.attachment(radio_object(), RADIO_LOCAL, OWN_LOCAL, 5, radio_item());
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::Attached {
+                item: radio_item(),
+                point: 5
+            }]
+        );
+        assert_eq!(rig.attached(), [(radio_item(), 5)]);
+        // Described again, it is nothing new.
+        rig.attachment(radio_object(), RADIO_LOCAL, OWN_LOCAL, 5, radio_item());
+        assert_eq!(rig.events(), []);
+        // A second one, on a HUD point, in the compressed form.
+        let (meter, meter_item) = (Uuid::from_bytes([0x28; 16]), Uuid::from_bytes([0x27; 16]));
+        rig.attachment_compressed(meter, 701, OWN_LOCAL, 35, meter_item);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::Attached {
+                item: meter_item,
+                point: 35
+            }]
+        );
+        assert_eq!(rig.attached(), [(radio_item(), 5), (meter_item, 35)]);
+        // None of this made the bot send anything.
+        assert_eq!(rig.sent_ids(), []);
+    }
+
+    #[test]
+    fn attachments_described_before_the_avatar_count_once_it_is_known() {
+        let mut rig = Rig::entered();
+        let (hat, hat_item) = (Uuid::from_bytes([0x38; 16]), Uuid::from_bytes([0x37; 16]));
+        rig.attachment(radio_object(), RADIO_LOCAL, OWN_LOCAL, 5, radio_item());
+        rig.attachment_compressed(hat, 701, OWN_LOCAL, 2, hat_item);
+        // Whose they are is not known yet.
+        assert_eq!(rig.events(), []);
+        assert_eq!(rig.attached(), []);
+        rig.own_update(0);
+        let mut events = rig.events();
+        events.sort_by_key(|event| format!("{event:?}"));
+        assert_eq!(
+            events,
+            [
+                SessionEvent::Attached {
+                    item: radio_item(),
+                    point: 5
+                },
+                SessionEvent::Attached { item: hat_item, point: 2 },
+                SessionEvent::Standing,
+            ]
+        );
+        assert_eq!(rig.attached(), [(radio_item(), 5), (hat_item, 2)]);
+        // The avatar described again changes nothing.
+        rig.own_update(0);
+        assert_eq!(rig.events(), []);
+        assert_eq!(rig.sent_ids(), []);
+    }
+
+    #[test]
+    fn other_avatars_attachments_and_plain_objects_are_not_the_bots() {
+        let mut rig = Rig::standing();
+        // On another avatar; and an object with no item in its name-values.
+        rig.attachment(radio_object(), RADIO_LOCAL, 4321, 5, radio_item());
+        rig.receive(messages::OBJECT_UPDATE, &wire::object_update(&[(object(3), OWN_LOCAL)]));
+        let plain = wire::Compressed {
+            parent_id: Some(OWN_LOCAL),
+            ..wire::Compressed::default()
+        };
+        let body = wire::object_update_compressed_blocks(&[wire::compressed_data(object(4), 702, &plain)]);
+        rig.receive(messages::OBJECT_UPDATE_COMPRESSED, &body);
+        assert_eq!(rig.events(), []);
+        assert_eq!(rig.attached(), []);
+        // Their going is nothing to report either.
+        rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[RADIO_LOCAL, 702]));
+        assert_eq!(rig.events(), []);
+    }
+
+    #[test]
+    fn a_killed_attachment_is_gone_from_the_avatar() {
+        let mut rig = Rig::standing();
+        rig.attachment(radio_object(), RADIO_LOCAL, OWN_LOCAL, 5, radio_item());
+        rig.events();
+        // Some other object going changes nothing.
+        rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[RADIO_LOCAL + 1]));
+        assert_eq!(rig.events(), []);
+        rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[RADIO_LOCAL]));
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::Detached {
+                item: radio_item(),
+                point: 5
+            }]
+        );
+        assert_eq!(rig.attached(), []);
+        // Attached again, by a script or a viewer, it is known again.
+        rig.attachment(radio_object(), RADIO_LOCAL + 9, OWN_LOCAL, 6, radio_item());
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::Attached {
+                item: radio_item(),
+                point: 6
+            }]
+        );
+        assert_eq!(rig.sent_ids(), []);
+    }
+
+    #[test]
+    fn an_attachment_shown_on_another_point_has_moved() {
+        let mut rig = Rig::standing();
+        rig.attachment(radio_object(), RADIO_LOCAL, OWN_LOCAL, 5, radio_item());
+        rig.events();
+        rig.attachment(radio_object(), RADIO_LOCAL, OWN_LOCAL, 1, radio_item());
+        assert_eq!(
+            rig.events(),
+            [
+                SessionEvent::Detached {
+                    item: radio_item(),
+                    point: 5
+                },
+                SessionEvent::Attached {
+                    item: radio_item(),
+                    point: 1
+                },
+            ]
+        );
+        assert_eq!(rig.attached(), [(radio_item(), 1)]);
+    }
+
+    #[test]
+    fn attachments_are_learned_anew_from_the_next_simulator() {
+        let mut rig = Rig::standing();
+        rig.attachment(radio_object(), RADIO_LOCAL, OWN_LOCAL, 5, radio_item());
+        rig.events();
+        start_teleport(&mut rig);
+        rig.session.handle_caps(1, finish(), rig.now);
+        // Forgotten with the circuit, without a word: nothing was detached.
+        assert_eq!(rig.attached(), []);
+        assert_eq!(rig.events(), []);
+        rig.enter("Target", ((1001 * 256) << 32) | (1000 * 256));
+        assert_eq!(rig.events(), [SessionEvent::RegionEntered("Target".into())]);
+        // The new simulator numbers things its own way.
+        rig.attachment(radio_object(), 55, OWN_LOCAL, 5, radio_item());
+        assert_eq!(rig.attached(), []);
+        rig.own_update(0);
+        let attached = SessionEvent::Attached {
+            item: radio_item(),
+            point: 5,
+        };
+        assert!(rig.events().contains(&attached));
+        assert_eq!(rig.attached(), [(radio_item(), 5)]);
+        // A kill for the old simulator's number is not about it.
+        rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[RADIO_LOCAL]));
+        assert_eq!(rig.events(), []);
+        assert_eq!(rig.sent_ids(), []);
+    }
+
+    #[test]
+    fn attach_asks_the_simulator_and_waits_for_the_object() {
+        let mut rig = Rig::standing();
+        assert_eq!(rig.session.attach(&radio(), 5, rig.now), Ok(()));
+        let sent = rig.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].id, messages::REZ_SINGLE_ATTACHMENT_FROM_INV);
+        assert!(sent[0].is_reliable());
+        // The item's flags, masks, name and description, and the add bit.
+        assert_eq!(
+            sent[0].body,
+            messages::rez_single_attachment_from_inv(&rig.agent(), &radio(), 5).body
+        );
+        assert_eq!(sent[0].body[64], 0x85);
+        assert_eq!(rig.session.next_deadline().min(rig.now + ATTACH_LIMIT), rig.session.next_deadline());
+        rig.ack_all();
+        // The object turning up on the avatar is the answer.
+        rig.attachment(radio_object(), RADIO_LOCAL, OWN_LOCAL, 5, radio_item());
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::Attached {
+                item: radio_item(),
+                point: 5
+            }]
+        );
+        rig.advance(ATTACH_LIMIT);
+        assert_eq!(rig.events(), []);
+
+        // Without a body part the point is the simulator's to choose.
+        let hat = AttachItem {
+            item_id: Uuid::from_bytes([0x37; 16]),
+            ..radio()
+        };
+        assert_eq!(rig.session.attach(&hat, 0, rig.now), Ok(()));
+        assert_eq!(rig.sent()[0].body[64], 0x80);
+    }
+
+    #[test]
+    fn an_attach_that_shows_nothing_fails_after_fifteen_seconds() {
+        let mut rig = Rig::standing();
+        rig.session.attach(&radio(), 0, rig.now).unwrap();
+        rig.ack_all();
+        // Somebody else's attachment of the same item is not it.
+        rig.attachment(radio_object(), RADIO_LOCAL, 4321, 5, radio_item());
+        rig.advance(ATTACH_LIMIT - secs(1));
+        assert_eq!(rig.events(), []);
+        rig.advance(secs(1));
+        assert_eq!(rig.events(), [SessionEvent::AttachFailed(radio_item())]);
+        // Once only, and the avatar stays connected.
+        rig.advance(secs(5));
+        assert_eq!(rig.events(), []);
+        assert_eq!(rig.session.present(), Ok(()));
+    }
+
+    #[test]
+    fn detach_asks_the_simulator_and_waits_for_the_object_to_go() {
+        let mut rig = Rig::standing();
+        rig.attachment(radio_object(), RADIO_LOCAL, OWN_LOCAL, 5, radio_item());
+        rig.events();
+        assert_eq!(rig.session.detach(radio_item(), rig.now), Ok(()));
+        let sent = rig.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].id, messages::DETACH_ATTACHMENT_INTO_INV);
+        assert!(sent[0].is_reliable());
+        assert_eq!(
+            sent[0].body,
+            [agent_id().as_bytes().to_vec(), radio_item().as_bytes().to_vec()].concat()
+        );
+        rig.ack_all();
+        rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[RADIO_LOCAL]));
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::Detached {
+                item: radio_item(),
+                point: 5
+            }]
+        );
+        rig.advance(ATTACH_LIMIT);
+        assert_eq!(rig.events(), []);
+
+        // One the simulator leaves on.
+        rig.attachment(radio_object(), RADIO_LOCAL, OWN_LOCAL, 5, radio_item());
+        rig.events();
+        rig.session.detach(radio_item(), rig.now).unwrap();
+        rig.ack_all();
+        rig.advance(ATTACH_LIMIT - secs(1));
+        assert_eq!(rig.events(), []);
+        rig.advance(secs(1));
+        assert_eq!(rig.events(), [SessionEvent::DetachFailed(radio_item())]);
+        assert_eq!(rig.attached(), [(radio_item(), 5)]);
+    }
+
+    #[test]
+    fn what_was_awaited_fails_when_the_avatar_changes_simulator_or_is_lost() {
+        let mut rig = Rig::standing();
+        let hat = Uuid::from_bytes([0x37; 16]);
+        rig.session.attach(&radio(), 0, rig.now).unwrap();
+        rig.session.detach(hat, rig.now).unwrap();
+        rig.ack_all();
+        start_teleport(&mut rig);
+        rig.session.handle_caps(1, finish(), rig.now);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::AttachFailed(radio_item()), SessionEvent::DetachFailed(hat)]
+        );
+        let mut rig = Rig::standing();
+        rig.session.attach(&radio(), 0, rig.now).unwrap();
+        rig.receive(messages::KICK_USER, &wire::kick_user("Bye"));
+        let events = rig.events();
+        assert_eq!(events[0], SessionEvent::AttachFailed(radio_item()));
+        assert!(matches!(events[1], SessionEvent::Lost(_)));
+    }
+
+    #[test]
+    fn attachments_animations_and_sounds_are_refused_outside_a_region() {
+        let hat = Uuid::from_bytes([0x37; 16]);
+        let refused = |rig: &mut Rig| {
+            let now = rig.now;
+            assert_eq!(rig.session.attach(&radio(), 5, now), Err(NOT_CONNECTED.to_string()));
+            assert_eq!(rig.session.detach(hat, now), Err(NOT_CONNECTED.to_string()));
+            assert_eq!(rig.session.animate(hat, true, now), Err(NOT_CONNECTED.to_string()));
+            assert_eq!(rig.session.animate(hat, false, now), Err(NOT_CONNECTED.to_string()));
+            assert_eq!(rig.session.play_sound(hat, now), Err(NOT_CONNECTED.to_string()));
+        };
+        // Before the handshake is done.
+        let mut rig = Rig::new();
+        rig.sent();
+        refused(&mut rig);
+        assert_eq!(rig.sent_ids(), []);
+        // In the middle of a teleport.
+        let mut rig = Rig::standing();
+        start_teleport(&mut rig);
+        rig.sent();
+        refused(&mut rig);
+        // While logging out.
+        let mut rig = Rig::standing();
+        rig.session.start_logout(rig.now);
+        rig.sent();
+        refused(&mut rig);
+        assert_eq!(rig.sent_ids(), []);
+        // Nothing is kept for later, and nothing is waited for.
+        rig.advance(ATTACH_LIMIT);
+        assert!(!rig
+            .events()
+            .iter()
+            .any(|event| matches!(event, SessionEvent::AttachFailed(_) | SessionEvent::DetachFailed(_))));
+    }
+
+    // ------------------------------------------------ animations and sounds
+
+    #[test]
+    fn animate_starts_and_stops_an_animation() {
+        let mut rig = Rig::standing();
+        let dance = Uuid::from_bytes([0x2A; 16]);
+        assert_eq!(rig.session.animate(dance, true, rig.now), Ok(()));
+        assert_eq!(rig.session.animate(dance, false, rig.now), Ok(()));
+        let sent = rig.sent();
+        assert_eq!(sent.iter().map(|p| p.id).collect::<Vec<_>>(), [messages::AGENT_ANIMATION; 2]);
+        assert!(sent.iter().all(Packet::is_reliable));
+        assert_eq!(sent[0].body, messages::agent_animation(&rig.agent(), dance, true).body);
+        assert_eq!(sent[1].body, messages::agent_animation(&rig.agent(), dance, false).body);
+        assert_eq!(rig.events(), []);
+    }
+
+    #[test]
+    fn play_sound_triggers_it_where_the_avatar_is() {
+        let mut rig = Rig::standing();
+        let bell = Uuid::from_bytes([0x50; 16]);
+        assert_eq!(rig.session.play_sound(bell, rig.now), Ok(()));
+        let sent = rig.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].id, messages::SOUND_TRIGGER);
+        // The region's handle, the avatar's position, full volume, and
+        // null owner and object ids.
+        let expected = messages::sound_trigger(bell, HOME_HANDLE, [10.0, 20.0, 30.0], 1.0);
+        assert_eq!(sent[0].body, expected.body);
+        assert_eq!(sent[0].body[16..64], [0; 48]);
+        assert_eq!(sent[0].body[sent[0].body.len() - 4..], 1.0f32.to_le_bytes());
+        assert_eq!(rig.events(), []);
+    }
+
+    #[test]
+    fn inventory_services_are_passed_on_for_the_current_circuit_only() {
+        let mut rig = Rig::entered();
+        let urls = InventoryUrls {
+            descendents: Some("http://127.0.0.1:9000/CAPS/fid/".to_string()),
+            items: Some("http://127.0.0.1:9000/CAPS/fi/".to_string()),
+            api: None,
+            appearance: None,
+        };
+        rig.session.handle_caps(1, CapsEvent::Inventory(urls.clone()), rig.now);
+        assert_eq!(rig.events(), [SessionEvent::InventoryUrls(urls.clone())]);
+        rig.session.handle_caps(7, CapsEvent::Inventory(urls), rig.now);
+        assert_eq!(rig.events(), []);
+        assert_eq!(rig.sent_ids(), []);
     }
 }

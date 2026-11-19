@@ -7,6 +7,7 @@ mod commands;
 mod config;
 mod control;
 mod escape;
+mod inventory;
 mod log;
 mod login;
 mod msglog;
@@ -181,6 +182,23 @@ struct Bot {
     /// Since when the config placement has been reached but for the
     /// position of the seat.
     startup_wait: Option<Instant>,
+    /// What inventory commands need of the grid.
+    inventory: Inventory,
+}
+
+/// The way to the avatar's inventory: the worker, and what the login and
+/// the current simulator said about where it is.
+struct Inventory {
+    jobs: Sender<inventory::Job>,
+    /// The current simulator's inventory services: not heard of yet
+    /// (`None`), or as far as it has them.
+    urls: Option<caps::InventoryUrls>,
+    /// The folder at the top of My Inventory, from the login.
+    root: Option<Uuid>,
+    /// The avatar, whose inventory it is.
+    agent: Uuid,
+    /// The circuit `urls` belong to.
+    generation: Option<u64>,
 }
 
 /// The session as commands see it. A simulator with an avatar search
@@ -190,6 +208,7 @@ struct Live<'a> {
     session: &'a mut Session<RealNet>,
     search_url: Option<&'a str>,
     avatar_searches: &'a Sender<Search>,
+    inventory: &'a Inventory,
 }
 
 impl Grid for Live<'_> {
@@ -247,6 +266,56 @@ impl Grid for Live<'_> {
     fn touch(&mut self, object: Uuid, now: Instant) -> Result<Touch, String> {
         self.session.touch(object, now)
     }
+    fn inventory(&mut self, id: u64, deadline: Instant, what: inventory::What) -> Result<(), String> {
+        self.session.present()?;
+        let Some(urls) = &self.inventory.urls else {
+            return Err("the simulator has not said yet whether it has an inventory service; try again in a moment".to_string());
+        };
+        let (Some(root), true) = (self.inventory.root, urls.descendents.is_some() && urls.items.is_some()) else {
+            return Err(inventory::NO_SERVICE.to_string());
+        };
+        let job = inventory::Job {
+            id,
+            generation: self.session.generation(),
+            urls: urls.clone(),
+            owner: self.inventory.agent,
+            root,
+            deadline,
+            what,
+        };
+        self.inventory
+            .jobs
+            .send(job)
+            .map_err(|_| "the inventory worker is not running".to_string())
+    }
+    fn outfit_service(&self) -> bool {
+        self.inventory.urls.as_ref().is_some_and(caps::InventoryUrls::outfit_service)
+    }
+    fn attached(&self) -> Vec<(Uuid, u8)> {
+        self.session.attached()
+    }
+    fn attach(&mut self, item: &inventory::Item, point: u8, now: Instant) -> Result<(), String> {
+        let item = udp::messages::AttachItem {
+            item_id: item.id,
+            owner_id: if item.owner.is_nil() { self.inventory.agent } else { item.owner },
+            flags: item.flags,
+            group_mask: item.group_mask,
+            everyone_mask: item.everyone_mask,
+            next_owner_mask: item.next_owner_mask,
+            name: item.name.clone(),
+            description: item.description.clone(),
+        };
+        self.session.attach(&item, point, now)
+    }
+    fn detach(&mut self, item: Uuid, now: Instant) -> Result<(), String> {
+        self.session.detach(item, now)
+    }
+    fn animate(&mut self, animation: Uuid, start: bool, now: Instant) -> Result<(), String> {
+        self.session.animate(animation, start, now)
+    }
+    fn play_sound(&mut self, sound: Uuid, now: Instant) -> Result<(), String> {
+        self.session.play_sound(sound, now)
+    }
 }
 
 /// The session, if there is one, for commands to act on.
@@ -254,12 +323,14 @@ fn live<'a>(
     session: &'a mut Option<Session<RealNet>>,
     search_url: &'a Option<String>,
     avatar_searches: &'a Sender<Search>,
+    inventory: &'a Inventory,
 ) -> Option<Live<'a>> {
     let session = session.as_mut()?;
     Some(Live {
         session,
         search_url: search_url.as_deref(),
         avatar_searches,
+        inventory,
     })
 }
 
@@ -285,6 +356,13 @@ impl Bot {
             commands: Commands::new(config.requesttp_timeout),
             avatar_searches: names::spawn_search(events.clone()),
             search_url: None,
+            inventory: Inventory {
+                jobs: inventory::spawn(events.clone()),
+                urls: None,
+                root: None,
+                agent: Uuid::nil(),
+                generation: None,
+            },
             config,
             session: None,
             events,
@@ -313,6 +391,11 @@ impl Bot {
                     info.sim_addr, info.circuit_code
                 );
                 self.reconciler.login_accepted();
+                self.inventory.root = info.inventory_root;
+                self.inventory.agent = info.agent_id;
+                if info.inventory_root.is_none() {
+                    debug!("the login gave no inventory root folder");
+                }
                 let net = RealNet::new(self.events.clone());
                 let name = format!("{} {}", cfg.first_name, cfg.last_name);
                 let generation = self.next_generation;
@@ -343,12 +426,28 @@ impl Bot {
         }
         self.names_url = None;
         self.search_url = None;
+        self.inventory.urls = None;
+        self.inventory.generation = None;
         self.commands.session_lost();
+    }
+
+    /// Notices a hand-over to another simulator: the inventory services
+    /// the bot knows are the old one's, and so is whatever a command is
+    /// asking them.
+    fn follow_simulator(&mut self) {
+        let generation = self.session.as_ref().map(Session::generation);
+        if generation != self.inventory.generation {
+            if self.inventory.generation.is_some() && generation.is_some() {
+                self.inventory.urls = None;
+                self.commands.simulator_changed();
+            }
+            self.inventory.generation = generation;
+        }
     }
 
     /// The grid answered an avatar search: the commands waiting for it go on.
     fn avatars_found(&mut self, query: Uuid, avatars: &[(Uuid, String)], now: Instant) {
-        let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches);
+        let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
         for sent in self.commands.avatars_found(query, avatars, live.as_mut(), now) {
             self.record_sent(sent, now);
         }
@@ -518,7 +617,7 @@ impl Bot {
                 return self.stop();
             }
             request => {
-                let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches);
+                let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
                 if let Some(sent) = self.commands.handle(request, reply, live.as_mut(), now) {
                     self.record_sent(sent, now);
                 }
@@ -668,7 +767,7 @@ impl Bot {
                 }
             }
             SessionEvent::TeleportOffer { from, name, lure } => {
-                let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches);
+                let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
                 self.commands.teleport_offer(from, &name, lure, live.as_mut(), now);
             }
             SessionEvent::TeleportRequested { from, name, text } => {
@@ -682,7 +781,32 @@ impl Bot {
                 };
                 self.commands.touch_failed(object, &reason);
             }
-            SessionEvent::Alert(message) => info!("simulator alert: {message}"),
+            SessionEvent::Alert(message) => {
+                info!("simulator alert: {message}");
+                self.commands.alert(&message);
+            }
+            SessionEvent::InventoryUrls(urls) => {
+                if urls.descendents.is_none() || urls.items.is_none() {
+                    debug!("the simulator has no inventory service");
+                } else if !urls.outfit_service() {
+                    debug!("the simulator has no outfit service: clothing cannot be changed here");
+                }
+                self.inventory.urls = Some(urls);
+            }
+            SessionEvent::Attached { item, point } => {
+                let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
+                if !self.commands.attached(item, point, live.as_mut(), now) {
+                    info!("attachment: item {item} is on {}", inventory::point_name(point));
+                }
+            }
+            SessionEvent::Detached { item, point } => {
+                let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
+                if !self.commands.detached(item, live.as_mut(), now) {
+                    info!("attachment: item {item} is gone from {}", inventory::point_name(point));
+                }
+            }
+            SessionEvent::AttachFailed(item) => self.commands.attach_failed(item),
+            SessionEvent::DetachFailed(item) => self.commands.detach_failed(item),
             SessionEvent::Chat(message) => self.record(Channel::Chat, message, now),
             SessionEvent::InstantMessage(message) => self.record(Channel::Im, message, now),
             SessionEvent::DisplayNamesUrl(url) => {
@@ -709,6 +833,7 @@ impl Bot {
     /// Runs timers and applies whatever the session has to report.
     fn service_session(&mut self) -> Flow {
         let now = Instant::now();
+        self.follow_simulator();
         let Some(session) = &mut self.session else {
             return Flow::Continue;
         };
@@ -795,6 +920,13 @@ impl Bot {
             (Event::Caps { generation, event }, Some(session)) => session.handle_caps(generation, event, now),
             (Event::Names { found, missing }, _) => self.recorder.names_resolved(found, missing, now),
             (Event::NamesFailed(ids), _) => self.recorder.lookup_failed(&ids),
+            // An answer about another simulator's inventory service is of
+            // no use: the commands that asked were told so.
+            (Event::Inventory { generation, .. }, Some(session)) if generation != session.generation() => {}
+            (Event::Inventory { id, result, .. }, _) => {
+                let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
+                self.commands.inventory_answer(id, result, live.as_mut(), now);
+            }
             // Left over from a session that is already gone.
             (_, None) => {}
         }

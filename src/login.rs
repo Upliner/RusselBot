@@ -9,6 +9,9 @@ use uuid::Uuid;
 
 pub const CHANNEL: &str = "RusselBot";
 const MAX_REDIRECTS: usize = 5;
+/// The login option that asks for the inventory's root folder, and the
+/// reply's key for it.
+const INVENTORY_ROOT: &str = "inventory-root";
 
 /// Where the login asks the grid to place the avatar.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -29,6 +32,8 @@ pub struct SessionInfo {
     pub circuit_code: u32,
     pub sim_addr: SocketAddr,
     pub seed_capability: String,
+    /// The folder at the top of My Inventory, when the grid says.
+    pub inventory_root: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -94,7 +99,9 @@ pub fn request_xml(cfg: &Config, start: Start, held: Option<&Location>) -> Strin
             ("id0", Value::Str(md5_hex(&format!("rslbot-id0:{identity}")))),
             ("agree_to_tos", Value::Bool(true)),
             ("read_critical", Value::Bool(true)),
-            ("options", Value::Array(Vec::new())),
+            // The one optional part of the reply the bot has a use for: the
+            // id of the folder at the top of My Inventory.
+            ("options", Value::Array(vec![str(INVENTORY_ROOT)])),
         ],
     )
 }
@@ -128,6 +135,7 @@ fn parse_reply(body: &str) -> Result<Reply, String> {
                 circuit_code: int("circuit_code")? as u32,
                 sim_addr: SocketAddr::new(ip, port),
                 seed_capability,
+                inventory_root: inventory_root(&reply),
             }))
         }
         "indeterminate" => match reply.str_field("next_url") {
@@ -139,6 +147,13 @@ fn parse_reply(body: &str) -> Result<Reply, String> {
             message: text("message"),
         })),
     }
+}
+
+/// The root folder's id: `inventory-root` is an array of one struct with
+/// `folder_id` (llstartup.cpp; OpenSim's LLLoginResponse writes the same).
+fn inventory_root(reply: &Value) -> Option<Uuid> {
+    let root = reply.get(INVENTORY_ROOT)?.as_array()?.first()?.get("folder_id")?.as_uuid()?;
+    (!root.is_nil()).then_some(root)
 }
 
 fn classify(failure: Failure) -> Outcome {
@@ -273,6 +288,46 @@ mod tests {
         assert_eq!(value("channel"), "<string>RusselBot</string>");
         assert_eq!(value("agree_to_tos"), "<boolean>1</boolean>");
         assert!(!xml.contains("secret"));
+        // The inventory's root folder is the only option asked for.
+        assert_eq!(value("options"), "<array><data><value><string>inventory-root</string>");
+        assert_eq!(xml.matches("<name>options</name>").count(), 1);
+    }
+
+    #[test]
+    fn reply_may_carry_the_inventory_root() {
+        let root = "<array><data><value><struct><member><name>folder_id</name>\
+                    <value><string>dddddddd-0000-0000-0000-000000000004</string></value></member>\
+                    </struct></value></data></array>";
+        let with_root = success_reply().replace(
+            "</struct></value></param>",
+            &format!("{}</struct></value></param>", member("inventory-root", root)),
+        );
+        let Outcome::Success(info) = outcome(with_root) else {
+            panic!("not a success")
+        };
+        assert_eq!(
+            info.inventory_root.map(|id| id.to_string()).as_deref(),
+            Some("dddddddd-0000-0000-0000-000000000004")
+        );
+        // Without the option in the reply the login is as good as before.
+        let Outcome::Success(info) = outcome(success_reply()) else {
+            panic!("not a success")
+        };
+        assert_eq!(info.inventory_root, None);
+        // A root that is no folder id is no root.
+        for bad in ["<array><data></data></array>", "<string>none</string>"] {
+            let reply = success_reply().replace(
+                "</struct></value></param>",
+                &format!("{}</struct></value></param>", member("inventory-root", bad)),
+            );
+            assert!(matches!(outcome(reply), Outcome::Success(info) if info.inventory_root.is_none()));
+        }
+        let nil = root.replace("dddddddd-0000-0000-0000-000000000004", "00000000-0000-0000-0000-000000000000");
+        let reply = success_reply().replace(
+            "</struct></value></param>",
+            &format!("{}</struct></value></param>", member("inventory-root", &nil)),
+        );
+        assert!(matches!(outcome(reply), Outcome::Success(info) if info.inventory_root.is_none()));
     }
 
     #[test]
@@ -330,6 +385,12 @@ mod tests {
         assert_eq!(
             info.seed_capability,
             "http://127.0.0.1:9000/CAPS/97f4ce1f-1dc5-4399-a41a-eaadb2f2609c0000/"
+        );
+        // OpenSim sends the root folder whether asked or not; the library's
+        // root next to it is another folder.
+        assert_eq!(
+            info.inventory_root.map(|id| id.to_string()).as_deref(),
+            Some("fa500bdc-8933-4110-af3e-6d10c1f63ae4")
         );
     }
 

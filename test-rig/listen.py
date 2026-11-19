@@ -5,7 +5,9 @@ chat it hears and every instant message it gets, and answers each instant
 message from the bot with "pong: <text>". It also prints where the bot's
 avatar is and what it is attached to whenever that changes, answers the
 bot's request for a teleport with an offer, prints the offers the bot
-sends, and says when the bot's avatar starts or stops sitting on the ground. Stands in for watching with a viewer. Start it while the bot is
+sends, and says when the bot's avatar starts or stops sitting on the ground,
+what is attached to it, which animations it plays and which sounds it
+triggers. Stands in for watching with a viewer. Start it while the bot is
 seated in Target, then use `rslbot ctl`.
 
 Usage: listen.py [SECONDS] [prim] [offer=N]   (default: 30 seconds)
@@ -21,6 +23,9 @@ Output lines:
   teleport request from <name>: <text>   teleport offer from <name>: <text>
   touch prim <uuid>
   bot ground sit: yes|no                 (from the animations it plays)
+  bot attachment <item uuid> on point <N>     bot attachment <item uuid> gone
+  bot plays <animation asset uuid>       bot stops <animation asset uuid>
+  bot sound <sound asset uuid> at <x> <y> <z> gain <g>
 Chat on channels other than 0 reaches scripts only, so it never shows here."""
 import hashlib, re, socket, struct, sys, time, urllib.request, uuid
 
@@ -107,6 +112,11 @@ def receive():
     return ("L", struct.unpack(">H", payload[2:4])[0]), payload[4:]
 
 
+# What the simulator says about objects and animations before the listening
+# starts: the bot's avatar and its attachments are described right at login.
+backlog = []
+
+
 def idle(seconds):
     """Keeps the circuit alive: acknowledges and answers pings."""
     deadline = time.time() + seconds
@@ -114,6 +124,8 @@ def idle(seconds):
         mid, payload = receive()
         if mid == ("H", 1):
             send(b"\x02", payload[:1], reliable=False)
+        elif mid in (("H", 12), ("H", 20)):
+            backlog.append((mid, payload))
 
 
 def text2(text):
@@ -136,6 +148,8 @@ while time.time() < deadline and not (position and shaken):
         shaken = True
     elif mid == ("L", 250):
         position = struct.unpack("<3f", payload[32:44])
+    elif mid in (("H", 12), ("H", 20)):
+        backlog.append((mid, payload))
 if not (position and shaken):
     sys.exit("handshake failed")
 idle(1)
@@ -169,24 +183,29 @@ def offer_teleport(to, text):
 
 
 def objects(payload):
-    """The blocks of an ObjectUpdate as (local id, full id, parent, ObjectData)."""
+    """The blocks of an ObjectUpdate as (local id, full id, parent,
+    ObjectData, State, NameValue)."""
     at, found = 11, []
     try:
         for _ in range(payload[10]):
             local, full = struct.unpack("<I", payload[at:at + 4])[0], payload[at + 5:at + 21]
+            state = payload[at + 4]
             at += 5 + 16 + 4 + 3 + 12
             size = payload[at]
             data = payload[at + 1:at + 1 + size]
             at += 1 + size
             parent = struct.unpack("<I", payload[at:at + 4])[0]
             at += 4 + 4 + 23
+            fields = []
             for width in (2, 1, 2, 2, 1):  # TextureEntry, TextureAnim, NameValue, Data, Text
-                at += width + int.from_bytes(payload[at:at + width], "little")
+                size = int.from_bytes(payload[at:at + width], "little")
+                fields.append(payload[at + width:at + width + size])
+                at += width + size
             at += 4
             for _ in range(3):  # MediaURL, PSBlock, ExtraParams
                 at += 1 + payload[at]
             at += 16 + 16 + 4 + 1 + 4 + 1 + 12 + 12
-            found.append((local, full, parent, data))
+            found.append((local, full, parent, data, state, fields[2]))
     except (IndexError, struct.error):
         pass
     return found
@@ -223,29 +242,64 @@ if PRIM:
 
 print("listening", flush=True)
 started, bot_seen, bot_on_ground = time.time(), None, None
+# The bot avatar's local id and this avatar's own; the attachments
+# described, by local id, as (item, point, parent); those reported as the
+# bot's; its animations. OpenSim describes the bot's avatar to this client
+# only when something about it changes, so until then an attachment on any
+# avatar but this one is taken to be the bot's: the rig has just the two.
+bot_local, own_local, worn, reported, bot_plays = None, None, {}, set(), set()
 deadline = started + SECONDS
 while time.time() < deadline:
     if OFFER_AFTER is not None and time.time() >= started + OFFER_AFTER:
         offer_teleport(BOT.bytes, "Join me, unasked")
         print("offered the bot a teleport", flush=True)
         OFFER_AFTER = None
-    mid, payload = receive()
+    mid, payload = backlog.pop(0) if backlog else receive()
     if mid == ("H", 1):
         send(b"\x02", payload[:1], reliable=False)
     elif mid == ("H", 12):  # ObjectUpdate
-        for local, full, parent, data in objects(payload):
+        for local, full, parent, data, state, names in objects(payload):
+            if full == agent:
+                own_local = local
             if full == BOT.bytes and len(data) >= 28:
+                bot_local = local
                 # An avatar's data starts with its collision plane.
                 where = tuple(round(v, 1) for v in struct.unpack("<3f", data[16:28]))
                 if (where, parent) != bot_seen:
                     bot_seen = (where, parent)
                     print("bot at %s %s %s parent %d" % (where + (parent,)), flush=True)
+            # An attachment's root prim names its inventory item; its point
+            # is the State with the nibbles swapped.
+            item = re.search(rb"AttachItemID STRING RW SV ([0-9a-f-]{36})", names)
+            if item:
+                worn[local] = (item.group(1).decode(), (state >> 4) | ((state & 0x0F) << 4), parent)
+        for local, (item, point, parent) in worn.items():
+            on_bot = parent == bot_local if bot_local else parent not in (0, own_local)
+            if on_bot and local not in reported:
+                reported.add(local)
+                print("bot attachment %s on point %d" % (item, point), flush=True)
+    elif mid == ("H", 16):  # KillObject
+        for i in range(payload[0]):
+            local = struct.unpack("<I", payload[1 + 4 * i:5 + 4 * i])[0]
+            item = worn.pop(local, None)
+            if local in reported:
+                reported.discard(local)
+                print("bot attachment %s gone" % item[0], flush=True)
     elif mid == ("H", 20) and payload[:16] == BOT.bytes:  # AvatarAnimation
         playing = {payload[17 + 20 * i:33 + 20 * i] for i in range(payload[16])}
         on_ground = bool(playing & GROUND_SITS)
         if on_ground != bot_on_ground:
             bot_on_ground = on_ground
             print("bot ground sit: %s" % ("yes" if on_ground else "no"), flush=True)
+        for animation in sorted(playing - bot_plays):
+            print("bot plays %s" % uuid.UUID(bytes=animation), flush=True)
+        for animation in sorted(bot_plays - playing):
+            print("bot stops %s" % uuid.UUID(bytes=animation), flush=True)
+        bot_plays = playing
+    elif mid == ("H", 29) and payload[16:32] == BOT.bytes:  # SoundTrigger: SoundID, OwnerID, ...
+        where = tuple(round(v, 1) for v in struct.unpack("<3f", payload[72:84]))
+        gain = struct.unpack("<f", payload[84:88])[0]
+        print("bot sound %s at %s %s %s gain %.1f" % ((uuid.UUID(bytes=payload[:16]),) + where + (gain,)), flush=True)
     elif mid == ("L", 139):  # ChatFromSimulator
         name, at = text1(payload, 0)
         chat_type = payload[at + 33]

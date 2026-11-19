@@ -124,7 +124,9 @@ instead.
 `test-rig/listen.py` logs in as `Rig Owner` four metres from the bot, prints
 the local chat it hears and the instant messages it gets, and answers each
 instant message with `pong: <text>`. It also prints where it sees the bot's
-avatar and what the avatar is attached to, grants the bot's teleport
+avatar and what the avatar is attached to, what is attached to the bot's
+avatar and on which point, the animations it plays and the sounds it
+triggers, grants the bot's teleport
 requests, prints the bot's teleport offers, and with its `prim` and
 `offer=N` arguments rezzes a box that says `Touched.` when clicked and
 sends the bot an unasked teleport offer. Run the bot with `socket = true`,
@@ -261,6 +263,72 @@ at once; the 10-second wait and the fallback to the position before the
 sit are covered by unit tests only. Not tried on Second Life: any of this,
 in particular whether the simulator there answers the request about the
 seat and in which form, and the positions in its terse updates.
+
+## Inventory, attachments, animations and sounds
+
+`test-rig/stock.py` gives the bot account something to work with. It logs
+in as `Sit Bot`, so the bot has to be stopped while it runs, makes the
+folder `Bot gear` at the top of My Inventory (a `Bot gear` from an earlier
+run goes to the Trash and is deleted first) and puts four items into it:
+the objects `Radio` and `Watch` (boxes it rezzes and takes), the animation
+`Dance` (a copy of the library's `tpose2`) and the sound `Bell` (OpenSim's
+click sound, uploaded as a new asset). The account also has what OpenSim
+gives every new one, among it `Clothing/Default Shirt`.
+
+```sh
+test-rig/stock.py                 # prints: stocked Bot gear/ (<uuid>) with Radio, Watch, Dance and Bell
+```
+
+`listen.py` prints, besides what is described above,
+`bot attachment <item> on point <N>` and `bot attachment <item> gone` from
+the object updates and kills it gets, `bot plays <asset>` and
+`bot stops <asset>` from the bot avatar's animation list, and
+`bot sound <asset> at <x> <y> <z> gain <g>` for a sound the bot triggers.
+OpenSim describes the bot's avatar to the helper only when something about
+it changes, so the helper takes an attachment on any avatar but its own to
+be the bot's: the rig has just the two.
+
+The items below were run with the config of item 1 plus `socket = true`,
+`--verbose`, the release build, and `listen.py` running four metres away.
+`<radio>`, `<watch>` and `<gear>` are the UUIDs `inventory` prints for the
+two objects and the folder.
+
+| # | Inject | Expected | Result (2026-11-19, OpenSim 9d00a55552) |
+|---|---|---|---|
+| 84 | `ctl inventory` | One line of five tab-separated fields per entry, in the order of the paths, folders with a `/` at the end; the Library is not in it; status 0; one log line with the count and no line per entry | Pass: 39 entries, among them `Bot gear/` with its four items, `Clothing/Default Shirt` as `clothing shirt`, the body parts as `bodypart` with `shape`, `skin`, `hair`, `eyes`, and the six links of `Current Outfit/` as `link`. With `--verbose`: four requests, of 1, 10, 10 and 1 folders |
+| 85 | `ctl inventory "Bot gear"`, `ctl inventory -n Clothing`, `ctl inventory <gear>`, `ctl inventory -n /` | The four items; the two pieces of clothing; the same four lines with their full paths; the folders at the top | Pass, all four |
+| 86 | `ctl inventory -a` before and after `ctl attach "Bot gear/Radio" left hand`; `ctl inventory -a Clothing` | Nothing and status 0; then the one line `<radio> object Left Hand attached Bot gear/Radio`; nothing | Pass |
+| 87 | `ctl inventory Nowhere`, `ctl inventory "Bot gear/Radio"`, `ctl inventory -x`, `ctl inventory Objects Clothing` | Status 1: `no folder named "Nowhere" was found in My Inventory`; `no folder named "Radio" was found in "Bot gear"`; the option named; `takes one folder`. Nothing asked of the grid for the last two | Pass |
+| 88 | `ctl attach "Bot gear/Radio" left hand` | `"Radio" <uuid> is attached to Left Hand`, status 0, within a second; the helper prints `bot attachment <radio> on point 5`; the log has the request and the outcome | Pass |
+| 89 | `ctl attach <watch> 5` while the radio is on the left hand | Attached to `Left Hand` as well; `inventory -a` lists both; the helper sees both on point 5 | Pass: nothing was taken off to make room |
+| 90 | `ctl attach "Bot gear/Radio" Chest` while it is attached; `ctl attach "Bot gear/Dance"`; `ctl attach "Bot gear/Radio" elbow`; `ctl attach "Bot gear"`; `ctl attach /` | Status 1: `is attached to Left Hand already`; `is an animation, not an object`; `"elbow" is not an attachment point`; `no item named "Bot gear"`; `My Inventory itself is a folder`. Nothing sent to the simulator | Pass, all five |
+| 91 | `ctl detach left hand` with both attached | One answer naming `Radio` and `Watch`, status 0; the helper prints `gone` for both; `inventory -a` prints nothing | Pass |
+| 92 | `ctl attach "Bot gear/Radio"` (no body part) after it was on the left hand, and again after it was on the chest | Attached where it was last | Pass: `Left Hand`, then `Chest`. OpenSim keeps the last point with the object, not in the inventory item, so the listing shows `-` for it while it is not attached |
+| 93 | `ctl detach "Bot gear/Radio"`; `ctl wear "Bot gear/Radio"`; `ctl unwear "Bot gear/Radio"` | Detached; attached as by `attach`; detached | Pass |
+| 94 | `ctl detach "Bot gear/Watch"` (not attached), `ctl detach Chest` (nothing on it) | Status 1: `is not attached`; `nothing is attached to Chest` | Pass |
+| 95 | `ctl attach "Bot gear/Radio" HUD Center`, `ctl tp 128 128 25 Home`, `ctl inventory -a`, `ctl home`, `ctl inventory -a` once seated again | `is attached to HUD Center`; in `Home` and back in `Target` the listing shows the radio on `HUD Center`; the log has `attachment: item <radio> is on HUD Center` after each arrival | Pass. OpenSim described the attachment in full after each teleport. Commands given while the teleport back was under way (it took 12 s) answered `the avatar is not connected to a region` |
+| 96 | `ctl attach "Bot gear/Radio" right hand`, 20 s later `ctl quit`, then start the bot | Without any command: `attachment: item <radio> is on Right Hand` in the log, and `inventory -a` lists it | Pass. With the bot stopped within a second of the attach, OpenSim had not saved the attachment yet and the avatar came back without it (`attachments show Sit Bot` on the console: none), which the bot reported correctly |
+| 97 | `ctl anim play "Bot gear/Dance"`, `ctl anim stop "Bot gear/Dance"`, and `stop` once more | `playing "Dance" <uuid>`, `stopped ...`, `stopped ...`, status 0 each; the helper prints `bot plays 01645eeb-...` (the animation's asset) and then `bot stops` it | Pass |
+| 98 | `ctl anim play "Bot gear/Radio"`, `ctl anim pause "Bot gear/Dance"`, `ctl anim play` | Status 1: `is an object, not an animation`; the two forms of `anim` named, twice | Pass |
+| 99 | `ctl sound "Bot gear/Bell"`; `ctl sound "Bot gear/Dance"` | `played "Bell" <uuid>`, status 0, and the helper prints `bot sound <asset> at <the bot's position> gain 1.0`; then status 1, `is an animation, not a sound` | Pass. A first version of `stock.py` made the sound item without an asset; `sound` refused that one with `the inventory does not give the bot the sound itself` |
+| 100 | `ctl wear "Clothing/Default Shirt"`, `ctl unwear shirt`, `ctl unwear skin`, `ctl wear "Bot gear/Bell"` | Status 1: twice `this grid makes the avatar's appearance in the viewer, which the bot cannot do; ...`; `skin can only be replaced, with wear`; `is a sound, which cannot be worn`. `inventory "Current Outfit"` unchanged | Pass |
+| 101 | Seated in holding mode: all of the above but item 95 | `ctl status` still shows `seat: target` and `mode: holding` | Pass |
+| 102 | `kick user Sit Bot bye`, then before the next login `ctl inventory`, `attach`, `wear`, `detach` of an item and of a body part, `unwear shirt`, `anim play`, `sound` | Status 1, `the avatar is not connected to a region`, for each; nothing is done after the bot is back | Pass, all eight; `inventory -a` after the re-login printed nothing |
+| 103 | Two folders `Bot gear` at the top (left by an earlier `stock.py`), `ctl inventory "Bot gear"` | Status 1; the error lists the folders' UUIDs | Pass, with three of them, while `stock.py` did not yet clear up after itself (debug build): `My Inventory holds 3 folders named "Bot gear": ...; name one by its UUID` |
+| 104 | `--verbose`, no inventory command given: items 1, 3 and 9 | As before; no line starting `inventory:` in the log (each request to the inventory service writes one), and no message sent that was not sent before | Pass: login, seated; re-sit after `stand user`; back from `Home` and seated. Sent: `AgentUpdate`, `CompletePingCheck`, `UseCircuitCode`, `CompleteAgentMovement`, `RegionHandshakeReply`, `AgentThrottle`, `AgentRequestSit`, `AgentSit`, `RequestMultipleObjects` (one per sit), `MapNameRequest`, `TeleportLocationRequest` |
+
+Not covered on this rig, because OpenSim has neither service: wearing and
+taking off clothing and body parts, and the bookkeeping in the Current
+Outfit folder after an attach or a detach (unit tests against a local HTTP
+listener only; what the bot sends is taken from viewer source). Also not
+covered: an attachment described in the compressed form or as a cached
+object (OpenSim describes attachments in full; unit tests only for the
+compressed form, and a cached one the bot would not learn of), an
+attachment detached by its own script, an attach the simulator refuses
+(the 15-second error and the simulator's alert in it are in unit tests
+only), a listing that takes longer than 50 seconds, and a link in a path
+(OpenSim's default inventory has links only in `Current Outfit`, where they
+were listed as `link`). Not tried on Second Life: any of this.
 
 Not covered: Windows, where the socket is TCP. On Second Life, looking a
 name up through `AvatarPickerRequest` found nobody (2026-11-18, an avatar

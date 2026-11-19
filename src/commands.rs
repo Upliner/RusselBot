@@ -1,12 +1,14 @@
 //! What the bot does with a command from the control socket: the chat-bar
 //! parsing of `say`, the avatars commands name and their lookup on the
-//! grid, the commands that move the avatar, and the ones waiting for a
-//! lookup or for the simulator to say how they ended.
+//! grid, the commands that move the avatar, the ones that use its
+//! inventory, and the ones waiting for a lookup, for the inventory or for
+//! the simulator to say how they ended.
 
 use crate::config::DEFAULT_REQUESTTP_TIMEOUT;
 use crate::control::{Request, Response};
+use crate::inventory::{self, Clothes, Entry, Failed, Item, ListArgs, Outcome, Removal, What};
 use crate::persist::{Location, SitState};
-use crate::session::{Touch, NOT_CONNECTED};
+use crate::session::{Touch, ATTACH_LIMIT, NOT_CONNECTED};
 use crate::udp::messages::{Vector3, MAX_TEXT};
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
@@ -15,6 +17,10 @@ use uuid::Uuid;
 
 /// How long the grid has to answer a name lookup.
 pub const LOOKUP_LIMIT: Duration = Duration::from_secs(10);
+
+/// How long after its deadline an inventory job is given up on without an
+/// answer from the worker, which keeps the deadline itself.
+const JOB_GRACE: Duration = Duration::from_secs(3);
 
 /// Teleport offers kept for `accepttp`, one per avatar.
 const MAX_OFFERS: usize = 100;
@@ -188,6 +194,112 @@ pub trait Grid {
     /// Ends like `teleport`.
     fn accept_teleport(&mut self, lure: Uuid, now: Instant) -> Result<(), String>;
     fn touch(&mut self, object: Uuid, now: Instant) -> Result<Touch, String>;
+    /// Hands the inventory worker a job, to be answered through
+    /// `Commands::inventory_answer` with the same `id`. Refuses where the
+    /// simulator has no inventory service.
+    fn inventory(&mut self, id: u64, deadline: Instant, what: What) -> Result<(), String>;
+    /// Whether the grid makes the avatar's appearance from its Current
+    /// Outfit folder, which is what clothing needs.
+    fn outfit_service(&self) -> bool;
+    /// The inventory items attached to the avatar now, and their points.
+    fn attached(&self) -> Vec<(Uuid, u8)>;
+    /// Ends in the session's `Attached` or `AttachFailed`. `point` 0
+    /// leaves the choice to the simulator.
+    fn attach(&mut self, item: &Item, point: u8, now: Instant) -> Result<(), String>;
+    /// Ends in the session's `Detached` or `DetachFailed`.
+    fn detach(&mut self, item: Uuid, now: Instant) -> Result<(), String>;
+    fn animate(&mut self, animation: Uuid, start: bool, now: Instant) -> Result<(), String>;
+    fn play_sound(&mut self, sound: Uuid, now: Instant) -> Result<(), String>;
+}
+
+/// What a command does once the inventory has answered.
+#[derive(Debug, Clone, PartialEq)]
+enum Then {
+    /// Print the listing.
+    List(ListArgs),
+    /// Attach the item found; `given` is the item as the command named it.
+    Attach {
+        given: String,
+        point: Option<u8>,
+    },
+    Wear {
+        given: String,
+    },
+    Detach {
+        given: String,
+    },
+    Anim {
+        given: String,
+        start: bool,
+    },
+    Sound {
+        given: String,
+    },
+    /// Detach what is on the point, now that the items' names are known.
+    DetachPoint {
+        point: u8,
+        items: Vec<Uuid>,
+    },
+    /// Say what was put on, or taken off.
+    Outfit {
+        put_on: bool,
+    },
+}
+
+impl Then {
+    /// What to tell the operator when the job came to nothing.
+    fn failure(&self, failed: Failed) -> String {
+        let limit = inventory::LIMIT.as_secs();
+        match (failed, self) {
+            (Failed::Reason(reason), _) => reason,
+            (Failed::TimedOut, Then::List(_)) => {
+                format!("the listing took longer than {limit} s; name a folder to list less of the inventory")
+            }
+            (Failed::TimedOut, Then::DetachPoint { point, .. }) => format!(
+                "the grid did not say within {limit} s what is attached to {}",
+                inventory::point_name(*point)
+            ),
+            (Failed::TimedOut, Then::Outfit { .. }) => {
+                format!("the grid did not answer within {limit} s; the avatar's outfit may or may not have changed")
+            }
+            (
+                Failed::TimedOut,
+                Then::Attach { given, .. }
+                | Then::Wear { given }
+                | Then::Detach { given }
+                | Then::Anim { given, .. }
+                | Then::Sound { given },
+            ) => format!("the grid did not answer the lookup of \"{given}\" within {limit} s"),
+        }
+    }
+}
+
+/// A command waiting for an inventory job.
+struct Pending {
+    command: &'static str,
+    reply: Sender<Response>,
+    /// When the command gives up on the inventory: `LIMIT` after it
+    /// arrived, whatever jobs it takes.
+    deadline: Instant,
+    then: Then,
+}
+
+/// An `attach` or `wear` waiting to see its object on the avatar.
+struct Attaching {
+    command: &'static str,
+    item: Item,
+    reply: Sender<Response>,
+    /// What the simulator said meanwhile, which may be why not.
+    alert: Option<String>,
+}
+
+/// A `detach` waiting to see its objects gone from the avatar.
+struct Detaching {
+    reply: Sender<Response>,
+    waiting: Vec<Item>,
+    gone: Vec<Item>,
+    /// Those the simulator did not take off in time.
+    stuck: Vec<Item>,
 }
 
 /// An instant message that went out, for the message log.
@@ -268,6 +380,14 @@ pub struct Commands {
     last_tp: Option<Location>,
     /// What the last `sit` command that was carried out named.
     last_sit: Option<SitState>,
+    /// Inventory jobs under way, by their id.
+    jobs: HashMap<u64, Pending>,
+    job_ids: u64,
+    /// Changes to the Current Outfit folder that follow an attach or a
+    /// detach and that nobody waits for: what each is, by job id.
+    notes: HashMap<u64, String>,
+    attaching: Vec<Attaching>,
+    detaching: Vec<Detaching>,
 }
 
 impl Default for Commands {
@@ -306,6 +426,11 @@ impl Commands {
             went_manual: false,
             last_tp: None,
             last_sit: None,
+            jobs: HashMap::new(),
+            job_ids: 0,
+            notes: HashMap::new(),
+            attaching: Vec::new(),
+            detaching: Vec::new(),
         }
     }
 
@@ -330,6 +455,13 @@ impl Commands {
             Request::Home => "home",
             Request::Status => "status",
             Request::Quit => "quit",
+            Request::Inventory(_) => "inventory",
+            Request::Attach { .. } => "attach",
+            Request::Wear(_) => "wear",
+            Request::Detach(_) => "detach",
+            Request::Anim { stop: false, .. } => "anim play",
+            Request::Anim { stop: true, .. } => "anim stop",
+            Request::Sound(_) => "sound",
         };
         let done = match request {
             Request::Say(message) => self.say(&message, grid, now),
@@ -348,6 +480,24 @@ impl Commands {
             }
             Request::Touch(object) => self.touch(&object, &reply, grid, now),
             Request::Persist { .. } | Request::Home | Request::Status | Request::Quit => Err("not a command for the grid".to_string()),
+            Request::Inventory(args) => self.inventory(&args, &reply, grid, now),
+            Request::Attach { item, part } => self.find_for_attach(&item, part.as_deref(), &reply, grid, now),
+            Request::Wear(item) => {
+                let then = Then::Wear { given: item.clone() };
+                self.find(&item, then, command, &reply, grid, now)
+            }
+            Request::Detach(what) => self.detach(&what, &reply, grid, now),
+            Request::Anim { stop, item } => {
+                let then = Then::Anim {
+                    given: item.clone(),
+                    start: !stop,
+                };
+                self.find(&item, then, command, &reply, grid, now)
+            }
+            Request::Sound(item) => {
+                let then = Then::Sound { given: item.clone() };
+                self.find(&item, then, command, &reply, grid, now)
+            }
         };
         finish(command, done, &reply)
     }
@@ -479,6 +629,447 @@ impl Commands {
                 Ok(Done::Parked)
             }
         }
+    }
+
+    // ----------------------------------------------------- the inventory
+
+    /// Hands the worker a job and parks the command until it answers.
+    fn start<G: Grid>(
+        &mut self,
+        grid: &mut G,
+        what: What,
+        then: Then,
+        command: &'static str,
+        reply: &Sender<Response>,
+        deadline: Instant,
+    ) -> Result<Done, String> {
+        self.job_ids += 1;
+        grid.inventory(self.job_ids, deadline, what)?;
+        let pending = Pending {
+            command,
+            reply: reply.clone(),
+            deadline,
+            then,
+        };
+        self.jobs.insert(self.job_ids, pending);
+        Ok(Done::Parked)
+    }
+
+    /// `inventory [-a] [-n] [<folder>]`.
+    fn inventory<G: Grid>(
+        &mut self,
+        args: &[String],
+        reply: &Sender<Response>,
+        grid: Option<&mut G>,
+        now: Instant,
+    ) -> Result<Done, String> {
+        let args = inventory::parse_list_args(args)?;
+        let what = What::List {
+            folder: args.folder.clone(),
+            recursive: args.recursive,
+        };
+        self.start(
+            grid.ok_or(NOT_CONNECTED)?,
+            what,
+            Then::List(args),
+            "inventory",
+            reply,
+            now + inventory::LIMIT,
+        )
+    }
+
+    /// Looks the item a command names up, for `then` to go on with.
+    fn find<G: Grid>(
+        &mut self,
+        item: &str,
+        then: Then,
+        command: &'static str,
+        reply: &Sender<Response>,
+        grid: Option<&mut G>,
+        now: Instant,
+    ) -> Result<Done, String> {
+        let item = inventory::parse_ref(item)?;
+        self.start(
+            grid.ok_or(NOT_CONNECTED)?,
+            What::Find(item),
+            then,
+            command,
+            reply,
+            now + inventory::LIMIT,
+        )
+    }
+
+    /// `attach <item> [<body part>]`: the body part is read before the
+    /// grid is asked anything.
+    fn find_for_attach<G: Grid>(
+        &mut self,
+        item: &str,
+        part: Option<&str>,
+        reply: &Sender<Response>,
+        grid: Option<&mut G>,
+        now: Instant,
+    ) -> Result<Done, String> {
+        let point = match part {
+            Some(part) => Some(inventory::parse_point(part).ok_or_else(|| {
+                format!("\"{part}\" is not an attachment point; give a name such as `Left Hand` or `HUD Center`, or a number from 1 to 127")
+            })?),
+            None => None,
+        };
+        let then = Then::Attach {
+            given: item.to_string(),
+            point,
+        };
+        self.find(item, then, "attach", reply, grid, now)
+    }
+
+    /// `detach <what>`, or `unwear`: an item, an attachment point, or a
+    /// kind of clothing.
+    fn detach<G: Grid>(&mut self, what: &str, reply: &Sender<Response>, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
+        let deadline = now + inventory::LIMIT;
+        match inventory::parse_removal(what)? {
+            Removal::Item(item) => {
+                let then = Then::Detach { given: what.to_string() };
+                self.start(grid.ok_or(NOT_CONNECTED)?, What::Find(item), then, "detach", reply, deadline)
+            }
+            Removal::Point(point) => {
+                let grid = grid.ok_or(NOT_CONNECTED)?;
+                let items: Vec<Uuid> = grid
+                    .attached()
+                    .iter()
+                    .filter(|(_, on)| *on == point)
+                    .map(|(item, _)| *item)
+                    .collect();
+                if items.is_empty() {
+                    return Err(format!("nothing is attached to {}", inventory::point_name(point)));
+                }
+                // The items' names, for the answer and the log.
+                let then = Then::DetachPoint {
+                    point,
+                    items: items.clone(),
+                };
+                self.start(grid, What::Items(items), then, "detach", reply, deadline)
+            }
+            Removal::Kind(kind) if inventory::is_body_part(kind) => Err(keeps_body_part(kind)),
+            Removal::Kind(kind) => {
+                let grid = grid.ok_or(NOT_CONNECTED)?;
+                if !grid.outfit_service() {
+                    return Err(inventory::NO_OUTFIT_SERVICE.to_string());
+                }
+                crate::info!("control: taking off every {} the avatar wears", inventory::kind_name(kind));
+                let what = What::TakeOff(Clothes::Kind(kind));
+                self.start(grid, what, Then::Outfit { put_on: false }, "detach", reply, deadline)
+            }
+        }
+    }
+
+    /// The inventory worker answered job `id`: the command that waited for
+    /// it goes on. An answer nobody waits for any more is ignored.
+    pub fn inventory_answer<G: Grid>(&mut self, id: u64, result: Result<Outcome, Failed>, grid: Option<&mut G>, now: Instant) {
+        if let Some(what) = self.notes.remove(&id) {
+            match result {
+                Ok(_) => crate::debug!("Current Outfit folder: {what}"),
+                Err(Failed::Reason(reason)) => crate::info!("Current Outfit folder not updated ({what}): {reason}"),
+                Err(Failed::TimedOut) => crate::info!("Current Outfit folder not updated ({what}): the grid did not answer in time"),
+            }
+            return;
+        }
+        let Some(pending) = self.jobs.remove(&id) else {
+            return;
+        };
+        let Pending {
+            command,
+            reply,
+            deadline,
+            then,
+        } = pending;
+        let done = match result {
+            Err(failed) => Err(then.failure(failed)),
+            Ok(outcome) => self.go_on(then, outcome, command, &reply, deadline, grid, now),
+        };
+        finish(command, done, &reply);
+    }
+
+    /// What a command does with the inventory's answer.
+    #[allow(clippy::too_many_arguments)]
+    fn go_on<G: Grid>(
+        &mut self,
+        then: Then,
+        outcome: Outcome,
+        command: &'static str,
+        reply: &Sender<Response>,
+        deadline: Instant,
+        grid: Option<&mut G>,
+        now: Instant,
+    ) -> Result<Done, String> {
+        let grid = grid.ok_or(NOT_CONNECTED)?;
+        match (then, outcome) {
+            (Then::List(args), Outcome::Listed(entries)) => Ok(Done::Answer(list(&args, &entries, grid))),
+            (Then::Attach { point, .. }, Outcome::Found(item)) => self.attach(item, point, command, reply, grid, now),
+            (Then::Wear { .. }, Outcome::Found(item)) => match item.asset_type {
+                inventory::ASSET_OBJECT => self.attach(item, None, command, reply, grid, now),
+                inventory::ASSET_CLOTHING | inventory::ASSET_BODY_PART => {
+                    if !grid.outfit_service() {
+                        return Err(inventory::NO_OUTFIT_SERVICE.to_string());
+                    }
+                    crate::info!("control: wearing {}", item.show());
+                    self.start(grid, What::Wear(item), Then::Outfit { put_on: true }, command, reply, deadline)
+                }
+                other => Err(format!(
+                    "{} is {}, which cannot be worn",
+                    item.show(),
+                    inventory::type_phrase(other)
+                )),
+            },
+            (Then::Detach { .. }, Outcome::Found(item)) => match item.asset_type {
+                inventory::ASSET_OBJECT => {
+                    if !grid.attached().iter().any(|(attached, _)| *attached == item.id) {
+                        return Err(format!("{} is not attached", item.show()));
+                    }
+                    grid.detach(item.id, now)?;
+                    crate::info!("control: detaching {}", item.show());
+                    self.detaching.push(Detaching {
+                        reply: reply.clone(),
+                        waiting: vec![item],
+                        gone: Vec::new(),
+                        stuck: Vec::new(),
+                    });
+                    Ok(Done::Parked)
+                }
+                inventory::ASSET_BODY_PART => Err(format!("{} is a body part: {}", item.show(), keeps_body_part(item.subtype()))),
+                inventory::ASSET_CLOTHING => {
+                    if !grid.outfit_service() {
+                        return Err(inventory::NO_OUTFIT_SERVICE.to_string());
+                    }
+                    crate::info!("control: taking off {}", item.show());
+                    let what = What::TakeOff(Clothes::Item(item));
+                    self.start(grid, what, Then::Outfit { put_on: false }, command, reply, deadline)
+                }
+                other => Err(format!(
+                    "{} is {}, which is neither attached nor worn",
+                    item.show(),
+                    inventory::type_phrase(other)
+                )),
+            },
+            (Then::DetachPoint { point, items }, Outcome::Items(found)) => {
+                // What is on the point may have changed while the grid was asked.
+                let attached = grid.attached();
+                let still: Vec<Uuid> = items.into_iter().filter(|item| attached.contains(&(*item, point))).collect();
+                if still.is_empty() {
+                    return Err(format!("nothing is attached to {}", inventory::point_name(point)));
+                }
+                let mut waiting = Vec::new();
+                for id in still {
+                    grid.detach(id, now)?;
+                    // An item the inventory did not describe goes by its id.
+                    let described = found.iter().find(|item| item.id == id).cloned();
+                    waiting.push(described.unwrap_or(Item { id, ..Item::default() }));
+                }
+                crate::info!("control: detaching {} from {}", names(&waiting), inventory::point_name(point));
+                self.detaching.push(Detaching {
+                    reply: reply.clone(),
+                    waiting,
+                    gone: Vec::new(),
+                    stuck: Vec::new(),
+                });
+                Ok(Done::Parked)
+            }
+            (Then::Anim { start, .. }, Outcome::Found(item)) => {
+                let animation = asset_of(&item, inventory::ASSET_ANIMATION, "an animation")?;
+                grid.animate(animation, start, now)?;
+                let text = match start {
+                    true => format!("playing {}", item.show()),
+                    false => format!("stopped {}", item.show()),
+                };
+                crate::info!("control: {text}");
+                Ok(Done::Answer(Some(text)))
+            }
+            (Then::Sound { .. }, Outcome::Found(item)) => {
+                let sound = asset_of(&item, inventory::ASSET_SOUND, "a sound")?;
+                grid.play_sound(sound, now)?;
+                let text = format!("played {}", item.show());
+                crate::info!("control: {text}");
+                Ok(Done::Answer(Some(text)))
+            }
+            (Then::Outfit { put_on }, Outcome::Outfit(items)) => {
+                let text = match put_on {
+                    true => {
+                        let kinds: Vec<String> = items.iter().map(|item| inventory::kind_name(item.subtype())).collect();
+                        format!("wearing {} ({})", names(&items), kinds.join(", "))
+                    }
+                    false => format!("took off {}", names(&items)),
+                };
+                crate::info!("control: {text}");
+                Ok(Done::Answer(Some(text)))
+            }
+            (then, outcome) => Err(format!("the inventory answered {outcome:?} where {then:?} was expected")),
+        }
+    }
+
+    /// Attaches an item the inventory has described: to `point`, or where
+    /// the simulator puts it, which is where it was last.
+    fn attach<G: Grid>(
+        &mut self,
+        item: Item,
+        point: Option<u8>,
+        command: &'static str,
+        reply: &Sender<Response>,
+        grid: &mut G,
+        now: Instant,
+    ) -> Result<Done, String> {
+        if item.asset_type != inventory::ASSET_OBJECT {
+            return Err(format!(
+                "{} is {}, not an object",
+                item.show(),
+                inventory::type_phrase(item.asset_type)
+            ));
+        }
+        if let Some((_, on)) = grid.attached().iter().find(|(attached, _)| *attached == item.id) {
+            return Err(format!("{} is attached to {} already", item.show(), inventory::point_name(*on)));
+        }
+        grid.attach(&item, point.unwrap_or(0), now)?;
+        let place = point.map_or("the point it was last on".to_string(), inventory::point_name);
+        crate::info!("control: attaching {} to {place}", item.show());
+        let (same, others) = std::mem::take(&mut self.attaching)
+            .into_iter()
+            .partition(|earlier| earlier.item.id == item.id);
+        self.attaching = others;
+        for earlier in same {
+            refuse(
+                earlier.command,
+                &earlier.reply,
+                "superseded by a newer attach of the same item".to_string(),
+            );
+        }
+        self.attaching.push(Attaching {
+            command,
+            item,
+            reply: reply.clone(),
+            alert: None,
+        });
+        Ok(Done::Parked)
+    }
+
+    /// Asks for a change to the Current Outfit folder that nobody waits
+    /// for: where the grid keeps that folder, viewers expect it to say
+    /// what is attached.
+    fn note<G: Grid>(&mut self, grid: Option<&mut G>, what: What, text: String, now: Instant) {
+        let Some(grid) = grid.filter(|grid| grid.outfit_service()) else {
+            return;
+        };
+        self.job_ids += 1;
+        match grid.inventory(self.job_ids, now + inventory::LIMIT, what) {
+            Ok(()) => {
+                self.notes.insert(self.job_ids, text);
+            }
+            Err(reason) => crate::info!("Current Outfit folder not updated ({text}): {reason}"),
+        }
+    }
+
+    /// The simulator shows the object of `item` on the avatar. Returns
+    /// whether a command of the bot's put it there.
+    pub fn attached<G: Grid>(&mut self, item: Uuid, point: u8, grid: Option<&mut G>, now: Instant) -> bool {
+        let (done, attaching): (Vec<_>, Vec<_>) = std::mem::take(&mut self.attaching).into_iter().partition(|a| a.item.id == item);
+        self.attaching = attaching;
+        let Some(attach) = done.into_iter().next() else {
+            return false;
+        };
+        let text = format!("{} is attached to {}", attach.item.show(), inventory::point_name(point));
+        crate::info!("control: {text}");
+        let _ = attach.reply.send(Response::Ok(Some(text)));
+        let what = format!("adding {}", attach.item.show());
+        self.note(grid, What::Link(attach.item), what, now);
+        true
+    }
+
+    /// The simulator did not show the object in time.
+    pub fn attach_failed(&mut self, item: Uuid) {
+        let (failed, attaching): (Vec<_>, Vec<_>) = std::mem::take(&mut self.attaching).into_iter().partition(|a| a.item.id == item);
+        self.attaching = attaching;
+        for attach in failed {
+            let mut reason = format!(
+                "the simulator did not attach {} within {} s",
+                attach.item.show(),
+                ATTACH_LIMIT.as_secs()
+            );
+            if let Some(alert) = attach.alert {
+                reason.push_str(&format!("; it said: {alert}"));
+            }
+            refuse(attach.command, &attach.reply, reason);
+        }
+    }
+
+    /// The simulator sent text for the user to read: it may be why an
+    /// attach that is waiting will not happen.
+    pub fn alert(&mut self, message: &str) {
+        for attach in &mut self.attaching {
+            attach.alert = Some(message.to_string());
+        }
+    }
+
+    /// The object of `item` is gone from the avatar. Returns whether a
+    /// command of the bot's took it off.
+    pub fn detached<G: Grid>(&mut self, item: Uuid, grid: Option<&mut G>, now: Instant) -> bool {
+        let mut ours = None;
+        for detach in &mut self.detaching {
+            if let Some(index) = detach.waiting.iter().position(|waiting| waiting.id == item) {
+                let gone = detach.waiting.remove(index);
+                crate::info!("control: {} is detached", gone.show());
+                ours = Some(gone.show());
+                detach.gone.push(gone);
+            }
+        }
+        self.settle_detaches();
+        match ours {
+            Some(shown) => {
+                self.note(grid, What::Unlink(item), format!("removing {shown}"), now);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The simulator did not take the object off in time.
+    pub fn detach_failed(&mut self, item: Uuid) {
+        for detach in &mut self.detaching {
+            if let Some(index) = detach.waiting.iter().position(|waiting| waiting.id == item) {
+                detach.stuck.push(detach.waiting.remove(index));
+            }
+        }
+        self.settle_detaches();
+    }
+
+    /// Answers the `detach` commands that have nothing left to wait for.
+    fn settle_detaches(&mut self) {
+        let (settled, detaching): (Vec<_>, Vec<_>) = std::mem::take(&mut self.detaching).into_iter().partition(|d| d.waiting.is_empty());
+        self.detaching = detaching;
+        for detach in settled {
+            if detach.stuck.is_empty() {
+                let _ = detach.reply.send(Response::Ok(Some(format!("detached {}", names(&detach.gone)))));
+                continue;
+            }
+            let mut reason = format!(
+                "the simulator did not detach {} within {} s",
+                names(&detach.stuck),
+                ATTACH_LIMIT.as_secs()
+            );
+            if !detach.gone.is_empty() {
+                reason.push_str(&format!("; detached {}", names(&detach.gone)));
+            }
+            refuse("detach", &detach.reply, reason);
+        }
+    }
+
+    /// The avatar is on another simulator: what was asked of the old
+    /// one's inventory service will not be used.
+    pub fn simulator_changed(&mut self) {
+        self.fail_jobs("the avatar changed simulator while the inventory was being read");
+    }
+
+    fn fail_jobs(&mut self, reason: &str) {
+        for (_, pending) in std::mem::take(&mut self.jobs) {
+            refuse(pending.command, &pending.reply, reason.to_string());
+        }
+        self.notes.clear();
     }
 
     /// Does `then` with the avatar `to` names if it is known, and otherwise
@@ -618,6 +1209,18 @@ impl Commands {
             let reason = format!("the grid did not answer the lookup of \"{given}\" within {limit} s");
             refuse(then.command(), &reply, reason);
         }
+        // The worker answers by the deadline; this is for one that does not.
+        let late: Vec<u64> = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| now >= job.deadline + JOB_GRACE)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in late {
+            if let Some(job) = self.jobs.remove(&id) {
+                refuse(job.command, &job.reply, job.then.failure(Failed::TimedOut));
+            }
+        }
     }
 
     /// The session is gone, and with it any answer the commands waited for
@@ -635,12 +1238,21 @@ impl Commands {
         for (_, reply) in std::mem::take(&mut self.touches) {
             refuse("touch", &reply, "the session was lost".to_string());
         }
+        self.fail_jobs("the session was lost");
+        for attach in std::mem::take(&mut self.attaching) {
+            refuse(attach.command, &attach.reply, "the session was lost".to_string());
+        }
+        for detach in std::mem::take(&mut self.detaching) {
+            refuse("detach", &detach.reply, "the session was lost".to_string());
+        }
         self.offers.clear();
     }
 
     /// When `tick` next has something to do.
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.waiting.iter().map(|w| w.deadline).min()
+        let lookups = self.waiting.iter().map(|w| w.deadline);
+        let jobs = self.jobs.values().map(|job| job.deadline + JOB_GRACE);
+        lookups.chain(jobs).min()
     }
 
     // ------------------------------------------- what the session reports
@@ -734,6 +1346,55 @@ impl Commands {
             crate::info!("teleport offer from {who} ignored: too many offers are waiting");
         }
     }
+}
+
+/// The answer to `inventory`: the listing, or nothing when it is empty.
+fn list<G: Grid>(args: &ListArgs, entries: &[Entry], grid: &G) -> Option<String> {
+    let attached: HashMap<Uuid, u8> = grid.attached().into_iter().collect();
+    let (text, count) = inventory::listing(entries, &attached, args.attached);
+    let mut filters = String::new();
+    if args.attached {
+        filters.push_str(", attached only");
+    }
+    if !args.recursive {
+        filters.push_str(", direct children only");
+    }
+    let entries = if count == 1 { "entry" } else { "entries" };
+    crate::info!("control: inventory: listed {count} {entries} under {}{filters}", args.folder.show());
+    (count > 0).then_some(text)
+}
+
+/// The asset an `anim` or `sound` command plays: the item has to be of
+/// the right type, and the inventory has to give the asset's id.
+fn asset_of(item: &Item, asset_type: i32, wanted: &str) -> Result<Uuid, String> {
+    if item.asset_type != asset_type {
+        return Err(format!(
+            "{} is {}, not {wanted}",
+            item.show(),
+            inventory::type_phrase(item.asset_type)
+        ));
+    }
+    if item.asset_id.is_nil() {
+        let what = wanted.rsplit(' ').next().unwrap_or(wanted);
+        return Err(format!("the inventory does not give the bot the {what} itself for {}", item.show()));
+    }
+    Ok(item.asset_id)
+}
+
+/// Why a body part is not taken off.
+fn keeps_body_part(kind: u8) -> String {
+    let kind = inventory::kind_name(kind);
+    format!("the avatar cannot be without {kind}; {kind} can only be replaced, with `wear`")
+}
+
+/// Items for an answer or the log: each by name and id; one the inventory
+/// did not describe by its id alone.
+fn names(items: &[Item]) -> String {
+    let shown: Vec<String> = items
+        .iter()
+        .map(|item| if item.name.is_empty() { item.id.to_string() } else { item.show() })
+        .collect();
+    shown.join(", ")
 }
 
 fn check_length(text: &str, limit: usize) -> Result<(), String> {
@@ -863,6 +1524,11 @@ mod tests {
         OfferTp(Uuid, String),
         AcceptTp(Uuid),
         Touch(Uuid),
+        /// An attach of this item to this point; 0 is the simulator's choice.
+        Attach(Item, u8),
+        Detach(Uuid),
+        Animate(Uuid, bool),
+        Sound(Uuid),
     }
 
     struct FakeGrid {
@@ -871,6 +1537,14 @@ mod tests {
         position: Option<Vector3>,
         /// What `touch` answers.
         touch: Result<Touch, String>,
+        /// The inventory jobs handed over: id, deadline and what.
+        jobs: Vec<(u64, Instant, What)>,
+        /// The simulator has no inventory service.
+        no_inventory: bool,
+        /// The grid makes the avatar's appearance.
+        outfit: bool,
+        /// What is attached to the avatar.
+        attached: Vec<(Uuid, u8)>,
     }
 
     impl Default for FakeGrid {
@@ -881,6 +1555,10 @@ mod tests {
                 offline: false,
                 position,
                 touch: Ok(Touch::Sent),
+                jobs: Vec::new(),
+                no_inventory: false,
+                outfit: false,
+                attached: Vec::new(),
             }
         }
     }
@@ -956,6 +1634,40 @@ mod tests {
             self.check()?;
             self.calls.push(Call::Touch(object));
             self.touch.clone()
+        }
+        fn inventory(&mut self, id: u64, deadline: Instant, what: What) -> Result<(), String> {
+            self.check()?;
+            if self.no_inventory {
+                return Err(inventory::NO_SERVICE.to_string());
+            }
+            self.jobs.push((id, deadline, what));
+            Ok(())
+        }
+        fn outfit_service(&self) -> bool {
+            self.outfit
+        }
+        fn attached(&self) -> Vec<(Uuid, u8)> {
+            self.attached.clone()
+        }
+        fn attach(&mut self, item: &Item, point: u8, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::Attach(item.clone(), point));
+            Ok(())
+        }
+        fn detach(&mut self, item: Uuid, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::Detach(item));
+            Ok(())
+        }
+        fn animate(&mut self, animation: Uuid, start: bool, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::Animate(animation, start));
+            Ok(())
+        }
+        fn play_sound(&mut self, sound: Uuid, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::Sound(sound));
+            Ok(())
         }
     }
 
@@ -1710,5 +2422,784 @@ mod tests {
         let mut rig = Rig::new();
         rig.grid.touch = Err("object is not known to the bot".to_string());
         assert!(error(&rig.command(Request::Touch(other_object().to_string()))).contains("not known"));
+    }
+
+    // ------------------------------------------------------- the inventory
+
+    use crate::inventory::{Ref, ASSET_ANIMATION, ASSET_BODY_PART, ASSET_CLOTHING, ASSET_NOTECARD, ASSET_OBJECT, ASSET_SOUND};
+
+    /// An inventory item of the tests: its id and its asset's follow from
+    /// its name.
+    fn item(name: &str, asset_type: i32, flags: u32) -> Item {
+        let seed = name.bytes().fold(7u128, |sum, byte| sum * 131 + u128::from(byte));
+        Item {
+            id: Uuid::from_u128(seed),
+            parent: Uuid::from_u128(1),
+            name: name.to_string(),
+            description: format!("{name}, described"),
+            asset_type,
+            inv_type: asset_type,
+            flags,
+            asset_id: Uuid::from_u128(seed + 1),
+            owner: Uuid::from_u128(0xA1),
+            group_mask: 0,
+            everyone_mask: 0x8000,
+            next_owner_mask: 0x0008_2000,
+        }
+    }
+
+    fn radio() -> Item {
+        item("Radio", ASSET_OBJECT, 5)
+    }
+
+    fn hat() -> Item {
+        item("Hat", ASSET_OBJECT, 2)
+    }
+
+    fn watch() -> Item {
+        item("Watch", ASSET_OBJECT, 5)
+    }
+
+    fn dance() -> Item {
+        item("Dance", ASSET_ANIMATION, 0)
+    }
+
+    fn bell() -> Item {
+        item("Bell", ASSET_SOUND, 0)
+    }
+
+    fn shirt() -> Item {
+        item("Blue shirt", ASSET_CLOTHING, 4)
+    }
+
+    fn path(names: &[&str]) -> Ref {
+        Ref::Path(names.iter().map(|name| name.to_string()).collect())
+    }
+
+    fn entry(item: &Item, path: &str) -> Entry {
+        Entry {
+            id: item.id,
+            asset_type: item.asset_type,
+            flags: item.flags,
+            path: path.to_string(),
+        }
+    }
+
+    impl Rig {
+        /// The one inventory job handed over since the last call.
+        fn job(&mut self) -> (u64, What) {
+            match &std::mem::take(&mut self.grid.jobs)[..] {
+                [(id, _, what)] => (*id, what.clone()),
+                other => panic!("expected one inventory job, got {other:?}"),
+            }
+        }
+
+        fn answer(&mut self, id: u64, result: Result<Outcome, Failed>) {
+            self.commands.inventory_answer(id, result, Some(&mut self.grid), self.now);
+        }
+
+        /// Runs a command that names an item and answers its lookup with
+        /// `found`.
+        fn with_item(&mut self, request: Request, found: &Item) -> Receiver<Response> {
+            let answer = self.command(request);
+            let (id, what) = self.job();
+            assert!(matches!(what, What::Find(_)), "{what:?}");
+            self.answer(id, Ok(Outcome::Found(found.clone())));
+            answer
+        }
+
+        fn attach(&mut self, item: &str, part: Option<&str>) -> Request {
+            let _ = self;
+            Request::Attach {
+                item: item.to_string(),
+                part: part.map(str::to_string),
+            }
+        }
+
+        fn sim_attached(&mut self, item: &Item, point: u8) -> bool {
+            self.grid.attached.push((item.id, point));
+            self.commands.attached(item.id, point, Some(&mut self.grid), self.now)
+        }
+
+        fn sim_detached(&mut self, item: &Item) -> bool {
+            self.grid.attached.retain(|(id, _)| *id != item.id);
+            self.commands.detached(item.id, Some(&mut self.grid), self.now)
+        }
+
+        fn inventory(&mut self, args: &[&str]) -> Receiver<Response> {
+            self.command(Request::Inventory(Rig::words(args)))
+        }
+    }
+
+    fn not_answered(answer: &Receiver<Response>) {
+        assert!(answer.try_recv().is_err(), "answered too early");
+    }
+
+    #[test]
+    fn inventory_is_listed_when_the_worker_has_answered() {
+        let mut rig = Rig::new();
+        let answer = rig.inventory(&[]);
+        not_answered(&answer);
+        // The whole of My Inventory, with 50 s for the grid.
+        assert_eq!(rig.grid.jobs[0].1, rig.now + inventory::LIMIT);
+        let (id, what) = rig.job();
+        assert_eq!(
+            what,
+            What::List {
+                folder: path(&[]),
+                recursive: true
+            }
+        );
+        rig.grid.attached = vec![(radio().id, 6)];
+        let entries = vec![entry(&radio(), "Objects/Radio"), entry(&hat(), "Objects/Hat")];
+        rig.answer(id, Ok(Outcome::Listed(entries)));
+        let text = ok(&answer).unwrap();
+        // In the order of the paths; the attached one where it is now.
+        assert_eq!(
+            text,
+            format!(
+                "{}\tobject\tSkull\t-\tObjects/Hat\n{}\tobject\tRight Hand\tattached\tObjects/Radio",
+                hat().id,
+                radio().id
+            )
+        );
+        assert_eq!(rig.calls(), []);
+        assert!(!rig.commands.take_manual());
+        assert_eq!(rig.commands.next_deadline(), None);
+    }
+
+    #[test]
+    fn inventory_passes_its_folder_and_filters_on() {
+        let mut rig = Rig::new();
+        let answer = rig.inventory(&["-n", "Objects/Bot gear", "-a"]);
+        let (id, what) = rig.job();
+        assert_eq!(
+            what,
+            What::List {
+                folder: path(&["Objects", "Bot gear"]),
+                recursive: false
+            }
+        );
+        rig.grid.attached = vec![(radio().id, 5)];
+        let entries = vec![entry(&radio(), "Objects/Bot gear/Radio"), entry(&hat(), "Objects/Bot gear/Hat")];
+        rig.answer(id, Ok(Outcome::Listed(entries.clone())));
+        // Only what is attached now.
+        let text = ok(&answer).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.ends_with("\tattached\tObjects/Bot gear/Radio"), "{text}");
+        // Nothing to list is success without text.
+        let answer = rig.inventory(&["-a", "Clothing"]);
+        let (id, _) = rig.job();
+        rig.answer(id, Ok(Outcome::Listed(vec![entry(&shirt(), "Clothing/Blue shirt")])));
+        assert_eq!(ok(&answer), None);
+        let answer = rig.inventory(&["Empty"]);
+        let (id, _) = rig.job();
+        rig.answer(id, Ok(Outcome::Listed(vec![])));
+        assert_eq!(ok(&answer), None);
+        // A folder by its id.
+        rig.inventory(&[&hat().id.to_string()]);
+        assert!(matches!(rig.job().1, What::List { folder: Ref::Id(id), recursive: true } if id == hat().id));
+    }
+
+    #[test]
+    fn inventory_is_refused_before_the_grid_is_asked() {
+        let mut rig = Rig::new();
+        assert!(error(&rig.inventory(&["-x"])).contains("`-x`"));
+        assert!(error(&rig.inventory(&["Objects", "Clothing"])).contains("one folder"));
+        assert_eq!(rig.grid.jobs.len(), 0);
+        // A simulator without the service.
+        rig.grid.no_inventory = true;
+        assert_eq!(error(&rig.inventory(&[])), inventory::NO_SERVICE);
+        assert_eq!(error(&rig.command(Request::Sound("Sounds/Bell".into()))), inventory::NO_SERVICE);
+        rig.grid.no_inventory = false;
+        // Not in a region: teleporting, logging out, or between logins.
+        rig.grid.offline = true;
+        assert_eq!(error(&rig.inventory(&[])), NOT_CONNECTED);
+        let (reply, answer) = mpsc::channel();
+        let request = Request::Inventory(vec![]);
+        rig.commands.handle(request, reply, None::<&mut FakeGrid>, rig.now);
+        assert_eq!(error(&answer), NOT_CONNECTED);
+        assert_eq!(rig.grid.jobs.len(), 0);
+        assert_eq!(rig.commands.next_deadline(), None);
+    }
+
+    #[test]
+    fn inventory_reports_what_the_worker_could_not_do() {
+        let mut rig = Rig::new();
+        let answer = rig.inventory(&["Nowhere"]);
+        let (id, _) = rig.job();
+        let reason = "no folder named \"Nowhere\" was found in My Inventory";
+        rig.answer(id, Err(Failed::Reason(reason.to_string())));
+        assert_eq!(error(&answer), reason);
+        // Too much to list in time: the error says what to do about it.
+        let answer = rig.inventory(&[]);
+        let (id, _) = rig.job();
+        rig.answer(id, Err(Failed::TimedOut));
+        let reason = error(&answer);
+        assert!(reason.contains("longer than 50 s") && reason.contains("name a folder"), "{reason}");
+        // A lookup that took too long names what was looked up.
+        let answer = rig.command(Request::Sound("Sounds/Bell".into()));
+        let (id, _) = rig.job();
+        rig.answer(id, Err(Failed::TimedOut));
+        let reason = error(&answer);
+        assert!(reason.contains("\"Sounds/Bell\"") && reason.contains("50 s"), "{reason}");
+    }
+
+    #[test]
+    fn a_listing_under_way_fails_with_the_session_or_the_simulator() {
+        let mut rig = Rig::new();
+        let lost = rig.inventory(&[]);
+        let (lost_id, _) = rig.job();
+        assert_eq!(rig.commands.next_deadline(), Some(rig.now + inventory::LIMIT + JOB_GRACE));
+        rig.commands.session_lost();
+        assert!(error(&lost).contains("session was lost"));
+        let moved = rig.inventory(&[]);
+        let (moved_id, _) = rig.job();
+        rig.commands.simulator_changed();
+        assert!(error(&moved).contains("changed simulator"));
+        assert_eq!(rig.commands.next_deadline(), None);
+        // The worker's answers for the dropped jobs come to nothing.
+        rig.answer(lost_id, Ok(Outcome::Listed(vec![])));
+        rig.answer(moved_id, Ok(Outcome::Found(radio())));
+        rig.answer(999, Err(Failed::TimedOut));
+        assert!(lost.try_recv().is_err() && moved.try_recv().is_err());
+        assert_eq!(rig.calls(), []);
+    }
+
+    #[test]
+    fn a_worker_that_never_answers_is_given_up_on() {
+        let mut rig = Rig::new();
+        let answer = rig.inventory(&[]);
+        let (id, _) = rig.job();
+        rig.commands.tick(rig.now + inventory::LIMIT);
+        not_answered(&answer);
+        rig.commands.tick(rig.now + inventory::LIMIT + JOB_GRACE);
+        assert!(error(&answer).contains("name a folder"));
+        rig.answer(id, Ok(Outcome::Listed(vec![])));
+        assert!(answer.try_recv().is_err());
+    }
+
+    // -------------------------------------------------------- attachments
+
+    #[test]
+    fn attach_puts_an_object_on_the_named_point() {
+        let mut rig = Rig::new();
+        let request = rig.attach("Objects/Radio", Some("Left Hand"));
+        let answer = rig.command(request);
+        let (id, what) = rig.job();
+        assert_eq!(what, What::Find(path(&["Objects", "Radio"])));
+        assert_eq!(rig.calls(), []);
+        rig.answer(id, Ok(Outcome::Found(radio())));
+        // The item as the inventory described it, for the simulator.
+        assert_eq!(rig.calls(), [Call::Attach(radio(), 5)]);
+        not_answered(&answer);
+        // Something else turning up is not the answer.
+        assert!(!rig.sim_attached(&hat(), 2));
+        not_answered(&answer);
+        assert!(rig.sim_attached(&radio(), 5));
+        let text = ok(&answer).unwrap();
+        assert!(
+            text.contains("\"Radio\"") && text.contains(&radio().id.to_string()) && text.ends_with("Left Hand"),
+            "{text}"
+        );
+        // Neither the command nor its outcome is a movement.
+        assert!(!rig.commands.take_manual());
+    }
+
+    #[test]
+    fn body_parts_are_read_by_name_and_number() {
+        let mut rig = Rig::new();
+        for (part, point) in [("left hand", 5), ("5", 5), ("HUD Center", 35), ("r upper arm", 18), ("127", 127)] {
+            let request = rig.attach("Objects/Radio", Some(part));
+            rig.with_item(request, &radio());
+            assert_eq!(rig.calls(), [Call::Attach(radio(), point)], "{part}");
+        }
+        // What is no attachment point is refused before the grid is asked.
+        for part in ["elbow", "Center", "0", "128"] {
+            let request = rig.attach("Objects/Radio", Some(part));
+            let reason = error(&rig.command(request));
+            assert!(
+                reason.contains(&format!("\"{part}\"")) && reason.contains("not an attachment point"),
+                "{reason}"
+            );
+        }
+        assert_eq!(rig.grid.jobs.len(), 0);
+        assert_eq!(rig.calls(), []);
+    }
+
+    #[test]
+    fn attach_without_a_body_part_leaves_the_point_to_the_simulator() {
+        let mut rig = Rig::new();
+        let request = rig.attach("Objects/Hat", None);
+        let answer = rig.with_item(request, &hat());
+        assert_eq!(rig.calls(), [Call::Attach(hat(), 0)]);
+        // The answer names the point the simulator shows it on.
+        assert!(rig.sim_attached(&hat(), 2));
+        assert!(ok(&answer).unwrap().ends_with("is attached to Skull"));
+        // By UUID.
+        let request = rig.attach(&radio().id.to_string(), None);
+        rig.command(request);
+        assert_eq!(rig.job().1, What::Find(Ref::Id(radio().id)));
+    }
+
+    #[test]
+    fn attach_adds_to_what_is_on_the_point() {
+        let mut rig = Rig::new();
+        rig.grid.attached = vec![(watch().id, 5)];
+        let request = rig.attach("Objects/Radio", Some("Left Hand"));
+        let answer = rig.with_item(request, &radio());
+        // The watch is not taken off to make room.
+        assert_eq!(rig.calls(), [Call::Attach(radio(), 5)]);
+        assert!(rig.sim_attached(&radio(), 5));
+        ok(&answer);
+        assert_eq!(rig.grid.attached, [(watch().id, 5), (radio().id, 5)]);
+    }
+
+    #[test]
+    fn attach_refuses_what_is_no_object_or_attached_already() {
+        let mut rig = Rig::new();
+        let request = rig.attach("Animations/Dance", None);
+        let reason = error(&rig.with_item(request, &dance()));
+        assert!(
+            reason.contains("\"Dance\"") && reason.contains("is an animation, not an object"),
+            "{reason}"
+        );
+        rig.grid.attached = vec![(radio().id, 5)];
+        let request = rig.attach("Objects/Radio", Some("Chest"));
+        let reason = error(&rig.with_item(request, &radio()));
+        assert!(
+            reason.contains("\"Radio\"") && reason.contains("attached to Left Hand already"),
+            "{reason}"
+        );
+        // An item that cannot be found.
+        let request = rig.attach("Objects/Dish", None);
+        let answer = rig.command(request);
+        let (id, _) = rig.job();
+        rig.answer(id, Err(Failed::Reason("no item named \"Dish\" was found in \"Objects\"".into())));
+        assert!(error(&answer).contains("\"Dish\""));
+        // Nothing went to the simulator for any of them.
+        assert_eq!(rig.calls(), []);
+        assert_eq!(rig.grid.attached, [(radio().id, 5)]);
+    }
+
+    #[test]
+    fn an_attach_the_simulator_does_not_carry_out_fails() {
+        let mut rig = Rig::new();
+        let request = rig.attach("Objects/Radio", None);
+        let answer = rig.with_item(request, &radio());
+        rig.commands.attach_failed(hat().id);
+        not_answered(&answer);
+        rig.commands.attach_failed(radio().id);
+        let reason = error(&answer);
+        assert!(reason.contains("did not attach \"Radio\"") && reason.contains("15 s"), "{reason}");
+        assert!(!reason.contains("it said"), "{reason}");
+        // What the simulator said meanwhile is likely the reason.
+        let request = rig.attach("Objects/Radio", None);
+        let answer = rig.with_item(request, &radio());
+        rig.commands.alert("Too many attachments");
+        rig.commands.attach_failed(radio().id);
+        assert!(error(&answer).ends_with("; it said: Too many attachments"));
+        // An alert while nothing is awaited is nobody's.
+        rig.commands.alert("Region restarting");
+        let request = rig.attach("Objects/Radio", None);
+        let answer = rig.with_item(request, &radio());
+        rig.commands.attach_failed(radio().id);
+        assert!(!error(&answer).contains("Region restarting"));
+        // The avatar left the region while the inventory was asked.
+        let request = rig.attach("Objects/Radio", None);
+        let answer = rig.command(request);
+        let (id, _) = rig.job();
+        rig.grid.offline = true;
+        rig.answer(id, Ok(Outcome::Found(radio())));
+        assert_eq!(error(&answer), NOT_CONNECTED);
+        // And with the session gone, the one waiting for the simulator.
+        rig.grid.offline = false;
+        let request = rig.attach("Objects/Radio", None);
+        let answer = rig.with_item(request, &radio());
+        rig.commands.session_lost();
+        assert!(error(&answer).contains("session was lost"));
+        assert!(!rig.commands.take_manual());
+    }
+
+    #[test]
+    fn wear_attaches_an_object_like_attach_without_a_body_part() {
+        let mut rig = Rig::new();
+        let answer = rig.with_item(Request::Wear("Objects/Hat".into()), &hat());
+        assert_eq!(rig.calls(), [Call::Attach(hat(), 0)]);
+        assert!(rig.sim_attached(&hat(), 2));
+        assert!(ok(&answer).unwrap().ends_with("is attached to Skull"));
+        // Also where the grid has no outfit service.
+        assert!(!rig.grid.outfit);
+        let reason = error(&rig.with_item(Request::Wear("Notecards/Readme".into()), &item("Readme", ASSET_NOTECARD, 0)));
+        assert!(reason.contains("\"Readme\"") && reason.contains("is a notecard"), "{reason}");
+        rig.grid.attached = vec![(hat().id, 2)];
+        assert!(error(&rig.with_item(Request::Wear("Objects/Hat".into()), &hat())).contains("attached to Skull already"));
+    }
+
+    #[test]
+    fn detach_takes_an_attached_item_off() {
+        let mut rig = Rig::new();
+        rig.grid.attached = vec![(radio().id, 5), (hat().id, 2)];
+        let answer = rig.with_item(Request::Detach("Objects/Radio".into()), &radio());
+        assert_eq!(rig.calls(), [Call::Detach(radio().id)]);
+        not_answered(&answer);
+        assert!(rig.sim_detached(&radio()));
+        let text = ok(&answer).unwrap();
+        assert!(
+            text.starts_with("detached \"Radio\"") && text.contains(&radio().id.to_string()),
+            "{text}"
+        );
+        // Something going by itself is nobody's command.
+        assert!(!rig.sim_detached(&hat()));
+        // An object that is not attached.
+        let reason = error(&rig.with_item(Request::Detach("Objects/Hat".into()), &hat()));
+        assert!(reason.contains("\"Hat\"") && reason.contains("is not attached"), "{reason}");
+        assert_eq!(rig.calls(), []);
+        assert!(!rig.commands.take_manual());
+    }
+
+    #[test]
+    fn detach_reads_a_uuid_then_a_point_then_a_path() {
+        let mut rig = Rig::new();
+        rig.grid.attached = vec![(radio().id, 1)];
+        rig.command(Request::Detach(radio().id.to_string()));
+        assert_eq!(rig.job().1, What::Find(Ref::Id(radio().id)));
+        // `Chest` is the point; `/Chest` an item of that name.
+        rig.command(Request::Detach("Chest".into()));
+        assert_eq!(rig.job().1, What::Items(vec![radio().id]));
+        rig.command(Request::Detach("/Chest".into()));
+        assert_eq!(rig.job().1, What::Find(path(&["Chest"])));
+        rig.command(Request::Detach("Objects/Radio".into()));
+        assert_eq!(rig.job().1, What::Find(path(&["Objects", "Radio"])));
+    }
+
+    #[test]
+    fn detach_takes_everything_off_a_point_and_answers_once() {
+        let mut rig = Rig::new();
+        rig.grid.attached = vec![(watch().id, 5), (hat().id, 2), (radio().id, 5)];
+        let answer = rig.command(Request::Detach("left hand".into()));
+        let (id, what) = rig.job();
+        assert_eq!(what, What::Items(vec![watch().id, radio().id]));
+        assert_eq!(rig.calls(), []);
+        rig.answer(id, Ok(Outcome::Items(vec![radio(), watch()])));
+        assert_eq!(rig.calls(), [Call::Detach(watch().id), Call::Detach(radio().id)]);
+        assert!(rig.sim_detached(&watch()));
+        not_answered(&answer);
+        assert!(rig.sim_detached(&radio()));
+        let text = ok(&answer).unwrap();
+        assert!(
+            text.contains("\"Watch\"") && text.contains("\"Radio\"") && !text.contains("Hat"),
+            "{text}"
+        );
+        assert_eq!(rig.grid.attached, [(hat().id, 2)]);
+
+        // Nothing on the point: refused, and nothing is asked or sent.
+        let reason = error(&rig.command(Request::Detach("Chest".into())));
+        assert_eq!(reason, "nothing is attached to Chest");
+        assert_eq!((rig.grid.jobs.len(), rig.calls().len()), (0, 0));
+
+        // One of two stays on: an error that says which went.
+        rig.grid.attached = vec![(watch().id, 5), (radio().id, 5)];
+        let answer = rig.command(Request::Detach("5".into()));
+        let (id, _) = rig.job();
+        // An item the inventory did not describe goes by its id.
+        rig.answer(id, Ok(Outcome::Items(vec![watch()])));
+        assert!(rig.sim_detached(&watch()));
+        rig.commands.detach_failed(radio().id);
+        let reason = error(&answer);
+        assert!(
+            reason.contains(&format!("did not detach {}", radio().id)) && reason.contains("; detached \"Watch\""),
+            "{reason}"
+        );
+
+        // It went by itself while the grid was asked for its name.
+        rig.grid.attached = vec![(hat().id, 2)];
+        let answer = rig.command(Request::Detach("Skull".into()));
+        let (id, _) = rig.job();
+        rig.grid.attached.clear();
+        rig.answer(id, Ok(Outcome::Items(vec![hat()])));
+        assert_eq!(error(&answer), "nothing is attached to Skull");
+        rig.calls();
+        // The names could not be had in time.
+        rig.grid.attached = vec![(hat().id, 2)];
+        let answer = rig.command(Request::Detach("Skull".into()));
+        let (id, _) = rig.job();
+        rig.answer(id, Err(Failed::TimedOut));
+        assert!(error(&answer).contains("what is attached to Skull"));
+        assert_eq!(rig.calls(), []);
+    }
+
+    #[test]
+    fn a_detach_the_simulator_does_not_carry_out_fails() {
+        let mut rig = Rig::new();
+        rig.grid.attached = vec![(radio().id, 5)];
+        let answer = rig.with_item(Request::Detach("Objects/Radio".into()), &radio());
+        rig.commands.detach_failed(radio().id);
+        let reason = error(&answer);
+        assert!(reason.contains("did not detach \"Radio\"") && reason.contains("15 s"), "{reason}");
+        let answer = rig.with_item(Request::Detach("Objects/Radio".into()), &radio());
+        rig.commands.session_lost();
+        assert!(error(&answer).contains("session was lost"));
+    }
+
+    #[test]
+    fn outfit_commands_need_the_avatar_in_a_region() {
+        let mut rig = Rig::new();
+        rig.grid.offline = true;
+        rig.grid.outfit = true;
+        rig.grid.attached = vec![(radio().id, 5)];
+        let attach = rig.attach("Objects/Radio", None);
+        let requests = [
+            attach,
+            Request::Wear("Objects/Radio".into()),
+            Request::Detach("Objects/Radio".into()),
+            Request::Detach("Left Hand".into()),
+            Request::Detach("shirt".into()),
+            Request::Anim {
+                stop: false,
+                item: "Animations/Dance".into(),
+            },
+            Request::Sound("Sounds/Bell".into()),
+        ];
+        for request in requests {
+            // With a session that is on its way out, and with none.
+            assert_eq!(error(&rig.command(request.clone())), NOT_CONNECTED, "{request:?}");
+            let (reply, answer) = mpsc::channel();
+            rig.commands.handle(request, reply, None::<&mut FakeGrid>, rig.now);
+            assert_eq!(error(&answer), NOT_CONNECTED);
+        }
+        assert_eq!((rig.grid.jobs.len(), rig.calls().len()), (0, 0));
+        assert!(!rig.commands.take_manual());
+    }
+
+    // ------------------------------------------------ animations and sounds
+
+    fn anim(stop: bool, item: &str) -> Request {
+        Request::Anim {
+            stop,
+            item: item.to_string(),
+        }
+    }
+
+    #[test]
+    fn anim_starts_and_stops_an_animation_by_its_asset() {
+        let mut rig = Rig::new();
+        let answer = rig.command(anim(false, "Animations/Dance"));
+        let (id, what) = rig.job();
+        assert_eq!(what, What::Find(path(&["Animations", "Dance"])));
+        rig.answer(id, Ok(Outcome::Found(dance())));
+        // The asset, not the inventory item; answered on hand-over.
+        assert_eq!(rig.calls(), [Call::Animate(dance().asset_id, true)]);
+        let text = ok(&answer).unwrap();
+        assert!(
+            text.starts_with("playing \"Dance\"") && text.contains(&dance().id.to_string()),
+            "{text}"
+        );
+        // Stopping answers the same whether or not it was playing.
+        let answer = rig.with_item(anim(true, &dance().id.to_string()), &dance());
+        assert_eq!(rig.calls(), [Call::Animate(dance().asset_id, false)]);
+        assert!(ok(&answer).unwrap().starts_with("stopped \"Dance\""));
+        assert!(!rig.commands.take_manual());
+    }
+
+    #[test]
+    fn anim_refuses_what_is_no_animation() {
+        let mut rig = Rig::new();
+        for stop in [false, true] {
+            let reason = error(&rig.with_item(anim(stop, "Objects/Radio"), &radio()));
+            assert!(
+                reason.contains("\"Radio\"") && reason.contains("is an object, not an animation"),
+                "{reason}"
+            );
+            // An item whose animation the inventory does not give.
+            let hidden = Item {
+                asset_id: Uuid::nil(),
+                ..dance()
+            };
+            let reason = error(&rig.with_item(anim(stop, "Animations/Dance"), &hidden));
+            assert!(reason.contains("does not give the bot the animation itself"), "{reason}");
+        }
+        let answer = rig.command(anim(false, "Animations/Jig"));
+        let (id, _) = rig.job();
+        rig.answer(id, Err(Failed::Reason("no item named \"Jig\" was found in \"Animations\"".into())));
+        assert!(error(&answer).contains("\"Jig\""));
+        assert_eq!(rig.calls(), []);
+        // The avatar left the region while the inventory was asked.
+        let answer = rig.command(anim(false, "Animations/Dance"));
+        let (id, _) = rig.job();
+        rig.grid.offline = true;
+        rig.answer(id, Ok(Outcome::Found(dance())));
+        assert_eq!(error(&answer), NOT_CONNECTED);
+        assert_eq!(rig.calls(), []);
+    }
+
+    #[test]
+    fn sound_plays_a_sound_by_its_asset() {
+        let mut rig = Rig::new();
+        let answer = rig.with_item(Request::Sound("Sounds/Bell".into()), &bell());
+        assert_eq!(rig.calls(), [Call::Sound(bell().asset_id)]);
+        assert!(ok(&answer).unwrap().starts_with("played \"Bell\""));
+        let reason = error(&rig.with_item(Request::Sound("Animations/Dance".into()), &dance()));
+        assert!(
+            reason.contains("\"Dance\"") && reason.contains("is an animation, not a sound"),
+            "{reason}"
+        );
+        let hidden = Item {
+            asset_id: Uuid::nil(),
+            ..bell()
+        };
+        let reason = error(&rig.with_item(Request::Sound("Sounds/Bell".into()), &hidden));
+        assert!(reason.contains("does not give the bot the sound itself"), "{reason}");
+        assert_eq!(rig.calls(), []);
+        assert!(!rig.commands.take_manual());
+    }
+
+    // ----------------------------------------------------------- clothing
+
+    #[test]
+    fn wear_puts_clothing_on_through_the_outfit_service() {
+        let mut rig = Rig::new();
+        rig.grid.outfit = true;
+        let answer = rig.with_item(Request::Wear("Clothing/Blue shirt".into()), &shirt());
+        // A second job for the same command, with the same deadline.
+        assert_eq!(rig.grid.jobs[0].1, rig.now + inventory::LIMIT);
+        let (id, what) = rig.job();
+        assert_eq!(what, What::Wear(shirt()));
+        not_answered(&answer);
+        rig.answer(id, Ok(Outcome::Outfit(vec![shirt()])));
+        let text = ok(&answer).unwrap();
+        assert!(text.starts_with("wearing \"Blue shirt\"") && text.ends_with("(shirt)"), "{text}");
+        // A body part goes the same way; the worker replaces the old one.
+        let skin = item("Tanned skin", ASSET_BODY_PART, 1);
+        let answer = rig.with_item(Request::Wear("Body Parts/Tanned skin".into()), &skin);
+        let (id, what) = rig.job();
+        assert_eq!(what, What::Wear(skin.clone()));
+        rig.answer(id, Ok(Outcome::Outfit(vec![skin])));
+        assert!(ok(&answer).unwrap().ends_with("(skin)"));
+        // The grid's refusal is the answer.
+        let answer = rig.with_item(Request::Wear("Clothing/Blue shirt".into()), &shirt());
+        let (id, _) = rig.job();
+        rig.answer(id, Err(Failed::Reason("\"Blue shirt\" is worn already".into())));
+        assert!(error(&answer).contains("worn already"));
+        let answer = rig.with_item(Request::Wear("Clothing/Blue shirt".into()), &shirt());
+        let (id, _) = rig.job();
+        rig.answer(id, Err(Failed::TimedOut));
+        assert!(error(&answer).contains("may or may not have changed"));
+        // Nothing of this goes to the simulator.
+        assert_eq!(rig.calls(), []);
+        assert!(!rig.commands.take_manual());
+    }
+
+    #[test]
+    fn clothing_is_refused_where_the_grid_leaves_the_appearance_to_the_viewer() {
+        let mut rig = Rig::new();
+        assert!(!rig.grid.outfit);
+        let skin = item("Tanned skin", ASSET_BODY_PART, 1);
+        for (request, found) in [
+            (Request::Wear("Clothing/Blue shirt".into()), shirt()),
+            (Request::Wear("Body Parts/Tanned skin".into()), skin),
+            (Request::Detach("Clothing/Blue shirt".into()), shirt()),
+        ] {
+            let reason = error(&rig.with_item(request, &found));
+            assert_eq!(reason, inventory::NO_OUTFIT_SERVICE);
+            // No job follows the lookup: nothing in the inventory changes.
+            assert_eq!(rig.grid.jobs.len(), 0);
+        }
+        assert_eq!(error(&rig.command(Request::Detach("shirt".into()))), inventory::NO_OUTFIT_SERVICE);
+        assert_eq!((rig.grid.jobs.len(), rig.calls().len()), (0, 0));
+    }
+
+    #[test]
+    fn unwear_takes_clothing_off_by_item_and_by_kind() {
+        let mut rig = Rig::new();
+        rig.grid.outfit = true;
+        let answer = rig.with_item(Request::Detach("Clothing/Blue shirt".into()), &shirt());
+        let (id, what) = rig.job();
+        assert_eq!(what, What::TakeOff(Clothes::Item(shirt())));
+        rig.answer(id, Ok(Outcome::Outfit(vec![shirt()])));
+        assert!(ok(&answer).unwrap().starts_with("took off \"Blue shirt\""));
+        // A kind of clothing: no lookup, the worker picks the pieces.
+        let answer = rig.command(Request::Detach("Shirt".into()));
+        let (id, what) = rig.job();
+        assert_eq!(what, What::TakeOff(Clothes::Kind(4)));
+        let white = item("White shirt", ASSET_CLOTHING, 4);
+        rig.answer(id, Ok(Outcome::Outfit(vec![shirt(), white])));
+        let text = ok(&answer).unwrap();
+        assert!(text.contains("\"Blue shirt\"") && text.contains("\"White shirt\""), "{text}");
+        // Nothing of the kind is worn.
+        let answer = rig.command(Request::Detach("pants".into()));
+        let (id, _) = rig.job();
+        rig.answer(id, Err(Failed::Reason("the avatar wears no pants".into())));
+        assert_eq!(error(&answer), "the avatar wears no pants");
+        assert_eq!(rig.calls(), []);
+    }
+
+    #[test]
+    fn body_parts_are_not_taken_off() {
+        // On any grid, and without asking it.
+        for outfit in [true, false] {
+            let mut rig = Rig::new();
+            rig.grid.outfit = outfit;
+            for kind in ["skin", "shape", "Hair", "eyes"] {
+                let reason = error(&rig.command(Request::Detach(kind.into())));
+                let kind = kind.to_lowercase();
+                assert!(reason.contains(&format!("{kind} can only be replaced, with `wear`")), "{reason}");
+            }
+            assert_eq!(rig.grid.jobs.len(), 0);
+            // A body part named as an item.
+            let skin = item("Tanned skin", ASSET_BODY_PART, 1);
+            let reason = error(&rig.with_item(Request::Detach("Body Parts/Tanned skin".into()), &skin));
+            assert!(
+                reason.contains("\"Tanned skin\"") && reason.contains("skin can only be replaced"),
+                "{reason}"
+            );
+            // Something that is neither attached nor worn.
+            let reason = error(&rig.with_item(Request::Detach("Animations/Dance".into()), &dance()));
+            assert!(reason.contains("is an animation, which is neither attached nor worn"), "{reason}");
+            assert_eq!((rig.grid.jobs.len(), rig.calls().len()), (0, 0));
+        }
+    }
+
+    #[test]
+    fn the_outfit_folder_follows_the_bots_own_attachments() {
+        let mut rig = Rig::new();
+        rig.grid.outfit = true;
+        let request = rig.attach("Objects/Radio", None);
+        let answer = rig.with_item(request, &radio());
+        assert!(rig.sim_attached(&radio(), 5));
+        // Answered at once; the folder is brought up to date afterwards.
+        ok(&answer);
+        let (link, what) = rig.job();
+        assert_eq!(what, What::Link(radio()));
+        // The grid refuses the change: logged, and the answer stands.
+        rig.answer(link, Err(Failed::Reason("the grid refused to add \"Radio\"".into())));
+        assert!(answer.try_recv().is_err());
+        // The same after a detach.
+        let answer = rig.with_item(Request::Detach("Objects/Radio".into()), &radio());
+        assert!(rig.sim_detached(&radio()));
+        ok(&answer);
+        let (unlink, what) = rig.job();
+        assert_eq!(what, What::Unlink(radio().id));
+        rig.answer(unlink, Ok(Outcome::Outfit(vec![])));
+        // What comes and goes without a command leaves the folder alone.
+        assert!(!rig.sim_attached(&hat(), 2));
+        assert!(!rig.sim_detached(&hat()));
+        assert_eq!(rig.grid.jobs.len(), 0);
+        // Nobody waits for the bookkeeping.
+        assert_eq!(rig.commands.next_deadline(), None);
+    }
+
+    #[test]
+    fn the_outfit_folder_is_left_alone_without_the_outfit_service() {
+        let mut rig = Rig::new();
+        assert!(!rig.grid.outfit);
+        let request = rig.attach("Objects/Radio", None);
+        let answer = rig.with_item(request, &radio());
+        assert!(rig.sim_attached(&radio(), 5));
+        ok(&answer);
+        let answer = rig.with_item(Request::Detach("Objects/Radio".into()), &radio());
+        assert!(rig.sim_detached(&radio()));
+        ok(&answer);
+        assert_eq!(rig.grid.jobs.len(), 0);
     }
 }

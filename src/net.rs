@@ -48,6 +48,12 @@ pub enum Event {
         query: Uuid,
         reason: String,
     },
+    /// What became of an inventory job.
+    Inventory {
+        id: u64,
+        generation: u64,
+        result: Result<crate::inventory::Outcome, crate::inventory::Failed>,
+    },
     /// A command from the control socket, to be answered on `reply`.
     Control {
         request: Request,

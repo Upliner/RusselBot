@@ -10,6 +10,7 @@ use uuid::Uuid;
 pub const START_PING_CHECK: MessageId = high(1);
 pub const COMPLETE_PING_CHECK: MessageId = high(2);
 pub const AGENT_UPDATE: MessageId = high(4);
+pub const AGENT_ANIMATION: MessageId = high(5);
 pub const AGENT_REQUEST_SIT: MessageId = high(6);
 pub const AGENT_SIT: MessageId = high(7);
 pub const OBJECT_UPDATE: MessageId = high(12);
@@ -43,9 +44,13 @@ pub const LOGOUT_REQUEST: MessageId = low(252);
 pub const LOGOUT_REPLY: MessageId = low(253);
 pub const IMPROVED_INSTANT_MESSAGE: MessageId = low(254);
 pub const RETRIEVE_INSTANT_MESSAGES: MessageId = low(255);
+pub const REZ_SINGLE_ATTACHMENT_FROM_INV: MessageId = low(395);
+pub const DETACH_ATTACHMENT_INTO_INV: MessageId = low(397);
 pub const MAP_NAME_REQUEST: MessageId = low(408);
 pub const MAP_BLOCK_REPLY: MessageId = low(409);
 pub const PACKET_ACK: MessageId = 0xFFFF_FFFB;
+/// Sent by the bot to play a sound, and by simulators when one plays.
+pub const SOUND_TRIGGER: MessageId = high(29);
 
 // Messages a real simulator sends that the bot ignores; listed so verbose
 // logging can name them.
@@ -55,7 +60,6 @@ pub const IMPROVED_TERSE_OBJECT_UPDATE: MessageId = high(15);
 pub const KILL_OBJECT: MessageId = high(16);
 pub const AVATAR_ANIMATION: MessageId = high(20);
 pub const CAMERA_CONSTRAINT: MessageId = high(22);
-pub const SOUND_TRIGGER: MessageId = high(29);
 pub const COARSE_LOCATION_UPDATE: MessageId = medium(6);
 pub const ATTACHED_SOUND: MessageId = medium(13);
 pub const VIEWER_EFFECT: MessageId = medium(17);
@@ -77,6 +81,7 @@ pub fn name(id: MessageId) -> String {
         START_PING_CHECK => "StartPingCheck",
         COMPLETE_PING_CHECK => "CompletePingCheck",
         AGENT_UPDATE => "AgentUpdate",
+        AGENT_ANIMATION => "AgentAnimation",
         AGENT_REQUEST_SIT => "AgentRequestSit",
         AGENT_SIT => "AgentSit",
         OBJECT_UPDATE => "ObjectUpdate",
@@ -109,6 +114,8 @@ pub fn name(id: MessageId) -> String {
         LOGOUT_REPLY => "LogoutReply",
         IMPROVED_INSTANT_MESSAGE => "ImprovedInstantMessage",
         RETRIEVE_INSTANT_MESSAGES => "RetrieveInstantMessages",
+        REZ_SINGLE_ATTACHMENT_FROM_INV => "RezSingleAttachmentFromInv",
+        DETACH_ATTACHMENT_INTO_INV => "DetachAttachmentIntoInv",
         MAP_NAME_REQUEST => "MapNameRequest",
         MAP_BLOCK_REPLY => "MapBlockReply",
         PACKET_ACK => "PacketAck",
@@ -438,6 +445,82 @@ pub fn request_multiple_objects(agent: &Agent, local_ids: &[u32]) -> Outgoing {
     writer.finish(REQUEST_MULTIPLE_OBJECTS, true)
 }
 
+/// RezSingleAttachmentFromInv's AttachmentPt: do not take off what is on
+/// the point already (ATTACHMENT_ADD, indra_constants.h:194).
+pub const ATTACHMENT_ADD: u8 = 0x80;
+
+/// What RezSingleAttachmentFromInv says about the inventory item besides
+/// its id: the fields the simulator would otherwise have to look up.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AttachItem {
+    pub item_id: Uuid,
+    pub owner_id: Uuid,
+    pub flags: u32,
+    pub group_mask: u32,
+    pub everyone_mask: u32,
+    pub next_owner_mask: u32,
+    pub name: String,
+    pub description: String,
+}
+
+/// RezSingleAttachmentFromInv, Low 395, Zerocoded: ItemID, OwnerID,
+/// AttachmentPt U8, ItemFlags U32, GroupMask U32, EveryoneMask U32,
+/// NextOwnerMask U32, Name Variable 1, Description Variable 1
+/// (message_template.msg:8611). `point` 0 leaves the choice to the
+/// simulator, which takes the point the item was last on; the add bit is
+/// always set, so nothing is taken off to make room.
+pub fn rez_single_attachment_from_inv(agent: &Agent, item: &AttachItem, point: u8) -> Outgoing {
+    Writer::agent(agent)
+        .uuid(item.item_id)
+        .uuid(item.owner_id)
+        .u8(point | ATTACHMENT_ADD)
+        .u32(item.flags)
+        .u32(item.group_mask)
+        .u32(item.everyone_mask)
+        .u32(item.next_owner_mask)
+        .text1(&item.name)
+        .text1(&item.description)
+        .finish(REZ_SINGLE_ATTACHMENT_FROM_INV, true)
+}
+
+/// DetachAttachmentIntoInv, Low 397: AgentID, ItemID
+/// (message_template.msg:8660). There is no session id in this one.
+pub fn detach_attachment_into_inv(agent: &Agent, item: Uuid) -> Outgoing {
+    Writer::default()
+        .uuid(agent.agent_id)
+        .uuid(item)
+        .finish(DETACH_ATTACHMENT_INTO_INV, false)
+}
+
+/// AgentAnimation, High 5: AnimationList Variable { AnimID LLUUID,
+/// StartAnim BOOL }, PhysicalAvatarEventList Variable
+/// (message_template.msg:1706). `animation` is the asset's id; `start`
+/// false stops it.
+pub fn agent_animation(agent: &Agent, animation: Uuid, start: bool) -> Outgoing {
+    Writer::agent(agent)
+        .u8(1) // AnimationList block count
+        .uuid(animation)
+        .u8(u8::from(start))
+        .u8(0) // PhysicalAvatarEventList block count
+        .finish(AGENT_ANIMATION, false)
+}
+
+/// SoundTrigger, High 29: SoundID, OwnerID, ObjectID, ParentID, Handle
+/// U64, Position LLVector3, Gain F32 (message_template.msg:7368). A viewer
+/// leaves the three ids after the sound's null; the simulator fills them
+/// in (llviewermessage.cpp:718-742).
+pub fn sound_trigger(sound: Uuid, region_handle: u64, position: Vector3, gain: f32) -> Outgoing {
+    Writer::default()
+        .uuid(sound)
+        .uuid(Uuid::nil()) // OwnerID
+        .uuid(Uuid::nil()) // ObjectID
+        .uuid(Uuid::nil()) // ParentID
+        .u64(region_handle)
+        .vector3(position)
+        .f32(gain)
+        .finish(SOUND_TRIGGER, false)
+}
+
 // ---------------------------------------------------------------- incoming
 
 #[derive(Debug, PartialEq)]
@@ -496,6 +579,19 @@ impl<'a> Reader<'a> {
     }
     fn variable2(&mut self) -> Decoded<&'a [u8]> {
         let len = usize::from(self.u16()?);
+        self.bytes(len)
+    }
+    /// A string that ends with a NUL, as data packers write one; without
+    /// the NUL.
+    fn cstring(&mut self) -> Decoded<&'a [u8]> {
+        let len = self.0.iter().position(|byte| *byte == 0).ok_or(DecodeError)?;
+        let string = self.bytes(len)?;
+        self.skip(1)?;
+        Ok(string)
+    }
+    /// Binary data as data packers write it: a 32-bit length, then the data.
+    fn binary(&mut self) -> Decoded<&'a [u8]> {
+        let len = usize::try_from(self.u32()?).map_err(|_| DecodeError)?;
         self.bytes(len)
     }
 }
@@ -559,6 +655,28 @@ pub struct ObjectParent {
     pub parent_id: u32,
     /// Missing when the update carries it in a form the bot does not read.
     pub transform: Option<Transform>,
+    /// For an attachment, the point it is on, with the nibbles swapped.
+    pub state: u8,
+    /// The inventory item an attachment was made from: the name-value
+    /// `AttachItemID` of its root prim.
+    pub attach_item: Option<Uuid>,
+}
+
+impl ObjectParent {
+    /// The attachment point in `State`; meaningful for an attachment.
+    pub fn attachment_point(&self) -> u8 {
+        attachment_point(self.state)
+    }
+}
+
+/// What a compressed update says about an attachment's root prim.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Worn {
+    /// The inventory item it was made from.
+    pub item: Uuid,
+    /// Region-local id of what it is attached to.
+    pub parent_id: u32,
+    pub point: u8,
 }
 
 /// One object from an ObjectUpdateCompressed.
@@ -567,6 +685,27 @@ pub struct CompressedObject {
     pub full_id: Uuid,
     pub local_id: u32,
     pub transform: Option<Transform>,
+    /// Set when the update names the inventory item the object was
+    /// attached from; missing also when its optional fields do not read.
+    pub attachment: Option<Worn>,
+}
+
+/// The attachment point in an object's `State`: the two nibbles swapped
+/// (ATTACHMENT_ID_FROM_STATE, indra_constants.h:386; OpenSim writes it the
+/// same way, LLClientView.cs:7393).
+pub fn attachment_point(state: u8) -> u8 {
+    state.rotate_left(4)
+}
+
+/// The inventory item named by `AttachItemID` in an object's name-values:
+/// lines of `Name TYPE CLASS SENDTO value`, of which an attachment's root
+/// prim has `AttachItemID STRING RW SV <uuid>` (llviewerobject.cpp:7589;
+/// LLClientView.cs:7380).
+fn attach_item(name_values: &[u8]) -> Option<Uuid> {
+    let list = text(name_values);
+    let line = list.lines().find(|line| line.split_whitespace().next() == Some("AttachItemID"))?;
+    let item = Uuid::parse_str(line.split_whitespace().last()?).ok()?;
+    (!item.is_nil()).then_some(item)
 }
 
 #[derive(Debug, PartialEq)]
@@ -728,7 +867,8 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
         // (llviewerobjectlist.cpp:538-540), then State U8, CRC U32,
         // Material U8, ClickAction U8, Scale LLVector3, Position LLVector3,
         // Rotation LLVector3 (llviewerobject.cpp:1719, 1778-1795), so the
-        // position is at offset 40 and the rotation at 52.
+        // position is at offset 40 and the rotation at 52. What follows
+        // the rotation is read by `compressed_attachment`.
         OBJECT_UPDATE_COMPRESSED => {
             r.skip(8 + 2)?;
             let count = r.u8()?;
@@ -739,12 +879,18 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
                 let (full_id, local_id) = (data.uuid()?, data.u32()?);
                 // Whatever is too short to hold them describes the object
                 // all the same.
-                let transform = data.skip(20).and_then(|()| Ok((data.vector3()?, data.vector3()?))).ok();
-                let transform = transform.and_then(|(position, rotation)| Transform::checked(position, unpack(rotation)));
+                let (transform, attachment) = match compressed_motion(&mut data) {
+                    Ok((state, position, rotation)) => (
+                        Transform::checked(position, unpack(rotation)),
+                        compressed_attachment(&mut data, state).unwrap_or(None),
+                    ),
+                    Err(_) => (None, None),
+                };
                 objects.push(CompressedObject {
                     full_id,
                     local_id,
                     transform,
+                    attachment,
                 });
             }
             Incoming::ObjectsCompressed(objects)
@@ -875,6 +1021,85 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
     })
 }
 
+/// The fixed fields of a compressed update after the local id: PCode U8,
+/// State U8, CRC U32, Material U8, ClickAction U8, Scale, Position,
+/// Rotation. Returns the state, the position and the rotation.
+fn compressed_motion(data: &mut Reader) -> Decoded<(u8, Vector3, Vector3)> {
+    data.skip(1)?;
+    let state = data.u8()?;
+    data.skip(4 + 1 + 1 + 12)?;
+    Ok((state, data.vector3()?, data.vector3()?))
+}
+
+// The flags of a compressed update that say which optional fields it has
+// (llviewerobject.cpp:1804-1942; OpenSim's CompressedFlags,
+// LLClientView.cs:7566).
+const COMPRESSED_SCRATCH_PAD: u32 = 0x01;
+const COMPRESSED_TREE: u32 = 0x02;
+const COMPRESSED_TEXT: u32 = 0x04;
+const COMPRESSED_PARTICLES: u32 = 0x08;
+const COMPRESSED_SOUND: u32 = 0x10;
+const COMPRESSED_PARENT: u32 = 0x20;
+const COMPRESSED_ANGULAR_VELOCITY: u32 = 0x80;
+const COMPRESSED_NAME_VALUES: u32 = 0x100;
+const COMPRESSED_MEDIA_URL: u32 = 0x200;
+/// The legacy particle system block: 68 bytes of system and 18 of
+/// particle data (llpartdata.cpp:42-50).
+const PARTICLE_BLOCK: usize = 86;
+
+/// Walks what follows the rotation in a compressed update, up to its
+/// name-values: the flags U32 and OwnerID, then, each only when its flag
+/// is set unless said otherwise: the angular velocity (0x80, LLVector3),
+/// ParentID (0x20, U32), a tree's species (0x02, U8) or else the scratch
+/// pad (0x01, a U32 and then binary data with its own length), the text
+/// (0x04, a string and four colour bytes), the media URL (0x200, a
+/// string), the particle system (0x08, 86 bytes), the extra parameters
+/// (always: a count U8, then per parameter a type U16 and binary data),
+/// the sound (0x10, 25 bytes) and the name-values (0x100, a string).
+/// Strings end with a NUL. Returns the attachment the name-values make of
+/// the object, if they do; an error when the data ends early, in which
+/// case nothing is made of what was read.
+fn compressed_attachment(data: &mut Reader, state: u8) -> Decoded<Option<Worn>> {
+    let flags = data.u32()?;
+    data.skip(16)?; // OwnerID
+    if flags & COMPRESSED_ANGULAR_VELOCITY != 0 {
+        data.skip(12)?;
+    }
+    let parent_id = if flags & COMPRESSED_PARENT != 0 { data.u32()? } else { 0 };
+    if flags & COMPRESSED_TREE != 0 {
+        data.skip(1)?;
+    } else if flags & COMPRESSED_SCRATCH_PAD != 0 {
+        data.skip(4)?;
+        data.binary()?;
+    }
+    if flags & COMPRESSED_TEXT != 0 {
+        data.cstring()?;
+        data.skip(4)?;
+    }
+    if flags & COMPRESSED_MEDIA_URL != 0 {
+        data.cstring()?;
+    }
+    if flags & COMPRESSED_PARTICLES != 0 {
+        data.skip(PARTICLE_BLOCK)?;
+    }
+    for _ in 0..data.u8()? {
+        data.skip(2)?;
+        data.binary()?;
+    }
+    if flags & COMPRESSED_SOUND != 0 {
+        data.skip(16 + 4 + 1 + 4)?;
+    }
+    if flags & COMPRESSED_NAME_VALUES == 0 {
+        return Ok(None);
+    }
+    let item = attach_item(data.cstring()?);
+    Ok(item.map(|item| Worn {
+        item,
+        parent_id,
+        point: attachment_point(state),
+    }))
+}
+
 /// A rotation sent as the x, y and z of a unit quaternion whose w is not
 /// negative (LLQuaternion::unpackFromVector3, llquaternion.cpp:943).
 fn unpack(rotation: Vector3) -> Quaternion {
@@ -902,15 +1127,16 @@ fn transform_from_motion(data: &[u8]) -> Option<Transform> {
 }
 
 /// ObjectUpdate, High 12: RegionHandle U64, TimeDilation U16, then
-/// ObjectData Variable. Each block is read up to ParentID and the rest is
-/// skipped by its length prefixes to reach the next block.
+/// ObjectData Variable. Each block is read up to ParentID, its NameValue
+/// field is looked at, and the rest is skipped by its length prefixes to
+/// reach the next block.
 fn decode_object_update(r: &mut Reader) -> Decoded<Vec<ObjectParent>> {
     r.skip(8 + 2)?;
     let count = r.u8()?;
     let mut objects = Vec::with_capacity(usize::from(count));
     for _ in 0..count {
         let local_id = r.u32()?;
-        r.skip(1)?; // State
+        let state = r.u8()?;
         let full_id = r.uuid()?;
         r.skip(4 + 1 + 1 + 1 + 12)?; // CRC, PCode, Material, ClickAction, Scale
         let transform = transform_from_motion(r.variable1()?); // ObjectData
@@ -919,7 +1145,7 @@ fn decode_object_update(r: &mut Reader) -> Decoded<Vec<ObjectParent>> {
         r.skip(23)?; // PathCurve .. ProfileHollow
         r.variable2()?; // TextureEntry
         r.variable1()?; // TextureAnim
-        r.variable2()?; // NameValue
+        let attach_item = attach_item(r.variable2()?); // NameValue
         r.variable2()?; // Data
         r.variable1()?; // Text
         r.skip(4)?; // TextColor
@@ -933,6 +1159,8 @@ fn decode_object_update(r: &mut Reader) -> Decoded<Vec<ObjectParent>> {
             local_id,
             parent_id,
             transform,
+            state,
+            attach_item,
         });
     }
     Ok(objects)
@@ -1176,6 +1404,134 @@ pub mod testing {
         pub parent_id: u32,
         /// The ObjectData field.
         pub data: Vec<u8>,
+        /// For an attachment: the point it is on and its NameValue field.
+        pub worn: Option<(u8, String)>,
+    }
+
+    /// The name-value an attachment's root prim carries.
+    pub fn attach_item_id(item: Uuid) -> String {
+        format!("AttachItemID STRING RW SV {item}")
+    }
+
+    /// An attachment's root prim in a full update, with a motion.
+    pub fn attachment_block(full_id: Uuid, local_id: u32, parent_id: u32, point: u8, item: Uuid) -> Block {
+        Block {
+            full_id,
+            local_id,
+            parent_id,
+            data: object_data([0.1, 0.0, 0.2], [0.0; 3], false),
+            worn: Some((point, attach_item_id(item))),
+        }
+    }
+
+    /// The optional fields of a compressed update.
+    #[derive(Default)]
+    pub struct Compressed {
+        pub state: u8,
+        pub angular_velocity: bool,
+        pub parent_id: Option<u32>,
+        pub tree: bool,
+        pub scratch_pad: Option<Vec<u8>>,
+        pub text: Option<String>,
+        pub media_url: Option<String>,
+        pub particles: bool,
+        /// The data of each extra parameter.
+        pub extra_params: Vec<Vec<u8>>,
+        pub sound: bool,
+        pub name_values: Option<String>,
+    }
+
+    impl Compressed {
+        /// An attachment's root prim: a parent, and the item in the
+        /// name-values.
+        pub fn attachment(parent_id: u32, point: u8, item: Uuid) -> Compressed {
+            Compressed {
+                state: point.rotate_left(4),
+                parent_id: Some(parent_id),
+                name_values: Some(attach_item_id(item)),
+                ..Compressed::default()
+            }
+        }
+    }
+
+    fn cstring(text: &str) -> Vec<u8> {
+        [text.as_bytes(), &[0]].concat()
+    }
+
+    fn binary(data: &[u8]) -> Vec<u8> {
+        [&(data.len() as u32).to_le_bytes()[..], data].concat()
+    }
+
+    /// The Data field of one compressed block, laid out field by field
+    /// from llviewerobject.cpp:1783-1942, with 23 bytes of what follows the
+    /// name-values (the volume) at the end.
+    pub fn compressed_data(full_id: Uuid, local_id: u32, fields: &Compressed) -> Vec<u8> {
+        let mut data = full_id.as_bytes().to_vec();
+        data.extend(local_id.to_le_bytes());
+        data.push(9); // PCode
+        data.push(fields.state);
+        data.extend([0x99; 4 + 1 + 1 + 12]); // CRC, Material, ClickAction, Scale
+        data.extend(vector([1.0, 2.0, 3.0]));
+        data.extend(vector([0.0; 3]));
+        let flag = |set: bool, bit: u32| if set { bit } else { 0 };
+        let flags = flag(fields.scratch_pad.is_some() && !fields.tree, 0x01)
+            | flag(fields.tree, 0x02)
+            | flag(fields.text.is_some(), 0x04)
+            | flag(fields.particles, 0x08)
+            | flag(fields.sound, 0x10)
+            | flag(fields.parent_id.is_some(), 0x20)
+            | flag(fields.angular_velocity, 0x80)
+            | flag(fields.name_values.is_some(), 0x100)
+            | flag(fields.media_url.is_some(), 0x200);
+        data.extend(flags.to_le_bytes());
+        data.extend([0x0E; 16]); // OwnerID
+        if fields.angular_velocity {
+            data.extend([0xA0; 12]);
+        }
+        if let Some(parent_id) = fields.parent_id {
+            data.extend(parent_id.to_le_bytes());
+        }
+        if fields.tree {
+            data.push(0x7E);
+        } else if let Some(pad) = &fields.scratch_pad {
+            data.extend((pad.len() as u32).to_le_bytes());
+            data.extend(binary(pad));
+        }
+        if let Some(text) = &fields.text {
+            data.extend(cstring(text));
+            data.extend([0xC0; 4]);
+        }
+        if let Some(url) = &fields.media_url {
+            data.extend(cstring(url));
+        }
+        if fields.particles {
+            data.extend([0xFA; 86]);
+        }
+        data.push(fields.extra_params.len() as u8);
+        for (index, param) in fields.extra_params.iter().enumerate() {
+            data.extend((0x10 * (index as u16 + 1)).to_le_bytes());
+            data.extend(binary(param));
+        }
+        if fields.sound {
+            data.extend([0x50; 16 + 4 + 1 + 4]);
+        }
+        if let Some(names) = &fields.name_values {
+            data.extend(cstring(names));
+        }
+        data.extend([0x11; 23]);
+        data
+    }
+
+    /// An ObjectUpdateCompressed made of `compressed_data` blocks.
+    pub fn object_update_compressed_blocks(blocks: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = vec![0; 8 + 2];
+        body.push(blocks.len() as u8);
+        for data in blocks {
+            body.extend([0xEF; 4]); // UpdateFlags
+            body.extend((data.len() as u16).to_le_bytes());
+            body.extend(data);
+        }
+        body
     }
 
     /// An ObjectData field in full precision: 60 bytes, or 76 for an
@@ -1200,6 +1556,7 @@ pub mod testing {
                 local_id: index as u32 + 100,
                 parent_id: *parent_id,
                 data: vec![0xCD; 32],
+                worn: None,
             })
             .collect();
         object_blocks(&blocks)
@@ -1217,12 +1574,18 @@ pub mod testing {
                 local_id,
                 parent_id,
                 data,
+                worn,
             },
         ) in objects.iter().enumerate()
         {
             let pad = index + 1;
+            // Filler where the object is no attachment, as before.
+            let (state, name_value) = match worn {
+                Some((point, names)) => (point.rotate_left(4), [names.as_bytes(), &[0]].concat()),
+                None => (0, vec![0x33; pad * 20]),
+            };
             body.extend(local_id.to_le_bytes()); // ID
-            body.push(0); // State
+            body.push(state);
             body.extend(full_id.as_bytes());
             body.extend([0xAB; 4 + 1 + 1 + 1 + 12]);
             body.push(data.len() as u8); // ObjectData
@@ -1233,8 +1596,8 @@ pub mod testing {
             body.extend((pad as u16 * 7).to_le_bytes()); // TextureEntry
             body.extend(vec![0x22; pad * 7]);
             body.push(0); // TextureAnim
-            body.extend((pad as u16 * 20).to_le_bytes()); // NameValue
-            body.extend(vec![0x33; pad * 20]);
+            body.extend((name_value.len() as u16).to_le_bytes()); // NameValue
+            body.extend(name_value);
             body.extend(0u16.to_le_bytes()); // Data
             body.push(pad as u8); // Text
             body.extend(vec![0x44; pad]);
@@ -1429,6 +1792,80 @@ mod tests {
     }
 
     #[test]
+    fn encodes_rez_single_attachment_from_inv() {
+        let item = AttachItem {
+            item_id: Uuid::from_bytes([0x17; 16]),
+            owner_id: Uuid::from_bytes([0xA1; 16]),
+            flags: 0x0000_0105,
+            group_mask: 0x0102_0304,
+            everyone_mask: 0x0008_0000,
+            next_owner_mask: 0x7FFF_FFFF,
+            name: "Radio".into(),
+            description: "plays".into(),
+        };
+        let msg = rez_single_attachment_from_inv(&agent(), &item, 5);
+        assert_eq!((msg.id, msg.zerocoded), (low(395), true));
+        let expected = [
+            agent_prefix(),
+            vec![0x17; 16],
+            vec![0xA1; 16],
+            vec![0x85], // left hand, with the add bit
+            vec![5, 1, 0, 0],
+            vec![4, 3, 2, 1],
+            vec![0, 0, 8, 0],
+            vec![0xFF, 0xFF, 0xFF, 0x7F],
+            vec![6],
+            b"Radio\0".to_vec(),
+            vec![6],
+            b"plays\0".to_vec(),
+        ]
+        .concat();
+        assert_eq!(msg.body, expected);
+        // Without a point the simulator chooses, and still adds.
+        let msg = rez_single_attachment_from_inv(&agent(), &item, 0);
+        assert_eq!(msg.body[64], 0x80);
+        // An empty description is a lone NUL.
+        let bare = AttachItem {
+            name: "x".into(),
+            ..AttachItem::default()
+        };
+        let msg = rez_single_attachment_from_inv(&agent(), &bare, 1);
+        assert_eq!(msg.body[64 + 1 + 16..], [2, b'x', 0, 1, 0]);
+    }
+
+    #[test]
+    fn encodes_detach_attachment_into_inv() {
+        let msg = detach_attachment_into_inv(&agent(), Uuid::from_bytes([0x17; 16]));
+        assert_eq!((msg.id, msg.zerocoded), (low(397), false));
+        // The agent id and the item id, and no session id.
+        assert_eq!(msg.body, [vec![0xA1; 16], vec![0x17; 16]].concat());
+    }
+
+    #[test]
+    fn encodes_agent_animation() {
+        let animation = Uuid::from_bytes([0x2A; 16]);
+        let start = agent_animation(&agent(), animation, true);
+        assert_eq!((start.id, start.zerocoded), (high(5), false));
+        assert_eq!(start.body, [agent_prefix(), vec![1], vec![0x2A; 16], vec![1], vec![0]].concat());
+        let stop = agent_animation(&agent(), animation, false);
+        assert_eq!(stop.body, [agent_prefix(), vec![1], vec![0x2A; 16], vec![0], vec![0]].concat());
+    }
+
+    #[test]
+    fn encodes_sound_trigger() {
+        let msg = sound_trigger(Uuid::from_bytes([0x50; 16]), 0x0003_E800_0003_E900, [1.0, 2.0, 3.0], 1.0);
+        assert_eq!((msg.id, msg.zerocoded), (high(29), false));
+        let expected = [
+            vec![0x50; 16],
+            vec![0; 48], // OwnerID, ObjectID, ParentID
+            vec![0, 0xE9, 3, 0, 0, 0xE8, 3, 0],
+            [1.0f32, 2.0, 3.0, 1.0].iter().flat_map(|f| f.to_le_bytes()).collect(),
+        ]
+        .concat();
+        assert_eq!(msg.body, expected);
+    }
+
+    #[test]
     fn decodes_the_other_object_messages() {
         let (a, b) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]));
         let body = object_update_compressed(&[(a, 500), (b, 501)]);
@@ -1436,6 +1873,7 @@ mod tests {
             full_id,
             local_id,
             transform: None,
+            attachment: None,
         };
         assert_eq!(
             decode(high(13), &body),
@@ -1673,19 +2111,25 @@ mod tests {
                     full_id: ids[0],
                     local_id: 100,
                     parent_id: 0,
-                    transform: None
+                    transform: None,
+                    state: 0,
+                    attach_item: None
                 },
                 ObjectParent {
                     full_id: ids[1],
                     local_id: 101,
                     parent_id: 4242,
-                    transform: None
+                    transform: None,
+                    state: 0,
+                    attach_item: None
                 },
                 ObjectParent {
                     full_id: ids[2],
                     local_id: 102,
                     parent_id: 77,
-                    transform: None
+                    transform: None,
+                    state: 0,
+                    attach_item: None
                 },
             ]))
         );
@@ -1711,12 +2155,14 @@ mod tests {
                 local_id: 7,
                 parent_id: 0,
                 data: object_data([131.0, 64.0, 23.0], QUARTER_TURN.0, false),
+                worn: None,
             },
             Block {
                 full_id: avatar,
                 local_id: 8,
                 parent_id: 7,
                 data: object_data([0.5, 0.0, 0.75], [0.0; 3], true),
+                worn: None,
             },
             // A quantized form: described, but without a motion.
             Block {
@@ -1724,6 +2170,7 @@ mod tests {
                 local_id: 9,
                 parent_id: 0,
                 data: vec![0x12; 32],
+                worn: None,
             },
         ]);
         let Ok(Incoming::ObjectUpdate(objects)) = decode(high(12), &body) else {
@@ -1780,6 +2227,282 @@ mod tests {
         assert_eq!(objects[1].transform.unwrap().position, [1.0, 2.0, 3.0]);
         // Cut inside the second block's data: an error, not a guess.
         assert_eq!(decode(high(13), &body[..body.len() - 20]), Err(DecodeError));
+    }
+
+    fn item() -> Uuid {
+        Uuid::from_bytes([0x17; 16])
+    }
+
+    #[test]
+    fn attachment_point_is_the_state_with_its_nibbles_swapped() {
+        assert_eq!(attachment_point(0x50), 5);
+        assert_eq!(attachment_point(0x10), 1);
+        // Points from 16 on spill into the low nibble.
+        assert_eq!(attachment_point(0xF1), 31);
+        assert_eq!(attachment_point(0x73), 55);
+        assert_eq!(attachment_point(0), 0);
+        for point in 0..=255u8 {
+            assert_eq!(attachment_point(point.rotate_left(4)), point);
+        }
+    }
+
+    #[test]
+    fn name_values_name_the_attached_item() {
+        let names = format!("AttachItemID STRING RW SV {}", item());
+        assert_eq!(attach_item(names.as_bytes()), Some(item()));
+        // With its NUL, and among other name-values.
+        let several = format!("AttachPt U32 RW S 5\n{names}\nAttachmentOffset VEC3 RW DS 0, 0, 0\0");
+        assert_eq!(attach_item(several.as_bytes()), Some(item()));
+        // An avatar's names, nothing at all, and things that only look alike.
+        assert_eq!(attach_item(b"FirstName STRING RW SV Sit\nLastName STRING RW SV Bot\0"), None);
+        assert_eq!(attach_item(b""), None);
+        assert_eq!(attach_item(b"AttachItemID STRING RW SV not-a-uuid"), None);
+        assert_eq!(attach_item(b"AttachItemID"), None);
+        assert_eq!(attach_item(format!("Title STRING RW SV AttachItemID {}", item()).as_bytes()), None);
+        assert_eq!(attach_item(format!("AttachItemID STRING RW SV {}", Uuid::nil()).as_bytes()), None);
+        assert_eq!(attach_item(&[0x33; 40]), None);
+    }
+
+    #[test]
+    fn object_update_tells_an_attachment_from_other_objects() {
+        let (hat, avatar, prim) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
+        let body = object_blocks(&[
+            attachment_block(hat, 30, 8, 2, item()),
+            Block {
+                full_id: avatar,
+                local_id: 8,
+                parent_id: 0,
+                data: object_data([1.0, 2.0, 3.0], [0.0; 3], true),
+                worn: None,
+            },
+            // A child prim of the attachment has no item of its own.
+            Block {
+                full_id: prim,
+                local_id: 31,
+                parent_id: 30,
+                data: object_data([0.0; 3], [0.0; 3], false),
+                worn: Some((2, String::new())),
+            },
+        ]);
+        let Ok(Incoming::ObjectUpdate(objects)) = decode(high(12), &body) else {
+            panic!("not an object update")
+        };
+        assert_eq!(
+            objects.iter().map(|o| (o.full_id, o.local_id, o.parent_id)).collect::<Vec<_>>(),
+            [(hat, 30, 8), (avatar, 8, 0), (prim, 31, 30)]
+        );
+        assert_eq!((objects[0].attach_item, objects[0].attachment_point()), (Some(item()), 2));
+        assert_eq!(objects[0].state, 0x20);
+        assert!(objects[0].transform.is_some());
+        assert_eq!((objects[1].attach_item, objects[1].state), (None, 0));
+        assert_eq!((objects[2].attach_item, objects[2].attachment_point()), (None, 2));
+        // Cut anywhere in the last block: an error, not a guess.
+        for cut in [1, 60, 150] {
+            assert_eq!(decode(high(12), &body[..body.len() - cut]), Err(DecodeError), "cut {cut}");
+        }
+    }
+
+    /// Decodes one compressed block and returns what it says of an
+    /// attachment.
+    fn worn(fields: &Compressed) -> Option<Worn> {
+        let body = object_update_compressed_blocks(&[compressed_data(Uuid::from_bytes([1; 16]), 500, fields)]);
+        let Ok(Incoming::ObjectsCompressed(objects)) = decode(high(13), &body) else {
+            panic!("not compressed")
+        };
+        assert_eq!((objects[0].full_id, objects[0].local_id), (Uuid::from_bytes([1; 16]), 500));
+        assert_eq!(objects[0].transform.unwrap().position, [1.0, 2.0, 3.0]);
+        objects[0].attachment
+    }
+
+    #[test]
+    fn compressed_update_tells_an_attachment_from_other_objects() {
+        let on_hand = Worn {
+            item: item(),
+            parent_id: 8,
+            point: 5,
+        };
+        assert_eq!(worn(&Compressed::attachment(8, 5, item())), Some(on_hand));
+        let hud = Compressed::attachment(8, 35, item());
+        assert_eq!(hud.state, 0x32);
+        assert_eq!(worn(&hud).map(|worn| worn.point), Some(35));
+        // No name-values, or name-values without the item.
+        assert_eq!(worn(&Compressed::default()), None);
+        let named = Compressed {
+            parent_id: Some(8),
+            name_values: Some("Title STRING RW SV Chair".into()),
+            ..Compressed::default()
+        };
+        assert_eq!(worn(&named), None);
+        // Without a parent the item is still read; it is on nothing.
+        let loose = Compressed {
+            name_values: Some(attach_item_id(item())),
+            ..Compressed::default()
+        };
+        assert_eq!(worn(&loose).map(|worn| worn.parent_id), Some(0));
+    }
+
+    #[test]
+    fn compressed_update_is_walked_past_every_optional_field() {
+        // Each optional field present by itself, and all of them at once:
+        // a wrong width anywhere loses the name-values at the end.
+        let attachment = || Compressed::attachment(8, 5, item());
+        let each: Vec<(&str, Compressed)> = vec![
+            (
+                "angular velocity",
+                Compressed {
+                    angular_velocity: true,
+                    ..attachment()
+                },
+            ),
+            (
+                "tree",
+                Compressed {
+                    tree: true,
+                    ..attachment()
+                },
+            ),
+            (
+                "scratch pad",
+                Compressed {
+                    scratch_pad: Some(vec![0x5C; 7]),
+                    ..attachment()
+                },
+            ),
+            (
+                "empty scratch pad",
+                Compressed {
+                    scratch_pad: Some(vec![]),
+                    ..attachment()
+                },
+            ),
+            // A tree's species takes the scratch pad's place.
+            (
+                "tree and scratch pad",
+                Compressed {
+                    tree: true,
+                    scratch_pad: Some(vec![1, 2]),
+                    ..attachment()
+                },
+            ),
+            (
+                "text",
+                Compressed {
+                    text: Some("hover".into()),
+                    ..attachment()
+                },
+            ),
+            (
+                "empty text",
+                Compressed {
+                    text: Some(String::new()),
+                    ..attachment()
+                },
+            ),
+            (
+                "media url",
+                Compressed {
+                    media_url: Some("http://example.com/".into()),
+                    ..attachment()
+                },
+            ),
+            (
+                "particles",
+                Compressed {
+                    particles: true,
+                    ..attachment()
+                },
+            ),
+            (
+                "one extra parameter",
+                Compressed {
+                    extra_params: vec![vec![0xE1; 4]],
+                    ..attachment()
+                },
+            ),
+            (
+                "extra parameters",
+                Compressed {
+                    extra_params: vec![vec![0xE1; 16], vec![], vec![0xE3; 17]],
+                    ..attachment()
+                },
+            ),
+            (
+                "sound",
+                Compressed {
+                    sound: true,
+                    ..attachment()
+                },
+            ),
+            (
+                "everything",
+                Compressed {
+                    angular_velocity: true,
+                    scratch_pad: Some(vec![0x5C; 3]),
+                    text: Some("hover".into()),
+                    media_url: Some("http://example.com/".into()),
+                    particles: true,
+                    extra_params: vec![vec![0xE1; 16], vec![0xE2; 2]],
+                    sound: true,
+                    ..attachment()
+                },
+            ),
+        ];
+        let expected = Some(Worn {
+            item: item(),
+            parent_id: 8,
+            point: 5,
+        });
+        for (what, fields) in &each {
+            assert_eq!(worn(fields), expected, "{what}");
+        }
+        // The same fields without a parent or name-values make no attachment.
+        for (what, fields) in each {
+            let plain = Compressed {
+                parent_id: None,
+                name_values: None,
+                ..fields
+            };
+            assert_eq!(worn(&plain), None, "{what}");
+        }
+    }
+
+    #[test]
+    fn truncated_compressed_data_describes_the_object_without_an_attachment() {
+        let full = compressed_data(
+            Uuid::from_bytes([1; 16]),
+            500,
+            &Compressed {
+                text: Some("hover".into()),
+                extra_params: vec![vec![0xE1; 16]],
+                ..Compressed::attachment(8, 5, item())
+            },
+        );
+        // Whole, it is an attachment.
+        let decoded = |data: &[u8]| {
+            let Ok(Incoming::ObjectsCompressed(objects)) = decode(high(13), &object_update_compressed_blocks(&[data.to_vec()])) else {
+                panic!("not compressed")
+            };
+            objects[0]
+        };
+        assert!(decoded(&full).attachment.is_some());
+        // The data ends inside the name-values, inside the extra parameters,
+        // inside the text, after the flags, before the flags: the object is
+        // known, by position where that is whole, and is no attachment.
+        let end = full.len() - 23;
+        for (cut, positioned) in [(end - 1, true), (end - 50, true), (90, true), (70, true), (62, false), (30, false)] {
+            let object = decoded(&full[..cut]);
+            assert_eq!((object.local_id, object.attachment), (500, None), "cut at {cut}");
+            assert_eq!(object.transform.is_some(), positioned, "cut at {cut}");
+        }
+        // A length that points past the end is not followed.
+        let mut bad = full.clone();
+        let params = 64 + 4 + 16 + 4 + 6 + 4;
+        assert_eq!(bad[params], 1, "the extra-parameter count");
+        bad[params + 3..params + 7].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(decoded(&bad).attachment, None);
+        // A message cut inside a block is still an error as a whole.
+        let body = object_update_compressed_blocks(&[full]);
+        assert_eq!(decode(high(13), &body[..body.len() - 5]), Err(DecodeError));
     }
 
     #[test]
