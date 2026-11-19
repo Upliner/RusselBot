@@ -4,10 +4,13 @@ use md5::{Digest, Md5};
 use serde::Deserialize;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
 
 pub const DEFAULT_LOGIN_URL: &str = "https://login.agni.lindenlab.com/cgi-bin/login.cgi";
 pub const DEFAULT_CONFIG_PATH: &str = "russelbot.toml";
+pub const DEFAULT_REQUESTTP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const MAX_SCAN_DISTANCE: f64 = 1024.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -26,6 +29,12 @@ pub struct Config {
     pub fetch_offline_im: bool,
     /// Listen on the control socket.
     pub socket: bool,
+    /// How long after a `requesttp` the asked avatar's teleport offer is
+    /// accepted without the operator.
+    pub requesttp_timeout: Duration,
+    /// How far around the avatar objects are learned from the start, in
+    /// metres; without it they are learned when first needed.
+    pub scan_distance: Option<f32>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -52,6 +61,8 @@ struct Raw {
     log_im: Option<toml::Value>,
     fetch_offline_im: Option<toml::Value>,
     socket: Option<toml::Value>,
+    requesttp_timeout: Option<toml::Value>,
+    scan_distance: Option<toml::Value>,
 }
 
 /// Hashes a plain password into the form grids accept: `$1$` + MD5 hex.
@@ -83,6 +94,15 @@ fn flag(value: Option<toml::Value>, key: &str) -> Result<bool, ConfigError> {
         None => Ok(false),
         Some(toml::Value::Boolean(on)) => Ok(on),
         Some(_) => err(format!("`{key}` must be true or false")),
+    }
+}
+
+/// A TOML integer or float.
+fn number(value: &toml::Value) -> Option<f64> {
+    match value {
+        toml::Value::Integer(n) => Some(*n as f64),
+        toml::Value::Float(n) => Some(*n),
+        _ => None,
     }
 }
 
@@ -162,6 +182,17 @@ impl Config {
         let log_im = log_path(raw.log_im, "log_im")?;
         let fetch_offline_im = flag(raw.fetch_offline_im, "fetch_offline_im")?;
         let socket = flag(raw.socket, "socket")?;
+        let requesttp_timeout = match raw.requesttp_timeout.as_ref().map(number) {
+            None => DEFAULT_REQUESTTP_TIMEOUT,
+            // Up to a year; beyond that the number is a mistake.
+            Some(Some(minutes)) if minutes > 0.0 && minutes <= 525_600.0 => Duration::from_secs_f64(minutes * 60.0),
+            Some(_) => return err("`requesttp_timeout` must be a number of minutes greater than zero"),
+        };
+        let scan_distance = match raw.scan_distance.as_ref().map(number) {
+            None => None,
+            Some(Some(metres)) if (1.0..=MAX_SCAN_DISTANCE).contains(&metres) => Some(metres as f32),
+            Some(_) => return err("`scan_distance` must be a number of metres from 1 to 1024"),
+        };
 
         Ok(Config {
             login_url,
@@ -175,6 +206,8 @@ impl Config {
             log_im,
             fetch_offline_im,
             socket,
+            requesttp_timeout,
+            scan_distance,
         })
     }
 }
@@ -305,6 +338,31 @@ mod tests {
         assert!(!Config::parse(&(base() + "socket = false\n")).unwrap().socket);
         assert!(Config::parse(&(base() + "socket = true\n")).unwrap().socket);
         assert!(rejected(&(base() + "socket = \"yes\"\n")).contains("`socket`"));
+    }
+
+    #[test]
+    fn teleport_request_timeout_is_ten_minutes_unless_configured() {
+        assert_eq!(Config::parse(&base()).unwrap().requesttp_timeout, Duration::from_secs(600));
+        let cfg = Config::parse(&(base() + "requesttp_timeout = 30\n")).unwrap();
+        assert_eq!(cfg.requesttp_timeout, Duration::from_secs(1800));
+        let cfg = Config::parse(&(base() + "requesttp_timeout = 0.5\n")).unwrap();
+        assert_eq!(cfg.requesttp_timeout, Duration::from_secs(30));
+        for bad in ["0", "-5", "\"soon\"", "true", "inf", "nan", "1e9"] {
+            let text = base() + &format!("requesttp_timeout = {bad}\n");
+            assert!(rejected(&text).contains("`requesttp_timeout`"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn scan_distance_is_optional_and_bounded() {
+        assert_eq!(Config::parse(&base()).unwrap().scan_distance, None);
+        assert_eq!(Config::parse(&(base() + "scan_distance = 64\n")).unwrap().scan_distance, Some(64.0));
+        assert_eq!(Config::parse(&(base() + "scan_distance = 1.5\n")).unwrap().scan_distance, Some(1.5));
+        assert_eq!(Config::parse(&(base() + "scan_distance = 1024\n")).unwrap().scan_distance, Some(1024.0));
+        for bad in ["0", "0.5", "5000", "-32", "\"far\"", "nan"] {
+            let text = base() + &format!("scan_distance = {bad}\n");
+            assert!(rejected(&text).contains("`scan_distance`"), "{bad}");
+        }
     }
 
     #[test]

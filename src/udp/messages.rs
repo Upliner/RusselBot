@@ -17,6 +17,12 @@ pub const AVATAR_SIT_RESPONSE: MessageId = high(21);
 pub const USE_CIRCUIT_CODE: MessageId = low(3);
 pub const AVATAR_PICKER_REQUEST: MessageId = low(26);
 pub const AVATAR_PICKER_REPLY: MessageId = low(28);
+pub const START_LURE: MessageId = low(70);
+pub const TELEPORT_LURE_REQUEST: MessageId = low(71);
+pub const OBJECT_GRAB: MessageId = low(117);
+pub const OBJECT_DEGRAB: MessageId = low(119);
+pub const REQUEST_MULTIPLE_OBJECTS: MessageId = medium(3);
+pub const OBJECT_UPDATE_COMPRESSED: MessageId = high(13);
 pub const TELEPORT_LOCATION_REQUEST: MessageId = low(63);
 pub const TELEPORT_LOCAL: MessageId = low(64);
 pub const TELEPORT_PROGRESS: MessageId = low(66);
@@ -78,6 +84,12 @@ pub fn name(id: MessageId) -> String {
         USE_CIRCUIT_CODE => "UseCircuitCode",
         AVATAR_PICKER_REQUEST => "AvatarPickerRequest",
         AVATAR_PICKER_REPLY => "AvatarPickerReply",
+        START_LURE => "StartLure",
+        TELEPORT_LURE_REQUEST => "TeleportLureRequest",
+        OBJECT_GRAB => "ObjectGrab",
+        OBJECT_DEGRAB => "ObjectDeGrab",
+        REQUEST_MULTIPLE_OBJECTS => "RequestMultipleObjects",
+        OBJECT_UPDATE_COMPRESSED => "ObjectUpdateCompressed",
         TELEPORT_LOCATION_REQUEST => "TeleportLocationRequest",
         TELEPORT_LOCAL => "TeleportLocal",
         TELEPORT_PROGRESS => "TeleportProgress",
@@ -243,8 +255,14 @@ pub fn agent_throttle(agent: &Agent, circuit_code: u32, throttles: [f32; 7]) -> 
         .finish(AGENT_THROTTLE, true)
 }
 
-/// AgentUpdate, High 4, Zerocoded: an idle avatar with a fixed camera.
-pub fn agent_update(agent: &Agent, camera: Vector3, far: f32) -> Outgoing {
+/// AgentUpdate control flag: stand up from whatever the avatar sits on.
+pub const CONTROL_STAND_UP: u32 = 1 << 16;
+/// AgentUpdate control flag: sit down on the ground.
+pub const CONTROL_SIT_ON_GROUND: u32 = 1 << 17;
+
+/// AgentUpdate, High 4, Zerocoded: an avatar with a fixed camera that does
+/// nothing but what `control_flags` say.
+pub fn agent_update(agent: &Agent, camera: Vector3, far: f32, control_flags: u32) -> Outgoing {
     Writer::agent(agent)
         .vector3([0.0; 3]) // BodyRotation: identity (x, y, z; w is implied)
         .vector3([0.0; 3]) // HeadRotation
@@ -254,7 +272,7 @@ pub fn agent_update(agent: &Agent, camera: Vector3, far: f32) -> Outgoing {
         .vector3([0.0, 1.0, 0.0]) // CameraLeftAxis
         .vector3([0.0, 0.0, 1.0]) // CameraUpAxis
         .f32(far)
-        .u32(0) // ControlFlags
+        .u32(control_flags)
         .u8(0) // Flags
         .finish(AGENT_UPDATE, true)
 }
@@ -321,11 +339,31 @@ pub fn chat_from_viewer(agent: &Agent, text: &str, chat_type: u8, channel: i32) 
     Writer::agent(agent).text2(text).u8(chat_type).i32(channel).finish(CHAT_FROM_VIEWER, true)
 }
 
-/// ImprovedInstantMessage, Low 254, Zerocoded: a plain instant message from
-/// the agent to another avatar. The conversation id is the two agent ids
-/// combined, which is how viewers pair a reply with the message.
-pub fn instant_message(agent: &Agent, from_name: &str, to: Uuid, position: Vector3, text: &str) -> Outgoing {
-    let conversation = Uuid::from_u128(agent.agent_id.as_u128() ^ to.as_u128());
+/// Instant-message dialog: an ordinary message.
+pub const IM_PLAIN: u8 = 0;
+/// Instant-message dialog: an offer to teleport the recipient to the sender.
+pub const IM_TELEPORT_OFFER: u8 = 22;
+/// Instant-message dialog: a request to be teleported to the recipient.
+pub const IM_TELEPORT_REQUEST: u8 = 26;
+/// TeleportFlags: the teleport answers an offer.
+const TELEPORT_VIA_LURE: u32 = 1 << 2;
+
+/// ImprovedInstantMessage, Low 254, Zerocoded: an instant message from the
+/// agent to another avatar. For a plain message the conversation id is the
+/// two agent ids combined, which is how viewers pair a reply with the
+/// message; other dialogs carry no id.
+pub fn instant_message(
+    agent: &Agent,
+    from_name: &str,
+    to: Uuid,
+    position: Vector3,
+    dialog: u8,
+    text: &str,
+) -> Outgoing {
+    let conversation = match dialog {
+        IM_PLAIN => Uuid::from_u128(agent.agent_id.as_u128() ^ to.as_u128()),
+        _ => Uuid::nil(),
+    };
     Writer::agent(agent)
         .u8(0) // FromGroup
         .uuid(to)
@@ -333,7 +371,7 @@ pub fn instant_message(agent: &Agent, from_name: &str, to: Uuid, position: Vecto
         .uuid(Uuid::nil()) // RegionID, filled in on the simulator
         .vector3(position)
         .u8(0) // Offline
-        .u8(0) // Dialog: nothing special
+        .u8(dialog)
         .uuid(conversation)
         .u32(0) // Timestamp
         .text1(from_name)
@@ -348,6 +386,52 @@ pub fn instant_message(agent: &Agent, from_name: &str, to: Uuid, position: Vecto
 /// the avatars whose names match `name`.
 pub fn avatar_picker_request(agent: &Agent, query: Uuid, name: &str) -> Outgoing {
     Writer::agent(agent).uuid(query).text1(name).finish(AVATAR_PICKER_REQUEST, false)
+}
+
+/// StartLure, Low 70: LureType U8, Message Variable 1, then the avatars
+/// offered a teleport to where the agent is.
+pub fn start_lure(agent: &Agent, message: &str, target: Uuid) -> Outgoing {
+    Writer::agent(agent)
+        .u8(0) // LureType
+        .text1(message)
+        .u8(1) // TargetData block count
+        .uuid(target)
+        .finish(START_LURE, false)
+}
+
+/// TeleportLureRequest, Low 71: accepts the teleport offer `lure`.
+pub fn teleport_lure_request(agent: &Agent, lure: Uuid) -> Outgoing {
+    Writer::agent(agent).uuid(lure).u32(TELEPORT_VIA_LURE).finish(TELEPORT_LURE_REQUEST, false)
+}
+
+/// ObjectGrab, Low 117, Zerocoded: LocalID U32, GrabOffset, then
+/// SurfaceInfo Variable. The press of a touch.
+pub fn object_grab(agent: &Agent, local_id: u32) -> Outgoing {
+    Writer::agent(agent)
+        .u32(local_id)
+        .vector3([0.0; 3]) // GrabOffset
+        .u8(0) // SurfaceInfo block count
+        .finish(OBJECT_GRAB, true)
+}
+
+/// ObjectDeGrab, Low 119: LocalID U32, then SurfaceInfo Variable. The
+/// release of a touch.
+pub fn object_degrab(agent: &Agent, local_id: u32) -> Outgoing {
+    Writer::agent(agent)
+        .u32(local_id)
+        .u8(0) // SurfaceInfo block count
+        .finish(OBJECT_DEGRAB, false)
+}
+
+/// RequestMultipleObjects, Medium 3, Zerocoded: ObjectData Variable
+/// { CacheMissType U8, ID U32 }. Asks for the full description of objects
+/// the simulator assumed to be cached. At most 255 ids fit in one message.
+pub fn request_multiple_objects(agent: &Agent, local_ids: &[u32]) -> Outgoing {
+    let mut writer = Writer::agent(agent).u8(local_ids.len() as u8);
+    for id in local_ids {
+        writer = writer.u8(0).u32(*id); // CacheMissType: full
+    }
+    writer.finish(REQUEST_MULTIPLE_OBJECTS, true)
 }
 
 // ---------------------------------------------------------------- incoming
@@ -431,6 +515,8 @@ pub struct MapBlock {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ObjectParent {
     pub full_id: Uuid,
+    /// Region-local id, which is what the simulator takes touches by.
+    pub local_id: u32,
     /// Region-local id of the parent; zero when the object has none.
     pub parent_id: u32,
 }
@@ -448,6 +534,12 @@ pub enum Incoming {
     TeleportLocal { position: Vector3 },
     AvatarSitResponse { object: Uuid, autopilot: bool },
     ObjectUpdate(Vec<ObjectParent>),
+    /// Objects described in the compressed form, as id and region-local id.
+    ObjectsCompressed(Vec<(Uuid, u32)>),
+    /// Region-local ids of objects the simulator assumes to be cached.
+    ObjectsCached(Vec<u32>),
+    /// Region-local ids of objects that are gone or out of view.
+    ObjectsKilled(Vec<u32>),
     KickUser { reason: String },
     /// Text the simulator wants shown to the user.
     Alert { message: String },
@@ -547,6 +639,37 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
             Incoming::AvatarSitResponse { object: r.uuid()?, autopilot: r.u8()? != 0 }
         }
         OBJECT_UPDATE => Incoming::ObjectUpdate(decode_object_update(&mut r)?),
+        // ObjectUpdateCompressed, High 13: RegionHandle U64, TimeDilation
+        // U16, then ObjectData Variable { UpdateFlags U32, Data Variable 2 };
+        // the data starts with the FullID and the local ID.
+        OBJECT_UPDATE_COMPRESSED => {
+            r.skip(8 + 2)?;
+            let count = r.u8()?;
+            let mut objects = Vec::with_capacity(usize::from(count));
+            for _ in 0..count {
+                r.skip(4)?;
+                let mut data = Reader(r.variable2()?);
+                objects.push((data.uuid()?, data.u32()?));
+            }
+            Incoming::ObjectsCompressed(objects)
+        }
+        // ObjectUpdateCached, High 14: RegionHandle U64, TimeDilation U16,
+        // then ObjectData Variable { ID U32, CRC U32, UpdateFlags U32 }.
+        OBJECT_UPDATE_CACHED => {
+            r.skip(8 + 2)?;
+            let count = r.u8()?;
+            let mut ids = Vec::with_capacity(usize::from(count));
+            for _ in 0..count {
+                ids.push(r.u32()?);
+                r.skip(4 + 4)?;
+            }
+            Incoming::ObjectsCached(ids)
+        }
+        // KillObject, High 16: ObjectData Variable { ID U32 }.
+        KILL_OBJECT => {
+            let count = r.u8()?;
+            Incoming::ObjectsKilled((0..count).map(|_| r.u32()).collect::<Decoded<_>>()?)
+        }
         // KickUser, Low 163: TargetIP IPADDR, TargetPort IPPORT, AgentID,
         // SessionID, Reason Variable 2.
         KICK_USER => {
@@ -625,7 +748,8 @@ fn decode_object_update(r: &mut Reader) -> Decoded<Vec<ObjectParent>> {
     let count = r.u8()?;
     let mut objects = Vec::with_capacity(usize::from(count));
     for _ in 0..count {
-        r.skip(4 + 1)?; // ID, State
+        let local_id = r.u32()?;
+        r.skip(1)?; // State
         let full_id = r.uuid()?;
         r.skip(4 + 1 + 1 + 1 + 12)?; // CRC, PCode, Material, ClickAction, Scale
         r.variable1()?; // ObjectData
@@ -643,7 +767,7 @@ fn decode_object_update(r: &mut Reader) -> Decoded<Vec<ObjectParent>> {
         r.variable1()?; // ExtraParams
         // Sound, OwnerID, Gain, Flags, Radius, JointType, JointPivot, JointAxisOrAnchor
         r.skip(16 + 16 + 4 + 1 + 4 + 1 + 12 + 12)?;
-        objects.push(ObjectParent { full_id, parent_id });
+        objects.push(ObjectParent { full_id, local_id, parent_id });
     }
     Ok(objects)
 }
@@ -803,7 +927,38 @@ pub mod testing {
         body
     }
 
-    /// Blocks are (FullID, ParentID); variable fields get assorted lengths so
+    /// Blocks are (FullID, local ID); the rest of each block's data is filler.
+    pub fn object_update_compressed(objects: &[(Uuid, u32)]) -> Vec<u8> {
+        let mut body = vec![0; 8 + 2];
+        body.push(objects.len() as u8);
+        for (full_id, local_id) in objects {
+            body.extend([0xEF; 4]); // UpdateFlags
+            body.extend(50u16.to_le_bytes());
+            body.extend(full_id.as_bytes());
+            body.extend(local_id.to_le_bytes());
+            body.extend([0x99; 30]); // PCode and what follows
+        }
+        body
+    }
+
+    pub fn object_update_cached(local_ids: &[u32]) -> Vec<u8> {
+        let mut body = vec![0; 8 + 2];
+        body.push(local_ids.len() as u8);
+        for id in local_ids {
+            body.extend(id.to_le_bytes());
+            body.extend([0xCC; 4 + 4]); // CRC, UpdateFlags
+        }
+        body
+    }
+
+    pub fn kill_object(local_ids: &[u32]) -> Vec<u8> {
+        let mut body = vec![local_ids.len() as u8];
+        body.extend(local_ids.iter().flat_map(|id| id.to_le_bytes()));
+        body
+    }
+
+    /// Blocks are (FullID, ParentID), with local ids counting up from 100;
+    /// variable fields get assorted lengths so
     /// a wrong skip misaligns the next block.
     pub fn object_update(objects: &[(Uuid, u32)]) -> Vec<u8> {
         let mut body = vec![0; 8 + 2];
@@ -885,7 +1040,7 @@ mod tests {
 
     #[test]
     fn encodes_agent_update() {
-        let msg = agent_update(&agent(), [10.0, 20.0, 30.0], 32.0);
+        let msg = agent_update(&agent(), [10.0, 20.0, 30.0], 32.0, 0);
         assert_eq!((msg.id, msg.zerocoded), (high(4), true));
         // AgentID, SessionID, two quaternions, State, four vectors, Far, ControlFlags, Flags.
         assert_eq!(msg.body.len(), 32 + 12 + 12 + 1 + 4 * 12 + 4 + 4 + 1);
@@ -893,6 +1048,11 @@ mod tests {
         assert_eq!(msg.body[57..61], 10.0f32.to_le_bytes());
         assert_eq!(msg.body[105..109], 32.0f32.to_le_bytes());
         assert_eq!(msg.body[109..], [0; 5]);
+        // The control flags sit between the draw distance and the flags.
+        let msg = agent_update(&agent(), [10.0, 20.0, 30.0], 32.0, CONTROL_STAND_UP);
+        assert_eq!(msg.body[109..], [0, 0, 1, 0, 0]);
+        let msg = agent_update(&agent(), [10.0, 20.0, 30.0], 32.0, CONTROL_SIT_ON_GROUND);
+        assert_eq!(msg.body[109..], [0, 0, 2, 0, 0]);
     }
 
     #[test]
@@ -927,7 +1087,7 @@ mod tests {
     #[test]
     fn encodes_instant_message() {
         let to = Uuid::from_bytes([0x0F; 16]);
-        let msg = instant_message(&agent(), "Sit Bot", to, [1.0, 2.0, 3.0], "hello");
+        let msg = instant_message(&agent(), "Sit Bot", to, [1.0, 2.0, 3.0], IM_PLAIN, "hello");
         assert_eq!((msg.id, msg.zerocoded), (low(254), true));
         let expected = [
             agent_prefix(),
@@ -953,6 +1113,61 @@ mod tests {
             panic!("not an instant message")
         };
         assert_eq!((from_agent, from_name.as_str(), dialog, text.as_str()), (agent().agent_id, "Sit Bot", 0, "hello"));
+    }
+
+    #[test]
+    fn teleport_request_is_an_instant_message_without_a_conversation() {
+        let to = Uuid::from_bytes([0x0F; 16]);
+        let msg = instant_message(&agent(), "Sit Bot", to, [0.0; 3], IM_TELEPORT_REQUEST, "may I?");
+        let Ok(Incoming::InstantMessage { dialog, id, text, .. }) = decode(msg.id, &msg.body) else {
+            panic!("not an instant message")
+        };
+        assert_eq!((dialog, id, text.as_str()), (26, Uuid::nil(), "may I?"));
+    }
+
+    #[test]
+    fn encodes_teleport_offers() {
+        let to = Uuid::from_bytes([0x0F; 16]);
+        let msg = start_lure(&agent(), "come", to);
+        assert_eq!((msg.id, msg.zerocoded), (low(70), false));
+        assert_eq!(msg.body, [agent_prefix(), vec![0, 5], b"come\0".to_vec(), vec![1], vec![0x0F; 16]].concat());
+
+        let msg = teleport_lure_request(&agent(), Uuid::from_bytes([0x44; 16]));
+        assert_eq!((msg.id, msg.zerocoded), (low(71), false));
+        assert_eq!(msg.body, [agent_prefix(), vec![0x44; 16], vec![4, 0, 0, 0]].concat());
+    }
+
+    #[test]
+    fn encodes_a_touch() {
+        let msg = object_grab(&agent(), 0x0403_0201);
+        assert_eq!((msg.id, msg.zerocoded), (low(117), true));
+        assert_eq!(msg.body, [agent_prefix(), vec![1, 2, 3, 4], vec![0; 12], vec![0]].concat());
+        let msg = object_degrab(&agent(), 0x0403_0201);
+        assert_eq!((msg.id, msg.zerocoded), (low(119), false));
+        assert_eq!(msg.body, [agent_prefix(), vec![1, 2, 3, 4], vec![0]].concat());
+    }
+
+    #[test]
+    fn encodes_request_multiple_objects() {
+        let msg = request_multiple_objects(&agent(), &[7, 0x0102]);
+        assert_eq!((msg.id, msg.zerocoded), (medium(3), true));
+        assert_eq!(msg.body, [agent_prefix(), vec![2, 0, 7, 0, 0, 0, 0, 2, 1, 0, 0]].concat());
+    }
+
+    #[test]
+    fn decodes_the_other_object_messages() {
+        let (a, b) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]));
+        let body = object_update_compressed(&[(a, 500), (b, 501)]);
+        assert_eq!(decode(high(13), &body), Ok(Incoming::ObjectsCompressed(vec![(a, 500), (b, 501)])));
+        assert_eq!(decode(high(13), &body[..body.len() - 40]), Err(DecodeError));
+
+        let body = object_update_cached(&[500, 501]);
+        assert_eq!(decode(high(14), &body), Ok(Incoming::ObjectsCached(vec![500, 501])));
+        assert_eq!(decode(high(14), &body[..body.len() - 1]), Err(DecodeError));
+
+        let body = kill_object(&[500, 501]);
+        assert_eq!(decode(high(16), &body), Ok(Incoming::ObjectsKilled(vec![500, 501])));
+        assert_eq!(decode(high(16), &body[..body.len() - 1]), Err(DecodeError));
     }
 
     #[test]
@@ -1156,9 +1371,9 @@ mod tests {
         assert_eq!(
             decode(high(12), &body),
             Ok(Incoming::ObjectUpdate(vec![
-                ObjectParent { full_id: ids[0], parent_id: 0 },
-                ObjectParent { full_id: ids[1], parent_id: 4242 },
-                ObjectParent { full_id: ids[2], parent_id: 77 },
+                ObjectParent { full_id: ids[0], local_id: 100, parent_id: 0 },
+                ObjectParent { full_id: ids[1], local_id: 101, parent_id: 4242 },
+                ObjectParent { full_id: ids[2], local_id: 102, parent_id: 77 },
             ]))
         );
     }

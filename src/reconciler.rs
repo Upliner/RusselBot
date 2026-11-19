@@ -65,6 +65,9 @@ pub struct Memory {
     sit_failures: u32,
     reposition: bool,
     fatal: Option<String>,
+    /// The operator placed the avatar by hand: stay connected, and leave
+    /// region and seat alone.
+    manual: bool,
 }
 
 pub fn same_region(a: &str, b: &str) -> bool {
@@ -78,8 +81,9 @@ fn gate(not_before: Option<Instant>, action: Action, now: Instant) -> Decision {
     }
 }
 
-/// Chooses the next step from the current state alone, by the first rule
-/// that applies: log in, teleport, sit, or nothing.
+/// Chooses the next step from the current state and the placement mode
+/// alone, by the first rule that applies: log in, nothing (manual mode),
+/// teleport, sit, or nothing.
 pub fn decide(observed: &Observed, memory: &Memory, target_region: &str, now: Instant) -> Decision {
     if let Some(message) = &memory.fatal {
         return Decision::Exit { code: 1, message: message.clone() };
@@ -88,9 +92,12 @@ pub fn decide(observed: &Observed, memory: &Memory, target_region: &str, now: In
         return Decision::Wait(None);
     }
     let Some(region) = &observed.region else {
-        let start = if memory.last_login_refused { Start::Last } else { Start::Target };
+        let start = if memory.last_login_refused || memory.manual { Start::Last } else { Start::Target };
         return gate(memory.next_login, Action::Login(start), now);
     };
+    if memory.manual {
+        return Decision::Wait(None);
+    }
     if !same_region(region, target_region) {
         return gate(memory.next_teleport, Action::Teleport, now);
     }
@@ -128,6 +135,7 @@ impl Reconciler {
                 sit_failures: 0,
                 reposition: false,
                 fatal: None,
+                manual: false,
             },
         }
     }
@@ -139,6 +147,32 @@ impl Reconciler {
     #[cfg(test)]
     pub fn observed(&self) -> &Observed {
         &self.observed
+    }
+
+    pub fn is_manual(&self) -> bool {
+        self.memory.manual
+    }
+
+    /// Switches between holding the configured place (the default) and
+    /// leaving the avatar where the operator put it. Going manual gives up
+    /// a teleport or sit of the bot's own without counting it as failed;
+    /// coming back starts the return at once.
+    pub fn set_manual(&mut self, manual: bool) {
+        self.memory.manual = manual;
+        if manual {
+            if matches!(self.memory.in_flight, Some(Action::Teleport | Action::Sit)) {
+                self.memory.in_flight = None;
+            }
+        } else {
+            // What happened to the avatar under the operator's hand says
+            // nothing about how well the bot's own attempts go.
+            self.memory.teleport.reset();
+            self.memory.sit.reset();
+            self.memory.next_teleport = None;
+            self.memory.next_sit = None;
+            self.memory.sit_failures = 0;
+            self.memory.reposition = false;
+        }
     }
 
     pub fn in_target_region(&self) -> bool {
@@ -387,6 +421,93 @@ mod tests {
         rec.region_entered("Elsewhere", now + secs(5));
         assert_eq!(rec.observed().seat, Seat::Unknown);
         assert_eq!(step(&mut rec, now + secs(5)), start(Action::Teleport));
+    }
+
+    // ------------------------------------------------------- manual mode
+
+    #[test]
+    fn manual_mode_leaves_region_and_seat_alone() {
+        let now = Instant::now();
+        let mut rec = seated(now);
+        rec.set_manual(true);
+        assert!(rec.is_manual());
+        assert_eq!(rec.standing(now + secs(1)), Some(secs(5)));
+        assert_eq!(rec.decide(now + secs(100)), Decision::Wait(None));
+        rec.region_entered("Elsewhere", now + secs(200));
+        assert_eq!(rec.decide(now + secs(200)), Decision::Wait(None));
+        assert_eq!(rec.decide(now + secs(4000)), Decision::Wait(None));
+    }
+
+    #[test]
+    fn kicked_in_manual_mode_logs_in_at_the_last_location_and_stays() {
+        let now = Instant::now();
+        let mut rec = seated(now);
+        rec.set_manual(true);
+        rec.region_entered("Elsewhere", now + secs(5));
+        let lost = now + secs(60);
+        assert_eq!(rec.session_lost(lost), secs(10));
+        assert_eq!(rec.decide(lost + secs(9)), Decision::Wait(Some(lost + secs(10))));
+        assert_eq!(step(&mut rec, lost + secs(10)), start(Action::Login(Start::Last)));
+        rec.login_accepted();
+        rec.region_entered("Elsewhere", lost + secs(11));
+        assert_eq!(rec.decide(lost + secs(11)), Decision::Wait(None));
+    }
+
+    #[test]
+    fn going_manual_gives_up_the_bots_own_sit_or_teleport() {
+        let now = Instant::now();
+        let mut rec = logged_in(TARGET, now);
+        assert_eq!(step(&mut rec, now), start(Action::Sit));
+        rec.set_manual(true);
+        // Not stuck waiting for the sit to end, and no failure counted.
+        rec.set_manual(false);
+        assert_eq!(step(&mut rec, now), start(Action::Sit));
+
+        let mut rec = logged_in("Elsewhere", now);
+        assert_eq!(step(&mut rec, now), start(Action::Teleport));
+        rec.set_manual(true);
+        rec.set_manual(false);
+        assert_eq!(step(&mut rec, now), start(Action::Teleport));
+    }
+
+    #[test]
+    fn going_manual_does_not_interrupt_a_login() {
+        let now = Instant::now();
+        let mut rec = Reconciler::new(TARGET);
+        assert_eq!(step(&mut rec, now), start(Action::Login(Start::Target)));
+        rec.set_manual(true);
+        assert_eq!(rec.decide(now), Decision::Wait(None));
+        rec.login_accepted();
+        rec.region_entered(TARGET, now);
+        assert_eq!(rec.decide(now), Decision::Wait(None));
+    }
+
+    #[test]
+    fn leaving_manual_mode_returns_at_once() {
+        let now = Instant::now();
+        let mut rec = seated(now);
+        // Backoff left over from being unseated and from failed sits.
+        assert_eq!(rec.standing(now + secs(1)), Some(secs(5)));
+        assert_eq!(step(&mut rec, now + secs(6)), start(Action::Sit));
+        assert_eq!(rec.sit_failed(now + secs(21)), secs(10));
+        rec.set_manual(true);
+        rec.region_entered("Elsewhere", now + secs(30));
+        rec.set_manual(false);
+        assert!(!rec.is_manual());
+        assert_eq!(step(&mut rec, now + secs(30)), start(Action::Teleport));
+        rec.region_entered(TARGET, now + secs(35));
+        assert_eq!(step(&mut rec, now + secs(35)), start(Action::Sit));
+
+        // The delays start over as well: being unseated now waits 5 s again.
+        rec.seated(now + secs(36));
+        assert_eq!(rec.standing(now + secs(40)), Some(secs(5)));
+
+        // In the target region already: the sit does not wait either.
+        let mut rec = seated(now);
+        rec.set_manual(true);
+        assert_eq!(rec.standing(now + secs(1)), Some(secs(5)));
+        rec.set_manual(false);
+        assert_eq!(step(&mut rec, now + secs(1)), start(Action::Sit));
     }
 
     #[test]

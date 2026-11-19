@@ -23,22 +23,43 @@ const DEFAULT_TCP_ADDRESS: &str = "127.0.0.1:47115";
 const MAX_LINE: usize = 8192;
 /// How long a client has to send its line.
 const READ_LIMIT: Duration = Duration::from_secs(5);
-/// How long a connection waits for the main loop's answer.
-const ANSWER_LIMIT: Duration = Duration::from_secs(20);
+/// How long a connection waits for the main loop's answer. A teleport may
+/// take a minute to end one way or the other.
+const ANSWER_LIMIT: Duration = Duration::from_secs(75);
 /// How long `ctl` waits for the bot's answer.
-const CLIENT_LIMIT: Duration = Duration::from_secs(30);
+const CLIENT_LIMIT: Duration = Duration::from_secs(90);
 const MAX_CONNECTIONS: usize = 16;
 /// How long a client turned away for that has to send its line.
 const BUSY_READ_LIMIT: Duration = Duration::from_secs(1);
 
 pub const CTL_USAGE: &str = "\
 Usage: rslbot ctl say MESSAGE...
+       rslbot ctl shout MESSAGE...
+       rslbot ctl whisper MESSAGE...
        rslbot ctl im AVATAR MESSAGE...
+       rslbot ctl stand | unsit
+       rslbot ctl sit UUID | ground
+       rslbot ctl tp X Y [Z] [REGION...]
+       rslbot ctl requesttp AVATAR [MESSAGE...]
+       rslbot ctl accepttp AVATAR
+       rslbot ctl sendtp AVATAR [MESSAGE...]
+       rslbot ctl touch UUID
+       rslbot ctl home
+       rslbot ctl status
+       rslbot ctl quit
 
 Sends a command to a running bot that has `socket = true` in its config.
 `say` speaks in local chat; MESSAGE is read as a viewer's chat bar reads it,
-so `/1 hello` goes to channel 1. `im` sends an instant message; AVATAR is
+so `/1 hello` goes to channel 1. `im` sends an instant message. AVATAR is
 one argument: \"First Last\", first.last, a single word or a UUID.
+
+`stand`, `sit`, `tp`, `requesttp` and `accepttp` move the avatar, and the
+bot then leaves it where it is until `home` sends it back to the configured
+region and seat. `tp` without REGION stays in the current region, and
+without Z keeps the current height. `requesttp` asks AVATAR to teleport the
+bot to them; `accepttp` accepts an offer AVATAR has sent; `sendtp` offers
+AVATAR a teleport to the bot. `touch` clicks an object. `status` shows
+where the avatar is; `quit` logs out and stops the bot.
 
 The socket address is taken from the environment variable RUSSELBOT_SOCK
 when it is set.";
@@ -47,7 +68,24 @@ when it is set.";
 pub enum Request {
     /// Local chat, still to be read the way a chat bar reads it.
     Say(String),
+    /// Local chat, shouted as it is.
+    Shout(String),
+    /// Local chat, whispered as it is.
+    Whisper(String),
     Im { to: String, text: String },
+    Stand,
+    /// A UUID or `ground`, still to be read.
+    Sit(String),
+    /// `x y [z] [region words]`, still to be read.
+    Tp(Vec<String>),
+    AskTp { to: String, message: String },
+    AcceptTp(String),
+    SendTp { to: String, message: String },
+    /// A UUID, still to be read.
+    Touch(String),
+    Home,
+    Status,
+    Quit,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,24 +112,70 @@ impl Request {
         let line = std::str::from_utf8(line).map_err(|_| "the command is not valid UTF-8".to_string())?;
         let mut fields = decode_line(line);
         let command = fields.remove(0);
-        let arguments = |wanted: usize| {
-            if fields.len() == wanted {
-                Ok(())
-            } else {
-                let plural = if wanted == 1 { "" } else { "s" };
-                Err(format!("`{command}` takes {wanted} argument{plural}, not {}", fields.len()))
-            }
+        let given = fields.len();
+        let plural = |count: usize| if count == 1 { "" } else { "s" };
+        let arguments = |wanted: usize| match given == wanted {
+            true => Ok(()),
+            false if wanted == 0 => Err(format!("`{command}` takes no arguments")),
+            false => Err(format!("`{command}` takes {wanted} argument{}, not {given}", plural(wanted))),
+        };
+        let at_least = |wanted: usize| match given >= wanted {
+            true => Ok(()),
+            false => Err(format!("`{command}` takes at least {wanted} argument{}, not {given}", plural(wanted))),
+        };
+        // An avatar, then the words of an optional message.
+        let avatar_and_message = |mut fields: Vec<String>| {
+            let to = fields.remove(0);
+            (to, fields.join(" "))
         };
         match command.as_str() {
             "say" => {
                 arguments(1)?;
                 Ok(Request::Say(fields.remove(0)))
             }
+            "shout" => {
+                at_least(1)?;
+                Ok(Request::Shout(fields.join(" ")))
+            }
+            "whisper" => {
+                at_least(1)?;
+                Ok(Request::Whisper(fields.join(" ")))
+            }
             "im" => {
                 arguments(2)?;
                 let text = fields.remove(1);
                 Ok(Request::Im { to: fields.remove(0), text })
             }
+            "stand" | "unsit" => arguments(0).map(|()| Request::Stand),
+            "sit" => {
+                arguments(1)?;
+                Ok(Request::Sit(fields.remove(0)))
+            }
+            "tp" => {
+                at_least(2)?;
+                Ok(Request::Tp(fields))
+            }
+            "requesttp" => {
+                at_least(1)?;
+                let (to, message) = avatar_and_message(fields);
+                Ok(Request::AskTp { to, message })
+            }
+            "accepttp" => {
+                arguments(1)?;
+                Ok(Request::AcceptTp(fields.remove(0)))
+            }
+            "sendtp" => {
+                at_least(1)?;
+                let (to, message) = avatar_and_message(fields);
+                Ok(Request::SendTp { to, message })
+            }
+            "touch" => {
+                arguments(1)?;
+                Ok(Request::Touch(fields.remove(0)))
+            }
+            "home" => arguments(0).map(|()| Request::Home),
+            "status" => arguments(0).map(|()| Request::Status),
+            "quit" => arguments(0).map(|()| Request::Quit),
             "" => Err("no command given".to_string()),
             other => Err(format!("unknown command `{other}`")),
         }
@@ -389,6 +473,47 @@ mod tests {
     }
 
     #[test]
+    fn movement_requests_are_read_from_their_lines() {
+        let text = |s: &str| s.to_string();
+        assert_eq!(Request::decode(b"stand"), Ok(Request::Stand));
+        assert_eq!(Request::decode(b"unsit"), Ok(Request::Stand));
+        assert_eq!(Request::decode(b"sit\tground"), Ok(Request::Sit(text("ground"))));
+        assert_eq!(
+            Request::decode(b"tp\t128\t128\t25\tBlue\tLagoon"),
+            Ok(Request::Tp(vec![text("128"), text("128"), text("25"), text("Blue"), text("Lagoon")]))
+        );
+        assert_eq!(
+            Request::decode(b"requesttp\tJane Doe"),
+            Ok(Request::AskTp { to: text("Jane Doe"), message: String::new() })
+        );
+        assert_eq!(
+            Request::decode(b"sendtp\tJane Doe\tcome\tand see"),
+            Ok(Request::SendTp { to: text("Jane Doe"), message: text("come and see") })
+        );
+        assert_eq!(Request::decode(b"accepttp\tjane.doe"), Ok(Request::AcceptTp(text("jane.doe"))));
+        assert_eq!(Request::decode(b"touch\tabc"), Ok(Request::Touch(text("abc"))));
+        assert_eq!(Request::decode(b"home"), Ok(Request::Home));
+        assert_eq!(Request::decode(b"status"), Ok(Request::Status));
+        assert_eq!(Request::decode(b"quit"), Ok(Request::Quit));
+        assert_eq!(Request::decode(b"shout\tover\there"), Ok(Request::Shout(text("over here"))));
+        assert_eq!(Request::decode(b"whisper\tpsst"), Ok(Request::Whisper(text("psst"))));
+    }
+
+    #[test]
+    fn movement_requests_with_the_wrong_arguments_are_refused() {
+        assert!(Request::decode(b"stand\tup").unwrap_err().contains("`stand` takes no arguments"));
+        assert!(Request::decode(b"quit\tnow").unwrap_err().contains("`quit`"));
+        assert!(Request::decode(b"sit").unwrap_err().contains("`sit` takes 1 argument, not 0"));
+        assert!(Request::decode(b"sit\ta\tb").unwrap_err().contains("`sit`"));
+        assert!(Request::decode(b"tp\t128").unwrap_err().contains("at least 2 arguments, not 1"));
+        assert!(Request::decode(b"requesttp").unwrap_err().contains("at least 1 argument, not 0"));
+        assert!(Request::decode(b"sendtp").unwrap_err().contains("`sendtp`"));
+        assert!(Request::decode(b"accepttp\ta\tb").unwrap_err().contains("`accepttp`"));
+        assert!(Request::decode(b"touch").unwrap_err().contains("`touch`"));
+        assert!(Request::decode(b"shout").unwrap_err().contains("`shout`"));
+    }
+
+    #[test]
     fn bad_requests_are_refused_with_a_reason() {
         assert!(Request::decode(b"dance").unwrap_err().contains("`dance`"));
         assert!(Request::decode(b"dance\twith\tme").unwrap_err().contains("`dance`"));
@@ -496,6 +621,7 @@ mod tests {
                 Request::Say(text) if text == "fail" => Response::Error("refused".to_string()),
                 Request::Say(_) => Response::Ok(None),
                 Request::Im { to, text } => Response::Ok(Some(format!("sent to {to}: {text}"))),
+                other => Response::Ok(Some(format!("{other:?}"))),
             })
         }
 

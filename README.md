@@ -2,11 +2,14 @@ RusselBot is a lightweight bot software for Second Life and OpenSimulator writte
 replacement for heavy .NET/Mono bots. Requires just a few MBs of memory which makes it possible
 to run even on cheapest VPS machines without requiring to run heavy Mono runtime.
 
-First version follows only one single simple scenario:
+Left alone, the bot follows one simple scenario:
 * Connect to the grid, connect to the region
 * If current region is not the target region, issue teleport command to the target destination
 * Issue "sit" command on a target object.
 * Keep the avatar alive, respond all necessary server queries to keep it online.
+
+Through its [control socket](#control-socket) it can also be told to talk,
+stand, sit elsewhere, teleport, exchange teleport offers and touch objects.
 
 ## Status
 
@@ -14,9 +17,10 @@ Verified by unit tests and against a local OpenSim, including kicks, region
 restarts, simulator outages and being unseated or teleported away; see
 `docs/test-rig.md` for the rig and the results. Chat and IM logging is
 verified there too, except IMs from scripts and delivery of offline IMs,
-which the rig cannot produce. The control socket is verified there as well,
-and `ctl im` by avatar name was checked by hand on Second Life on 2026-11-19;
-it has not been tried on Windows. On Second Life, checked by hand on 2026-11-18:
+which the rig cannot produce. The control socket and its commands are verified there as well,
+and `ctl im` by avatar name was checked by hand on Second Life on 2026-11-19.
+The movement, teleport-offer and touch commands have not been tried on
+Second Life yet, and nothing has been tried on Windows. On Second Life, checked by hand on 2026-11-18:
 login, sitting, logging of chat and IMs from avatars and from objects, and
 fetching offline IMs (delivered with the time they were sent). Multi-factor login is not supported: an account that has it enabled
 makes the bot exit with an error.
@@ -71,6 +75,8 @@ One TOML file; see `russelbot.example.toml`.
 | `log_im` | no | File that receives instant messages |
 | `fetch_offline_im` | no | `true` to also fetch IMs stored while the avatar was offline. Default: `false` |
 | `socket` | no | `true` to listen on the control socket, see [Control socket](#control-socket). Default: `false` |
+| `requesttp_timeout` | no | Minutes after `requesttp` during which the asked avatar's teleport offer is accepted. Default: `10` |
+| `scan_distance` | no | Metres (1 to 1024) within which objects are learned from the start, for `touch`; see [Touching objects](#touching-objects). Default: learn within 32 m when `touch` is first used |
 
 To keep the plain password out of the file:
 
@@ -87,8 +93,9 @@ The bot reads local chat the avatar hears and instant messages sent to it,
 from avatars and from objects, and writes each one to standard error. It
 never answers by itself; it talks only when told to through the
 [control socket](#control-socket). The instant messages it sends that way
-are recorded too, as kind `im_out`. Group chat, offers, invitations and
-typing notifications are not recorded.
+are recorded too, as kind `im_out`. Group chat, offers (teleport offers
+and requests included; those appear on standard error only), invitations
+and typing notifications are not recorded.
 
 With `log_chat` and/or `log_im` set, each message is also appended to that
 file as one tab-separated line (UTF-8). The file is created when missing and
@@ -138,10 +145,37 @@ socket, and `rslbot ctl` sends them:
 ```sh
 target/release/rslbot ctl say hello there          # local chat, channel 0
 target/release/rslbot ctl say /1 test message      # channel 1
-target/release/rslbot ctl say /shout over here
+target/release/rslbot ctl shout over here
 target/release/rslbot ctl im "Jane Doe" are you there?
-target/release/rslbot ctl im jane.doe are you there?
+target/release/rslbot ctl stand
+target/release/rslbot ctl tp 128 128 25 Blue Lagoon
+target/release/rslbot ctl status
+target/release/rslbot ctl home
 ```
+
+| Command | Does |
+|---|---|
+| `say MESSAGE...` | Local chat, read the way a viewer's chat bar reads it (below) |
+| `shout MESSAGE...`, `whisper MESSAGE...` | Local chat on channel 0, shouted or whispered; the message is sent as it is |
+| `im AVATAR MESSAGE...` | Instant message |
+| `stand`, `unsit` | Stand up (two names for the same command) |
+| `sit UUID` | Sit on that object. Answers when the simulator has confirmed, or after 15 s with an error |
+| `sit ground` | Sit on the ground |
+| `tp X Y [Z] [REGION...]` | Teleport. Without `REGION`, inside the current region; without `Z`, at the current height. Answers on arrival or with the reason it failed |
+| `requesttp AVATAR [MESSAGE...]` | Ask the avatar to teleport the bot to them; when they agree, the bot goes |
+| `accepttp AVATAR` | Accept a teleport offer the avatar has sent, and go |
+| `sendtp AVATAR [MESSAGE...]` | Offer the avatar a teleport to the bot |
+| `touch UUID` | Click that object once |
+| `home` | Go back to the configured region and seat, and stay there again |
+| `status` | Print where the avatar is |
+| `quit` | Log out and stop the bot, like Ctrl-C |
+
+`AVATAR` is one argument: `"First Last"` (quoted), `first.last`, a single
+word (last name `Resident`), or a UUID. A name is looked up on the grid and
+must match an avatar's full name exactly, in any letter case; the bot does
+not guess from partial matches. A UUID is used as it is.
+
+### Talking
 
 `say` reads its message the way a viewer's chat bar does:
 
@@ -152,27 +186,97 @@ target/release/rslbot ctl im jane.doe are you there?
 | `/shout ` or `/whisper ` | Shouted or whispered on channel 0 |
 | anything else | Said on channel 0 as it is, `/me waves` included |
 
-`im` takes the recipient as its first argument and the rest as the message.
-The recipient is `"First Last"` (quoted, so that it is one argument),
-`first.last`, a single word (last name `Resident`), or a UUID. A name is
-looked up on the grid and must match an avatar's full name exactly, in any
-letter case; the bot does not guess from partial matches. A UUID is used as
-it is.
-
 The words of a message are joined with single spaces; quote the message to
 keep other spacing. A message can be 1023 bytes long. Everything after
 `ctl` belongs to the command, so a message may start with `-`. Mind the
 shell: quote what it would expand, and in Git Bash on Windows write `//1`
 for a leading `/1`, which it would otherwise turn into a path.
 
+### Moving, and staying put
+
+Left alone the bot holds its seat: it returns to the configured region and
+object whenever it finds the avatar elsewhere. `stand`, `unsit`, `sit`,
+`tp`, `requesttp` and `accepttp` switch that off. From then on the bot is
+in manual mode: it stays logged in, and logs in again after a kick or an
+outage (at the avatar's last location), but it no longer teleports or sits
+by itself. `home` switches holding back on, and the bot returns at once.
+Manual mode ends with the bot process too; a restarted bot holds its seat.
+`sendtp`, `touch` and the talking commands leave the mode alone.
+
+In `tp`, a third argument that is a number is `Z`, and anything else starts
+the region's name, which may be several words. A region whose name starts
+with a number therefore needs `Z` given: `tp 128 128 25 7 Seas`. Without
+`Z` the bot uses the height the simulator last reported for the avatar,
+on arrival in the region or after a teleport inside it; a seat that has
+carried the avatar elsewhere since is not noticed, so give `Z` when in
+doubt.
+
+`status` prints, for example:
+
+```
+connected: yes
+region: Target
+position: 128, 128, 25
+seat: target
+mode: holding
+```
+
+`seat` is `target` (the configured object), `object <uuid>` (an object the
+avatar was seated on by command or by the simulator), `other` (attached to
+something the simulator did not name), `none` or `unknown`. A ground sit
+shows as `none`: the bot does not track it. `mode` is `holding` or `manual`.
+While the avatar is not in a region, only `connected: no` and `mode` are
+printed.
+
+### Teleport offers
+
+`requesttp AVATAR` sends the request a viewer sends with "Request
+Teleport". If that avatar answers with an offer within `requesttp_timeout`
+minutes (10 unless configured), the bot accepts it and goes; one request,
+one acceptance. `home` cancels the wait.
+
+Any other teleport offer is not accepted by itself. It is noted on
+standard error and kept, the latest one per avatar, until the session
+ends; `accepttp AVATAR` accepts it. Whether an old offer still works is up
+to the grid, and its refusal is what the command prints.
+
+When an avatar asks to be teleported to the bot, that is noted on standard
+error as well, and `sendtp AVATAR` is the answer if you want to give one.
+
+### Touching objects
+
+The simulator takes a touch by its own short-lived number for the object,
+not by UUID, so the bot can only touch objects it has been told about.
+Much of that it picks up from what the simulator sends anyway. For the
+rest it has to ask (a scan), and that costs traffic, so it asks only when
+there is a reason:
+
+- Without `scan_distance`, nothing extra is sent until `touch` names an
+  object the bot does not know. That first `touch` starts a scan of the
+  objects within 32 m and waits up to 10 seconds for the object to turn
+  up; later ones answer at once. A new region starts over.
+- With `scan_distance = N`, the bot scans from the moment it enters a
+  region and asks the simulator to describe objects within N metres, so
+  `touch` answers at once and reaches further, at the price of that
+  traffic all the time.
+
+An object the bot has not learned of is an error naming the distance. On
+OpenSimulator the distance makes little difference: it describes objects
+regardless.
+
+### Exit status and limits
+
 | Exit status of `rslbot ctl` | Meaning |
 |---|---|
-| 0 | The message was handed to the simulator. For `im` this does not mean the recipient is online or has read it |
-| 1 | The bot refused (the reason is printed): not in a region right now, unknown avatar, no answer to the name lookup within 10 s, empty or over-long message, unknown command. Or no bot is listening on the socket |
+| 0 | Done: the message was handed to the simulator, the avatar arrived, sat, and so on. For `im`, `requesttp` and `sendtp` this does not mean the other avatar is online, has read it or agreed |
+| 1 | The bot refused or the action failed, and the reason is printed: not in a region right now, unknown avatar or region, no answer to a name lookup within 10 s, a sit not confirmed within 15 s, a teleport without outcome after 60 s, an unknown object, a bad argument, an unknown command. Or no bot is listening on the socket |
 | 2 | No command given |
 
 A command is carried out at once or not at all: one sent while the bot is
-logged out or teleporting fails and is not kept for later.
+logged out or teleporting fails and is not kept for later. `rslbot ctl`
+waits up to 90 seconds for the answer, since a teleport may take a minute.
+
+### The socket
 
 The socket is the Unix domain socket `~/russelbot-ctl`, accessible only to
 the user running the bot, and is removed when the bot exits. Set the

@@ -120,7 +120,11 @@ instead.
 
 `test-rig/listen.py` logs in as `Rig Owner` four metres from the bot, prints
 the local chat it hears and the instant messages it gets, and answers each
-instant message with `pong: <text>`. Run the bot with `socket = true`,
+instant message with `pong: <text>`. It also prints where it sees the bot's
+avatar and what the avatar is attached to, grants the bot's teleport
+requests, prints the bot's teleport offers, and with its `prim` and
+`offer=N` arguments rezzes a box that says `Touched.` when clicked and
+sends the bot an unasked teleport offer. Run the bot with `socket = true`,
 `log_chat` and `log_im` set and `--verbose`, wait for `seated`, start the
 helper, then use `rslbot ctl`.
 
@@ -139,6 +143,43 @@ helper, then use `rslbot ctl`.
 | 33 | Ctrl-C the bot, then `ctl say ...` | The socket file is gone; `cannot reach the bot at <path>`, status 1 | Pass |
 | 34 | `RUSSELBOT_SOCK` in a directory that does not exist; no `HOME` and no `RUSSELBOT_SOCK`; `socket = "yes"` | Error naming `socket`, status 2, no login attempt | Pass, all three |
 | 35 | No `socket` key | No socket file is created | Pass |
+
+### Movement, teleport offers and touch
+
+Run the helper as `test-rig/listen.py 120 prim offer=45`; `<prim>` below is
+the UUID it prints.
+
+| # | Inject | Expected | Result (2026-11-19, OpenSim 9d00a55552) |
+|---|---|---|---|
+| 36 | `ctl status` while seated | `connected: yes`, `region: Target`, a position, `seat: target`, `mode: holding` | Pass |
+| 37 | `ctl touch <prim>`, twice | Status 0 each; the box says `Touched.` each time; with `--verbose`, no `RequestMultipleObjects` before the first `touch` | Pass |
+| 38 | `ctl touch` with a UUID that does not exist | `scanning for objects within 32 m` in the log, then status 1 naming the object and 32 m | Pass |
+| 39 | `ctl stand`, wait, `ctl status` | The helper sees the avatar detached; `placement: manual` in the log; `seat: none`, `mode: manual`; no sit follows | Pass |
+| 40 | `ctl sit ground` | Status 0 | Pass as far as the rig shows: the command is accepted and sent. The helper does not decode animations, so the sitting itself was not seen |
+| 41 | `ctl sit <prim>` | `seated on <prim>`, status 0; the helper sees the avatar attached; `seat: object <prim>` | Pass |
+| 42 | `ctl sit` with a UUID that does not exist, while seated on the box | Status 1 after 15 s; the avatar stays on the box | Pass |
+| 43 | `ctl sit chair`, `ctl tp north 1` | Status 1 naming the argument; nothing sent | Pass |
+| 44 | `ctl tp 100 120`, then `ctl tp 110 120 40` | `arrived in Target` twice; `position: 100, 120, <height as before>` after the first | Pass |
+| 45 | `ctl tp 128 128 25 Home`, `ctl tp 128 128 25 Nowhere`, `ctl tp 120 126 Target` | `arrived in Home` without a new login; `region "Nowhere" not found`, status 1; `arrived in Target` | Pass |
+| 46 | `ctl requesttp "Rig Owner" please bring me over` | `asked Rig Owner <uuid> for a teleport`; the helper gets the request and offers; the log says the offer was accepted as requested; the avatar is at the helper's position | Pass |
+| 47 | `ctl sendtp rig.owner come and see` | `offered Rig Owner <uuid> a teleport`; the helper prints the offer with the text | Pass |
+| 48 | `ctl accepttp "Rig Owner"` with no offer waiting | `there is no teleport offer from Rig Owner`, status 1 | Pass |
+| 49 | The helper's unasked offer, then `ctl accepttp "Rig Owner"` twice | The log notes the offer and that `accepttp` accepts it; the avatar stays; the first `accepttp` prints `arrived in Target`; the second is refused | Pass |
+| 50 | `kick user Sit Bot bye` in manual mode | Login after 10 s with `start: last`; no teleport and no sit afterwards; `mode: manual` | Pass |
+| 51 | `ctl home` in the target region, and again after `ctl tp 128 128 25 Home` | `placement: holding`; the bot sits, or teleports to `Target` and sits; `seat: target`, `mode: holding` | Pass, both |
+| 52 | `ctl shout over here`, `ctl whisper psst` | The helper hears the shout; `chat [shout]` and `chat [whisper]` rows from the echo | Pass; the whisper was out of the helper's earshot at 20 m |
+| 53 | `ctl quit` | Status 0; `logged out`; the bot exits and the socket file is gone | Pass |
+| 54 | `scan_distance = 64`, then `ctl touch` with a UUID that does not exist, 14 s after the start | `scanning for objects within 64 m` on entering the region; status 1 at once, naming 64 m | Pass |
+| 55 | `scan_distance = 5000`; `requesttp_timeout = 0` | Error naming the key, status 2 | Pass, both |
+| 56 | Items 3 and 9 again, with no command given since `home` | The bot sits again and teleports back as before | Pass |
+
+Not covered on this rig: what the scan costs and finds. OpenSim describes
+every object in full and never as cached, so the bot had nothing to ask
+about and sent no `RequestMultipleObjects` even after a scan started; that
+path, and the effect of the scan distance, are covered by unit tests only
+until tried on Second Life. Also not covered: an avatar's request to be
+teleported to the bot (unit tests only), and a ground sit as seen by
+others.
 
 Not covered: Windows, where the socket is TCP. On Second Life, looking a
 name up through `AvatarPickerRequest` found nobody (2026-11-18, an avatar

@@ -28,7 +28,9 @@ use msglog::{Channel, Logs, Recorder};
 use names::{Lookup, Search};
 use net::{Event, RealNet};
 use reconciler::{Action, Decision, Reconciler};
-use session::{Session, SessionEvent};
+use control::{Request, Response};
+use session::{Seat, Session, SessionEvent, Touch};
+use udp::messages::Vector3;
 use std::io::{BufRead, IsTerminal};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -192,6 +194,50 @@ impl Grid for Live<'_> {
         let search = Search { url: url.to_string(), query, name: name.to_string() };
         self.avatar_searches.send(search).map_err(|_| "the avatar search is not running".to_string())
     }
+    fn stand(&mut self, now: Instant) -> Result<(), String> {
+        self.session.stand(now)
+    }
+    fn sit_ground(&mut self, now: Instant) -> Result<(), String> {
+        self.session.sit_ground(now)
+    }
+    fn sit(&mut self, object: Uuid, now: Instant) -> Result<(), String> {
+        self.session.present()?;
+        self.session.start_sit(object, now);
+        Ok(())
+    }
+    fn teleport(&mut self, region: &str, position: Vector3, now: Instant) -> Result<(), String> {
+        self.session.present()?;
+        self.session.start_teleport(region, position, now);
+        Ok(())
+    }
+    fn region(&self) -> Option<String> {
+        self.session.region().map(str::to_string)
+    }
+    fn position(&self) -> Option<Vector3> {
+        self.session.position()
+    }
+    fn request_teleport(&mut self, to: Uuid, message: &str, now: Instant) -> Result<(), String> {
+        self.session.request_teleport(to, message, now)
+    }
+    fn offer_teleport(&mut self, to: Uuid, message: &str, now: Instant) -> Result<(), String> {
+        self.session.offer_teleport(to, message, now)
+    }
+    fn accept_teleport(&mut self, lure: Uuid, now: Instant) -> Result<(), String> {
+        self.session.accept_teleport(lure, now)
+    }
+    fn touch(&mut self, object: Uuid, now: Instant) -> Result<Touch, String> {
+        self.session.touch(object, now)
+    }
+}
+
+/// The session, if there is one, for commands to act on.
+fn live<'a>(
+    session: &'a mut Option<Session<RealNet>>,
+    search_url: &'a Option<String>,
+    avatar_searches: &'a Sender<Search>,
+) -> Option<Live<'a>> {
+    let session = session.as_mut()?;
+    Some(Live { session, search_url: search_url.as_deref(), avatar_searches })
 }
 
 /// What the main loop should do after handling something.
@@ -221,8 +267,9 @@ impl Bot {
                 self.reconciler.login_accepted();
                 let net = RealNet::new(self.events.clone());
                 let name = format!("{} {}", cfg.first_name, cfg.last_name);
+                let generation = self.next_generation;
                 let session =
-                    Session::new(net, &info, &name, cfg.object, cfg.fetch_offline_im, self.next_generation, now);
+                    Session::new(net, &info, &name, cfg.scan_distance, cfg.fetch_offline_im, generation, now);
                 self.session = Some(session);
             }
             Outcome::NeedsOperator(failure) => {
@@ -258,16 +305,86 @@ impl Bot {
         self.commands.session_lost();
     }
 
-    /// The grid answered an avatar search: the messages waiting for it go out.
+    /// The grid answered an avatar search: the commands waiting for it go on.
     fn avatars_found(&mut self, query: Uuid, avatars: &[(Uuid, String)], now: Instant) {
-        let mut live = self.session.as_mut().map(|session| Live {
-            session,
-            search_url: self.search_url.as_deref(),
-            avatar_searches: &self.avatar_searches,
-        });
+        let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches);
         for sent in self.commands.avatars_found(query, avatars, live.as_mut(), now) {
             self.record_sent(sent, now);
         }
+        self.follow_commands();
+    }
+
+    /// Stops putting the avatar back once a command has moved it.
+    fn follow_commands(&mut self) {
+        if self.commands.take_manual() {
+            self.set_manual(true);
+        }
+    }
+
+    /// Switches between holding the configured seat and leaving the avatar
+    /// where the operator put it.
+    fn set_manual(&mut self, manual: bool) {
+        if self.reconciler.is_manual() == manual {
+            return;
+        }
+        self.reconciler.set_manual(manual);
+        if manual {
+            info!("placement: manual; the avatar stays where commands put it until `home`");
+        } else {
+            info!("placement: holding; returning to the configured region and seat");
+        }
+    }
+
+    /// The answer to the `status` command.
+    fn status(&self) -> String {
+        let mut lines = Vec::new();
+        let region = self.session.as_ref().and_then(|session| session.region().map(|name| (session, name)));
+        lines.push(format!("connected: {}", if region.is_some() { "yes" } else { "no" }));
+        if let Some((session, name)) = region {
+            lines.push(format!("region: {name}"));
+            if let Some([x, y, z]) = session.position() {
+                lines.push(format!("position: {x}, {y}, {z}"));
+            }
+            let seat = match session.seat() {
+                Seat::Unknown => "unknown".to_string(),
+                Seat::None => "none".to_string(),
+                Seat::Object(object) if object == self.config.object => "target".to_string(),
+                Seat::Object(object) => format!("object {object}"),
+                Seat::Other => "other".to_string(),
+            };
+            lines.push(format!("seat: {seat}"));
+        }
+        lines.push(format!("mode: {}", if self.reconciler.is_manual() { "manual" } else { "holding" }));
+        lines.join("\n")
+    }
+
+    /// Carries out a command from the control socket.
+    fn control(&mut self, request: Request, reply: Sender<Response>, now: Instant) -> Flow {
+        match request {
+            Request::Status => {
+                // The client may have gone away; nothing depends on it.
+                let _ = reply.send(Response::Ok(Some(self.status())));
+            }
+            Request::Home => {
+                info!("control: home");
+                self.commands.forget_requests();
+                self.set_manual(false);
+                let _ = reply.send(Response::Ok(None));
+            }
+            Request::Quit => {
+                info!("control: quit");
+                let _ = reply.send(Response::Ok(None));
+                return self.stop();
+            }
+            request => {
+                let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches);
+                if let Some(sent) = self.commands.handle(request, reply, live.as_mut(), now) {
+                    self.record_sent(sent, now);
+                }
+                self.follow_commands();
+            }
+        }
+        Flow::Continue
     }
 
     /// Puts an instant message the bot sent into the message log.
@@ -314,19 +431,20 @@ impl Bot {
     }
 
     fn apply(&mut self, event: SessionEvent, now: Instant) -> Flow {
-        let rec = &mut self.reconciler;
+        let manual = self.reconciler.is_manual();
         match event {
             SessionEvent::RegionEntered(name) => {
-                rec.region_entered(&name, now);
-                let target = if rec.in_target_region() {
+                self.reconciler.region_entered(&name, now);
+                let target = if self.reconciler.in_target_region() {
                     "the target region"
                 } else {
                     "not the target region"
                 };
                 info!("connected, in region \"{name}\" ({target})");
+                self.commands.arrived(&name);
             }
             SessionEvent::Lost(reason) => {
-                let delay = rec.session_lost(now);
+                let delay = self.reconciler.session_lost(now);
                 self.drop_session();
                 if self.stopping {
                     info!("session lost while logging out: {reason}");
@@ -334,28 +452,60 @@ impl Bot {
                 }
                 info!("session lost: {reason}; next login in {}", seconds(delay));
             }
-            SessionEvent::Seated => {
-                rec.seated(now);
-                info!("seated on {}", self.config.object);
+            SessionEvent::Seated(object) => {
+                if object == self.config.object {
+                    self.reconciler.seated(now);
+                    info!("seated on {object}");
+                } else {
+                    // Not the seat the bot holds: as good as standing to it.
+                    self.reconciler.standing(now);
+                    info!("seated on {object}, which is not the target");
+                }
+                self.commands.seated(object);
             }
-            SessionEvent::Standing => match rec.standing(now) {
+            SessionEvent::Standing => match self.reconciler.standing(now) {
+                Some(_) if manual => info!("unseated"),
                 Some(delay) => info!("unseated; sitting again in {}", seconds(delay)),
                 None => info!("not seated on the target"),
             },
             SessionEvent::SitFailed(reason) => {
-                let delay = rec.sit_failed(now);
-                info!("sit failed: {reason}; next attempt in {}", seconds(delay));
+                // A sit of the operator's is answered to the operator; only
+                // the bot's own count towards its backoff.
+                if self.commands.sit_failed(&reason) || manual {
+                    info!("sit failed: {reason}");
+                } else {
+                    let delay = self.reconciler.sit_failed(now);
+                    info!("sit failed: {reason}; next attempt in {}", seconds(delay));
+                }
             }
             SessionEvent::TeleportArrived => {
-                rec.teleport_arrived();
-                info!("teleport arrived at the configured position");
+                self.reconciler.teleport_arrived();
+                info!("teleport arrived");
+                let region = self.session.as_ref().and_then(Session::region).unwrap_or_default().to_string();
+                self.commands.arrived(&region);
             }
             SessionEvent::TeleportFailed(reason) => {
-                let delay = rec.teleport_failed(now);
-                info!(
-                    "teleport failed: {reason}; next attempt in {}",
-                    seconds(delay)
-                );
+                if self.commands.teleport_failed(&reason) || manual {
+                    info!("teleport failed: {reason}");
+                } else {
+                    let delay = self.reconciler.teleport_failed(now);
+                    info!("teleport failed: {reason}; next attempt in {}", seconds(delay));
+                }
+            }
+            SessionEvent::TeleportOffer { from, name, lure } => {
+                let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches);
+                self.commands.teleport_offer(from, &name, lure, live.as_mut(), now);
+            }
+            SessionEvent::TeleportRequested { from, name, text } => {
+                info!("{name} <{from}> asks to be teleported here ({text}); `rslbot ctl sendtp` offers it");
+            }
+            SessionEvent::Touched(object) => self.commands.touched(object),
+            SessionEvent::TouchFailed(object) => {
+                let reason = match &self.session {
+                    Some(session) => session.unknown_object(object),
+                    None => "the session was lost".to_string(),
+                };
+                self.commands.touch_failed(object, &reason);
             }
             SessionEvent::Alert(message) => info!("simulator alert: {message}"),
             SessionEvent::Chat(message) => self.record(Channel::Chat, message, now),
@@ -419,7 +569,7 @@ impl Bot {
                 }
                 (Action::Sit, Some(session)) => {
                     info!("sitting on {}", self.config.object);
-                    session.start_sit(now);
+                    session.start_sit(self.config.object, now);
                 }
                 // The reconciler only asks for these while connected.
                 (Action::Teleport | Action::Sit, None) => return Ok(None),
@@ -449,16 +599,7 @@ impl Bot {
         let now = Instant::now();
         match (event, &mut self.session) {
             (Event::Signal, _) => return self.stop(),
-            (Event::Control { request, reply }, session) => {
-                let mut live = session.as_mut().map(|session| Live {
-                    session,
-                    search_url: self.search_url.as_deref(),
-                    avatar_searches: &self.avatar_searches,
-                });
-                if let Some(sent) = self.commands.handle(request, reply, live.as_mut(), now) {
-                    self.record_sent(sent, now);
-                }
-            }
+            (Event::Control { request, reply }, _) => return self.control(request, reply, now),
             (Event::AvatarsFound { query, avatars }, _) => self.avatars_found(query, &avatars, now),
             (Event::AvatarSearchFailed { query, reason }, _) => self.commands.lookup_failed(query, &reason),
             (Event::Datagram { generation, data }, Some(session)) => {
@@ -512,7 +653,7 @@ fn run_bot(config_path: &Path) -> i32 {
         logs,
         name_lookups: names::spawn(events.clone()),
         names_url: None,
-        commands: Commands::default(),
+        commands: Commands::new(config.requesttp_timeout),
         avatar_searches: names::spawn_search(events.clone()),
         search_url: None,
         reconciler: Reconciler::new(&config.region),

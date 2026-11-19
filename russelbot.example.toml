@@ -37,3 +37,13 @@ object = "00000000-0000-0000-0000-000000000000"
 # is ~/russelbot-ctl (127.0.0.1:47115 on Windows) unless the environment
 # variable RUSSELBOT_SOCK names another. Off by default.
 # socket = true
+
+# Optional: how many minutes after `rslbot ctl requesttp <avatar>` the bot
+# still accepts that avatar's teleport offer by itself. Default: 10.
+# requesttp_timeout = 10
+
+# Optional: learn the objects within this many metres (1 to 1024) as soon as
+# the avatar enters a region, so that `rslbot ctl touch <uuid>` answers at
+# once. This costs traffic all the time. Without it the bot learns the
+# objects within 32 metres when `touch` is first used.
+# scan_distance = 64

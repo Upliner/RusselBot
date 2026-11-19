@@ -2,18 +2,35 @@
 """Rig helper: logs in as the estate owner next to the bot and listens, to
 exercise the bot's control socket. For SECONDS it prints every line of local
 chat it hears and every instant message it gets, and answers each instant
-message from the bot with "pong: <text>". Stands in for watching with a
-viewer. Start it while the bot is seated in Target, then use `rslbot ctl`.
+message from the bot with "pong: <text>". It also prints where the bot's
+avatar is and what it is attached to whenever that changes, answers the
+bot's request for a teleport with an offer, and prints the offers the bot
+sends. Stands in for watching with a viewer. Start it while the bot is
+seated in Target, then use `rslbot ctl`.
 
-Usage: listen.py [SECONDS]   (default: 30)
+Usage: listen.py [SECONDS] [prim] [offer=N]   (default: 30 seconds)
 
-Output lines:  chat <type> <name>: <text>   and   im <name> <id>: <text>
+  prim      rez a box near the bot with the library script DefaultWithTouch,
+            which says "Touched." when clicked, and print its UUID; the box
+            goes to the trash at the end
+  offer=N   after N seconds, offer the bot a teleport it did not ask for
+
+Output lines:
+  chat <type> <name>: <text>          im <name> <id>: <text>
+  bot at <x> <y> <z> parent <local id>   (parent 0: not sitting on an object)
+  teleport request from <name>: <text>   teleport offer from <name>: <text>
+  touch prim <uuid>
 Chat on channels other than 0 reaches scripts only, so it never shows here."""
 import hashlib, re, socket, struct, sys, time, urllib.request, uuid
 
 FIRST, LAST, PASSWORD = "Rig", "Owner", "rigowner"
 LOGIN = "http://127.0.0.1:9000/"
-SECONDS = float(sys.argv[1]) if len(sys.argv) > 1 else 30.0
+ARGS = sys.argv[1:]
+SECONDS = float(next((a for a in ARGS if a.replace(".", "").isdigit()), 30.0))
+PRIM = "prim" in ARGS
+OFFER_AFTER = next((float(a[6:]) for a in ARGS if a.startswith("offer=")), None)
+BOT = uuid.UUID("7e570000-0000-4000-8000-0000000000b0")
+TOUCH_SCRIPT = uuid.UUID("9267e689-4f37-4ce5-b2c2-455ee2e1ab12")  # library item DefaultWithTouch
 
 
 def member(n, v):
@@ -141,12 +158,84 @@ def reply(to, text):
     send(low(254), im)
 
 
+def offer_teleport(to, text):
+    """StartLure: offers `to` a teleport to where this avatar stands."""
+    message = text.encode() + b"\0"
+    send(low(70), agent + session + bytes([0, len(message)]) + message + bytes([1]) + to)
+
+
+def objects(payload):
+    """The blocks of an ObjectUpdate as (local id, full id, parent, ObjectData)."""
+    at, found = 11, []
+    try:
+        for _ in range(payload[10]):
+            local, full = struct.unpack("<I", payload[at:at + 4])[0], payload[at + 5:at + 21]
+            at += 5 + 16 + 4 + 3 + 12
+            size = payload[at]
+            data = payload[at + 1:at + 1 + size]
+            at += 1 + size
+            parent = struct.unpack("<I", payload[at:at + 4])[0]
+            at += 4 + 4 + 23
+            for width in (2, 1, 2, 2, 1):  # TextureEntry, TextureAnim, NameValue, Data, Text
+                at += width + int.from_bytes(payload[at:at + width], "little")
+            at += 4
+            for _ in range(3):  # MediaURL, PSBlock, ExtraParams
+                at += 1 + payload[at]
+            at += 16 + 16 + 4 + 1 + 4 + 1 + 12 + 12
+            found.append((local, full, parent, data))
+    except (IndexError, struct.error):
+        pass
+    return found
+
+
+prim = None
+if PRIM:
+    # A box two metres from the bot's seat, as rezprim.py makes it.
+    where = struct.pack("<3f", position[0] + 4.0, position[1] + 2.0, position[2] - 0.5)
+    add = agent + session + bytes(16)
+    add += bytes([9, 3]) + struct.pack("<I", 0)
+    add += bytes([16, 1]) + struct.pack("<HH", 0, 0) + bytes([100, 100]) + bytes(9) + struct.pack("<HHH", 0, 0, 0)
+    add += bytes([1]) + where + where + bytes(16) + bytes([0])
+    add += struct.pack("<3f", 1.0, 1.0, 0.5) + bytes(12) + bytes([0])
+    send(b"\xff\x01", add)
+    deadline = time.time() + 10
+    while time.time() < deadline and not prim:
+        mid, payload = receive()
+        if mid == ("H", 12) and payload[10] >= 1 and payload[36] == 9:
+            prim = (struct.unpack("<I", payload[11:15])[0], uuid.UUID(bytes=payload[16:32]))
+    if not prim:
+        sys.exit("no ObjectUpdate for the new prim")
+    # RezScript naming a library item: the simulator copies that script in.
+    # OpenSim takes the prim to put it in from the folder id.
+    script_name, description = b"Touch\0", b"\0"
+    rez = agent + session + bytes(16) + struct.pack("<I", prim[0]) + bytes([1])
+    rez += TOUCH_SCRIPT.bytes + prim[1].bytes + agent + agent + bytes(16)
+    rez += struct.pack("<5I", *([0x7FFFFFFF] * 5)) + bytes([0]) + bytes(16)
+    rez += bytes([10, 10]) + struct.pack("<I", 0) + bytes([0]) + struct.pack("<i", 0)
+    rez += bytes([len(script_name)]) + script_name + bytes([len(description)]) + description
+    rez += struct.pack("<iI", 0, 0) + bytes([0])
+    send(low(304), rez)
+    print("touch prim", prim[1], flush=True)
+
 print("listening", flush=True)
-deadline = time.time() + SECONDS
+started, bot_seen = time.time(), None
+deadline = started + SECONDS
 while time.time() < deadline:
+    if OFFER_AFTER is not None and time.time() >= started + OFFER_AFTER:
+        offer_teleport(BOT.bytes, "Join me, unasked")
+        print("offered the bot a teleport", flush=True)
+        OFFER_AFTER = None
     mid, payload = receive()
     if mid == ("H", 1):
         send(b"\x02", payload[:1], reliable=False)
+    elif mid == ("H", 12):  # ObjectUpdate
+        for local, full, parent, data in objects(payload):
+            if full == BOT.bytes and len(data) >= 28:
+                # An avatar's data starts with its collision plane.
+                where = tuple(round(v, 1) for v in struct.unpack("<3f", data[16:28]))
+                if (where, parent) != bot_seen:
+                    bot_seen = (where, parent)
+                    print("bot at %s %s %s parent %d" % (where + (parent,)), flush=True)
     elif mid == ("L", 139):  # ChatFromSimulator
         name, at = text1(payload, 0)
         chat_type = payload[at + 33]
@@ -161,6 +250,16 @@ while time.time() < deadline:
             print("im %s %s: %s" % (name, im_id, text), flush=True)
             if sender != agent:
                 reply(sender, "pong: " + text)
+        elif dialog == 26:  # a request to be teleported here: grant it
+            print("teleport request from %s: %s" % (name, text), flush=True)
+            offer_teleport(sender, "Join me in Target")
+        elif dialog == 22:
+            print("teleport offer from %s: %s" % (name, text), flush=True)
 
+if prim:
+    # DeRezObject (Low 291) to the trash.
+    derez = agent + session + bytes(16) + bytes([6]) + bytes(16) + uuid.uuid4().bytes + bytes([1, 0])
+    send(low(291), derez + bytes([1]) + struct.pack("<I", prim[0]))
+    idle(1)
 send(low(252), agent + session)
 time.sleep(1)

@@ -10,7 +10,7 @@ See proposal.md for motivation. What the code looks like today and what that mea
 - The session sends an idle `AgentUpdate` every second with control flags fixed at 0, drops every instant message whose dialog is not 0 or 19, and decodes `ObjectUpdate` only far enough to find its own avatar's parent. `ObjectUpdateCached` and `KillObject` are known by name only; `ObjectUpdateCompressed` not at all.
 - `reconciler::decide` is a pure function over `Observed` and `Memory` with the rules log in / teleport / sit / nothing. `Bot` (`main.rs`) feeds it every session event.
 - The connection thread waits 20 s for the main loop's answer and `ctl` waits 30 s. A teleport may take 60 s (`TELEPORT_LIMIT`), a sit 15 s (`SIT_LIMIT`).
-- `references/` holds viewer and OpenSim sources but no `message_template.msg`; the layouts below are from the template as remembered and from those sources, and each is to be checked when implemented (task 1.1).
+- The layouts below were checked against `references/kokua/scripts/messages/message_template.msg` and the viewer source when implemented (task 1.1): `StartLure` Low 70, `TeleportLureRequest` Low 71 (flags `TELEPORT_FLAGS_VIA_LURE`), `ObjectGrab` Low 117 (Zerocoded), `ObjectDeGrab` Low 119, `RequestMultipleObjects` Medium 3 (Zerocoded), `ObjectUpdateCompressed` High 13 (block data starts with FullID and LocalID, per `llviewerobjectlist.cpp`), `ObjectUpdateCached` High 14, `KillObject` High 16, control flags from `llagentconstants.h`, dialogs 22 and 26 from `llinstantmessage.h`. All matched.
 
 ## Goals / Non-Goals
 
@@ -44,6 +44,8 @@ New `Request` variants: `Stand`, `Sit(String)`, `Tp(Vec<String>)`, `RequestTp { 
 *Alternative:* answer `tp` with "started" and leave the outcome to the log. A script could then not tell a failed teleport from a good one.
 
 ### Session: sit on any object, and say what the avatar sits on
+*As built:* `start_sit` leaves an earlier confirmation alone, so a sit elsewhere that fails leaves the avatar known as seated where it was; a sit that is confirmed is reported even when it names the seat the avatar already has. `Session::new` no longer takes the target object: `Bot` passes it to `start_sit`. `home` also makes `Commands` forget whom it asked for a teleport, so a late offer cannot take the avatar away from the seat it was just sent back to.
+
 `start_sit` takes the object. `sat_on_target: bool` becomes `seat_confirmed: Option<Uuid>`: the object named in the bot's own request while that request is pending (the simulator may answer with another prim of the linkset, as today), or the object named in an unrequested `AvatarSitResponse`. `SessionEvent::Seated` carries that UUID; `Standing` stays. `Bot` tells the reconciler `seated` only when the UUID is the configured object and `standing` otherwise, so the reconciler's three seat states keep their meaning. An accessor returns the seat for `status`: confirmed object, parented to something unconfirmed (`other`), not parented (`none`), or unknown.
 
 `stand(now)` sends one reliable `AgentUpdate` with `AGENT_CONTROL_STAND_UP` (0x00010000) and drops a pending sit; `sit_ground(now)` sends one with `AGENT_CONTROL_SIT_ON_GROUND` (0x00020000). `messages::agent_update` gets a control-flags parameter; the periodic update keeps sending 0. `sit <uuid>` while seated sends `AgentRequestSit` directly; simulators move the avatar.
@@ -92,7 +94,7 @@ The event methods keep updating `Observed` in both modes, so the state is right 
 
 ## Risks / Trade-offs
 
-- [Message layouts written from memory] → Task 1.1 checks every new layout against the template or the OpenSim/viewer sources before any encoder is written; byte-level tests then pin them.
+- [Message layouts wrong] → Checked against the template (see Context); byte-level tests pin them.
 - [Second Life sends most objects compressed or cached; if the compressed layout or the cache-miss request is wrong, `touch` knows nothing there] → Rig first, then a check on Second Life with `--verbose`; `touch` fails with a clear error rather than touching the wrong thing, since it only ever uses a number the simulator gave for that UUID.
 - [Answering cache misses makes the simulator send full updates it would have skipped] → Only once a scan has started: after the first `touch`, or from the start when the operator set `scan_distance`. Inside the existing 30 kbit/s task throttle either way.
 - [The free part still costs memory: two tables per region even when `touch` is never used] → Capped; a few hundred kilobytes in a crowded region. Traffic, which is what the operator asked to protect, is unchanged.
