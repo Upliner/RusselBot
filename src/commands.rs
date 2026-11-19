@@ -1051,7 +1051,7 @@ impl Commands {
                     }
                     false => format!("took off {}", names(&items)),
                 };
-                crate::info!("control: {text}");
+                crate::info!("{}: {text}", self.origin.tag());
                 Ok(Done::Answer(Some(text)))
             }
             (then, outcome) => Err(format!("the inventory answered {outcome:?} where {then:?} was expected")),

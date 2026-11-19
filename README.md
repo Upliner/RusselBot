@@ -35,11 +35,64 @@ makes the bot exit with an error.
 [RLV](#rlv) is verified by unit tests and on the local OpenSim
 (`docs/test-rig.md`, items 108 to 124, 2026-11-19), with a script of the
 bot's own that says to it what it is told: the version queries, the force
-commands, `drop` and `follow`, and the `[persist]` table. Nothing of it
-has been tried on Second Life: not what `@version` should answer there (the
-text is the one RLV viewers are known for, not one the specification
-quotes), not a real collar, relay or piece of furniture, not `@remoutfit`,
-and not commands that arrive while the avatar logs in.
+commands, `drop` and `follow`, and the `[persist]` table. On Second Life,
+checked by hand on 2026-11-19 in three logins of two to fifteen minutes,
+with `rlv = true`, wearing a collar and a relay, near objects named
+`corestat` that seat an avatar and put handcuffs on it, and with `rlv cmd`:
+
+- The version queries, at every login. The collar asked `@versionnew` ten
+  seconds after the region was entered, the bot answered, and the collar
+  reported "RLV ready!" four seconds later. Each `corestat` asked
+  `@versionnew` and went on to force a sit. The handcuffs asked the old
+  `@version`, got the `RestrainedLife viewer v0.1.0 (...)` text, and set
+  their restrictions in the same second, so that text was taken as well;
+  the specification does not quote it.
+- `@sit:UUID=force` with the setting `drop`, five times from such objects:
+  carried out as `sit`, and four of them confirmed by the simulator within
+  a second, on another prim than the one named, as happens in a linkset.
+  The fifth came in the same second as another from a second object, which
+  took its place. The first of all switched a holding bot to manual mode.
+- `rlv cmd @sitground=force` and `rlv cmd @unsit=force`: handed to the
+  simulator. The log does not show what the avatar then did.
+- `rlv cmd @tpto:Polasido/219/112/612=force`, inside the region the avatar
+  was in: arrived within the second. A teleport to another region was not
+  tried.
+- `rlv cmd @tpto:219/102/611=force`, three numbers that were coordinates
+  inside the region and not global ones: the bot asked for a region at
+  0, 0, the grid did not answer, and the teleport ended after 60 seconds,
+  during which the bot refused other commands as it does during any
+  teleport. Such coordinates are refused since, before anything is sent.
+  The global form with global coordinates was not tried.
+- The setting `follow`, with a forced sit: `persist cur UUID` at once, the
+  avatar seated within the second on another prim than the one named, and
+  `persist cur cur` in the same second with the seat's position, 16 metres
+  from where the avatar had stood. So Second Life answers the bot's
+  question about a seat fast enough. The object then unseated the avatar
+  three times within a minute, by itself and not with `@unsit=force`, and
+  the bot sat it down again after 5, 10 and 20 seconds, as it does on any
+  held seat: an object that lets the avatar go that way does not get rid
+  of a following bot. `rlv persist drop` given meanwhile changed nothing,
+  as it applies to later movements only; `rslbot ctl stand` would have.
+- `rlv cmd @remattach:skull=force`: the two attachments on the skull were
+  detached within a second. `@remattach` with a UUID was answered as not
+  supported; that form was added afterwards and has unit tests only.
+- `rlv cmd @remoutfit:shoes=force`: the shoes the avatar wore were taken
+  off in two seconds. With an item's UUID in place of the kind it was
+  refused.
+- What is not supported yet. Over the three logins the objects sent 1,337
+  commands the bot noted as not supported, nearly all of them restrictions
+  and their exceptions; the handcuffs alone sent 71 messages of three
+  exceptions each within two seconds. The `corestat` objects asked
+  `@getstatus` eight times, after `@unsit=n`, and got no answer. A bare
+  `@clear` was noted as
+  malformed in these runs, wrongly; it is read as a command since.
+
+Not tried there: `@detach` and `@detachme` (on the local OpenSim only,
+`docs/test-rig.md`, item 116), `@tpto` to another region and by global
+coordinates, the setting `follow` with a forced stand, ground sit or
+teleport, and commands that arrive while the avatar logs in: the first
+ones came two to four seconds after the region was entered, and none had
+to wait.
 
 The inventory commands (`inventory`, `attach`, `wear`, `detach`, `anim`,
 `sound`) are verified by unit tests and on the local OpenSim, where the
@@ -832,6 +885,7 @@ beside it is, with the same checks and refusals:
 | `@tpto:REGION/X/Y/Z=force` | `tp X Y Z REGION` |
 | `@tpto:X/Y/Z=force` | A teleport to that point of the grid, X and Y in metres from the grid's origin. `rslbot ctl tp` has no such form |
 | `@detach:POINT=force`, `@remattach:POINT=force` | `detach POINT` |
+| `@detach:UUID=force`, `@remattach:UUID=force` | `detach` of the attachment with that UUID |
 | `@remoutfit:KIND=force` | `unwear KIND` |
 | `@detachme=force` | `detach` of the item the object that says it was attached from |
 
@@ -839,7 +893,10 @@ beside it is, with the same checks and refusals:
 or by the names RLV has for some of them: `center 2`, `top right`, `top`,
 `top left`, `center`, `bottom left`, `bottom`, `bottom right` for the
 points of the heads-up display, and `root` for `Avatar Center`. A number
-is not taken as a point. What follows a `;` in `@tpto` (a direction to
+is not taken as a point. `UUID` for `@detach` and `@remattach` is the
+attached object's own, which is what a script knows; the bot also takes
+the UUID of the inventory item, as `inventory -a` prints it, since the RLV
+specification does not say which is meant. What follows a `;` in `@tpto` (a direction to
 look in) is ignored. Nobody waits for the outcome of these commands: it is
 in the log, as it is for the commands they stand for. None of them counts
 as the last `tp` or `sit` command for `persist last_cmd`.
@@ -854,7 +911,10 @@ option, which would take everything off. An instant message that says
 
 * `@tpto:X/Y/Z` takes regions to be 256 metres square, which they are on
   Second Life. On a grid with larger regions use the form with the
-  region's name.
+  region's name. X and Y are global, counted from the grid's origin; on
+  Second Life they run into the hundreds of thousands. Numbers that are
+  both below 256 are refused, as they are most likely meant for a place
+  inside a region, which is `@tpto:REGION/X/Y/Z`.
 * `@detachme` works when the script is in the attachment's root prim. From
   a child prim the bot cannot tell which attachment is meant, and refuses.
 * Commands that arrive while the avatar cannot act, during the login or a

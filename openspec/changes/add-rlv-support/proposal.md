@@ -26,6 +26,7 @@ This change is the first step: reading RLV commands, answering the version queri
   | `@tpto:<region>/<x>/<y>/<z>[;lookat]=force` | `tp <x> <y> <z> <region>` |
   | `@tpto:<X>/<Y>/<Z>=force` (global coordinates) | a teleport to that point of the grid; `ctl tp` has no such form, the teleport underneath is the same |
   | `@detach:<attachment point>=force`, `@remattach:<attachment point>=force` | `detach <body part>` |
+  | `@detach:<uuid>=force`, `@remattach:<uuid>=force` | `detach` of the item the attachment with that UUID was made from |
   | `@remoutfit:<kind>=force` | `unwear <kind>` |
   | `@detachme=force` | `detach` of the item the sending attachment was made from |
 

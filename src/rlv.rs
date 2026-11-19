@@ -56,6 +56,9 @@ pub enum Param {
     Channel(Option<i32>),
     /// Set or lift a restriction: `n`, `add`, `y` or `rem`.
     Restrict,
+    /// None of these: `@clear` comes alone, or with a filter after its
+    /// `=`.
+    Absent,
 }
 
 /// One RLV command: `behaviour[:option]=param`.
@@ -90,7 +93,18 @@ fn parse_one(piece: &str) -> Result<Command, Malformed> {
         text: piece.to_string(),
         reason,
     };
-    let (left, param) = piece.split_once('=').ok_or_else(|| malformed("it has no `=`"))?;
+    let Some((left, param)) = piece.split_once('=') else {
+        // `@clear` alone lifts everything its sender has set.
+        if !piece.eq_ignore_ascii_case("clear") {
+            return Err(malformed("it has no `=`"));
+        }
+        return Ok(Command {
+            text: piece.to_string(),
+            behaviour: "clear".to_string(),
+            option: None,
+            param: Param::Absent,
+        });
+    };
     let (behaviour, option) = match left.split_once(':') {
         Some((behaviour, option)) => (behaviour, Some(option.to_string())),
         None => (left, None),
@@ -99,9 +113,11 @@ fn parse_one(piece: &str) -> Result<Command, Malformed> {
         return Err(malformed("it names no behaviour"));
     }
     let lowered = param.to_ascii_lowercase();
+    let filter = behaviour.eq_ignore_ascii_case("clear") && option.is_none();
     let digits = lowered.strip_prefix(['-', '+']).unwrap_or(&lowered);
     let param = match lowered.as_str() {
         "force" => Param::Force,
+        _ if filter => Param::Absent,
         "n" | "add" | "y" | "rem" => Param::Restrict,
         _ if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => Param::Channel(lowered.parse().ok()),
         _ => return Err(malformed("its param is not `force`, a channel number, `n`, `add`, `y` or `rem`")),
@@ -242,6 +258,14 @@ fn destination(option: &str) -> Result<Destination, String> {
                 return Err("the destination is outside any grid".to_string());
             }
             let handle = ((corner(x) as u64) << 32) | corner(y) as u64;
+            // No grid has a region there, and one asked for it never
+            // answers. Most likely these are coordinates inside a region.
+            if handle == 0 {
+                return Err(format!(
+                    "\"{place}\" are global coordinates in the region at 0, 0, where no grid has one; \
+                     for a place inside a region write `region/x/y/z`"
+                ));
+            }
             Ok(Destination::Global(
                 handle,
                 [(x - corner(x)) as f32, (y - corner(y)) as f32, z as f32],
@@ -346,14 +370,23 @@ pub fn deal<G: Grid>(
             }
         },
         // Without an option these take everything off, which no command of
-        // the bot does; with one that is no point they name a folder.
-        (Param::Force, "detach" | "remattach") => match option.and_then(point) {
-            Some(point) => {
+        // the bot does; with one that is neither a point nor a UUID they
+        // name a folder.
+        (Param::Force, "detach" | "remattach") => {
+            if let Some(point) = option.and_then(point) {
                 let name = inventory::point_name(point);
-                as_command(format!("detach {name}"), Request::Detach(name), Step::Done, grid)
+                return as_command(format!("detach {name}"), Request::Detach(name), Step::Done, grid);
             }
-            None => unsupported(),
-        },
+            let Some(given) = option.and_then(|option| Uuid::parse_str(option).ok()) else {
+                return unsupported();
+            };
+            // The UUID of an attachment, as a script knows it: its object.
+            // One that is no such object is taken for the inventory item,
+            // which is what the bot's own commands show.
+            let attached = grid.as_ref().and_then(|grid| grid.attached_item(given));
+            let item = attached.unwrap_or(given);
+            as_command(format!("detach {item}"), Request::Detach(item.to_string()), Step::Done, grid)
+        }
         (Param::Force, "remoutfit") => match option.map(|kind| (kind, inventory::parse_kind(kind))) {
             Some((_, Some(kind))) => {
                 let name = inventory::kind_name(kind);
@@ -604,6 +637,12 @@ mod tests {
         assert_eq!(param, Param::Force);
         // An empty option is still an option.
         assert_eq!(parts("@detach:=force").1.as_deref(), Some(""));
+        // `@clear` is the one command that may come without a param.
+        assert_eq!(parts("@clear"), ("clear".to_string(), None, Param::Absent));
+        assert_eq!(parts("@CLEAR"), ("clear".to_string(), None, Param::Absent));
+        // And what follows its `=` is a filter, not one of the params.
+        assert_eq!(parts("@clear=tp").2, Param::Absent);
+        assert_eq!(parts("@clear=tplure:").2, Param::Absent);
     }
 
     #[test]
@@ -631,6 +670,7 @@ mod tests {
     #[test]
     fn malformed_pieces_say_why() {
         assert_eq!(reason("@nonsense"), "it has no `=`");
+        assert_eq!(reason("@clearance"), "it has no `=`");
         assert_eq!(reason("@=force"), "it names no behaviour");
         assert_eq!(reason("@:chest=force"), "it names no behaviour");
         assert!(reason("@unsit=maybe").starts_with("its param"));
@@ -768,6 +808,8 @@ mod tests {
             "@fly=add",
             "@unsit=rem",
             "@clear=force",
+            "@clear",
+            "@clear,detachme=force".split(',').next().unwrap(),
             "@notify:5;detach=add",
             "@getstatus=2222",
             "@getsitid=2222",
@@ -785,7 +827,6 @@ mod tests {
             "@remoutfit=force",
             "@detach:Outfits/Beach=force",
             "@detach:5=force",
-            "@detach:11111111-2222-3333-4444-555555555555=force",
         ] {
             assert_eq!(failed(rig.deal(text)), "not supported", "{text}");
         }
@@ -874,12 +915,15 @@ mod tests {
         // Region 1000, 1000 has its corner at 256000, 256000.
         assert_eq!(rig.deal("@tpto:256128/256100/25=force"), Step::Moved(Movement::Teleport));
         assert_eq!(rig.deal("@tpto:256511.5/512000/30;0=force"), Step::Moved(Movement::Teleport));
+        // One of the two below 256 is still a region of some grid.
+        assert_eq!(rig.deal("@tpto:300/10/20=force"), Step::Moved(Movement::Teleport));
         let handle = |x: u64, y: u64| (x << 32) | y;
         assert_eq!(
             rig.calls(),
             [
                 Call::TeleportTo(handle(256000, 256000), [128.0, 100.0, 25.0]),
                 Call::TeleportTo(handle(256256, 512000), [255.5, 0.0, 30.0]),
+                Call::TeleportTo(handle(256, 0), [44.0, 10.0, 20.0]),
             ]
         );
         assert!(rig.commands.take_manual());
@@ -904,6 +948,10 @@ mod tests {
             ("@tpto:-1/2/3=force", "`X`"),
             ("@tpto:1/nan/3=force", "`Y`"),
             ("@tpto:1e12/2/3=force", "outside any grid"),
+            // Coordinates inside a region, given without its name.
+            ("@tpto:219/102/611=force", "`region/x/y/z`"),
+            ("@tpto:0/0/0=force", "region at 0, 0"),
+            ("@tpto:255.9/255.9/4000;1.57=force", "region at 0, 0"),
         ] {
             let reason = failed(rig.deal(text));
             assert!(reason.contains(part), "{text}: {reason}");
@@ -911,7 +959,7 @@ mod tests {
         assert_eq!(rig.calls(), []);
         assert!(!rig.commands.take_manual());
         rig.grid.offline = true;
-        assert_eq!(failed(rig.deal("@tpto:1/2/3=force")), NOT_CONNECTED);
+        assert_eq!(failed(rig.deal("@tpto:256/2/3=force")), NOT_CONNECTED);
         assert_eq!(failed(rig.deal("@tpto:Home/1/2/3=force")), NOT_CONNECTED);
     }
 
@@ -958,6 +1006,39 @@ mod tests {
     }
 
     use crate::inventory::{Clothes, What};
+
+    #[test]
+    fn a_forced_detach_takes_an_attachment_off_by_its_uuid() {
+        let mut rig = Rig::new();
+        let (object, item) = (Uuid::from_bytes([3; 16]), Uuid::from_bytes([4; 16]));
+        rig.grid.worn = vec![(object, item)];
+        let found = |rig: &Rig| match rig.grid.jobs.last() {
+            Some((_, _, What::Find(inventory::Ref::Id(id)))) => *id,
+            other => panic!("expected a lookup of an item, got {other:?}"),
+        };
+        // By the attachment's own UUID, which is what a script has: the item
+        // it was made from is detached, as `detach <item>` does it.
+        assert_eq!(rig.deal(&format!("@remattach:{object}=force")), Step::Done);
+        assert_eq!(found(&rig), item);
+        assert_eq!(
+            rig.deal(&format!("@detach:{}=force", object.to_string().to_uppercase())),
+            Step::Done
+        );
+        assert_eq!(found(&rig), item);
+        // A UUID that is no attachment's object is taken for the item.
+        assert_eq!(rig.deal(&format!("@remattach:{item}=force")), Step::Done);
+        assert_eq!(found(&rig), item);
+        let other = Uuid::from_bytes([5; 16]);
+        assert_eq!(rig.deal(&format!("@remattach:{other}=force")), Step::Done);
+        assert_eq!(found(&rig), other);
+        assert_eq!(rig.grid.jobs.len(), 4);
+        // The operator has UUIDs of items only, and may give one.
+        let operator = Issuer::operator(collar().id);
+        assert_eq!(rig.deal_from(&operator, &format!("@remattach:{item}=force")), Step::Done);
+        assert!(!rig.commands.take_manual());
+        rig.grid.offline = true;
+        assert_eq!(failed(rig.deal(&format!("@remattach:{object}=force"))), NOT_CONNECTED);
+    }
 
     #[test]
     fn a_forced_remoutfit_takes_a_kind_of_clothing_off() {

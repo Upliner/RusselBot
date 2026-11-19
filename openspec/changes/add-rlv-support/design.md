@@ -82,11 +82,21 @@ The key is `[persist] rlv`, a string, next to the top-level `rlv`, a boolean. Th
 
 `TeleportLocationRequest` takes a region handle, which is the region's south-west corner in metres, and a position inside the region. For global X, Y the bot takes the corner as `floor(X / 256) * 256`, `floor(Y / 256) * 256` and the remainder as the position, and sends the request at once, without the map lookup the named form needs. The session gets `start_teleport_to(handle, position)` next to `start_teleport`, sharing its end states; the `Grid` trait gets `teleport_global`. *Alternative:* ask the map for the region at those grid coordinates first. One more round trip and one more failure mode, to learn a name the teleport does not need.
 
+A point whose X and Y are both below 256 gives the handle 0, which is refused before anything is sent. On Second Life (2026-11-19) such a request got no answer at all, so the teleport ran into its 60-second limit with the avatar counted as on its way for all that time; the session already takes a map entry at 0, 0 for "no such region". The numbers were coordinates inside the region, typed without its name, which is the mistake the reason points at.
+
 The four-part form and the three-part form are told apart by the number of `/`-separated parts alone; a region name cannot contain `/`. Everything from the first `;` on is cut off before that (the look-at direction, which the bot's teleport request sets to a fixed value).
 
 ### Attachment points by their RLV names
 
 `@detach:<point>` is first read with `inventory::parse_point`, minus its numbers, and then against a table of nine RLV-only names: the eight HUD points without `HUD ` and `root`. Numbers are left out because RLV never sends them and a folder may be named `5`. An option that names no point is "not supported" rather than "refused", because in RLV it is a folder of the shared inventory; the log line should not call a valid command wrong.
+
+### `@remattach` by UUID
+
+Added after the first run on Second Life, where the operator tried `@remattach:<uuid>=force` and found it not supported. The specification lists the form (`@remattach[:attachpt or :uuid]=force`, the UUID since v2.9.20) and does not say whose UUID it is. A script can only know the attached object's, so that is what is looked up first, with the lookup `@detachme` uses. A UUID that is no attachment's object is passed on as the inventory item's, which is the only UUID `rslbot ctl` shows an operator and what was tried by hand; `detach <uuid>` then refuses what is not there. The same is accepted for `@detach`, which `@remattach` is an alias of.
+
+### `@clear` is well-formed without a param
+
+The same run showed objects sending a bare `@clear`, which the parser called malformed. The specification gives `@clear` and `@clear=<string>` as its two forms, so the parser reads both, with whatever follows the `=` as a filter and not as a param. It stays not supported, as there is nothing to clear.
 
 ### `@detachme`: from the sender to its inventory item
 

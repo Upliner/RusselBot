@@ -86,7 +86,7 @@ While RLV is on, a local chat message SHALL be read as RLV commands when it is o
 ### Requirement: Command syntax
 The text after the leading `@` SHALL be split at commas into commands, and empty pieces SHALL be skipped. Each command SHALL be read as `<behaviour>[:<option>]=<param>`: the param is everything after the first `=`; in what is before it, the option is everything after the first `:`, and the behaviour is the rest. The behaviour and the param SHALL be compared without regard to letter case; the option SHALL be taken as it is. Nothing SHALL be trimmed: a space is part of the piece it is in.
 
-A command without `=`, or with an empty behaviour, is malformed. So is a command whose param is not one of: `force`; a whole number (a query, the number being the channel to answer on); `n`, `add`, `y` or `rem` (a restriction). A malformed command SHALL NOT be carried out. The commands of one message SHALL be dealt with in the order they are written, each on its own: a command that is malformed, not supported or refused SHALL NOT keep the others from being carried out.
+A command without `=`, or with an empty behaviour, is malformed, with one exception: `clear`, which RLV writes alone, as `@clear`, or with a text after its `=` that says what to clear. Either form is well-formed, whatever that text is. So is a command whose param is not one of: `force`; a whole number (a query, the number being the channel to answer on); `n`, `add`, `y` or `rem` (a restriction). A malformed command SHALL NOT be carried out. The commands of one message SHALL be dealt with in the order they are written, each on its own: a command that is malformed, not supported or refused SHALL NOT keep the others from being carried out.
 
 #### Scenario: Several commands in one line
 - **WHEN** an object the avatar owns says `@versionnum=5,unsit=force` to its owner
@@ -107,6 +107,10 @@ A command without `=`, or with an empty behaviour, is malformed. So is a command
 #### Scenario: A second at-sign
 - **WHEN** an object the avatar owns says `@versionnum=5,@unsit=force` to its owner
 - **THEN** the bot answers on channel 5, and the avatar stays seated because `@unsit` is no behaviour the bot knows
+
+#### Scenario: Clear alone
+- **WHEN** an object the avatar owns says `@clear,unsit=force` or `@clear=tp,unsit=force` to its owner
+- **THEN** the operator log notes the first command as not supported, not as malformed, and the avatar stands up
 
 #### Scenario: Trailing comma
 - **WHEN** an object the avatar owns says `@unsit=force,` to its owner
@@ -153,12 +157,14 @@ While RLV is on, these commands with the param `force` SHALL be carried out as t
 | `@unsit=force` | `stand` |
 | `@tpto:<region>/<x>/<y>/<z>=force` | `tp <x> <y> <z> <region>` |
 | `@detach:<point>=force`, `@remattach:<point>=force` | `detach <point>` (see `avatar-outfit`) |
+| `@detach:<uuid>=force`, `@remattach:<uuid>=force` | `detach <item>`, the item being the inventory item the attachment with that UUID was made from |
 | `@remoutfit:<kind>=force` | `unwear <kind>` |
 | `@detachme=force` | `detach <item>`, the item being the inventory item the sender was made from |
 
 - `@sit` SHALL be refused when its option is not a UUID. While the RLV persist setting is `follow`, `@sit` is carried out through a persist in place of the `sit` command, as "Forced movement and the held placement" says. An option on `@sitground`, `@unsit` or `@detachme` SHALL be ignored.
-- `@tpto` with an option of four parts separated by `/` names a region and coordinates inside it. With three parts it gives global coordinates X, Y and Z in metres from the grid's origin: the bot SHALL teleport the avatar to the region that contains that point, taking regions to be 256 metres square, at the point's place inside the region and at height Z. `ctl tp` has no such form; the teleport SHALL otherwise be carried out and end as a `tp` does. In either form everything from a `;` on SHALL be ignored (RLV puts a direction to look in there), the coordinates SHALL be finite, non-negative decimal numbers, and an option of any other shape SHALL be refused.
+- `@tpto` with an option of four parts separated by `/` names a region and coordinates inside it. With three parts it gives global coordinates X, Y and Z in metres from the grid's origin: the bot SHALL teleport the avatar to the region that contains that point, taking regions to be 256 metres square, at the point's place inside the region and at height Z. Global coordinates that are both below 256 SHALL be refused, with a reason that names the form with the region's name: they lie in the region at 0, 0, which no grid has and which a grid asked for does not answer about, and are most likely coordinates inside a region. `ctl tp` has no such form; the teleport SHALL otherwise be carried out and end as a `tp` does. In either form everything from a `;` on SHALL be ignored (RLV puts a direction to look in there), the coordinates SHALL be finite, non-negative decimal numbers, and an option of any other shape SHALL be refused.
 - `<point>` SHALL be one of the attachment point names of `avatar-outfit` ("Body-part names"), compared without regard to case, or one of the names RLV uses instead: `center 2`, `top right`, `top`, `top left`, `center`, `bottom left`, `bottom`, `bottom right` for the points of the heads-up display, and `root` for `Avatar Center`. A number SHALL NOT be taken as a point.
+- `<uuid>` is the UUID of an attachment on the avatar: of the object, which is what a script knows of it. A UUID that is no such object's SHALL be taken as the UUID of the inventory item itself, which is what the bot's own commands show, and SHALL be dealt with as `detach <uuid>` deals with one.
 - `<kind>` SHALL be one of the kinds of clothing of `avatar-outfit`.
 - `@detachme` SHALL be refused when the sender is not an attachment the bot knows to be on the avatar (see `avatar-outfit`, "Knowing what is attached").
 
@@ -188,6 +194,10 @@ Nobody waits for the outcome of a force command: where the control-socket comman
 - **WHEN** region `Home` has its south-west corner at 256000, 256000 and an object the avatar owns says `@tpto:256128/256100/25=force` to its owner while the avatar is in another region
 - **THEN** the avatar arrives in `Home` near 128, 100, 25
 
+#### Scenario: Local coordinates without the region
+- **WHEN** an object the avatar owns says `@tpto:219/102/611=force` to its owner
+- **THEN** nothing is sent to the simulator, the avatar can be given other commands at once, and the operator log gives a reason that names `region/x/y/z`
+
 #### Scenario: Malformed destination
 - **WHEN** an object the avatar owns says `@tpto:north/128=force` or `@tpto:Home/128/-5/25=force` to its owner
 - **THEN** nothing is sent to the simulator and the operator log gives the reason
@@ -195,6 +205,18 @@ Nobody waits for the outcome of a force command: where the control-socket comman
 #### Scenario: Detaching from a point
 - **WHEN** `Watch` and `Radio` are attached to the left hand and an object the avatar owns says `@detach:left hand=force` to its owner
 - **THEN** both are detached, and attachments elsewhere stay
+
+#### Scenario: Detaching by the attachment's UUID
+- **WHEN** `Radio` is attached to the avatar and an object the avatar owns says `@remattach:<uuid>=force` to its owner, with the UUID of the attached object
+- **THEN** `Radio` is detached into the inventory
+
+#### Scenario: Detaching by the item's UUID
+- **WHEN** `Radio` is attached and `rslbot ctl rlv cmd @remattach:<uuid>=force` is run with the UUID `inventory -a` prints for it
+- **THEN** `Radio` is detached
+
+#### Scenario: UUID of nothing that is attached
+- **WHEN** an object the avatar owns says `@detach:<uuid>=force` to its owner with a UUID that is neither an attachment's nor an inventory item's
+- **THEN** nothing is detached and the operator log gives the reason `detach <uuid>` gives
 
 #### Scenario: HUD point by its RLV name
 - **WHEN** `Meter` is attached to `HUD Center` and an object the avatar owns says `@remattach:center=force` to its owner
@@ -341,7 +363,7 @@ The other force commands (`@detach`, `@remattach`, `@remoutfit`, `@detachme`) an
 - **THEN** the placement mode and the held placement are what they were
 
 ### Requirement: Commands that are not supported
-Every well-formed RLV command that "Version queries" and "Force commands" do not name is not supported. That includes every restriction (the params `n`, `add`, `y` and `rem`, whatever the behaviour), `@clear`, `@notify`, every other query (among them `@getstatus`, `@getstatusall`, `@getsitid`, `@getoutfit`, `@getattach`, `@getinv`, `@versionnumbl` and `@getblacklist`), every other force command (among them `@attach` and the other commands that name inventory folders, and `@setrot`), and these forms of the commands above: `@detach`, `@remattach` and `@remoutfit` without an option, and `@detach` or `@remattach` with an option that is not the name of an attachment point. For a command that is not supported the bot SHALL send the simulator nothing, say nothing in chat, and change nothing about itself; it SHALL note the command in the operator log. In particular the bot SHALL NOT restrict anything: every control-socket command works as it does while RLV is off.
+Every well-formed RLV command that "Version queries" and "Force commands" do not name is not supported. That includes every restriction (the params `n`, `add`, `y` and `rem`, whatever the behaviour), `@clear`, `@notify`, every other query (among them `@getstatus`, `@getstatusall`, `@getsitid`, `@getoutfit`, `@getattach`, `@getinv`, `@versionnumbl` and `@getblacklist`), every other force command (among them `@attach` and the other commands that name inventory folders, and `@setrot`), and these forms of the commands above: `@detach`, `@remattach` and `@remoutfit` without an option, and `@detach` or `@remattach` with an option that is neither the name of an attachment point nor a UUID. For a command that is not supported the bot SHALL send the simulator nothing, say nothing in chat, and change nothing about itself; it SHALL note the command in the operator log. In particular the bot SHALL NOT restrict anything: every control-socket command works as it does while RLV is off.
 
 #### Scenario: Restriction
 - **WHEN** an object the avatar owns says `@detach=n` to its owner and the operator then runs `rslbot ctl detach Objects/Radio`
