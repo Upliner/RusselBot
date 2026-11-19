@@ -30,19 +30,39 @@ login, sitting, logging of chat and IMs from avatars and from objects, and
 fetching offline IMs (delivered with the time they were sent). Multi-factor login is not supported: an account that has it enabled
 makes the bot exit with an error.
 
-The inventory commands (`inventory`, `attach`, `wear` for objects, `detach`,
-`anim`, `sound`) are verified by unit tests and on the local OpenSim. None of
-them has been tried on Second Life yet. That matters most for two things.
-Whether the bot learns what is attached to its avatar there is unverified:
-it reads that from the object descriptions the simulator sends by itself,
-and Second Life may send them in a form or at a time the bot does not see,
-in which case `inventory -a`, `detach BODY PART` and the confirmation of
-`attach` and `detach` would not work there. And the clothing commands
-(`wear` and `unwear` of clothing and body parts) and the keeping of the
-Current Outfit folder work through services only Second Life has; what the
-bot sends to them is taken from viewer source and covered by unit tests
-against replies written from that source, and has never met the real
-service.
+The inventory commands (`inventory`, `attach`, `wear`, `detach`, `anim`,
+`sound`) are verified by unit tests and on the local OpenSim, where the
+clothing commands can only be refused. On Second Life, checked by hand on
+2026-11-19 in one region, in two runs, the second with `--verbose`:
+
+- `attach` of three objects, by UUID and by path, without a body part: each
+  answered within a second with the point the simulator chose. All three
+  went to `Right Hand` and stayed there together.
+- `detach` of two of them by item: each answered within a second.
+- The Current Outfit folder: a link was added after each `attach` and
+  removed after each `detach`, and the grid took both. An item that already
+  had a link there got no second one.
+- `wear` and `unwear` of a piece of clothing (shoes), three times: the grid
+  took the link and the request for the new appearance and answered in two
+  seconds. The log does not show what the avatar then looked like.
+- What is attached: at login the bot learned of the avatar's attachments
+  from the simulator, five or six of them with their points. But one that
+  it had reported at one login, and that the Current Outfit folder still
+  listed, it did not report at the next login seven minutes later, and an
+  `attach` of that item was then carried out and confirmed, not refused. So
+  on Second Life the bot can miss an attachment that is there, and
+  `inventory -a`, `detach BODY PART` and the refusal to attach a thing twice
+  are only as good as what it has seen. Why it missed that one the log does
+  not tell. A likely cause is that Second Life mentioned the object as one
+  the viewer has cached, and the bot asks about cached objects only when it
+  is looking for one to touch.
+
+Not tried there, or not recorded: `inventory` in any form and its listing
+against what a viewer shows, `attach` with a body part named, `detach` by
+body part, `unwear` by kind of clothing, `wear` of a body part, a grid that
+refuses the new outfit, `anim`, `sound`, the points the bot reported
+compared with a viewer, and a viewer login afterwards to see whether it
+finds the avatar as the bot left it.
 
 ## Build
 
@@ -564,8 +584,9 @@ to find out. So the bot also knows of things attached before it started, or
 attached and detached by a script, and notes on standard error whatever
 comes or goes without a command of its own. After a teleport to another
 region or a new login it learns it again from the new simulator, which may
-take a moment. Whether Second Life tells the bot enough for this is not
-verified yet (see [Status](#status)).
+take a moment. On Second Life it has been seen to miss an attachment that
+was there (see [Status](#status)); the bot then answers as if the thing were
+not attached.
 
 None of these commands moves the avatar or changes whether the bot is
 holding its place.
@@ -605,7 +626,9 @@ cannot do. There `wear` and `unwear` of clothing and body parts fail with
 cannot do; ...`, and the Current Outfit folder is left alone. Objects are
 not affected: `attach`, `wear` on an object and `detach` work on both.
 
-All of this section is untested on Second Life; see [Status](#status).
+On Second Life `wear` and `unwear` of one piece of clothing and the notes
+in the Current Outfit folder have been tried; the rest of this section has
+not. See [Status](#status).
 
 ### Animations and sounds
 

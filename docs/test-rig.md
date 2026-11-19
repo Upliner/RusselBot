@@ -328,7 +328,8 @@ attachment detached by its own script, an attach the simulator refuses
 (the 15-second error and the simulator's alert in it are in unit tests
 only), a listing that takes longer than 50 seconds, and a link in a path
 (OpenSim's default inventory has links only in `Current Outfit`, where they
-were listed as `link`). Not tried on Second Life: any of this.
+were listed as `link`). What was tried on Second Life is under Status in
+`README.md`.
 
 Not covered: Windows, where the socket is TCP. On Second Life, looking a
 name up through `AvatarPickerRequest` found nobody (2026-11-18, an avatar
