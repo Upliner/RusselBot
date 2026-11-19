@@ -1,0 +1,34 @@
+# Tasks
+
+## 1. Config model and validation
+
+- [ ] 1.1 In `src/config.rs`, replace `region`, `position` and `object` on `Config` with `place: Place` (`Region { name, position }`, `Home`, `Latest`), `sit: Option<Sit>` (`Object(Uuid)`, `Ground`) and `deprecated_object: bool`; add `start` and `sit` to `Raw`. Verify with unit tests that a config with only `user` and a password parses to `Place::Latest` and no seat, and that today's full config parses to `Place::Region` and `Sit::Object`
+- [ ] 1.2 Parse `sit` (UUID or exactly `ground`), `object` (UUID only, sets `deprecated_object`), `start` (`home` or `latest`). Verify with unit tests for each accepted value, including `object` giving the same `sit` as the new key
+- [ ] 1.3 Reject: `sit` and `object` together, a bad `sit`, a bad `object`, `region` without `position` and the reverse, an empty `region`, a bad `start` (including `last`, with both accepted values in the message), `start` with `region`/`position`. Verify with one unit test per rule that the message names the keys the `bot-config` delta says it names; update `rejects_missing_required_keys` so that only `user` is required
+- [ ] 1.4 Rewrite the placement part of `russelbot.example.toml`: `region`/`position` as optional, `start` commented out with both values, `sit` with the UUID and a commented `sit = "ground"`, no `object`. Verify that `example_file_is_valid` still passes and add an assertion that the example parses to `Place::Region` and `Sit::Object`
+- [ ] 1.5 Update the README's key table and the paragraph on what the bot works towards: `region`/`position` optional as a pair, the new keys `start` and `sit`, and `object` marked as the deprecated spelling of `sit`; say that a seat object without a region is retried where the avatar is, and that a ground sit is sent once per arrival and cannot be observed. Verify by reading the rendered table against the `bot-config` delta's table, key by key
+
+## 2. Login start
+
+- [ ] 2.1 Add `Start::Home` in `src/login.rs`; make `start_location` return `home` for it and take the region and position from `Place::Region`. Verify with unit tests of `request_xml` for the three starts (`uri:Target&128&128&25`, `home`, `last`)
+
+## 3. Reconciler
+
+- [ ] 3.1 Introduce `Goal { region: Option<String>, start: Start, seat: Option<SeatGoal> }` and make `Reconciler::new` and `decide` take it; `in_target_region()` is true for any region when none is configured. Verify that the existing reconciler tests pass unchanged in meaning with a goal of region plus object
+- [ ] 3.2 Apply the six rules of the `presence-reconciler` delta in `decide`: login start from the goal (still `Last` after a refusal and in manual mode), teleport and reposition only with a region, object sit only with `SeatGoal::Object`. Verify with new unit tests: no region and no seat gives `Login(Last)` then `Wait(None)` in any region; `start = home` gives `Login(Home)` and `Login(Last)` after a refusal; a region without a seat teleports and then waits; a seat without a region sits without teleporting and after three failures keeps sitting under the backoff instead of teleporting; a first refused login with `Start::Last` is fatal
+- [ ] 3.3 Add `Action::SitGround` and `Memory::ground_done`, cleared by `region_entered`, `teleport_arrived`, `set_manual(false)` and by `standing` only after the avatar was reported seated on an object. Verify with unit tests: one `SitGround` after arrival and none after it is marked done; again after a teleport arrival, after returning from manual mode, and after sit-on-object followed by standing; not again after a `Standing` that follows no object sit; never in manual mode; with a region configured, only once in that region
+
+## 4. Wiring in the bot
+
+- [ ] 4.1 In `src/main.rs`, build the `Goal` from the config, carry out `Action::Teleport` and `Action::Sit` from `Place::Region` and `Sit::Object`, and carry out `Action::SitGround` with `Session::sit_ground` followed at once by the reconciler's "ground sit done", logging `sitting on the ground`. Compare against the configured object in the `Seated` handling and in `status` through `config.sit`; report every `Seated` on an object to the reconciler as needed by 3.3. Verify with `cargo build` and `cargo clippy --all-targets` free of warnings and the whole unit test suite passing
+- [ ] 4.2 Log the deprecation line once at startup when `deprecated_object` is set, and word the region and mode log lines from the goal (no "target region" when none is configured; "placement: holding" names only what is configured). Verify by running the bot against the rig with an `object` config and with a config without `region`, and reading the first lines of each log
+- [ ] 4.3 Update the README's control socket section: `home` in the command table ("hold the configured place again; does not move the avatar when no region is configured, also not with `start = \"home\"`"), and the `seat` values of `status` (`none` for a ground sit). Verify against the `avatar-commands` delta
+
+## 5. Verification on the local OpenSim rig
+
+- [ ] 5.1 Find the ground-sit animation IDs in the reference viewer or OpenSim sources and make `test-rig/listen.py` print a line when the bot's avatar starts or stops playing one (`AvatarAnimation`). Verify by running `rslbot ctl sit ground` and `rslbot ctl stand` against a seated-nowhere bot and seeing both lines
+- [ ] 5.2 Config with only the account, `socket = true`: the bot logs in at the last location, logs no teleport and no sit over five minutes, `status` shows `seat: none` and `mode: holding`; after a `tp` to the other region and `home` it stays in that region. Record the outcome in `docs/test-rig.md`
+- [ ] 5.3 `start = "home"`: set the rig avatar's home to one region, leave it in the other, start the bot and see the first region be the home region; then the same with `start = "latest"` landing in the other one. Record in `docs/test-rig.md`
+- [ ] 5.4 `sit = "ground"` with `region`/`position`: after login `listen.py` shows the ground-sit animation exactly once; after `stand` and `home` it shows again; after a `tp` away and `home` the bot teleports back and sits on the ground. Record in `docs/test-rig.md`, including whether a ground sit sent right at region entry took effect
+- [ ] 5.5 `sit = <uuid>` without `region`: started in the region with the object the bot sits without teleporting; started in the other region it retries the sit under the backoff and never teleports. Record in `docs/test-rig.md`
+- [ ] 5.6 Today's config with `object`: the bot behaves as before and logs the deprecation line; the same file with `object` renamed to `sit` behaves the same without the line. Run `openspec validate cleanup-placement-config --strict` and the full `cargo test`, and record what could not be verified (Second Life, Windows) in `docs/test-rig.md`
