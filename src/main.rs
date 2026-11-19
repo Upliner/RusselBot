@@ -24,20 +24,20 @@ mod xml;
 
 use commands::{Commands, Grid, SentIm};
 use config::{Config, Persist, Place, Sit, Source};
+use control::{Request, Response};
 use login::Outcome;
 use msglog::{Channel, Logs, Recorder};
 use names::{Lookup, Search};
 use net::{Event, RealNet};
 use persist::{Book, Location, LocationArg, Placement, SitArg, SitState, World};
 use reconciler::{Action, Decision, Goal, Reconciler, SeatGoal};
-use control::{Request, Response};
 use session::{Seat, Session, SessionEvent, Touch};
-use udp::messages::Vector3;
 use std::io::{BufRead, IsTerminal};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use udp::messages::Vector3;
 use uuid::Uuid;
 
 const EXIT_OK: i32 = 0;
@@ -204,8 +204,14 @@ impl Grid for Live<'_> {
             return self.session.find_avatar(query, name, now);
         };
         self.session.present()?;
-        let search = Search { url: url.to_string(), query, name: name.to_string() };
-        self.avatar_searches.send(search).map_err(|_| "the avatar search is not running".to_string())
+        let search = Search {
+            url: url.to_string(),
+            query,
+            name: name.to_string(),
+        };
+        self.avatar_searches
+            .send(search)
+            .map_err(|_| "the avatar search is not running".to_string())
     }
     fn stand(&mut self, now: Instant) -> Result<(), String> {
         self.session.stand(now)
@@ -250,7 +256,11 @@ fn live<'a>(
     avatar_searches: &'a Sender<Search>,
 ) -> Option<Live<'a>> {
     let session = session.as_mut()?;
-    Some(Live { session, search_url: search_url.as_deref(), avatar_searches })
+    Some(Live {
+        session,
+        search_url: search_url.as_deref(),
+        avatar_searches,
+    })
 }
 
 /// What the main loop should do after handling something.
@@ -306,24 +316,17 @@ impl Bot {
                 let net = RealNet::new(self.events.clone());
                 let name = format!("{} {}", cfg.first_name, cfg.last_name);
                 let generation = self.next_generation;
-                let session =
-                    Session::new(net, &info, &name, cfg.scan_distance, cfg.fetch_offline_im, generation, now);
+                let session = Session::new(net, &info, &name, cfg.scan_distance, cfg.fetch_offline_im, generation, now);
                 self.session = Some(session);
             }
             Outcome::NeedsOperator(failure) => {
-                info!(
-                    "login needs the operator ({}): {}",
-                    failure.reason, failure.message
-                );
+                info!("login needs the operator ({}): {}", failure.reason, failure.message);
                 self.reconciler.login_needs_operator(&failure);
             }
             Outcome::Refused(failure) => {
                 info!("login refused ({}): {}", failure.reason, failure.message);
                 if let Some(delay) = self.reconciler.login_refused(&failure, now) {
-                    info!(
-                        "next login in {}, asking for the last location",
-                        seconds(delay)
-                    );
+                    info!("next login in {}, asking for the last location", seconds(delay));
                 }
             }
             Outcome::Temporary(failure) => {
@@ -388,7 +391,9 @@ impl Bot {
         // `cur` needs the avatar in a region and not on its way out of it.
         let world = self.session.as_ref().filter(|session| session.present().is_ok());
         let world = world.map(|session| session as &dyn World);
-        let placement = self.book.resolve(location, sit, world, self.commands.last_tp(), self.commands.last_sit())?;
+        let placement = self
+            .book
+            .resolve(location, sit, world, self.commands.last_tp(), self.commands.last_sit())?;
         self.book.commit(placement.clone());
         self.startup = None;
         self.startup_wait = None;
@@ -470,7 +475,11 @@ impl Bot {
         let word = |source| if source == Source::Cur { "cur" } else { "cfg" };
         let what = format!("config: persist {} {}", word(position), word(sit));
         info!("{what}");
-        let location = if position == Source::Cur { LocationArg::Cur } else { LocationArg::Cfg };
+        let location = if position == Source::Cur {
+            LocationArg::Cur
+        } else {
+            LocationArg::Cfg
+        };
         let sit = if sit == Source::Cur { SitArg::Cur } else { SitArg::Cfg };
         if let Err(reason) = self.persist(&location, sit, now) {
             info!("{what} refused: {reason}");
@@ -482,7 +491,11 @@ impl Bot {
     fn status(&self) -> String {
         let here = self.session.as_ref().and_then(|session| {
             let region = session.region()?;
-            Some(Whereabouts { region, position: session.position(), seat: session.seat() })
+            Some(Whereabouts {
+                region,
+                position: session.position(),
+                seat: session.seat(),
+            })
         });
         status_text(here, self.book.held(), self.reconciler.is_manual())
     }
@@ -517,8 +530,16 @@ impl Bot {
 
     /// Puts an instant message the bot sent into the message log.
     fn record_sent(&mut self, sent: SentIm, now: Instant) {
-        let source = session::Source::Avatar { id: sent.to, name: sent.name };
-        let message = session::Message { kind: "im_out".to_string(), source, sent_at: None, text: sent.text };
+        let source = session::Source::Avatar {
+            id: sent.to,
+            name: sent.name,
+        };
+        let message = session::Message {
+            kind: "im_out".to_string(),
+            source,
+            sent_at: None,
+            text: sent.text,
+        };
         self.record(Channel::Im, message, now);
     }
 
@@ -539,7 +560,10 @@ impl Bot {
                     self.recorder.lookup_failed(&ids);
                 }
                 Some(Some(url)) => {
-                    let lookup = Lookup { url: url.clone(), ids: self.recorder.take_lookups() };
+                    let lookup = Lookup {
+                        url: url.clone(),
+                        ids: self.recorder.take_lookups(),
+                    };
                     if let Err(unsent) = self.name_lookups.send(lookup) {
                         self.recorder.lookup_failed(&unsent.0.ids);
                     }
@@ -566,7 +590,10 @@ impl Bot {
                 // Without a position in the config, where the first login
                 // put the avatar is the location to hold.
                 let position = self.session.as_ref().and_then(Session::position).unwrap_or_default();
-                if self.book.first_location(Location { region: name.clone(), position }) {
+                if self.book.first_location(Location {
+                    region: name.clone(),
+                    position,
+                }) {
                     self.sync_goal(now);
                     info!("placement: holding {}", self.book.held());
                 }
@@ -764,12 +791,8 @@ impl Bot {
             (Event::Control { request, reply }, _) => return self.control(request, reply, now),
             (Event::AvatarsFound { query, avatars }, _) => self.avatars_found(query, &avatars, now),
             (Event::AvatarSearchFailed { query, reason }, _) => self.commands.lookup_failed(query, &reason),
-            (Event::Datagram { generation, data }, Some(session)) => {
-                session.handle_datagram(generation, &data, now)
-            }
-            (Event::Caps { generation, event }, Some(session)) => {
-                session.handle_caps(generation, event, now)
-            }
+            (Event::Datagram { generation, data }, Some(session)) => session.handle_datagram(generation, &data, now),
+            (Event::Caps { generation, event }, Some(session)) => session.handle_caps(generation, event, now),
             (Event::Names { found, missing }, _) => self.recorder.names_resolved(found, missing, now),
             (Event::NamesFailed(ids), _) => self.recorder.lookup_failed(&ids),
             // Left over from a session that is already gone.
@@ -782,7 +805,10 @@ impl Bot {
 /// The placement the config describes: what the bot holds when it starts.
 fn config_placement(config: &Config) -> Placement {
     let location = match &config.place {
-        Place::Region { name, position } => Some(Location { region: name.clone(), position: *position }),
+        Place::Region { name, position } => Some(Location {
+            region: name.clone(),
+            position: *position,
+        }),
         Place::Home | Place::Latest => None,
     };
     let sit = match config.sit {
@@ -810,7 +836,11 @@ fn goal(held: &Placement, start: login::Start) -> Goal {
         SitState::Stand | SitState::Unchanged => None,
     };
     match &held.location {
-        Some(location) => Goal { region: Some(location.region.clone()), start: login::Start::Target, seat },
+        Some(location) => Goal {
+            region: Some(location.region.clone()),
+            start: login::Start::Target,
+            seat,
+        },
         None => Goal { region: None, start, seat },
     }
 }
@@ -1041,7 +1071,10 @@ mod tests {
     }
 
     fn at(region: &str, x: f32, y: f32, z: f32) -> Location {
-        Location { region: region.to_string(), position: [x, y, z] }
+        Location {
+            region: region.to_string(),
+            position: [x, y, z],
+        }
     }
 
     fn sat(prim: Uuid, requested: Option<Uuid>) -> Seat {
@@ -1051,12 +1084,30 @@ mod tests {
     #[test]
     fn the_config_describes_the_placement_to_start_with() {
         let placement = config_placement(&full(""));
-        assert_eq!(placement, Placement { location: Some(at("Target", 128.0, 128.0, 25.0)), sit: SitState::Object(object()) });
+        assert_eq!(
+            placement,
+            Placement {
+                location: Some(at("Target", 128.0, 128.0, 25.0)),
+                sit: SitState::Object(object())
+            }
+        );
         let ground = Config::parse(&format!("{ACCOUNT}sit = \"ground\"\nstart = \"home\"\n")).unwrap();
-        assert_eq!(config_placement(&ground), Placement { location: None, sit: SitState::Ground });
+        assert_eq!(
+            config_placement(&ground),
+            Placement {
+                location: None,
+                sit: SitState::Ground
+            }
+        );
         assert_eq!(config_start(&ground), login::Start::Home);
         let bare = Config::parse(ACCOUNT).unwrap();
-        assert_eq!(config_placement(&bare), Placement { location: None, sit: SitState::Stand });
+        assert_eq!(
+            config_placement(&bare),
+            Placement {
+                location: None,
+                sit: SitState::Stand
+            }
+        );
         assert_eq!(config_start(&bare), login::Start::Last);
     }
 
@@ -1073,10 +1124,24 @@ mod tests {
         for (sit, seat) in seats {
             // With a location: its region, and logins go there whatever the config says.
             let with = goal(&held(here.clone(), sit), login::Start::Home);
-            assert_eq!(with, Goal { region: Some("Blue Lagoon".to_string()), start: login::Start::Target, seat });
+            assert_eq!(
+                with,
+                Goal {
+                    region: Some("Blue Lagoon".to_string()),
+                    start: login::Start::Target,
+                    seat
+                }
+            );
             // Without one: no region, and logins go where the config's `start` says.
             let without = goal(&held(None, sit), login::Start::Home);
-            assert_eq!(without, Goal { region: None, start: login::Start::Home, seat });
+            assert_eq!(
+                without,
+                Goal {
+                    region: None,
+                    start: login::Start::Home,
+                    seat
+                }
+            );
         }
     }
 
@@ -1130,8 +1195,15 @@ mod tests {
 
     #[test]
     fn status_shows_the_place_the_seat_and_the_held_placement() {
-        let held = Placement { location: Some(at("Target", 128.0, 128.5, 25.0)), sit: SitState::Object(object()) };
-        let here = Whereabouts { region: "Target", position: Some([131.004, 64.5, 23.0]), seat: sat(object(), None) };
+        let held = Placement {
+            location: Some(at("Target", 128.0, 128.5, 25.0)),
+            sit: SitState::Object(object()),
+        };
+        let here = Whereabouts {
+            region: "Target",
+            position: Some([131.004, 64.5, 23.0]),
+            seat: sat(object(), None),
+        };
         assert_eq!(
             status_text(Some(here), &held, false),
             format!(
@@ -1141,34 +1213,66 @@ mod tests {
         );
         // On another object, in manual mode: the prim the simulator named.
         let other = Uuid::from_u128(7);
-        let here = Whereabouts { region: "Home", position: None, seat: sat(other, Some(Uuid::from_u128(8))) };
+        let here = Whereabouts {
+            region: "Home",
+            position: None,
+            seat: sat(other, Some(Uuid::from_u128(8))),
+        };
         assert_eq!(
             status_text(Some(here), &held, true),
             format!("connected: yes\nregion: Home\nseat: object {other}\npersist: Target/128/128.5/25 {OBJECT}\nmode: manual")
         );
         for (seat, word) in [(Seat::None, "none"), (Seat::Unknown, "unknown"), (Seat::Other, "other")] {
-            let here = Whereabouts { region: "Home", position: None, seat };
+            let here = Whereabouts {
+                region: "Home",
+                position: None,
+                seat,
+            };
             assert!(status_text(Some(here), &held, false).contains(&format!("\nseat: {word}\n")));
         }
     }
 
     #[test]
     fn status_between_logins_shows_what_is_held() {
-        let held = Placement { location: Some(at("Target", 128.0, 128.0, 25.0)), sit: SitState::Ground };
-        assert_eq!(status_text(None, &held, true), "connected: no\npersist: Target/128/128/25 ground\nmode: manual");
+        let held = Placement {
+            location: Some(at("Target", 128.0, 128.0, 25.0)),
+            sit: SitState::Ground,
+        };
+        assert_eq!(
+            status_text(None, &held, true),
+            "connected: no\npersist: Target/128/128/25 ground\nmode: manual"
+        );
         // Before the first login of a config without a position.
-        let held = Placement { location: None, sit: SitState::Stand };
-        assert_eq!(status_text(None, &held, false), "connected: no\npersist: unknown stand\nmode: holding");
+        let held = Placement {
+            location: None,
+            sit: SitState::Stand,
+        };
+        assert_eq!(
+            status_text(None, &held, false),
+            "connected: no\npersist: unknown stand\nmode: holding"
+        );
     }
 
     // --------------------------------------------- the config's persist
 
-    const CUR: Persist = Persist::On { position: Source::Cur, sit: Source::Cur };
-    const CFG: Persist = Persist::On { position: Source::Cfg, sit: Source::Cfg };
+    const CUR: Persist = Persist::On {
+        position: Source::Cur,
+        sit: Source::Cur,
+    };
+    const CFG: Persist = Persist::On {
+        position: Source::Cfg,
+        sit: Source::Cfg,
+    };
 
     /// In the target region, nothing more.
     fn arrived() -> Arrival {
-        Arrival { present: true, in_target_region: true, seated_on_target: false, ground_sat: false, seat_frame_known: false }
+        Arrival {
+            present: true,
+            in_target_region: true,
+            seated_on_target: false,
+            ground_sat: false,
+            seat_frame_known: false,
+        }
     }
 
     #[test]
@@ -1179,15 +1283,41 @@ mod tests {
         assert_eq!(due(SitState::Stand, arrived()), Startup::Now { settled: true });
         // An object: seated on it.
         assert_eq!(due(SitState::Object(object()), arrived()), Startup::NotYet);
-        let seated = Arrival { seated_on_target: true, ..arrived() };
+        let seated = Arrival {
+            seated_on_target: true,
+            ..arrived()
+        };
         assert_eq!(due(SitState::Object(object()), seated), Startup::Now { settled: true });
         // The ground: the ground sit sent.
         assert_eq!(due(SitState::Ground, arrived()), Startup::NotYet);
-        assert_eq!(due(SitState::Ground, Arrival { ground_sat: true, ..arrived() }), Startup::Now { settled: true });
+        assert_eq!(
+            due(
+                SitState::Ground,
+                Arrival {
+                    ground_sat: true,
+                    ..arrived()
+                }
+            ),
+            Startup::Now { settled: true }
+        );
         // Never before the avatar is in the target region and staying.
         for sit in [SitState::Stand, SitState::Ground, SitState::Object(object())] {
-            let reached = Arrival { seated_on_target: true, ground_sat: true, seat_frame_known: true, ..arrived() };
-            assert_eq!(due(sit, Arrival { in_target_region: false, ..reached }), Startup::NotYet);
+            let reached = Arrival {
+                seated_on_target: true,
+                ground_sat: true,
+                seat_frame_known: true,
+                ..arrived()
+            };
+            assert_eq!(
+                due(
+                    sit,
+                    Arrival {
+                        in_target_region: false,
+                        ..reached
+                    }
+                ),
+                Startup::NotYet
+            );
             assert_eq!(due(sit, Arrival { present: false, ..reached }), Startup::NotYet);
         }
     }
@@ -1195,28 +1325,49 @@ mod tests {
     #[test]
     fn a_current_location_waits_ten_seconds_for_the_seat() {
         let now = Instant::now();
-        let seated = Arrival { seated_on_target: true, ..arrived() };
+        let seated = Arrival {
+            seated_on_target: true,
+            ..arrived()
+        };
         let sit = SitState::Object(object());
         // The seat's position is known: at once.
-        let known = Arrival { seat_frame_known: true, ..seated };
+        let known = Arrival {
+            seat_frame_known: true,
+            ..seated
+        };
         assert_eq!(startup_due(sit, CUR, known, None, now), Startup::Now { settled: true });
         // Not known: wait, from when the wait began.
         assert_eq!(startup_due(sit, CUR, seated, None, now), Startup::Wait(now + SEAT_POSITION_WAIT));
         let later = now + Duration::from_secs(4);
-        assert_eq!(startup_due(sit, CUR, seated, Some(now), later), Startup::Wait(now + SEAT_POSITION_WAIT));
+        assert_eq!(
+            startup_due(sit, CUR, seated, Some(now), later),
+            Startup::Wait(now + SEAT_POSITION_WAIT)
+        );
         assert_eq!(startup_due(sit, CUR, known, Some(now), later), Startup::Now { settled: true });
         // After ten seconds it goes ahead with what it has.
         let late = now + SEAT_POSITION_WAIT;
         assert_eq!(startup_due(sit, CUR, seated, Some(now), late), Startup::Now { settled: false });
         // Only a current location is about the seat's position.
-        let seat_only = Persist::On { position: Source::Cfg, sit: Source::Cur };
+        let seat_only = Persist::On {
+            position: Source::Cfg,
+            sit: Source::Cur,
+        };
         for setting in [CFG, seat_only, Persist::Off] {
             assert_eq!(startup_due(sit, setting, seated, None, now), Startup::Now { settled: true });
         }
         // And only a seat on an object has one.
-        let on_ground = Arrival { ground_sat: true, ..arrived() };
-        assert_eq!(startup_due(SitState::Ground, CUR, on_ground, None, now), Startup::Now { settled: true });
-        assert_eq!(startup_due(SitState::Stand, CUR, arrived(), None, now), Startup::Now { settled: true });
+        let on_ground = Arrival {
+            ground_sat: true,
+            ..arrived()
+        };
+        assert_eq!(
+            startup_due(SitState::Ground, CUR, on_ground, None, now),
+            Startup::Now { settled: true }
+        );
+        assert_eq!(
+            startup_due(SitState::Stand, CUR, arrived(), None, now),
+            Startup::Now { settled: true }
+        );
     }
 
     // ------------------------------------------ persist without a session
@@ -1259,7 +1410,11 @@ mod tests {
         let mut bot = bot(full(""));
         bot.set_manual(true);
         for line in ["persist", "persist\tcur", "persist\tcfg\tcur", "persist\tcur\tstand"] {
-            assert_eq!(command(&mut bot, line), Response::Error(session::NOT_CONNECTED.to_string()), "{line}");
+            assert_eq!(
+                command(&mut bot, line),
+                Response::Error(session::NOT_CONNECTED.to_string()),
+                "{line}"
+            );
         }
         // Nothing changed: not the placement, not the mode, not the pending setting.
         assert_eq!(bot.book.held(), &config_placement(&full("")));
@@ -1271,12 +1426,21 @@ mod tests {
     fn malformed_persist_arguments_change_nothing() {
         let mut bot = bot(full(""));
         bot.set_manual(true);
-        let Response::Error(reason) = command(&mut bot, "persist\tTarget/128/128\tstand") else { panic!("accepted") };
-        assert!(reason.contains("Target/128/128") && reason.contains("<region>/<x>/<y>/<z>"), "{reason}");
-        let Response::Error(reason) = command(&mut bot, "persist\tcfg\tchair") else { panic!("accepted") };
+        let Response::Error(reason) = command(&mut bot, "persist\tTarget/128/128\tstand") else {
+            panic!("accepted")
+        };
+        assert!(
+            reason.contains("Target/128/128") && reason.contains("<region>/<x>/<y>/<z>"),
+            "{reason}"
+        );
+        let Response::Error(reason) = command(&mut bot, "persist\tcfg\tchair") else {
+            panic!("accepted")
+        };
         assert!(reason.contains("chair") && reason.contains("unchanged"), "{reason}");
         // Too many arguments do not get as far as the bot.
-        assert!(Request::decode(b"persist\tTarget/128/128/25\tstand\tnow").unwrap_err().contains("`persist`"));
+        assert!(Request::decode(b"persist\tTarget/128/128/25\tstand\tnow")
+            .unwrap_err()
+            .contains("`persist`"));
         assert_eq!(bot.book.held(), &config_placement(&full("")));
         assert!(bot.reconciler.is_manual());
     }
@@ -1291,7 +1455,10 @@ mod tests {
         // After a persist: that one, also from manual mode.
         command(&mut bot, "persist\tBlue Lagoon/10/20/30\tunchanged");
         bot.set_manual(true);
-        assert_eq!(command(&mut bot, "home"), Response::Ok(Some("Blue Lagoon/10/20/30 unchanged".to_string())));
+        assert_eq!(
+            command(&mut bot, "home"),
+            Response::Ok(Some("Blue Lagoon/10/20/30 unchanged".to_string()))
+        );
         assert!(!bot.reconciler.is_manual());
         assert_eq!(bot.reconciler.goal().seat, None);
         assert_eq!(bot.reconciler.goal().region.as_deref(), Some("Blue Lagoon"));
@@ -1319,7 +1486,10 @@ mod tests {
         assert_eq!(bot.status(), "connected: no\npersist: unknown stand\nmode: holding");
         assert_eq!(next_login(&bot), Decision::Start(Action::Login(login::Start::Last)));
         // `cfg` is accepted all the same, and still waits for that login.
-        assert_eq!(command(&mut bot, "persist\tcfg\tcfg"), Response::Ok(Some("unknown stand".to_string())));
+        assert_eq!(
+            command(&mut bot, "persist\tcfg\tcfg"),
+            Response::Ok(Some("unknown stand".to_string()))
+        );
         assert_eq!(next_login(&bot), Decision::Start(Action::Login(login::Start::Last)));
     }
 }

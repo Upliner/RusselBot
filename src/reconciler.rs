@@ -60,7 +60,10 @@ pub enum Decision {
     /// Nothing to do until the given time, or until something changes.
     Wait(Option<Instant>),
     Start(Action),
-    Exit { code: i32, message: String },
+    Exit {
+        code: i32,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,13 +118,20 @@ fn gate(not_before: Option<Instant>, action: Action, now: Instant) -> Decision {
 /// is off any object), or nothing.
 pub fn decide(observed: &Observed, memory: &Memory, goal: &Goal, now: Instant) -> Decision {
     if let Some(message) = &memory.fatal {
-        return Decision::Exit { code: 1, message: message.clone() };
+        return Decision::Exit {
+            code: 1,
+            message: message.clone(),
+        };
     }
     if memory.in_flight.is_some() {
         return Decision::Wait(None);
     }
     let Some(region) = &observed.region else {
-        let start = if memory.last_login_refused || memory.manual { Start::Last } else { goal.start };
+        let start = if memory.last_login_refused || memory.manual {
+            Start::Last
+        } else {
+            goal.start
+        };
         return gate(memory.next_login, Action::Login(start), now);
     };
     if memory.manual {
@@ -133,15 +143,11 @@ pub fn decide(observed: &Observed, memory: &Memory, goal: &Goal, now: Instant) -
     match (goal.seat, observed.seat) {
         (Some(SeatGoal::Object), Seat::SeatedOnTarget) => Decision::Wait(None),
         // Without a region there is no position to go back to.
-        (Some(SeatGoal::Object), _) if memory.reposition && goal.region.is_some() => {
-            gate(memory.next_teleport, Action::Teleport, now)
-        }
+        (Some(SeatGoal::Object), _) if memory.reposition && goal.region.is_some() => gate(memory.next_teleport, Action::Teleport, now),
         (Some(SeatGoal::Object), _) => gate(memory.next_sit, Action::Sit, now),
         // A ground sit means nothing to an avatar on an object: it waits
         // for the avatar to be reported standing.
-        (Some(SeatGoal::Ground), _) if !memory.ground_done && !memory.on_object => {
-            Decision::Start(Action::SitGround)
-        }
+        (Some(SeatGoal::Ground), _) if !memory.ground_done && !memory.on_object => Decision::Start(Action::SitGround),
         _ => Decision::Wait(None),
     }
 }
@@ -157,7 +163,10 @@ impl Reconciler {
         let start = goal.start;
         Reconciler {
             goal,
-            observed: Observed { region: None, seat: Seat::Unknown },
+            observed: Observed {
+                region: None,
+                seat: Seat::Unknown,
+            },
             memory: Memory {
                 in_flight: None,
                 login: Backoff::new(LOGIN_FIRST),
@@ -370,7 +379,10 @@ impl Reconciler {
         if stable {
             self.memory.login.reset();
         }
-        self.observed = Observed { region: None, seat: Seat::Unknown };
+        self.observed = Observed {
+            region: None,
+            seat: Seat::Unknown,
+        };
         self.memory.in_flight = None;
         self.memory.connected_since = None;
         self.memory.seated_since = None;
@@ -466,7 +478,11 @@ mod tests {
 
     /// The goal of a full config: a region and an object to sit on.
     fn holding() -> Goal {
-        Goal { region: Some(TARGET.to_string()), start: Start::Target, seat: Some(SeatGoal::Object) }
+        Goal {
+            region: Some(TARGET.to_string()),
+            start: Start::Target,
+            seat: Some(SeatGoal::Object),
+        }
     }
 
     fn secs(n: u64) -> Duration {
@@ -474,7 +490,10 @@ mod tests {
     }
 
     fn failure(reason: &str) -> Failure {
-        Failure { reason: reason.to_string(), message: format!("{reason} message") }
+        Failure {
+            reason: reason.to_string(),
+            message: format!("{reason} message"),
+        }
     }
 
     /// Starts whatever `decide` returns and reports it.
@@ -870,7 +889,11 @@ mod tests {
     // ------------------------------------------------- partial goals
 
     fn goal(region: Option<&str>, start: Start, seat: Option<SeatGoal>) -> Goal {
-        Goal { region: region.map(str::to_string), start, seat }
+        Goal {
+            region: region.map(str::to_string),
+            start,
+            seat,
+        }
     }
 
     /// A reconciler with `goal` that has logged in to `region`.
@@ -960,7 +983,11 @@ mod tests {
         assert_eq!(rec.teleport_failed(now), secs(10));
         assert_eq!(rec.decide(now + secs(1)), Decision::Wait(Some(now + secs(10))));
         // A persist names a place in another region.
-        rec.set_goal(goal(Some("Blue Lagoon"), Start::Target, Some(SeatGoal::Object)), false, now + secs(1));
+        rec.set_goal(
+            goal(Some("Blue Lagoon"), Start::Target, Some(SeatGoal::Object)),
+            false,
+            now + secs(1),
+        );
         rec.rearm();
         assert_eq!(step(&mut rec, now + secs(1)), start(Action::Teleport));
         // And the delays start over.

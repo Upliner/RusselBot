@@ -171,9 +171,7 @@ struct Writer(Vec<u8>);
 
 impl Writer {
     fn agent(agent: &Agent) -> Writer {
-        Writer::default()
-            .uuid(agent.agent_id)
-            .uuid(agent.session_id)
+        Writer::default().uuid(agent.agent_id).uuid(agent.session_id)
     }
     fn u8(mut self, v: u8) -> Self {
         self.0.push(v);
@@ -242,16 +240,12 @@ pub fn use_circuit_code(agent: &Agent, circuit_code: u32) -> Outgoing {
 
 /// CompleteAgentMovement, Low 249.
 pub fn complete_agent_movement(agent: &Agent, circuit_code: u32) -> Outgoing {
-    Writer::agent(agent)
-        .u32(circuit_code)
-        .finish(COMPLETE_AGENT_MOVEMENT, false)
+    Writer::agent(agent).u32(circuit_code).finish(COMPLETE_AGENT_MOVEMENT, false)
 }
 
 /// RegionHandshakeReply, Low 149, Zerocoded.
 pub fn region_handshake_reply(agent: &Agent) -> Outgoing {
-    Writer::agent(agent)
-        .u32(0)
-        .finish(REGION_HANDSHAKE_REPLY, true)
+    Writer::agent(agent).u32(0).finish(REGION_HANDSHAKE_REPLY, true)
 }
 
 /// AgentThrottle, Low 81, Zerocoded. `throttles` are bits per second for
@@ -289,9 +283,7 @@ pub fn agent_update(agent: &Agent, camera: Vector3, far: f32, control_flags: u32
 
 /// CompletePingCheck, High 2.
 pub fn complete_ping_check(ping_id: u8) -> Outgoing {
-    Writer::default()
-        .u8(ping_id)
-        .finish(COMPLETE_PING_CHECK, false)
+    Writer::default().u8(ping_id).finish(COMPLETE_PING_CHECK, false)
 }
 
 /// PacketAck, Fixed 0xFFFFFFFB. At most 255 ids fit in one message.
@@ -368,14 +360,7 @@ const TELEPORT_VIA_LURE: u32 = 1 << 2;
 /// agent to another avatar. For a plain message the conversation id is the
 /// two agent ids combined, which is how viewers pair a reply with the
 /// message; other dialogs carry no id.
-pub fn instant_message(
-    agent: &Agent,
-    from_name: &str,
-    to: Uuid,
-    position: Vector3,
-    dialog: u8,
-    text: &str,
-) -> Outgoing {
+pub fn instant_message(agent: &Agent, from_name: &str, to: Uuid, position: Vector3, dialog: u8, text: &str) -> Outgoing {
     let conversation = match dialog {
         IM_PLAIN => Uuid::from_u128(agent.agent_id.as_u128() ^ to.as_u128()),
         _ => Uuid::nil(),
@@ -401,10 +386,7 @@ pub fn instant_message(
 /// AvatarPickerRequest, Low 26: QueryID LLUUID, Name Variable 1. Asks for
 /// the avatars whose names match `name`.
 pub fn avatar_picker_request(agent: &Agent, query: Uuid, name: &str) -> Outgoing {
-    Writer::agent(agent)
-        .uuid(query)
-        .text1(name)
-        .finish(AVATAR_PICKER_REQUEST, false)
+    Writer::agent(agent).uuid(query).text1(name).finish(AVATAR_PICKER_REQUEST, false)
 }
 
 /// StartLure, Low 70: LureType U8, Message Variable 1, then the avatars
@@ -549,10 +531,7 @@ impl Transform {
     /// wrong offset tends to produce such values.
     fn checked(position: Vector3, rotation: Quaternion) -> Option<Transform> {
         let norm = rotation.iter().map(|part| part * part).sum::<f32>().sqrt();
-        let usable = position.iter().all(|part| part.is_finite())
-            && norm.is_finite()
-            && norm > 0.5
-            && norm < 2.0;
+        let usable = position.iter().all(|part| part.is_finite()) && norm.is_finite() && norm > 0.5 && norm < 2.0;
         usable.then(|| Transform {
             position,
             rotation: rotation.map(|part| part / norm),
@@ -562,13 +541,7 @@ impl Transform {
 
 /// `v` turned by the unit quaternion `q`.
 pub fn rotate(q: Quaternion, v: Vector3) -> Vector3 {
-    let cross = |a: Vector3, b: Vector3| {
-        [
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
-        ]
-    };
+    let cross = |a: Vector3, b: Vector3| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
     let axis = [q[0], q[1], q[2]];
     let once = cross(axis, v);
     let twice = cross(axis, once);
@@ -741,9 +714,7 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
         // TeleportLocal, Low 64: AgentID, LocationID U32, Position, LookAt, TeleportFlags U32.
         TELEPORT_LOCAL => {
             r.skip(20)?;
-            Incoming::TeleportLocal {
-                position: r.vector3()?,
-            }
+            Incoming::TeleportLocal { position: r.vector3()? }
         }
         // AvatarSitResponse, High 21: ID LLUUID, AutoPilot BOOL, ...
         AVATAR_SIT_RESPONSE => Incoming::AvatarSitResponse {
@@ -768,13 +739,8 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
                 let (full_id, local_id) = (data.uuid()?, data.u32()?);
                 // Whatever is too short to hold them describes the object
                 // all the same.
-                let transform = data
-                    .skip(20)
-                    .and_then(|()| Ok((data.vector3()?, data.vector3()?)))
-                    .ok();
-                let transform = transform.and_then(|(position, rotation)| {
-                    Transform::checked(position, unpack(rotation))
-                });
+                let transform = data.skip(20).and_then(|()| Ok((data.vector3()?, data.vector3()?))).ok();
+                let transform = transform.and_then(|(position, rotation)| Transform::checked(position, unpack(rotation)));
                 objects.push(CompressedObject {
                     full_id,
                     local_id,
@@ -1077,13 +1043,7 @@ pub mod testing {
     }
 
     /// `source` is (SourceID, OwnerID, SourceType).
-    pub fn chat_from_simulator(
-        from_name: &str,
-        source: (Uuid, Uuid, u8),
-        chat_type: u8,
-        audible: i8,
-        message: &str,
-    ) -> Vec<u8> {
+    pub fn chat_from_simulator(from_name: &str, source: (Uuid, Uuid, u8), chat_type: u8, audible: i8, message: &str) -> Vec<u8> {
         let mut body = string1(from_name);
         body.extend(source.0.as_bytes());
         body.extend(source.1.as_bytes());
@@ -1310,10 +1270,7 @@ mod tests {
         let msg = use_circuit_code(&agent(), 0x0403_0201);
         assert_eq!((msg.id, msg.zerocoded), (low(3), false));
         // Code, SessionID, ID: the session id comes before the agent id here.
-        assert_eq!(
-            msg.body,
-            [vec![1, 2, 3, 4], vec![0x5E; 16], vec![0xA1; 16]].concat()
-        );
+        assert_eq!(msg.body, [vec![1, 2, 3, 4], vec![0x5E; 16], vec![0xA1; 16]].concat());
     }
 
     #[test]
@@ -1376,10 +1333,7 @@ mod tests {
     fn encodes_map_name_request() {
         let msg = map_name_request(&agent(), "Target");
         assert_eq!(msg.id, low(408));
-        assert_eq!(
-            msg.body,
-            [agent_prefix(), vec![0; 9], vec![7], b"Target\0".to_vec()].concat()
-        );
+        assert_eq!(msg.body, [agent_prefix(), vec![0; 9], vec![7], b"Target\0".to_vec()].concat());
     }
 
     #[test]
@@ -1388,13 +1342,7 @@ mod tests {
         assert_eq!((msg.id, msg.zerocoded), (low(80), true));
         assert_eq!(
             msg.body,
-            [
-                agent_prefix(),
-                vec![3, 0],
-                b"hi\0".to_vec(),
-                vec![2, 4, 3, 2, 1]
-            ]
-            .concat()
+            [agent_prefix(), vec![3, 0], b"hi\0".to_vec(), vec![2, 4, 3, 2, 1]].concat()
         );
     }
 
@@ -1408,10 +1356,7 @@ mod tests {
             vec![0],         // FromGroup
             vec![0x0F; 16],  // ToAgentID
             vec![0; 4 + 16], // ParentEstateID, RegionID
-            [1.0f32, 2.0, 3.0]
-                .iter()
-                .flat_map(|f| f.to_le_bytes())
-                .collect(),
+            [1.0f32, 2.0, 3.0].iter().flat_map(|f| f.to_le_bytes()).collect(),
             vec![0, 0],            // Offline, Dialog
             vec![0xA1 ^ 0x0F; 16], // ID
             vec![0; 4],            // Timestamp
@@ -1444,18 +1389,8 @@ mod tests {
     #[test]
     fn teleport_request_is_an_instant_message_without_a_conversation() {
         let to = Uuid::from_bytes([0x0F; 16]);
-        let msg = instant_message(
-            &agent(),
-            "Sit Bot",
-            to,
-            [0.0; 3],
-            IM_TELEPORT_REQUEST,
-            "may I?",
-        );
-        let Ok(Incoming::InstantMessage {
-            dialog, id, text, ..
-        }) = decode(msg.id, &msg.body)
-        else {
+        let msg = instant_message(&agent(), "Sit Bot", to, [0.0; 3], IM_TELEPORT_REQUEST, "may I?");
+        let Ok(Incoming::InstantMessage { dialog, id, text, .. }) = decode(msg.id, &msg.body) else {
             panic!("not an instant message")
         };
         assert_eq!((dialog, id, text.as_str()), (26, Uuid::nil(), "may I?"));
@@ -1468,48 +1403,29 @@ mod tests {
         assert_eq!((msg.id, msg.zerocoded), (low(70), false));
         assert_eq!(
             msg.body,
-            [
-                agent_prefix(),
-                vec![0, 5],
-                b"come\0".to_vec(),
-                vec![1],
-                vec![0x0F; 16]
-            ]
-            .concat()
+            [agent_prefix(), vec![0, 5], b"come\0".to_vec(), vec![1], vec![0x0F; 16]].concat()
         );
 
         let msg = teleport_lure_request(&agent(), Uuid::from_bytes([0x44; 16]));
         assert_eq!((msg.id, msg.zerocoded), (low(71), false));
-        assert_eq!(
-            msg.body,
-            [agent_prefix(), vec![0x44; 16], vec![4, 0, 0, 0]].concat()
-        );
+        assert_eq!(msg.body, [agent_prefix(), vec![0x44; 16], vec![4, 0, 0, 0]].concat());
     }
 
     #[test]
     fn encodes_a_touch() {
         let msg = object_grab(&agent(), 0x0403_0201);
         assert_eq!((msg.id, msg.zerocoded), (low(117), true));
-        assert_eq!(
-            msg.body,
-            [agent_prefix(), vec![1, 2, 3, 4], vec![0; 12], vec![0]].concat()
-        );
+        assert_eq!(msg.body, [agent_prefix(), vec![1, 2, 3, 4], vec![0; 12], vec![0]].concat());
         let msg = object_degrab(&agent(), 0x0403_0201);
         assert_eq!((msg.id, msg.zerocoded), (low(119), false));
-        assert_eq!(
-            msg.body,
-            [agent_prefix(), vec![1, 2, 3, 4], vec![0]].concat()
-        );
+        assert_eq!(msg.body, [agent_prefix(), vec![1, 2, 3, 4], vec![0]].concat());
     }
 
     #[test]
     fn encodes_request_multiple_objects() {
         let msg = request_multiple_objects(&agent(), &[7, 0x0102]);
         assert_eq!((msg.id, msg.zerocoded), (medium(3), true));
-        assert_eq!(
-            msg.body,
-            [agent_prefix(), vec![2, 0, 7, 0, 0, 0, 0, 2, 1, 0, 0]].concat()
-        );
+        assert_eq!(msg.body, [agent_prefix(), vec![2, 0, 7, 0, 0, 0, 0, 2, 1, 0, 0]].concat());
     }
 
     #[test]
@@ -1523,25 +1439,16 @@ mod tests {
         };
         assert_eq!(
             decode(high(13), &body),
-            Ok(Incoming::ObjectsCompressed(vec![
-                plain(a, 500),
-                plain(b, 501)
-            ]))
+            Ok(Incoming::ObjectsCompressed(vec![plain(a, 500), plain(b, 501)]))
         );
         assert_eq!(decode(high(13), &body[..body.len() - 40]), Err(DecodeError));
 
         let body = object_update_cached(&[500, 501]);
-        assert_eq!(
-            decode(high(14), &body),
-            Ok(Incoming::ObjectsCached(vec![500, 501]))
-        );
+        assert_eq!(decode(high(14), &body), Ok(Incoming::ObjectsCached(vec![500, 501])));
         assert_eq!(decode(high(14), &body[..body.len() - 1]), Err(DecodeError));
 
         let body = kill_object(&[500, 501]);
-        assert_eq!(
-            decode(high(16), &body),
-            Ok(Incoming::ObjectsKilled(vec![500, 501]))
-        );
+        assert_eq!(decode(high(16), &body), Ok(Incoming::ObjectsKilled(vec![500, 501])));
         assert_eq!(decode(high(16), &body[..body.len() - 1]), Err(DecodeError));
     }
 
@@ -1550,16 +1457,7 @@ mod tests {
         let query = Uuid::from_bytes([0x33; 16]);
         let msg = avatar_picker_request(&agent(), query, "jane doe");
         assert_eq!((msg.id, msg.zerocoded), (low(26), false));
-        assert_eq!(
-            msg.body,
-            [
-                agent_prefix(),
-                vec![0x33; 16],
-                vec![9],
-                b"jane doe\0".to_vec()
-            ]
-            .concat()
-        );
+        assert_eq!(msg.body, [agent_prefix(), vec![0x33; 16], vec![9], b"jane doe\0".to_vec()].concat());
     }
 
     #[test]
@@ -1571,21 +1469,12 @@ mod tests {
             decode(low(28), &body),
             Ok(Incoming::AvatarPickerReply {
                 query,
-                avatars: vec![
-                    (jane, "Jane Doe".to_string()),
-                    (other, "Jane Doester".to_string())
-                ],
+                avatars: vec![(jane, "Jane Doe".to_string()), (other, "Jane Doester".to_string())],
             })
         );
         assert_eq!(decode(low(28), &body[..body.len() - 1]), Err(DecodeError));
         let none = avatar_picker_reply(query, &[]);
-        assert_eq!(
-            decode(low(28), &none),
-            Ok(Incoming::AvatarPickerReply {
-                query,
-                avatars: vec![]
-            })
-        );
+        assert_eq!(decode(low(28), &none), Ok(Incoming::AvatarPickerReply { query, avatars: vec![] }));
     }
 
     #[test]
@@ -1602,20 +1491,14 @@ mod tests {
         let target = Uuid::from_bytes([0x0B; 16]);
         let request = agent_request_sit(&agent(), target);
         assert_eq!((request.id, request.zerocoded), (high(6), true));
-        assert_eq!(
-            request.body,
-            [agent_prefix(), vec![0x0B; 16], vec![0; 12]].concat()
-        );
+        assert_eq!(request.body, [agent_prefix(), vec![0x0B; 16], vec![0; 12]].concat());
         let sit = agent_sit(&agent());
         assert_eq!((sit.id, sit.body), (high(7), agent_prefix()));
     }
 
     #[test]
     fn decodes_ping_and_acks() {
-        assert_eq!(
-            decode(high(1), &[7, 1, 0, 0, 0]),
-            Ok(Incoming::StartPingCheck { ping_id: 7 })
-        );
+        assert_eq!(decode(high(1), &[7, 1, 0, 0, 0]), Ok(Incoming::StartPingCheck { ping_id: 7 }));
         assert_eq!(
             decode(PACKET_ACK, &[2, 5, 0, 0, 0, 0, 1, 0, 0]),
             Ok(Incoming::PacketAck(vec![5, 256]))
@@ -1627,9 +1510,7 @@ mod tests {
     fn decodes_region_handshake() {
         assert_eq!(
             decode(low(148), &region_handshake("Target")),
-            Ok(Incoming::RegionHandshake {
-                sim_name: "Target".into()
-            })
+            Ok(Incoming::RegionHandshake { sim_name: "Target".into() })
         );
     }
 
@@ -1684,9 +1565,7 @@ mod tests {
         );
         assert_eq!(
             decode(low(64), &teleport_local([4.0, 5.0, 6.0])),
-            Ok(Incoming::TeleportLocal {
-                position: [4.0, 5.0, 6.0]
-            })
+            Ok(Incoming::TeleportLocal { position: [4.0, 5.0, 6.0] })
         );
     }
 
@@ -1695,21 +1574,13 @@ mod tests {
         let object = Uuid::from_bytes([0x0B; 16]);
         assert_eq!(
             decode(high(21), &avatar_sit_response(object, true)),
-            Ok(Incoming::AvatarSitResponse {
-                object,
-                autopilot: true
-            })
+            Ok(Incoming::AvatarSitResponse { object, autopilot: true })
         );
     }
 
     #[test]
     fn decodes_kick_logout_and_disable() {
-        assert_eq!(
-            decode(low(163), &kick_user("Bye")),
-            Ok(Incoming::KickUser {
-                reason: "Bye".into()
-            })
-        );
+        assert_eq!(decode(low(163), &kick_user("Bye")), Ok(Incoming::KickUser { reason: "Bye".into() }));
         assert_eq!(decode(low(253), &[0; 33]), Ok(Incoming::LogoutReply));
         assert_eq!(decode(low(152), &[]), Ok(Incoming::DisableSimulator));
     }
@@ -1719,40 +1590,24 @@ mod tests {
         let alert = Incoming::Alert {
             message: "No suitable surface".into(),
         };
-        assert_eq!(
-            decode(low(134), &alert_message("No suitable surface")),
-            Ok(alert)
-        );
+        assert_eq!(decode(low(134), &alert_message("No suitable surface")), Ok(alert));
         let alert = Incoming::Alert {
             message: "Region restarting".into(),
         };
-        assert_eq!(
-            decode(low(135), &agent_alert_message("Region restarting")),
-            Ok(alert)
-        );
+        assert_eq!(decode(low(135), &agent_alert_message("Region restarting")), Ok(alert));
     }
 
     #[test]
     fn encodes_retrieve_instant_messages() {
         let msg = retrieve_instant_messages(&agent());
-        assert_eq!(
-            (msg.id, msg.zerocoded, msg.body),
-            (low(255), false, agent_prefix())
-        );
+        assert_eq!((msg.id, msg.zerocoded, msg.body), (low(255), false, agent_prefix()));
     }
 
     #[test]
     fn decodes_chat_from_simulator() {
-        let (avatar, object, owner) = (
-            Uuid::from_bytes([1; 16]),
-            Uuid::from_bytes([2; 16]),
-            Uuid::from_bytes([3; 16]),
-        );
+        let (avatar, object, owner) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
         assert_eq!(
-            decode(
-                low(139),
-                &chat_from_simulator("Jane Doe", (avatar, avatar, 1), 1, 1, "hello")
-            ),
+            decode(low(139), &chat_from_simulator("Jane Doe", (avatar, avatar, 1), 1, 1, "hello")),
             Ok(Incoming::Chat {
                 from_name: "Jane Doe".into(),
                 source_id: avatar,
@@ -1781,38 +1636,25 @@ mod tests {
 
     #[test]
     fn decodes_improved_instant_message() {
-        let (sender, session, object) = (
-            Uuid::from_bytes([1; 16]),
-            Uuid::from_bytes([2; 16]),
-            Uuid::from_bytes([3; 16]),
-        );
-        let im = |dialog, id, offline, timestamp, from_name: &str, text: &str| {
-            Incoming::InstantMessage {
-                from_agent: sender,
-                from_name: from_name.into(),
-                dialog,
-                id,
-                offline,
-                timestamp,
-                text: text.into(),
-            }
+        let (sender, session, object) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
+        let im = |dialog, id, offline, timestamp, from_name: &str, text: &str| Incoming::InstantMessage {
+            from_agent: sender,
+            from_name: from_name.into(),
+            dialog,
+            id,
+            offline,
+            timestamp,
+            text: text.into(),
         };
         assert_eq!(
-            decode(
-                low(254),
-                &improved_instant_message(sender, "Jane Doe", 0, session, None, "hi")
-            ),
+            decode(low(254), &improved_instant_message(sender, "Jane Doe", 0, session, None, "hi")),
             Ok(im(0, session, false, 0, "Jane Doe", "hi"))
         );
         assert_eq!(
-            decode(
-                low(254),
-                &improved_instant_message(sender, "Clock", 19, object, None, "done")
-            ),
+            decode(low(254), &improved_instant_message(sender, "Clock", 19, object, None, "done")),
             Ok(im(19, object, false, 0, "Clock", "done"))
         );
-        let body =
-            improved_instant_message(sender, "Jane Doe", 0, session, Some(1_700_000_000), "later");
+        let body = improved_instant_message(sender, "Jane Doe", 0, session, Some(1_700_000_000), "later");
         assert_eq!(
             decode(low(254), &body),
             Ok(im(0, session, true, 1_700_000_000, "Jane Doe", "later"))
@@ -1822,11 +1664,7 @@ mod tests {
 
     #[test]
     fn decodes_object_update_with_several_blocks() {
-        let ids = [
-            Uuid::from_bytes([1; 16]),
-            agent().agent_id,
-            Uuid::from_bytes([3; 16]),
-        ];
+        let ids = [Uuid::from_bytes([1; 16]), agent().agent_id, Uuid::from_bytes([3; 16])];
         let body = object_update(&[(ids[0], 0), (ids[1], 4242), (ids[2], 77)]);
         assert_eq!(
             decode(high(12), &body),
@@ -1857,12 +1695,7 @@ mod tests {
     /// quaternion and in full.
     const QUARTER_TURN: (Vector3, Quaternion) = (
         [0.0, 0.0, std::f32::consts::FRAC_1_SQRT_2],
-        [
-            0.0,
-            0.0,
-            std::f32::consts::FRAC_1_SQRT_2,
-            std::f32::consts::FRAC_1_SQRT_2,
-        ],
+        [0.0, 0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2],
     );
 
     fn close(a: &[f32], b: &[f32]) -> bool {
@@ -1871,11 +1704,7 @@ mod tests {
 
     #[test]
     fn object_update_carries_position_and_rotation() {
-        let (prim, avatar, old) = (
-            Uuid::from_bytes([1; 16]),
-            Uuid::from_bytes([2; 16]),
-            Uuid::from_bytes([3; 16]),
-        );
+        let (prim, avatar, old) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
         let body = object_blocks(&[
             Block {
                 full_id: prim,
@@ -1901,19 +1730,12 @@ mod tests {
             panic!("not an object update")
         };
         assert_eq!(
-            objects
-                .iter()
-                .map(|o| (o.full_id, o.local_id, o.parent_id))
-                .collect::<Vec<_>>(),
+            objects.iter().map(|o| (o.full_id, o.local_id, o.parent_id)).collect::<Vec<_>>(),
             [(prim, 7, 0), (avatar, 8, 7), (old, 9, 0)]
         );
         let seat = objects[0].transform.unwrap();
         assert_eq!(seat.position, [131.0, 64.0, 23.0]);
-        assert!(
-            close(&seat.rotation, &QUARTER_TURN.1),
-            "{:?}",
-            seat.rotation
-        );
+        assert!(close(&seat.rotation, &QUARTER_TURN.1), "{:?}", seat.rotation);
         let rider = objects[1].transform.unwrap();
         assert_eq!(rider.position, [0.5, 0.0, 0.75]);
         assert!(close(&rider.rotation, &[0.0, 0.0, 0.0, 1.0]));
@@ -1927,22 +1749,13 @@ mod tests {
         let mut avatar = object_data([4.0, 5.0, 6.0], [0.0; 3], true);
         avatar.extend([0xEE; 64]);
         assert_eq!((prim.len(), avatar.len()), (124, 140));
-        assert_eq!(
-            transform_from_motion(&prim).unwrap().position,
-            [1.0, 2.0, 3.0]
-        );
-        assert_eq!(
-            transform_from_motion(&avatar).unwrap().position,
-            [4.0, 5.0, 6.0]
-        );
+        assert_eq!(transform_from_motion(&prim).unwrap().position, [1.0, 2.0, 3.0]);
+        assert_eq!(transform_from_motion(&avatar).unwrap().position, [4.0, 5.0, 6.0]);
     }
 
     #[test]
     fn positions_that_are_not_numbers_are_dropped() {
-        assert_eq!(
-            transform_from_motion(&object_data([f32::NAN, 2.0, 3.0], [0.0; 3], false)),
-            None
-        );
+        assert_eq!(transform_from_motion(&object_data([f32::NAN, 2.0, 3.0], [0.0; 3], false)), None);
         assert_eq!(
             transform_from_motion(&object_data([1.0, f32::INFINITY, 3.0], [0.0; 3], false)),
             None
@@ -1954,25 +1767,16 @@ mod tests {
     #[test]
     fn compressed_update_carries_position_and_rotation() {
         let (a, b) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]));
-        let body = object_update_compressed_at(&[
-            (a, 500, [10.0, 20.0, 30.0], QUARTER_TURN.0),
-            (b, 501, [1.0, 2.0, 3.0], [0.0; 3]),
-        ]);
+        let body = object_update_compressed_at(&[(a, 500, [10.0, 20.0, 30.0], QUARTER_TURN.0), (b, 501, [1.0, 2.0, 3.0], [0.0; 3])]);
         let Ok(Incoming::ObjectsCompressed(objects)) = decode(high(13), &body) else {
             panic!("not compressed")
         };
         assert_eq!(
-            objects
-                .iter()
-                .map(|o| (o.full_id, o.local_id))
-                .collect::<Vec<_>>(),
+            objects.iter().map(|o| (o.full_id, o.local_id)).collect::<Vec<_>>(),
             [(a, 500), (b, 501)]
         );
         assert_eq!(objects[0].transform.unwrap().position, [10.0, 20.0, 30.0]);
-        assert!(close(
-            &objects[0].transform.unwrap().rotation,
-            &QUARTER_TURN.1
-        ));
+        assert!(close(&objects[0].transform.unwrap().rotation, &QUARTER_TURN.1));
         assert_eq!(objects[1].transform.unwrap().position, [1.0, 2.0, 3.0]);
         // Cut inside the second block's data: an error, not a guess.
         assert_eq!(decode(high(13), &body[..body.len() - 20]), Err(DecodeError));
@@ -1997,43 +1801,23 @@ mod tests {
         let Ok(Incoming::ObjectsMoved(objects)) = decode(high(15), &body) else {
             panic!("not a terse update")
         };
-        assert_eq!(
-            objects.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            [7, 8]
-        );
+        assert_eq!(objects.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [7, 8]);
         assert_eq!(objects[0].1.position, [141.0, 64.0, 23.0]);
-        assert!(
-            close(&objects[0].1.rotation, &QUARTER_TURN.1),
-            "{:?}",
-            objects[0].1.rotation
-        );
+        assert!(close(&objects[0].1.rotation, &QUARTER_TURN.1), "{:?}", objects[0].1.rotation);
         // The avatar's block is longer by its collision plane.
         assert_eq!(objects[1].1.position, [0.5, 0.25, 0.75]);
         assert!(close(&objects[1].1.rotation, &[0.0, 0.0, 0.0, 1.0]));
         for cut in [1, 10, 30] {
-            assert_eq!(
-                decode(high(15), &body[..body.len() - cut]),
-                Err(DecodeError),
-                "cut {cut}"
-            );
+            assert_eq!(decode(high(15), &body[..body.len() - cut]), Err(DecodeError), "cut {cut}");
         }
     }
 
     #[test]
     fn rotate_turns_a_vector_by_a_quaternion() {
         // A quarter turn about the vertical axis takes x to y.
-        assert!(close(
-            &rotate(QUARTER_TURN.1, [1.0, 0.0, 0.0]),
-            &[0.0, 1.0, 0.0]
-        ));
-        assert!(close(
-            &rotate(QUARTER_TURN.1, [0.0, 1.0, 2.0]),
-            &[-1.0, 0.0, 2.0]
-        ));
-        assert!(close(
-            &rotate([0.0, 0.0, 0.0, 1.0], [3.0, 4.0, 5.0]),
-            &[3.0, 4.0, 5.0]
-        ));
+        assert!(close(&rotate(QUARTER_TURN.1, [1.0, 0.0, 0.0]), &[0.0, 1.0, 0.0]));
+        assert!(close(&rotate(QUARTER_TURN.1, [0.0, 1.0, 2.0]), &[-1.0, 0.0, 2.0]));
+        assert!(close(&rotate([0.0, 0.0, 0.0, 1.0], [3.0, 4.0, 5.0]), &[3.0, 4.0, 5.0]));
     }
 
     #[test]

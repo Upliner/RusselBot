@@ -37,10 +37,7 @@ pub fn format_timestamp(secs: u64) -> String {
 }
 
 pub fn write(args: Arguments) {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     eprintln!("{} {}", format_timestamp(secs), one_line(&args.to_string()));
 }
 

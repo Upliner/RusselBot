@@ -71,9 +71,11 @@ pub fn parse_seed_reply(body: &str) -> Result<Seed, String> {
     let reply = xml::parse_llsd(body).map_err(|e| e.to_string())?;
     let url = |name| reply.str_field(name).filter(|url| !url.is_empty()).map(str::to_string);
     match url(EVENT_QUEUE) {
-        Some(event_queue) => {
-            Ok(Seed { event_queue, display_names: url(DISPLAY_NAMES), avatar_search: url(AVATAR_SEARCH) })
-        }
+        Some(event_queue) => Ok(Seed {
+            event_queue,
+            display_names: url(DISPLAY_NAMES),
+            avatar_search: url(AVATAR_SEARCH),
+        }),
         None => Err("simulator offers no EventQueueGet capability".to_string()),
     }
 }
@@ -108,9 +110,9 @@ pub fn parse_events(body: &str) -> Result<(Option<i64>, Vec<EqEvent>), String> {
     for event in events {
         let name = event.str_field("message").unwrap_or("");
         parsed.push(match (name, event.get("body")) {
-            ("TeleportFinish", Some(body)) => EqEvent::TeleportFinish(
-                teleport_finish(body).ok_or("TeleportFinish event is missing fields")?,
-            ),
+            ("TeleportFinish", Some(body)) => {
+                EqEvent::TeleportFinish(teleport_finish(body).ok_or("TeleportFinish event is missing fields")?)
+            }
             _ => EqEvent::Other(name.to_string()),
         });
     }
@@ -194,9 +196,7 @@ pub fn run(seed_capability: &str, stop: &AtomicBool, mut emit: impl FnMut(CapsEv
             None => match fetch_seed(&agent, seed_capability) {
                 Ok(seed) => {
                     queue_url = Some(seed.event_queue);
-                    if !emit(CapsEvent::DisplayNames(seed.display_names))
-                        || !emit(CapsEvent::AvatarSearch(seed.avatar_search))
-                    {
+                    if !emit(CapsEvent::DisplayNames(seed.display_names)) || !emit(CapsEvent::AvatarSearch(seed.avatar_search)) {
                         return;
                     }
                     None

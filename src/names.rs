@@ -53,11 +53,19 @@ pub fn parse_reply(body: &str) -> Result<Reply, String> {
     let field = |agent: &Value, key| agent.str_field(key).unwrap_or("").trim().to_string();
     let mut found = Vec::new();
     for agent in list("agents") {
-        let Some(id) = agent.get("id").and_then(Value::as_uuid) else { continue };
+        let Some(id) = agent.get("id").and_then(Value::as_uuid) else {
+            continue;
+        };
         let first = field(agent, "legacy_first_name");
         let last = field(agent, "legacy_last_name");
         let legacy = format!("{first} {last}").trim().to_string();
-        found.push((id, Names { legacy, display: field(agent, "display_name") }));
+        found.push((
+            id,
+            Names {
+                legacy,
+                display: field(agent, "display_name"),
+            },
+        ));
     }
     let missing = list("bad_ids").iter().filter_map(Value::as_uuid).collect();
     Ok((found, missing))
@@ -193,7 +201,13 @@ mod tests {
     }
 
     fn jane() -> (Uuid, Names) {
-        (uuid(JANE), Names { legacy: "Jane Doe".into(), display: "JD".into() })
+        (
+            uuid(JANE),
+            Names {
+                legacy: "Jane Doe".into(),
+                display: "JD".into(),
+            },
+        )
     }
 
     #[test]
@@ -203,7 +217,10 @@ mod tests {
             request_url("http://sim/CAPS/names", &ids),
             format!("http://sim/CAPS/names/?ids={JANE}&ids={GROUP}")
         );
-        assert_eq!(request_url("http://sim/CAPS/names/", &ids[..1]), format!("http://sim/CAPS/names/?ids={JANE}"));
+        assert_eq!(
+            request_url("http://sim/CAPS/names/", &ids[..1]),
+            format!("http://sim/CAPS/names/?ids={JANE}")
+        );
     }
 
     #[test]
@@ -250,7 +267,12 @@ mod tests {
         let (events, incoming) = mpsc::channel();
         let lookups = spawn(events);
         let stranger = Uuid::from_bytes([7; 16]);
-        lookups.send(Lookup { url, ids: vec![uuid(JANE), uuid(GROUP), stranger] }).unwrap();
+        lookups
+            .send(Lookup {
+                url,
+                ids: vec![uuid(JANE), uuid(GROUP), stranger],
+            })
+            .unwrap();
 
         let Ok(Event::Names { found, missing }) = incoming.recv_timeout(Duration::from_secs(10)) else {
             panic!("no Names event")
@@ -258,7 +280,10 @@ mod tests {
         assert_eq!(found, [jane()]);
         assert_eq!(missing, [uuid(GROUP), stranger]);
         let request_line = server.join().unwrap();
-        assert!(request_line.starts_with(&format!("GET /CAPS/names/?ids={JANE}&ids={GROUP}&ids=")), "{request_line}");
+        assert!(
+            request_line.starts_with(&format!("GET /CAPS/names/?ids={JANE}&ids={GROUP}&ids=")),
+            "{request_line}"
+        );
     }
 
     #[test]
@@ -271,7 +296,12 @@ mod tests {
         );
         let (events, incoming) = mpsc::channel();
         let lookups = spawn(events);
-        lookups.send(Lookup { url, ids: vec![uuid(JANE)] }).unwrap();
+        lookups
+            .send(Lookup {
+                url,
+                ids: vec![uuid(JANE)],
+            })
+            .unwrap();
         let Ok(Event::NamesFailed(ids)) = incoming.recv_timeout(Duration::from_secs(10)) else {
             panic!("no NamesFailed event")
         };
@@ -307,14 +337,22 @@ mod tests {
         let (events, incoming) = mpsc::channel();
         let searches = spawn_search(events);
         let query = Uuid::from_bytes([3; 16]);
-        searches.send(Search { url, query, name: "jane doe".into() }).unwrap();
-        let Ok(Event::AvatarsFound { query: answered, avatars }) = incoming.recv_timeout(Duration::from_secs(10))
-        else {
+        searches
+            .send(Search {
+                url,
+                query,
+                name: "jane doe".into(),
+            })
+            .unwrap();
+        let Ok(Event::AvatarsFound { query: answered, avatars }) = incoming.recv_timeout(Duration::from_secs(10)) else {
             panic!("no AvatarsFound event")
         };
         assert_eq!((answered, avatars), (query, vec![(uuid(JANE), "Jane Doe".to_string())]));
         let request_line = server.join().unwrap();
-        assert!(request_line.starts_with("GET /CAPS/search/?page_size=100&names=jane%20doe "), "{request_line}");
+        assert!(
+            request_line.starts_with("GET /CAPS/search/?page_size=100&names=jane%20doe "),
+            "{request_line}"
+        );
     }
 
     #[test]
@@ -328,9 +366,14 @@ mod tests {
         let (events, incoming) = mpsc::channel();
         let searches = spawn_search(events);
         let query = Uuid::from_bytes([3; 16]);
-        searches.send(Search { url, query, name: "jane doe".into() }).unwrap();
-        let Ok(Event::AvatarSearchFailed { query: answered, reason }) = incoming.recv_timeout(Duration::from_secs(10))
-        else {
+        searches
+            .send(Search {
+                url,
+                query,
+                name: "jane doe".into(),
+            })
+            .unwrap();
+        let Ok(Event::AvatarSearchFailed { query: answered, reason }) = incoming.recv_timeout(Duration::from_secs(10)) else {
             panic!("no AvatarSearchFailed event")
         };
         assert_eq!((answered, reason.as_str()), (query, "HTTP 400"));

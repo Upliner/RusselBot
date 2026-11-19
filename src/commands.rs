@@ -48,8 +48,14 @@ fn check_text(text: &str) -> Result<(), String> {
 /// a channel, `//` the channel used last, `/shout ` and `/whisper ` the
 /// volume. Everything else, `/me` included, is the text itself.
 pub fn parse_chat(message: &str, last_channel: i32) -> Result<Chat, String> {
-    let chat = |channel, chat_type, text: &str| Chat { channel, chat_type, text: text.to_string() };
-    let digits = message.strip_prefix('/').map_or(0, |rest| rest.bytes().take_while(u8::is_ascii_digit).count());
+    let chat = |channel, chat_type, text: &str| Chat {
+        channel,
+        chat_type,
+        text: text.to_string(),
+    };
+    let digits = message
+        .strip_prefix('/')
+        .map_or(0, |rest| rest.bytes().take_while(u8::is_ascii_digit).count());
     let parsed = if let Some(rest) = message.strip_prefix("//") {
         chat(last_channel, SAY, rest)
     } else if digits > 0 {
@@ -114,7 +120,12 @@ pub fn parse_tp(args: &[String]) -> Result<Destination, String> {
         _ => (None, rest),
     };
     let region = region.join(" ").trim().to_string();
-    Ok(Destination { x, y, z, region: (!region.is_empty()).then_some(region) })
+    Ok(Destination {
+        x,
+        y,
+        z,
+        region: (!region.is_empty()).then_some(region),
+    })
 }
 
 /// Who an `im` command is for.
@@ -137,7 +148,9 @@ pub fn parse_recipient(given: &str) -> Result<Recipient, String> {
     match words[..] {
         [first] => Ok(Recipient::Name(format!("{first} resident"))),
         [first, last] => Ok(Recipient::Name(format!("{first} {last}"))),
-        _ => Err(format!("\"{given}\" is not an avatar name (`First Last`, `first.last` or one word) or a UUID")),
+        _ => Err(format!(
+            "\"{given}\" is not an avatar name (`First Last`, `first.last` or one word) or a UUID"
+        )),
     }
 }
 
@@ -300,13 +313,7 @@ impl Commands {
     /// the grid has resolved a name or the simulator has said how it ended.
     /// Returns the instant message sent. `persist`, `home`, `status` and
     /// `quit` are the bot's own business and never get here.
-    pub fn handle<G: Grid>(
-        &mut self,
-        request: Request,
-        reply: Sender<Response>,
-        grid: Option<&mut G>,
-        now: Instant,
-    ) -> Option<SentIm> {
+    pub fn handle<G: Grid>(&mut self, request: Request, reply: Sender<Response>, grid: Option<&mut G>, now: Instant) -> Option<SentIm> {
         let command = match &request {
             Request::Say(_) => "say",
             Request::Shout(_) => "shout",
@@ -328,21 +335,19 @@ impl Commands {
             Request::Say(message) => self.say(&message, grid, now),
             Request::Shout(message) => self.say_plainly(SHOUT, &message, grid, now),
             Request::Whisper(message) => self.say_plainly(WHISPER, &message, grid, now),
-            Request::Im { to, text } => {
-                check_text(&text).and_then(|()| self.with_avatar(&to, After::Im(text), &reply, grid, now))
-            }
+            Request::Im { to, text } => check_text(&text).and_then(|()| self.with_avatar(&to, After::Im(text), &reply, grid, now)),
             Request::Stand => self.stand(grid, now),
             Request::Sit(target) => self.sit(&target, &reply, grid, now),
             Request::Tp(args) => self.tp(&args, &reply, grid, now),
-            Request::AskTp { to, message } => check_length(&message, MAX_TEXT)
-                .and_then(|()| self.with_avatar(&to, After::RequestTp(message), &reply, grid, now)),
-            Request::AcceptTp(to) => self.with_avatar(&to, After::AcceptTp, &reply, grid, now),
-            Request::SendTp { to, message } => check_length(&message, MAX_OFFER_TEXT)
-                .and_then(|()| self.with_avatar(&to, After::SendTp(message), &reply, grid, now)),
-            Request::Touch(object) => self.touch(&object, &reply, grid, now),
-            Request::Persist { .. } | Request::Home | Request::Status | Request::Quit => {
-                Err("not a command for the grid".to_string())
+            Request::AskTp { to, message } => {
+                check_length(&message, MAX_TEXT).and_then(|()| self.with_avatar(&to, After::RequestTp(message), &reply, grid, now))
             }
+            Request::AcceptTp(to) => self.with_avatar(&to, After::AcceptTp, &reply, grid, now),
+            Request::SendTp { to, message } => {
+                check_length(&message, MAX_OFFER_TEXT).and_then(|()| self.with_avatar(&to, After::SendTp(message), &reply, grid, now))
+            }
+            Request::Touch(object) => self.touch(&object, &reply, grid, now),
+            Request::Persist { .. } | Request::Home | Request::Status | Request::Quit => Err("not a command for the grid".to_string()),
         };
         finish(command, done, &reply)
     }
@@ -386,13 +391,7 @@ impl Commands {
     }
 
     /// `shout` and `whisper`: the message as it is, on channel 0.
-    fn say_plainly<G: Grid>(
-        &mut self,
-        chat_type: u8,
-        message: &str,
-        grid: Option<&mut G>,
-        now: Instant,
-    ) -> Result<Done, String> {
+    fn say_plainly<G: Grid>(&mut self, chat_type: u8, message: &str, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
         check_text(message)?;
         grid.ok_or(NOT_CONNECTED)?.say(0, chat_type, message, now)?;
         let how = if chat_type == SHOUT { "shouted" } else { "whispered" };
@@ -416,13 +415,7 @@ impl Commands {
         }
     }
 
-    fn sit<G: Grid>(
-        &mut self,
-        target: &str,
-        reply: &Sender<Response>,
-        grid: Option<&mut G>,
-        now: Instant,
-    ) -> Result<Done, String> {
+    fn sit<G: Grid>(&mut self, target: &str, reply: &Sender<Response>, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
         let target = parse_sit(target)?;
         let grid = grid.ok_or(NOT_CONNECTED)?;
         let object = match target {
@@ -445,13 +438,7 @@ impl Commands {
         Ok(Done::Parked)
     }
 
-    fn tp<G: Grid>(
-        &mut self,
-        args: &[String],
-        reply: &Sender<Response>,
-        grid: Option<&mut G>,
-        now: Instant,
-    ) -> Result<Done, String> {
+    fn tp<G: Grid>(&mut self, args: &[String], reply: &Sender<Response>, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
         let to = parse_tp(args)?;
         let grid = grid.ok_or(NOT_CONNECTED)?;
         let region = match to.region {
@@ -465,7 +452,10 @@ impl Commands {
         grid.teleport(&region, [to.x, to.y, z], now)?;
         self.went_manual = true;
         crate::info!("control: teleporting to \"{region}\" at {}, {}, {z}", to.x, to.y);
-        self.last_tp = Some(Location { region, position: [to.x, to.y, z] });
+        self.last_tp = Some(Location {
+            region,
+            position: [to.x, to.y, z],
+        });
         self.park_teleport(reply);
         Ok(Done::Parked)
     }
@@ -476,15 +466,8 @@ impl Commands {
         }
     }
 
-    fn touch<G: Grid>(
-        &mut self,
-        object: &str,
-        reply: &Sender<Response>,
-        grid: Option<&mut G>,
-        now: Instant,
-    ) -> Result<Done, String> {
-        let object = Uuid::parse_str(object.trim())
-            .map_err(|_| format!("\"{}\" is not an object's UUID", object.trim()))?;
+    fn touch<G: Grid>(&mut self, object: &str, reply: &Sender<Response>, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
+        let object = Uuid::parse_str(object.trim()).map_err(|_| format!("\"{}\" is not an object's UUID", object.trim()))?;
         match grid.ok_or(NOT_CONNECTED)?.touch(object, now)? {
             Touch::Sent => {
                 crate::info!("control: touched {object}");
@@ -528,7 +511,14 @@ impl Commands {
         };
         let deadline = now + LOOKUP_LIMIT;
         let given = to.trim().to_string();
-        self.waiting.push(Waiting { query, name, given, then, reply: reply.clone(), deadline });
+        self.waiting.push(Waiting {
+            query,
+            name,
+            given,
+            then,
+            reply: reply.clone(),
+            deadline,
+        });
         Ok(Done::Parked)
     }
 
@@ -591,7 +581,9 @@ impl Commands {
         let (answered, waiting) = std::mem::take(&mut self.waiting).into_iter().partition(|w| w.query == query);
         self.waiting = waiting;
         for command in answered {
-            let Waiting { name, given, then, reply, .. } = command;
+            let Waiting {
+                name, given, then, reply, ..
+            } = command;
             let what = then.command();
             let done = match (exact_match(&name, avatars), grid.as_deref_mut()) {
                 (None, _) => Err(format!("the grid knows no avatar named \"{given}\"")),
@@ -692,7 +684,9 @@ impl Commands {
 
     /// A touch that waited for its object went out.
     pub fn touched(&mut self, object: Uuid) {
-        let (done, touches) = std::mem::take(&mut self.touches).into_iter().partition(|(wanted, _)| *wanted == object);
+        let (done, touches) = std::mem::take(&mut self.touches)
+            .into_iter()
+            .partition(|(wanted, _)| *wanted == object);
         self.touches = touches;
         for (_, reply) in done {
             crate::info!("control: touched {object}");
@@ -702,8 +696,9 @@ impl Commands {
 
     /// A touch gave up waiting for its object.
     pub fn touch_failed(&mut self, object: Uuid, reason: &str) {
-        let (failed, touches) =
-            std::mem::take(&mut self.touches).into_iter().partition(|(wanted, _)| *wanted == object);
+        let (failed, touches) = std::mem::take(&mut self.touches)
+            .into_iter()
+            .partition(|(wanted, _)| *wanted == object);
         self.touches = touches;
         for (_, reply) in failed {
             refuse("touch", &reply, reason.to_string());
@@ -712,23 +707,22 @@ impl Commands {
 
     /// An avatar offers the bot a teleport. One the bot asked for recently
     /// is accepted; any other is kept for `accepttp`.
-    pub fn teleport_offer<G: Grid>(
-        &mut self,
-        from: Uuid,
-        name: &str,
-        lure: Uuid,
-        grid: Option<&mut G>,
-        now: Instant,
-    ) {
+    pub fn teleport_offer<G: Grid>(&mut self, from: Uuid, name: &str, lure: Uuid, grid: Option<&mut G>, now: Instant) {
         let who = whom(from, name);
         let full_name = name.split_whitespace().collect::<Vec<_>>().join(" ");
         if !full_name.is_empty() {
             // The offer says who it is from: no lookup needed to answer it.
             self.known.insert(full_name.to_lowercase(), (from, full_name));
         }
-        let asked = self.asked.remove(&from).is_some_and(|at| now.duration_since(at) <= self.offer_timeout);
+        let asked = self
+            .asked
+            .remove(&from)
+            .is_some_and(|at| now.duration_since(at) <= self.offer_timeout);
         if asked {
-            match grid.ok_or(NOT_CONNECTED.to_string()).and_then(|grid| grid.accept_teleport(lure, now)) {
+            match grid
+                .ok_or(NOT_CONNECTED.to_string())
+                .and_then(|grid| grid.accept_teleport(lure, now))
+            {
                 Ok(()) => return crate::info!("accepting the teleport offer from {who}, as requested"),
                 Err(reason) => crate::info!("cannot accept the teleport offer from {who} now: {reason}"),
             }
@@ -775,7 +769,11 @@ mod tests {
     use std::sync::mpsc::{self, Receiver};
 
     fn chat(channel: i32, chat_type: u8, text: &str) -> Result<Chat, String> {
-        Ok(Chat { channel, chat_type, text: text.to_string() })
+        Ok(Chat {
+            channel,
+            chat_type,
+            text: text.to_string(),
+        })
     }
 
     #[test]
@@ -878,7 +876,12 @@ mod tests {
     impl Default for FakeGrid {
         fn default() -> FakeGrid {
             let position = Some([10.0, 20.0, 30.0]);
-            FakeGrid { calls: Vec::new(), offline: false, position, touch: Ok(Touch::Sent) }
+            FakeGrid {
+                calls: Vec::new(),
+                offline: false,
+                position,
+                touch: Ok(Touch::Sent),
+            }
         }
     }
 
@@ -967,11 +970,18 @@ mod tests {
     }
 
     fn jane_found() -> Vec<(Uuid, String)> {
-        vec![(Uuid::from_bytes([2; 16]), "Jane Doester".to_string()), (jane(), "Jane Doe".to_string())]
+        vec![
+            (Uuid::from_bytes([2; 16]), "Jane Doester".to_string()),
+            (jane(), "Jane Doe".to_string()),
+        ]
     }
 
     fn sent_to_jane(text: &str) -> SentIm {
-        SentIm { to: jane(), name: "Jane Doe".to_string(), text: text.to_string() }
+        SentIm {
+            to: jane(),
+            name: "Jane Doe".to_string(),
+            text: text.to_string(),
+        }
     }
 
     fn error(answer: &Receiver<Response>) -> String {
@@ -983,7 +993,11 @@ mod tests {
 
     impl Rig {
         fn new() -> Rig {
-            Rig { commands: Commands::default(), grid: FakeGrid::default(), now: Instant::now() }
+            Rig {
+                commands: Commands::default(),
+                grid: FakeGrid::default(),
+                now: Instant::now(),
+            }
         }
 
         fn run(&mut self, request: Request) -> (Receiver<Response>, Option<SentIm>) {
@@ -997,7 +1011,10 @@ mod tests {
         }
 
         fn im(&mut self, to: &str, text: &str) -> (Receiver<Response>, Option<SentIm>) {
-            self.run(Request::Im { to: to.to_string(), text: text.to_string() })
+            self.run(Request::Im {
+                to: to.to_string(),
+                text: text.to_string(),
+            })
         }
 
         fn found(&mut self, query: Uuid, avatars: &[(Uuid, String)]) -> Vec<SentIm> {
@@ -1046,7 +1063,9 @@ mod tests {
         assert_eq!(error(&rig.say("/3 hello")), NOT_CONNECTED);
         // No session at all.
         let (reply, answer) = mpsc::channel();
-        let sent = rig.commands.handle(Request::Say("hello".into()), reply, None::<&mut FakeGrid>, rig.now);
+        let sent = rig
+            .commands
+            .handle(Request::Say("hello".into()), reply, None::<&mut FakeGrid>, rig.now);
         assert_eq!((error(&answer).as_str(), sent), (NOT_CONNECTED, None));
         assert_eq!(rig.calls(), []);
         // A refused message does not change what `//` means.
@@ -1059,7 +1078,14 @@ mod tests {
     fn im_to_a_uuid_goes_out_at_once() {
         let mut rig = Rig::new();
         let (answer, sent) = rig.im(&jane().to_string(), "hello");
-        assert_eq!(sent, Some(SentIm { to: jane(), name: String::new(), text: "hello".into() }));
+        assert_eq!(
+            sent,
+            Some(SentIm {
+                to: jane(),
+                name: String::new(),
+                text: "hello".into()
+            })
+        );
         assert_eq!(answer.try_recv(), Ok(Response::Ok(Some(format!("sent to {}", jane())))));
         assert_eq!(rig.calls(), [Call::Im(jane(), "hello".into())]);
     }
@@ -1105,7 +1131,14 @@ mod tests {
         let query = rig.lookup("sitbot");
         let id = Uuid::from_bytes([5; 16]);
         let found = [(id, "sitbot Resident".to_string())];
-        assert_eq!(rig.found(query, &found), [SentIm { to: id, name: "sitbot Resident".into(), text: "hi".into() }]);
+        assert_eq!(
+            rig.found(query, &found),
+            [SentIm {
+                to: id,
+                name: "sitbot Resident".into(),
+                text: "hi".into()
+            }]
+        );
         assert!(matches!(answer.try_recv(), Ok(Response::Ok(Some(_)))));
     }
 
@@ -1211,16 +1244,30 @@ mod tests {
     }
 
     fn to(x: f32, y: f32, z: Option<f32>, region: Option<&str>) -> Result<Destination, String> {
-        Ok(Destination { x, y, z, region: region.map(str::to_string) })
+        Ok(Destination {
+            x,
+            y,
+            z,
+            region: region.map(str::to_string),
+        })
     }
 
     #[test]
     fn tp_reads_coordinates_then_an_optional_height_and_region() {
         assert_eq!(destination(&["100", "120"]), to(100.0, 120.0, None, None));
         assert_eq!(destination(&["100.5", "120", "40"]), to(100.5, 120.0, Some(40.0), None));
-        assert_eq!(destination(&["128", "128", "25", "Home"]), to(128.0, 128.0, Some(25.0), Some("Home")));
-        assert_eq!(destination(&["128", "128", "Blue", "Lagoon"]), to(128.0, 128.0, None, Some("Blue Lagoon")));
-        assert_eq!(destination(&["128", "128", "25", "Blue", "Lagoon"]), to(128.0, 128.0, Some(25.0), Some("Blue Lagoon")));
+        assert_eq!(
+            destination(&["128", "128", "25", "Home"]),
+            to(128.0, 128.0, Some(25.0), Some("Home"))
+        );
+        assert_eq!(
+            destination(&["128", "128", "Blue", "Lagoon"]),
+            to(128.0, 128.0, None, Some("Blue Lagoon"))
+        );
+        assert_eq!(
+            destination(&["128", "128", "25", "Blue", "Lagoon"]),
+            to(128.0, 128.0, Some(25.0), Some("Blue Lagoon"))
+        );
         // A region whose name starts with a number needs the height given.
         assert_eq!(destination(&["1", "2", "3", "7", "Seas"]), to(1.0, 2.0, Some(3.0), Some("7 Seas")));
         // Words that only look like numbers to a parser are names.
@@ -1291,8 +1338,14 @@ mod tests {
             Request::Sit("ground".into()),
             Request::Sit(other_object().to_string()),
             Request::Tp(Rig::words(&["1", "2", "3"])),
-            Request::AskTp { to: jane().to_string(), message: String::new() },
-            Request::SendTp { to: jane().to_string(), message: String::new() },
+            Request::AskTp {
+                to: jane().to_string(),
+                message: String::new(),
+            },
+            Request::SendTp {
+                to: jane().to_string(),
+                message: String::new(),
+            },
             Request::Touch(other_object().to_string()),
             Request::Shout("hello".into()),
         ];
@@ -1369,12 +1422,18 @@ mod tests {
 
         // The region and the height are the ones the command resolved to.
         rig.command(Request::Tp(Rig::words(&["100", "120"])));
-        let here = Location { region: "Home".to_string(), position: [100.0, 120.0, 30.0] };
+        let here = Location {
+            region: "Home".to_string(),
+            position: [100.0, 120.0, 30.0],
+        };
         assert_eq!(rig.commands.last_tp(), Some(&here));
         // The outcome does not matter.
         rig.command(Request::Tp(Rig::words(&["128", "128", "25", "Blue", "Lagoon"])));
         assert!(rig.commands.teleport_failed("region \"Blue Lagoon\" not found"));
-        let lagoon = Location { region: "Blue Lagoon".to_string(), position: [128.0, 128.0, 25.0] };
+        let lagoon = Location {
+            region: "Blue Lagoon".to_string(),
+            position: [128.0, 128.0, 25.0],
+        };
         assert_eq!(rig.commands.last_tp(), Some(&lagoon));
 
         rig.command(Request::Sit(other_object().to_string()));
@@ -1388,7 +1447,10 @@ mod tests {
         rig.command(Request::Stand);
         rig.offer(jane(), "Jane Doe", Uuid::from_bytes([0x44; 16]));
         rig.command(Request::AcceptTp(jane().to_string()));
-        rig.command(Request::AskTp { to: jane().to_string(), message: String::new() });
+        rig.command(Request::AskTp {
+            to: jane().to_string(),
+            message: String::new(),
+        });
         assert_eq!(rig.commands.last_tp(), Some(&lagoon));
         assert_eq!(rig.commands.last_sit(), Some(SitState::Ground));
 
@@ -1444,18 +1506,30 @@ mod tests {
     #[test]
     fn sendtp_offers_a_teleport_and_leaves_the_bot_where_it_is() {
         let mut rig = Rig::new();
-        let answer = rig.command(Request::SendTp { to: "Jane Doe".into(), message: "come and see".into() });
+        let answer = rig.command(Request::SendTp {
+            to: "Jane Doe".into(),
+            message: "come and see".into(),
+        });
         let query = rig.lookup("jane doe");
         assert_eq!(rig.found(query, &jane_found()), []);
         assert_eq!(ok(&answer), Some(format!("offered Jane Doe <{}> a teleport", jane())));
         // Without a message, the one viewers send.
-        rig.command(Request::SendTp { to: "jane.doe".into(), message: String::new() });
+        rig.command(Request::SendTp {
+            to: "jane.doe".into(),
+            message: String::new(),
+        });
         assert_eq!(
             rig.calls(),
-            [Call::OfferTp(jane(), "come and see".into()), Call::OfferTp(jane(), "Join me in Home".into())]
+            [
+                Call::OfferTp(jane(), "come and see".into()),
+                Call::OfferTp(jane(), "Join me in Home".into())
+            ]
         );
         assert!(!rig.commands.take_manual());
-        let long = Request::SendTp { to: "jane.doe".into(), message: "x".repeat(255) };
+        let long = Request::SendTp {
+            to: "jane.doe".into(),
+            message: "x".repeat(255),
+        };
         assert!(error(&rig.command(long)).contains("254"));
     }
 
@@ -1468,7 +1542,10 @@ mod tests {
     #[test]
     fn requested_teleport_offer_is_accepted_once() {
         let mut rig = Rig::new();
-        let answer = rig.command(Request::AskTp { to: jane().to_string(), message: "may I?".into() });
+        let answer = rig.command(Request::AskTp {
+            to: jane().to_string(),
+            message: "may I?".into(),
+        });
         assert_eq!(ok(&answer), Some(format!("asked {} for a teleport", jane())));
         assert!(rig.commands.take_manual());
         assert_eq!(rig.calls(), [Call::RequestTp(jane(), "may I?".into())]);
@@ -1484,7 +1561,10 @@ mod tests {
     #[test]
     fn requesttp_by_name_waits_for_the_lookup() {
         let mut rig = Rig::new();
-        let answer = rig.command(Request::AskTp { to: "Jane Doe".into(), message: String::new() });
+        let answer = rig.command(Request::AskTp {
+            to: "Jane Doe".into(),
+            message: String::new(),
+        });
         let query = rig.lookup("jane doe");
         assert!(!rig.commands.take_manual(), "nothing has been asked yet");
         rig.found(query, &jane_found());
@@ -1492,7 +1572,10 @@ mod tests {
         assert!(rig.commands.take_manual());
         assert_eq!(rig.calls(), [Call::RequestTp(jane(), String::new())]);
 
-        let answer = rig.command(Request::AskTp { to: "Nobody Here".into(), message: String::new() });
+        let answer = rig.command(Request::AskTp {
+            to: "Nobody Here".into(),
+            message: String::new(),
+        });
         let query = rig.lookup("nobody here");
         rig.found(query, &jane_found());
         assert!(error(&answer).contains("\"Nobody Here\""));
@@ -1503,7 +1586,10 @@ mod tests {
     #[test]
     fn late_and_unsolicited_offers_wait_for_accepttp() {
         let mut rig = Rig::new();
-        rig.command(Request::AskTp { to: jane().to_string(), message: String::new() });
+        rig.command(Request::AskTp {
+            to: jane().to_string(),
+            message: String::new(),
+        });
         rig.calls();
         rig.commands.take_manual();
         rig.now += Duration::from_secs(15 * 60);
@@ -1531,7 +1617,10 @@ mod tests {
     fn a_longer_timeout_accepts_a_later_offer() {
         let mut rig = Rig::new();
         rig.commands = Commands::new(Duration::from_secs(30 * 60));
-        rig.command(Request::AskTp { to: jane().to_string(), message: String::new() });
+        rig.command(Request::AskTp {
+            to: jane().to_string(),
+            message: String::new(),
+        });
         rig.calls();
         rig.now += Duration::from_secs(15 * 60);
         rig.offer(jane(), "Jane Doe", lure(1));
@@ -1563,7 +1652,10 @@ mod tests {
         assert!(error(&rig.command(Request::AcceptTp("Jane Doe".into()))).contains("no teleport offer"));
 
         // Sent home after asking: the answer must not take the bot away.
-        rig.command(Request::AskTp { to: jane().to_string(), message: String::new() });
+        rig.command(Request::AskTp {
+            to: jane().to_string(),
+            message: String::new(),
+        });
         rig.calls();
         rig.commands.forget_requests();
         rig.offer(jane(), "Jane Doe", lure(3));
@@ -1573,7 +1665,10 @@ mod tests {
     #[test]
     fn an_offer_that_cannot_be_accepted_now_is_kept() {
         let mut rig = Rig::new();
-        rig.command(Request::AskTp { to: jane().to_string(), message: String::new() });
+        rig.command(Request::AskTp {
+            to: jane().to_string(),
+            message: String::new(),
+        });
         rig.calls();
         rig.grid.offline = true;
         rig.offer(jane(), "Jane Doe", lure(1));

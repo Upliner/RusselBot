@@ -150,7 +150,13 @@ pub fn parse(datagram: &[u8]) -> Result<Packet, PacketError> {
         [n, ..] => (u32::from(n), 1),
         [] => return Err(PacketError("packet has no message number")),
     };
-    Ok(Packet { flags, sequence, acks, id, body: payload[id_len..].to_vec() })
+    Ok(Packet {
+        flags,
+        sequence,
+        acks,
+        id,
+        body: payload[id_len..].to_vec(),
+    })
 }
 
 #[cfg(test)]

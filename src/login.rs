@@ -134,7 +134,10 @@ fn parse_reply(body: &str) -> Result<Reply, String> {
             Some(url) if !url.is_empty() => Ok(Reply::Redirect(url.to_string())),
             _ => Err("indeterminate reply has no `next_url`".to_string()),
         },
-        _ => Ok(Reply::Failure(Failure { reason: text("reason"), message: text("message") })),
+        _ => Ok(Reply::Failure(Failure {
+            reason: text("reason"),
+            message: text("message"),
+        })),
     }
 }
 
@@ -147,7 +150,10 @@ fn classify(failure: Failure) -> Outcome {
 }
 
 fn temporary(reason: &str, message: impl Into<String>) -> Outcome {
-    Outcome::Temporary(Failure { reason: reason.to_string(), message: message.into() })
+    Outcome::Temporary(Failure {
+        reason: reason.to_string(),
+        message: message.into(),
+    })
 }
 
 /// Turns one HTTP exchange into an outcome, or the URL to continue at.
@@ -246,7 +252,10 @@ mod tests {
 
     /// The location the bot holds in these tests.
     fn held() -> Location {
-        Location { region: "Target Region".to_string(), position: [128.4, 60.6, 25.0] }
+        Location {
+            region: "Target Region".to_string(),
+            position: [128.4, 60.6, 25.0],
+        }
     }
 
     #[test]
@@ -279,7 +288,10 @@ mod tests {
     #[test]
     fn request_for_a_persisted_location() {
         // The held location counts, not the config's region and position.
-        let persisted = Location { region: "Blue Lagoon".to_string(), position: [128.0, 127.6, 25.4] };
+        let persisted = Location {
+            region: "Blue Lagoon".to_string(),
+            position: [128.0, 127.6, 25.4],
+        };
         assert_eq!(start_location(Start::Target, Some(&persisted)), "uri:Blue Lagoon&128&128&25");
         let xml = request_xml(&config(), Start::Target, Some(&persisted));
         assert!(xml.contains("<string>uri:Blue Lagoon&amp;128&amp;128&amp;25</string>"), "{xml}");
@@ -293,7 +305,9 @@ mod tests {
 
     #[test]
     fn parses_success_reply() {
-        let Outcome::Success(info) = outcome(success_reply()) else { panic!("not a success") };
+        let Outcome::Success(info) = outcome(success_reply()) else {
+            panic!("not a success")
+        };
         assert_eq!(info.agent_id.to_string(), "aaaaaaaa-0000-0000-0000-000000000001");
         assert_eq!(info.session_id.to_string(), "bbbbbbbb-0000-0000-0000-000000000002");
         assert_eq!(info.circuit_code, 123_456_789);
@@ -306,7 +320,9 @@ mod tests {
     #[test]
     fn parses_recorded_opensim_reply() {
         let body = include_str!("testdata/opensim_login_reply.xml").to_string();
-        let Outcome::Success(info) = outcome(body) else { panic!("not a success") };
+        let Outcome::Success(info) = outcome(body) else {
+            panic!("not a success")
+        };
         assert_eq!(info.agent_id.to_string(), "7e570000-0000-4000-8000-0000000000aa");
         assert_eq!(info.session_id.to_string(), "e62a055a-78db-4007-b506-dc4c2742c694");
         assert_eq!(info.circuit_code, 304_247_186);

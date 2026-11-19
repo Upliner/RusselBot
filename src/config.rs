@@ -44,7 +44,10 @@ pub enum Source {
 pub enum Persist {
     /// Nothing: it goes to manual mode.
     Off,
-    On { position: Source, sit: Source },
+    On {
+        position: Source,
+        sit: Source,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,9 +120,8 @@ pub fn hash_password(password: &str) -> String {
 }
 
 fn is_password_hash(s: &str) -> bool {
-    s.strip_prefix("$1$").is_some_and(|hex| {
-        hex.len() == 32 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    })
+    s.strip_prefix("$1$")
+        .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }
 
 fn err<T>(msg: impl Into<String>) -> Result<T, ConfigError> {
@@ -167,7 +169,10 @@ fn source(value: &toml::Value) -> Option<Source> {
 }
 
 fn persist(value: Option<toml::Value>) -> Result<Persist, ConfigError> {
-    let both = |source| Persist::On { position: source, sit: source };
+    let both = |source| Persist::On {
+        position: source,
+        sit: source,
+    };
     match value {
         None => Ok(both(Source::Cur)),
         Some(toml::Value::Boolean(false)) => Ok(Persist::Off),
@@ -188,8 +193,7 @@ fn persist(value: Option<toml::Value>) -> Result<Persist, ConfigError> {
                     "sit" => &mut sit,
                     _ => return err(format!("`persist` has no key `{key}`; its keys are `position` and `sit`")),
                 };
-                *slot = source(value)
-                    .ok_or_else(|| ConfigError(format!("`persist.{key}` must be \"cur\" or \"cfg\"")))?;
+                *slot = source(value).ok_or_else(|| ConfigError(format!("`persist.{key}` must be \"cur\" or \"cfg\"")))?;
             }
             Ok(Persist::On { position, sit })
         }
@@ -199,8 +203,7 @@ fn persist(value: Option<toml::Value>) -> Result<Persist, ConfigError> {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError(format!("cannot read {}: {e}", path.display())))?;
+        let text = std::fs::read_to_string(path).map_err(|e| ConfigError(format!("cannot read {}: {e}", path.display())))?;
         Config::parse(&text).map_err(|e| ConfigError(format!("{}: {e}", path.display())))
     }
 
@@ -208,9 +211,7 @@ impl Config {
         let raw: Raw = toml::from_str(text).map_err(|e| ConfigError(e.message().to_string()))?;
 
         let login_url = raw.login_url.unwrap_or_else(|| DEFAULT_LOGIN_URL.to_string());
-        let rest = login_url
-            .strip_prefix("http://")
-            .or_else(|| login_url.strip_prefix("https://"));
+        let rest = login_url.strip_prefix("http://").or_else(|| login_url.strip_prefix("https://"));
         if !rest.is_some_and(|r| !r.is_empty() && !r.starts_with('/')) {
             return err("`login_url` must be an http or https URL");
         }
@@ -225,9 +226,7 @@ impl Config {
         };
 
         let password_hash = match (raw.password, raw.password_hash) {
-            (Some(_), Some(_)) => {
-                return err("`password` and `password_hash` are both set; use only one")
-            }
+            (Some(_), Some(_)) => return err("`password` and `password_hash` are both set; use only one"),
             (None, None) => return err("one of `password` or `password_hash` is required"),
             (Some(plain), None) => {
                 if plain.is_empty() {
@@ -237,10 +236,8 @@ impl Config {
             }
             (None, Some(hash)) => {
                 if !is_password_hash(&hash) {
-                    return err(
-                        "`password_hash` must be `$1$` followed by 32 lowercase hex digits, \
-                         as printed by `rslbot hash`",
-                    );
+                    return err("`password_hash` must be `$1$` followed by 32 lowercase hex digits, \
+                         as printed by `rslbot hash`");
                 }
                 hash
             }
@@ -276,13 +273,14 @@ impl Config {
             (None, None) => None,
             (Some(sit), None) => match sit.trim() {
                 "ground" => Some(Sit::Ground),
-                object => Some(Sit::Object(Uuid::parse_str(object).map_err(|_| {
-                    ConfigError("`sit` must be the UUID of an object or \"ground\"".to_string())
-                })?)),
+                object => {
+                    Some(Sit::Object(Uuid::parse_str(object).map_err(|_| {
+                        ConfigError("`sit` must be the UUID of an object or \"ground\"".to_string())
+                    })?))
+                }
             },
             (None, Some(object)) => Some(Sit::Object(
-                Uuid::parse_str(object.trim())
-                    .map_err(|_| ConfigError("`object` is not a valid UUID".to_string()))?,
+                Uuid::parse_str(object.trim()).map_err(|_| ConfigError("`object` is not a valid UUID".to_string()))?,
             )),
         };
 
@@ -345,14 +343,24 @@ mod tests {
         assert_eq!(cfg.login_url, DEFAULT_LOGIN_URL);
         assert_eq!((cfg.first_name.as_str(), cfg.last_name.as_str()), ("Sit", "Bot"));
         assert_eq!(cfg.password_hash, "$1$5ebe2294ecd0e0f08eab7690d2a6ee69");
-        assert_eq!(cfg.place, Place::Region { name: "Target".to_string(), position: [128.0, 128.5, 25.0] });
+        assert_eq!(
+            cfg.place,
+            Place::Region {
+                name: "Target".to_string(),
+                position: [128.0, 128.5, 25.0]
+            }
+        );
         assert_eq!(cfg.sit, Some(Sit::Object(Uuid::parse_str(OBJECT).unwrap())));
         assert!(!cfg.deprecated_object);
     }
 
     /// `base()` without the lines of the given keys.
     fn without(keys: &[&str]) -> String {
-        base().lines().filter(|l| !keys.iter().any(|k| l.starts_with(k))).map(|l| format!("{l}\n")).collect()
+        base()
+            .lines()
+            .filter(|l| !keys.iter().any(|k| l.starts_with(k)))
+            .map(|l| format!("{l}\n"))
+            .collect()
     }
 
     #[test]
@@ -364,11 +372,17 @@ mod tests {
     #[test]
     fn start_names_the_login_location() {
         let bare = without(&["region", "position"]);
-        assert_eq!(Config::parse(&(bare.clone() + "start = \"latest\"\n")).unwrap().place, Place::Latest);
+        assert_eq!(
+            Config::parse(&(bare.clone() + "start = \"latest\"\n")).unwrap().place,
+            Place::Latest
+        );
         assert_eq!(Config::parse(&(bare.clone() + "start = \"home\"\n")).unwrap().place, Place::Home);
         for bad in ["last", "Home", "", "uri:Target&1&2&3"] {
             let msg = rejected(&(bare.clone() + &format!("start = \"{bad}\"\n")));
-            assert!(msg.contains("`start`") && msg.contains("\"home\"") && msg.contains("\"latest\""), "{msg}");
+            assert!(
+                msg.contains("`start`") && msg.contains("\"home\"") && msg.contains("\"latest\""),
+                "{msg}"
+            );
         }
     }
 
@@ -404,7 +418,13 @@ mod tests {
         let old = Config::parse(&base().replace("sit = ", "object = ")).unwrap();
         assert!(old.deprecated_object);
         let new = Config::parse(&base()).unwrap();
-        assert_eq!(Config { deprecated_object: false, ..old }, new);
+        assert_eq!(
+            Config {
+                deprecated_object: false,
+                ..old
+            },
+            new
+        );
         // The new value belongs to the new key.
         let msg = rejected(&base().replace("sit = ", "object = ").replace(OBJECT, "ground"));
         assert!(msg.contains("`object`"), "{msg}");
@@ -457,13 +477,22 @@ mod tests {
     fn rejects_persist_values_only_the_command_takes() {
         for bad in ["\"last\"", "\"last_cmd\"", "\"Target/128/128/25\"", "true", "5", "\"Cur\"", "\"\""] {
             let msg = rejected(&(base() + &format!("persist = {bad}\n")));
-            assert!(msg.contains("`persist`") && msg.contains("\"cfg\"") && msg.contains("\"off\""), "{bad}: {msg}");
+            assert!(
+                msg.contains("`persist`") && msg.contains("\"cfg\"") && msg.contains("\"off\""),
+                "{bad}: {msg}"
+            );
         }
     }
 
     #[test]
     fn rejects_malformed_persist_arrays() {
-        for bad in ["[]", "[\"cur\"]", "[\"cur\", \"cfg\", \"cur\"]", "[\"cur\", \"off\"]", "[\"cur\", false]"] {
+        for bad in [
+            "[]",
+            "[\"cur\"]",
+            "[\"cur\", \"cfg\", \"cur\"]",
+            "[\"cur\", \"off\"]",
+            "[\"cur\", false]",
+        ] {
             let msg = rejected(&(base() + &format!("persist = {bad}\n")));
             assert!(msg.contains("`persist`"), "{bad}: {msg}");
         }
@@ -593,7 +622,10 @@ mod tests {
         assert_eq!(Config::parse(&base()).unwrap().scan_distance, None);
         assert_eq!(Config::parse(&(base() + "scan_distance = 64\n")).unwrap().scan_distance, Some(64.0));
         assert_eq!(Config::parse(&(base() + "scan_distance = 1.5\n")).unwrap().scan_distance, Some(1.5));
-        assert_eq!(Config::parse(&(base() + "scan_distance = 1024\n")).unwrap().scan_distance, Some(1024.0));
+        assert_eq!(
+            Config::parse(&(base() + "scan_distance = 1024\n")).unwrap().scan_distance,
+            Some(1024.0)
+        );
         for bad in ["0", "0.5", "5000", "-32", "\"far\"", "nan"] {
             let text = base() + &format!("scan_distance = {bad}\n");
             assert!(rejected(&text).contains("`scan_distance`"), "{bad}");
@@ -618,10 +650,22 @@ mod tests {
     fn example_file_is_valid() {
         let cfg = Config::parse(include_str!("../russelbot.example.toml")).unwrap();
         assert_eq!(cfg.login_url, "http://127.0.0.1:9000/");
-        assert_eq!(cfg.place, Place::Region { name: "Target".to_string(), position: [128.0, 128.0, 25.0] });
+        assert_eq!(
+            cfg.place,
+            Place::Region {
+                name: "Target".to_string(),
+                position: [128.0, 128.0, 25.0]
+            }
+        );
         assert_eq!(cfg.sit, Some(Sit::Object(Uuid::nil())));
         assert!(!cfg.deprecated_object);
-        assert_eq!(cfg.persist, Persist::On { position: Source::Cur, sit: Source::Cur });
+        assert_eq!(
+            cfg.persist,
+            Persist::On {
+                position: Source::Cur,
+                sit: Source::Cur
+            }
+        );
     }
 
     #[test]
@@ -637,7 +681,13 @@ mod tests {
         assert!(text.contains(persist), "persist is not in the example");
         enabled = enabled.replace(persist, "persist = \"cfg\"");
         let cfg = Config::parse(&enabled).unwrap();
-        assert_eq!(cfg.persist, Persist::On { position: Source::Cfg, sit: Source::Cfg });
+        assert_eq!(
+            cfg.persist,
+            Persist::On {
+                position: Source::Cfg,
+                sit: Source::Cfg
+            }
+        );
         assert_eq!(cfg.log_chat, Some(PathBuf::from("chat.tsv")));
         assert_eq!(cfg.log_im, Some(PathBuf::from("im.tsv")));
         assert!(cfg.fetch_offline_im);

@@ -82,20 +82,32 @@ pub enum Request {
     Shout(String),
     /// Local chat, whispered as it is.
     Whisper(String),
-    Im { to: String, text: String },
+    Im {
+        to: String,
+        text: String,
+    },
     Stand,
     /// A UUID or `ground`, still to be read.
     Sit(String),
     /// `x y [z] [region words]`, still to be read.
     Tp(Vec<String>),
-    AskTp { to: String, message: String },
+    AskTp {
+        to: String,
+        message: String,
+    },
     AcceptTp(String),
-    SendTp { to: String, message: String },
+    SendTp {
+        to: String,
+        message: String,
+    },
     /// A UUID, still to be read.
     Touch(String),
     /// A location and a sit state, still to be read; what is left out
     /// stands for `cur`.
-    Persist { location: Option<String>, sit: Option<String> },
+    Persist {
+        location: Option<String>,
+        sit: Option<String>,
+    },
     Home,
     Status,
     Quit,
@@ -134,7 +146,10 @@ impl Request {
         };
         let at_least = |wanted: usize| match given >= wanted {
             true => Ok(()),
-            false => Err(format!("`{command}` takes at least {wanted} argument{}, not {given}", plural(wanted))),
+            false => Err(format!(
+                "`{command}` takes at least {wanted} argument{}, not {given}",
+                plural(wanted)
+            )),
         };
         // An avatar, then the words of an optional message.
         let avatar_and_message = |mut fields: Vec<String>| {
@@ -157,7 +172,10 @@ impl Request {
             "im" => {
                 arguments(2)?;
                 let text = fields.remove(1);
-                Ok(Request::Im { to: fields.remove(0), text })
+                Ok(Request::Im {
+                    to: fields.remove(0),
+                    text,
+                })
             }
             "stand" | "unsit" => arguments(0).map(|()| Request::Stand),
             "sit" => {
@@ -194,7 +212,10 @@ impl Request {
                     ));
                 }
                 let mut fields = fields.into_iter();
-                Ok(Request::Persist { location: fields.next(), sit: fields.next() })
+                Ok(Request::Persist {
+                    location: fields.next(),
+                    sit: fields.next(),
+                })
             }
             "home" => arguments(0).map(|()| Request::Home),
             "status" => arguments(0).map(|()| Request::Status),
@@ -358,7 +379,9 @@ pub fn listen(address: &str, events: Sender<Event>) -> Result<Server, String> {
             });
         }
     });
-    Ok(Server { address: address.to_string() })
+    Ok(Server {
+        address: address.to_string(),
+    })
 }
 
 /// What became of reading a client's line.
@@ -368,7 +391,6 @@ enum Line {
     /// The client hung up, went quiet or the read failed.
     Missing,
 }
-
 
 fn read_line(stream: &mut sys::Stream, limit: Duration) -> Line {
     let deadline = Instant::now() + limit;
@@ -444,12 +466,7 @@ fn exchange(address: &str, line: &str, limit: Duration) -> Result<Response, Stri
 
 /// The `ctl` subcommand: sends `args` as one command to the bot listening
 /// on `address` and reports the answer. Returns the exit status.
-pub fn client(
-    args: &[String],
-    address: Result<String, String>,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> i32 {
+pub fn client(args: &[String], address: Result<String, String>, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     match args.first().map(String::as_str) {
         None => {
             let _ = writeln!(err, "rslbot: ctl needs a command\n\n{CTL_USAGE}");
@@ -486,10 +503,16 @@ mod tests {
     #[test]
     fn requests_are_read_from_their_lines() {
         assert_eq!(Request::decode(b"say\thello there"), Ok(Request::Say("hello there".into())));
-        assert_eq!(Request::decode(b"say\t/1 test message\r"), Ok(Request::Say("/1 test message".into())));
+        assert_eq!(
+            Request::decode(b"say\t/1 test message\r"),
+            Ok(Request::Say("/1 test message".into()))
+        );
         assert_eq!(
             Request::decode(b"im\tJane Doe\tare you there?"),
-            Ok(Request::Im { to: "Jane Doe".into(), text: "are you there?".into() })
+            Ok(Request::Im {
+                to: "Jane Doe".into(),
+                text: "are you there?".into()
+            })
         );
         // Escapes carry what a line cannot.
         assert_eq!(Request::decode(b"say\ta\\tb\\nc\\\\d"), Ok(Request::Say("a\tb\nc\\d".into())));
@@ -503,24 +526,45 @@ mod tests {
         assert_eq!(Request::decode(b"sit\tground"), Ok(Request::Sit(text("ground"))));
         assert_eq!(
             Request::decode(b"tp\t128\t128\t25\tBlue\tLagoon"),
-            Ok(Request::Tp(vec![text("128"), text("128"), text("25"), text("Blue"), text("Lagoon")]))
+            Ok(Request::Tp(vec![
+                text("128"),
+                text("128"),
+                text("25"),
+                text("Blue"),
+                text("Lagoon")
+            ]))
         );
         assert_eq!(
             Request::decode(b"requesttp\tJane Doe"),
-            Ok(Request::AskTp { to: text("Jane Doe"), message: String::new() })
+            Ok(Request::AskTp {
+                to: text("Jane Doe"),
+                message: String::new()
+            })
         );
         assert_eq!(
             Request::decode(b"sendtp\tJane Doe\tcome\tand see"),
-            Ok(Request::SendTp { to: text("Jane Doe"), message: text("come and see") })
+            Ok(Request::SendTp {
+                to: text("Jane Doe"),
+                message: text("come and see")
+            })
         );
         assert_eq!(Request::decode(b"accepttp\tjane.doe"), Ok(Request::AcceptTp(text("jane.doe"))));
         assert_eq!(Request::decode(b"touch\tabc"), Ok(Request::Touch(text("abc"))));
         assert_eq!(Request::decode(b"home"), Ok(Request::Home));
         assert_eq!(Request::decode(b"persist"), Ok(Request::Persist { location: None, sit: None }));
-        assert_eq!(Request::decode(b"persist\tcur"), Ok(Request::Persist { location: Some(text("cur")), sit: None }));
+        assert_eq!(
+            Request::decode(b"persist\tcur"),
+            Ok(Request::Persist {
+                location: Some(text("cur")),
+                sit: None
+            })
+        );
         assert_eq!(
             Request::decode(b"persist\tBlue Lagoon/128/128/25\tstand"),
-            Ok(Request::Persist { location: Some(text("Blue Lagoon/128/128/25")), sit: Some(text("stand")) })
+            Ok(Request::Persist {
+                location: Some(text("Blue Lagoon/128/128/25")),
+                sit: Some(text("stand"))
+            })
         );
         assert_eq!(Request::decode(b"status"), Ok(Request::Status));
         assert_eq!(Request::decode(b"quit"), Ok(Request::Quit));
@@ -543,7 +587,10 @@ mod tests {
         assert!(Request::decode(b"home\tnow").unwrap_err().contains("`home` takes no arguments"));
         // An unquoted region name of two words makes three arguments.
         let reason = Request::decode(b"persist\tBlue\tLagoon/128/128/25\tstand").unwrap_err();
-        assert!(reason.contains("`persist`") && reason.contains("not 3") && reason.contains("quoted"), "{reason}");
+        assert!(
+            reason.contains("`persist`") && reason.contains("not 3") && reason.contains("quoted"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -581,7 +628,10 @@ mod tests {
     fn ctl_arguments_become_one_request_line() {
         assert_eq!(request_line(&strings(&["say", "hello", "there"])), "say\thello there\n");
         assert_eq!(request_line(&strings(&["say", "-v", "/1", "x"])), "say\t-v /1 x\n");
-        assert_eq!(request_line(&strings(&["im", "Jane Doe", "are", "you there?"])), "im\tJane Doe\tare you there?\n");
+        assert_eq!(
+            request_line(&strings(&["im", "Jane Doe", "are", "you there?"])),
+            "im\tJane Doe\tare you there?\n"
+        );
         assert_eq!(request_line(&strings(&["say", "a\tb"])), "say\ta\\tb\n");
         // What is missing is for the bot to complain about.
         assert_eq!(request_line(&strings(&["say"])), "say\n");
@@ -754,7 +804,10 @@ mod tests {
             // No address to be had at all.
             let (mut out, mut err) = (Vec::new(), Vec::new());
             let status = client(&strings(&["say", "x"]), Err("no home directory".to_string()), &mut out, &mut err);
-            assert_eq!((status, String::from_utf8(err).unwrap().as_str()), (1, "rslbot: no home directory\n"));
+            assert_eq!(
+                (status, String::from_utf8(err).unwrap().as_str()),
+                (1, "rslbot: no home directory\n")
+            );
         }
 
         #[test]
@@ -781,7 +834,10 @@ mod tests {
                 assert_eq!(stream.read_to_end(&mut rest).unwrap(), 0);
             }
             let waited = started.elapsed();
-            assert!(waited >= READ_LIMIT - Duration::from_secs(1) && waited < READ_LIMIT * 2, "{waited:?}");
+            assert!(
+                waited >= READ_LIMIT - Duration::from_secs(1) && waited < READ_LIMIT * 2,
+                "{waited:?}"
+            );
         }
 
         #[test]

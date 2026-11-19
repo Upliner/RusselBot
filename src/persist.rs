@@ -125,8 +125,7 @@ pub fn parse_location(text: &str) -> Result<LocationArg, String> {
         "last_cmd" => return Ok(LocationArg::LastCmd),
         _ => {}
     }
-    let malformed =
-        || format!("\"{text}\" is not a location: write <region>/<x>/<y>/<z>, or cur, cfg, last or last_cmd");
+    let malformed = || format!("\"{text}\" is not a location: write <region>/<x>/<y>/<z>, or cur, cfg, last or last_cmd");
     let parts: Vec<&str> = text.split('/').collect();
     let [region, x, y, z] = parts[..] else {
         return Err(malformed());
@@ -139,7 +138,10 @@ pub fn parse_location(text: &str) -> Result<LocationArg, String> {
     if region.is_empty() {
         return Err(malformed());
     }
-    Ok(LocationArg::At(Location { region: region.to_string(), position: [number(x)?, number(y)?, number(z)?] }))
+    Ok(LocationArg::At(Location {
+        region: region.to_string(),
+        position: [number(x)?, number(y)?, number(z)?],
+    }))
 }
 
 /// Reads an object's UUID, `ground`, `stand`, `unchanged` or one of the
@@ -184,7 +186,13 @@ pub struct Book {
 
 impl Book {
     pub fn new(config: Placement) -> Book {
-        Book { held: config.clone(), config, first: None, last: None, seats: VecDeque::new() }
+        Book {
+            held: config.clone(),
+            config,
+            first: None,
+            last: None,
+            seats: VecDeque::new(),
+        }
     }
 
     /// The placement the bot works towards in holding mode, and the one
@@ -196,7 +204,10 @@ impl Book {
     /// The placement the config describes; its location is the first
     /// location when the config names none.
     pub fn config(&self) -> Placement {
-        Placement { location: self.config.location.clone().or_else(|| self.first.clone()), sit: self.config.sit }
+        Placement {
+            location: self.config.location.clone().or_else(|| self.first.clone()),
+            sit: self.config.sit,
+        }
     }
 
     fn last(&self) -> Placement {
@@ -231,9 +242,12 @@ impl Book {
     /// The region `object` is known to be in: the current one when it has
     /// been learned there, else the one the avatar last sat on it in.
     fn region_of(&self, object: Uuid, world: Option<&dyn World>) -> Option<String> {
-        world
-            .and_then(|world| world.region_of(object))
-            .or_else(|| self.seats.iter().find(|(known, _)| *known == object).map(|(_, region)| region.clone()))
+        world.and_then(|world| world.region_of(object)).or_else(|| {
+            self.seats
+                .iter()
+                .find(|(known, _)| *known == object)
+                .map(|(_, region)| region.clone())
+        })
     }
 
     /// What the two arguments of a persist stand for right now. `world` is
@@ -272,7 +286,9 @@ impl Book {
             SitArg::LastCmd => last_sit.unwrap_or_else(|| self.last().sit),
         };
         if let (Some(location), SitState::Object(object)) = (&location, sit) {
-            if let Some(region) = self.region_of(object, world).filter(|region| !same_region(region, &location.region))
+            if let Some(region) = self
+                .region_of(object, world)
+                .filter(|region| !same_region(region, &location.region))
             {
                 return Err(format!(
                     "the object {object} is in region \"{region}\", but the location is in \"{}\"",
@@ -295,7 +311,10 @@ mod tests {
     use super::*;
 
     fn at(region: &str, x: f32, y: f32, z: f32) -> Location {
-        Location { region: region.to_string(), position: [x, y, z] }
+        Location {
+            region: region.to_string(),
+            position: [x, y, z],
+        }
     }
 
     fn object(n: u128) -> Uuid {
@@ -321,17 +340,27 @@ mod tests {
     }
 
     fn standing_in(region: &str) -> Fake {
-        Fake { here: at(region, 60.0, 70.0, 22.0), sitting: Sitting::Standing, known: Vec::new() }
+        Fake {
+            here: at(region, 60.0, 70.0, 22.0),
+            sitting: Sitting::Standing,
+            known: Vec::new(),
+        }
     }
 
     /// A book for a config with `region`, `position` and an object as `sit`.
     fn full() -> Book {
-        Book::new(Placement { location: Some(at("Target", 128.0, 128.0, 25.0)), sit: SitState::Object(object(1)) })
+        Book::new(Placement {
+            location: Some(at("Target", 128.0, 128.0, 25.0)),
+            sit: SitState::Object(object(1)),
+        })
     }
 
     /// A book for a config with only the account.
     fn bare() -> Book {
-        Book::new(Placement { location: None, sit: SitState::Stand })
+        Book::new(Placement {
+            location: None,
+            sit: SitState::Stand,
+        })
     }
 
     fn resolve(book: &Book, location: &str, sit: &str, world: Option<&dyn World>) -> Result<Placement, String> {
@@ -346,7 +375,10 @@ mod tests {
         assert_eq!(parsed, LocationArg::At(at("Blue Lagoon", 128.0, 128.5, 25.0)));
         let LocationArg::At(location) = parsed else { unreachable!() };
         assert_eq!(location.to_string(), "Blue Lagoon/128/128.5/25");
-        assert_eq!(parse_location(" Target / 1 / 2 / 3 ").unwrap(), LocationArg::At(at("Target", 1.0, 2.0, 3.0)));
+        assert_eq!(
+            parse_location(" Target / 1 / 2 / 3 ").unwrap(),
+            LocationArg::At(at("Target", 1.0, 2.0, 3.0))
+        );
     }
 
     #[test]
@@ -393,7 +425,10 @@ mod tests {
     #[test]
     fn a_sit_state_is_a_uuid_or_a_word() {
         let id = "11111111-2222-3333-4444-555555555555";
-        assert_eq!(parse_sit_state(id).unwrap(), SitArg::Is(SitState::Object(Uuid::parse_str(id).unwrap())));
+        assert_eq!(
+            parse_sit_state(id).unwrap(),
+            SitArg::Is(SitState::Object(Uuid::parse_str(id).unwrap()))
+        );
         let reason = parse_sit_state("chair").unwrap_err();
         for word in ["\"chair\"", "UUID", "ground", "stand", "unchanged", "last_cmd"] {
             assert!(reason.contains(word), "{reason}");
@@ -402,9 +437,16 @@ mod tests {
 
     #[test]
     fn placements_print_as_the_command_takes_them() {
-        let placement = Placement { location: Some(at("Target", 128.0, 128.0, 25.0)), sit: SitState::Object(object(1)) };
+        let placement = Placement {
+            location: Some(at("Target", 128.0, 128.0, 25.0)),
+            sit: SitState::Object(object(1)),
+        };
         assert_eq!(placement.to_string(), format!("Target/128/128/25 {}", object(1)));
-        for (sit, word) in [(SitState::Ground, "ground"), (SitState::Stand, "stand"), (SitState::Unchanged, "unchanged")] {
+        for (sit, word) in [
+            (SitState::Ground, "ground"),
+            (SitState::Stand, "stand"),
+            (SitState::Unchanged, "unchanged"),
+        ] {
             assert_eq!(Placement { location: None, sit }.to_string(), format!("unknown {word}"));
             assert_eq!(parse_sit_state(word).unwrap(), SitArg::Is(sit));
         }
@@ -414,9 +456,19 @@ mod tests {
 
     #[test]
     fn cur_while_seated_is_the_position_and_the_prim() {
-        let world = Fake { here: at("Target", 131.0, 64.0, 23.0), sitting: Sitting::Object(object(9)), known: vec![] };
+        let world = Fake {
+            here: at("Target", 131.0, 64.0, 23.0),
+            sitting: Sitting::Object(object(9)),
+            known: vec![],
+        };
         let placement = resolve(&full(), "cur", "cur", Some(&world)).unwrap();
-        assert_eq!(placement, Placement { location: Some(world.here.clone()), sit: SitState::Object(object(9)) });
+        assert_eq!(
+            placement,
+            Placement {
+                location: Some(world.here.clone()),
+                sit: SitState::Object(object(9))
+            }
+        );
     }
 
     #[test]
@@ -451,20 +503,41 @@ mod tests {
     #[test]
     fn cfg_is_the_config_placement() {
         let placement = resolve(&full(), "cfg", "cfg", None).unwrap();
-        assert_eq!(placement, Placement { location: Some(at("Target", 128.0, 128.0, 25.0)), sit: SitState::Object(object(1)) });
+        assert_eq!(
+            placement,
+            Placement {
+                location: Some(at("Target", 128.0, 128.0, 25.0)),
+                sit: SitState::Object(object(1))
+            }
+        );
     }
 
     #[test]
     fn cfg_without_a_position_is_the_first_location() {
         let mut book = bare();
         // Not known yet: accepted, and no location is held.
-        assert_eq!(resolve(&book, "cfg", "cfg", None).unwrap(), Placement { location: None, sit: SitState::Stand });
+        assert_eq!(
+            resolve(&book, "cfg", "cfg", None).unwrap(),
+            Placement {
+                location: None,
+                sit: SitState::Stand
+            }
+        );
         assert!(book.first_location(at("Home", 60.0, 70.0, 22.0)));
         let placement = resolve(&book, "cfg", "cfg", None).unwrap();
-        assert_eq!(placement, Placement { location: Some(at("Home", 60.0, 70.0, 22.0)), sit: SitState::Stand });
+        assert_eq!(
+            placement,
+            Placement {
+                location: Some(at("Home", 60.0, 70.0, 22.0)),
+                sit: SitState::Stand
+            }
+        );
         // Only the first report counts.
         assert!(!book.first_location(at("Target", 1.0, 2.0, 3.0)));
-        assert_eq!(resolve(&book, "cfg", "cfg", None).unwrap().location, Some(at("Home", 60.0, 70.0, 22.0)));
+        assert_eq!(
+            resolve(&book, "cfg", "cfg", None).unwrap().location,
+            Some(at("Home", 60.0, 70.0, 22.0))
+        );
     }
 
     #[test]
@@ -472,14 +545,23 @@ mod tests {
         let mut book = full();
         assert!(!book.first_location(at("Home", 60.0, 70.0, 22.0)));
         assert_eq!(book.held().location, Some(at("Target", 128.0, 128.0, 25.0)));
-        assert_eq!(resolve(&book, "cfg", "cfg", None).unwrap().location, Some(at("Target", 128.0, 128.0, 25.0)));
+        assert_eq!(
+            resolve(&book, "cfg", "cfg", None).unwrap().location,
+            Some(at("Target", 128.0, 128.0, 25.0))
+        );
     }
 
     #[test]
     fn last_is_the_last_persist_or_else_the_config() {
         let mut book = full();
-        assert_eq!(resolve(&book, "last", "last", None).unwrap(), resolve(&book, "cfg", "cfg", None).unwrap());
-        let persisted = Placement { location: Some(at("Blue Lagoon", 10.0, 20.0, 30.0)), sit: SitState::Ground };
+        assert_eq!(
+            resolve(&book, "last", "last", None).unwrap(),
+            resolve(&book, "cfg", "cfg", None).unwrap()
+        );
+        let persisted = Placement {
+            location: Some(at("Blue Lagoon", 10.0, 20.0, 30.0)),
+            sit: SitState::Ground,
+        };
         book.commit(persisted.clone());
         assert_eq!(book.held(), &persisted);
         assert_eq!(resolve(&book, "last", "last", None).unwrap(), persisted);
@@ -487,31 +569,55 @@ mod tests {
         assert_eq!(resolve(&book, "cfg", "cfg", None).unwrap().sit, SitState::Object(object(1)));
         // Each argument is taken by itself.
         let mixed = resolve(&book, "cfg", "last", None).unwrap();
-        assert_eq!(mixed, Placement { location: Some(at("Target", 128.0, 128.0, 25.0)), sit: SitState::Ground });
+        assert_eq!(
+            mixed,
+            Placement {
+                location: Some(at("Target", 128.0, 128.0, 25.0)),
+                sit: SitState::Ground
+            }
+        );
     }
 
     #[test]
     fn last_cmd_is_the_last_tp_and_sit_or_else_last() {
         let mut book = full();
-        book.commit(Placement { location: Some(at("Blue Lagoon", 10.0, 20.0, 30.0)), sit: SitState::Unchanged });
+        book.commit(Placement {
+            location: Some(at("Blue Lagoon", 10.0, 20.0, 30.0)),
+            sit: SitState::Unchanged,
+        });
         let (location, sit) = (LocationArg::LastCmd, SitArg::LastCmd);
         // No tp and no sit command yet: as `last`.
         let placement = book.resolve(&location, sit, None, None, None).unwrap();
         assert_eq!(placement, resolve(&book, "last", "last", None).unwrap());
         let tp = at("Home", 100.0, 120.0, 30.0);
         let placement = book.resolve(&location, sit, None, Some(&tp), None).unwrap();
-        assert_eq!(placement, Placement { location: Some(tp.clone()), sit: SitState::Unchanged });
+        assert_eq!(
+            placement,
+            Placement {
+                location: Some(tp.clone()),
+                sit: SitState::Unchanged
+            }
+        );
         let placement = book.resolve(&location, sit, None, None, Some(SitState::Object(object(7)))).unwrap();
         assert_eq!(placement.location, Some(at("Blue Lagoon", 10.0, 20.0, 30.0)));
         assert_eq!(placement.sit, SitState::Object(object(7)));
         let placement = book.resolve(&location, sit, None, Some(&tp), Some(SitState::Ground)).unwrap();
-        assert_eq!(placement, Placement { location: Some(tp), sit: SitState::Ground });
+        assert_eq!(
+            placement,
+            Placement {
+                location: Some(tp),
+                sit: SitState::Ground
+            }
+        );
     }
 
     #[test]
     fn a_failed_resolve_changes_nothing() {
         let mut book = full();
-        book.commit(Placement { location: Some(at("Home", 1.0, 2.0, 3.0)), sit: SitState::Ground });
+        book.commit(Placement {
+            location: Some(at("Home", 1.0, 2.0, 3.0)),
+            sit: SitState::Ground,
+        });
         let before = format!("{book:?}");
         assert!(resolve(&book, "cur", "cur", None).is_err());
         assert!(resolve(&book, "Target/1/2", "cur", None).is_err());
@@ -527,16 +633,25 @@ mod tests {
         assert_eq!(book.held().location, None);
         assert!(book.first_location(at("Home", 60.0, 70.0, 22.0)));
         assert_eq!(book.held().location, Some(at("Home", 60.0, 70.0, 22.0)));
-        assert_eq!(resolve(&book, "last", "last", None).unwrap().location, Some(at("Home", 60.0, 70.0, 22.0)));
+        assert_eq!(
+            resolve(&book, "last", "last", None).unwrap().location,
+            Some(at("Home", 60.0, 70.0, 22.0))
+        );
     }
 
     #[test]
     fn a_persisted_location_does_not_wait_for_the_first() {
         let mut book = bare();
-        book.commit(Placement { location: Some(at("Target", 1.0, 2.0, 3.0)), sit: SitState::Stand });
+        book.commit(Placement {
+            location: Some(at("Target", 1.0, 2.0, 3.0)),
+            sit: SitState::Stand,
+        });
         assert!(!book.first_location(at("Home", 60.0, 70.0, 22.0)));
         assert_eq!(book.held().location, Some(at("Target", 1.0, 2.0, 3.0)));
-        assert_eq!(resolve(&book, "last", "last", None).unwrap().location, Some(at("Target", 1.0, 2.0, 3.0)));
+        assert_eq!(
+            resolve(&book, "last", "last", None).unwrap().location,
+            Some(at("Target", 1.0, 2.0, 3.0))
+        );
     }
 
     // --------------------------------------------------- the region check
@@ -545,7 +660,11 @@ mod tests {
     fn seat_here_and_location_elsewhere_is_refused() {
         let mut book = full();
         book.seated(object(9), "Target");
-        let world = Fake { here: at("Target", 131.0, 64.0, 23.0), sitting: Sitting::Object(object(9)), known: vec![] };
+        let world = Fake {
+            here: at("Target", 131.0, 64.0, 23.0),
+            sitting: Sitting::Object(object(9)),
+            known: vec![],
+        };
         let reason = resolve(&book, "Home/128/128/25", "cur", Some(&world)).unwrap_err();
         assert!(reason.contains("\"Home\"") && reason.contains("\"Target\""), "{reason}");
         assert_eq!(book.held(), full().held());
@@ -559,7 +678,10 @@ mod tests {
         let reason = resolve(&book, "cur", &object(9).to_string(), Some(&world)).unwrap_err();
         assert!(reason.contains("\"Home\"") && reason.contains("\"Target\""), "{reason}");
         // Also without a session, and through the special words.
-        book.commit(Placement { location: Some(at("Target", 1.0, 2.0, 3.0)), sit: SitState::Object(object(9)) });
+        book.commit(Placement {
+            location: Some(at("Target", 1.0, 2.0, 3.0)),
+            sit: SitState::Object(object(9)),
+        });
         assert!(resolve(&book, "Home/1/2/3", "last", None).is_err());
         assert!(resolve(&book, "last", "last", None).is_ok());
     }

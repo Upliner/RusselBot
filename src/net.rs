@@ -21,20 +21,38 @@ const READ_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_DATAGRAM: usize = 65_536;
 
 pub enum Event {
-    Datagram { generation: u64, data: Vec<u8> },
-    Caps { generation: u64, event: CapsEvent },
+    Datagram {
+        generation: u64,
+        data: Vec<u8>,
+    },
+    Caps {
+        generation: u64,
+        event: CapsEvent,
+    },
     /// The answer to a name lookup: the avatars found, and the ids the grid
     /// does not know as avatars.
-    Names { found: Vec<(Uuid, Names)>, missing: Vec<Uuid> },
+    Names {
+        found: Vec<(Uuid, Names)>,
+        missing: Vec<Uuid>,
+    },
     /// A name lookup that got no answer.
     NamesFailed(Vec<Uuid>),
     /// The answer to an avatar search over HTTP: the avatars found, as id
     /// and `First Last`.
-    AvatarsFound { query: Uuid, avatars: Vec<(Uuid, String)> },
+    AvatarsFound {
+        query: Uuid,
+        avatars: Vec<(Uuid, String)>,
+    },
     /// An avatar search that got no answer, and why.
-    AvatarSearchFailed { query: Uuid, reason: String },
+    AvatarSearchFailed {
+        query: Uuid,
+        reason: String,
+    },
     /// A command from the control socket, to be answered on `reply`.
-    Control { request: Request, reply: Sender<Response> },
+    Control {
+        request: Request,
+        reply: Sender<Response>,
+    },
     /// The operator asked the bot to stop.
     Signal,
 }
@@ -51,7 +69,10 @@ pub struct RealNet {
 
 impl RealNet {
     pub fn new(events: Sender<Event>) -> RealNet {
-        RealNet { events, links: HashMap::new() }
+        RealNet {
+            events,
+            links: HashMap::new(),
+        }
     }
 }
 

@@ -202,10 +202,7 @@ pub fn parse_xmlrpc_response(input: &str) -> Result<Value, XmlError> {
     match first.tag_name().name() {
         "fault" => {
             let fault = elements(first).next().map(xmlrpc_value).transpose()?;
-            let reason = fault
-                .as_ref()
-                .and_then(|f| f.str_field("faultString"))
-                .unwrap_or("unknown fault");
+            let reason = fault.as_ref().and_then(|f| f.str_field("faultString")).unwrap_or("unknown fault");
             err(format!("XML-RPC fault: {reason}"))
         }
         "params" => {
@@ -384,10 +381,7 @@ mod tests {
         assert_eq!(value.str_field("login"), Some("true"));
         assert_eq!(value.get("sim_port").unwrap().as_i64(), Some(9000));
         assert_eq!(value.str_field("bare"), Some("plain & simple"));
-        assert_eq!(
-            value.get("list").unwrap().as_array(),
-            Some(&[Value::Int(1), Value::Bool(true)][..])
-        );
+        assert_eq!(value.get("list").unwrap().as_array(), Some(&[Value::Int(1), Value::Bool(true)][..]));
     }
 
     #[test]

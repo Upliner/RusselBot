@@ -22,8 +22,7 @@ const MAX_PENDING: usize = 1000;
 /// Expired cache entries are dropped once the cache has grown this large.
 const CACHE_PRUNE_SIZE: usize = 10_000;
 
-pub const COLUMNS: [&str; 7] =
-    ["time", "kind", "avatar_name", "display_name", "object_name", "object_uuid", "text"];
+pub const COLUMNS: [&str; 7] = ["time", "kind", "avatar_name", "display_name", "object_name", "object_uuid", "text"];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Channel {
@@ -90,7 +89,13 @@ impl Recorder {
             }
         }
         let time = message.sent_at.map_or(received, u64::from);
-        self.pending.push_back(Entry { channel, message, time, needs, deadline: now + NAME_WAIT });
+        self.pending.push_back(Entry {
+            channel,
+            message,
+            time,
+            needs,
+            deadline: now + NAME_WAIT,
+        });
     }
 
     /// Whether any ids are waiting to be looked up.
@@ -237,7 +242,10 @@ impl LogFile {
         if file.metadata()?.len() == 0 {
             file.write_all(header().as_bytes())?;
         }
-        Ok(LogFile { path: path.to_path_buf(), file })
+        Ok(LogFile {
+            path: path.to_path_buf(),
+            file,
+        })
     }
 
     /// One `write` per row keeps rows whole for anyone reading along.
@@ -271,7 +279,10 @@ impl Logs {
                 message: format!("cannot open {}: {e}", path.unwrap_or(Path::new("")).display()),
             })
         };
-        Ok(Logs { chat: open(chat, "log_chat")?, im: open(im, "log_im")? })
+        Ok(Logs {
+            chat: open(chat, "log_chat")?,
+            im: open(im, "log_im")?,
+        })
     }
 
     pub fn write(&mut self, record: &Record) {
@@ -297,17 +308,37 @@ mod tests {
     }
 
     fn jane() -> Names {
-        Names { legacy: "Jane Doe".into(), display: "JD".into() }
+        Names {
+            legacy: "Jane Doe".into(),
+            display: "JD".into(),
+        }
     }
 
     fn said(by: u8, name: &str, text: &str) -> Message {
-        let source = Source::Avatar { id: id(by), name: name.into() };
-        Message { kind: "say".into(), source, sent_at: None, text: text.into() }
+        let source = Source::Avatar {
+            id: id(by),
+            name: name.into(),
+        };
+        Message {
+            kind: "say".into(),
+            source,
+            sent_at: None,
+            text: text.into(),
+        }
     }
 
     fn object_said(owner: u8, text: &str) -> Message {
-        let source = Source::Object { id: Some(id(0xB0)), name: "Clock".into(), owner: id(owner) };
-        Message { kind: "say".into(), source, sent_at: None, text: text.into() }
+        let source = Source::Object {
+            id: Some(id(0xB0)),
+            name: "Clock".into(),
+            owner: id(owner),
+        };
+        Message {
+            kind: "say".into(),
+            source,
+            sent_at: None,
+            text: text.into(),
+        }
     }
 
     fn record(avatar: &str, display: &str, text: &str) -> Record {
@@ -324,7 +355,11 @@ mod tests {
     }
 
     fn object_record(avatar: &str, display: &str) -> Record {
-        Record { object_name: "Clock".into(), object_uuid: Some(id(0xB0)), ..record(avatar, display, "tick") }
+        Record {
+            object_name: "Clock".into(),
+            object_uuid: Some(id(0xB0)),
+            ..record(avatar, display, "tick")
+        }
     }
 
     fn texts(records: &[Record]) -> Vec<&str> {
@@ -335,7 +370,10 @@ mod tests {
 
     #[test]
     fn formats_the_spec_row() {
-        assert_eq!(record("Jane Doe", "JD", "hello").row(), "2026-11-18T17:04:23Z\tsay\tJane Doe\tJD\t\t\thello\n");
+        assert_eq!(
+            record("Jane Doe", "JD", "hello").row(),
+            "2026-11-18T17:04:23Z\tsay\tJane Doe\tJD\t\t\thello\n"
+        );
         assert_eq!(header(), "time\tkind\tavatar_name\tdisplay_name\tobject_name\tobject_uuid\ttext\n");
     }
 
@@ -350,7 +388,10 @@ mod tests {
     #[test]
     fn escapes_what_would_break_a_row() {
         let row = record("Tab\tby", "Back\\slash", "a\tb\nc\r\nd\\n").row();
-        assert_eq!(row, "2026-11-18T17:04:23Z\tsay\tTab\\tby\tBack\\\\slash\t\t\ta\\tb\\nc\\r\\nd\\\\n\n");
+        assert_eq!(
+            row,
+            "2026-11-18T17:04:23Z\tsay\tTab\\tby\tBack\\\\slash\t\t\ta\\tb\\nc\\r\\nd\\\\n\n"
+        );
         assert_eq!(row.matches('\t').count(), 6);
         assert_eq!(row.matches('\n').count(), 1);
     }
@@ -364,7 +405,12 @@ mod tests {
             format!("chat [say] Clock <{}>, owner Jane Doe (JD): tick", id(0xB0))
         );
         assert_eq!(object_record("", "").log_line(), format!("chat [say] Clock <{}>: tick", id(0xB0)));
-        let im = Record { channel: Channel::Im, kind: "object".into(), object_uuid: None, ..object_record("Jane Doe", "") };
+        let im = Record {
+            channel: Channel::Im,
+            kind: "object".into(),
+            object_uuid: None,
+            ..object_record("Jane Doe", "")
+        };
         assert_eq!(im.log_line(), "im [object] Clock, owner Jane Doe: tick");
     }
 
@@ -388,12 +434,24 @@ mod tests {
     // ----------------------------------------------- instant messages sent
 
     fn sent(to: u8, name: &str, text: &str) -> Message {
-        let source = Source::Avatar { id: id(to), name: name.into() };
-        Message { kind: "im_out".into(), source, sent_at: None, text: text.into() }
+        let source = Source::Avatar {
+            id: id(to),
+            name: name.into(),
+        };
+        Message {
+            kind: "im_out".into(),
+            source,
+            sent_at: None,
+            text: text.into(),
+        }
     }
 
     fn im_record(kind: &str, avatar: &str, display: &str, text: &str) -> Record {
-        Record { channel: Channel::Im, kind: kind.into(), ..record(avatar, display, text) }
+        Record {
+            channel: Channel::Im,
+            kind: kind.into(),
+            ..record(avatar, display, text)
+        }
     }
 
     #[test]
@@ -432,13 +490,19 @@ mod tests {
         let now = Instant::now();
         let mut rec = Recorder::default();
         rec.push(Channel::Im, sent(1, "Jane Doe", "are you there?"), T0, now);
-        let reply = Message { kind: "im".into(), ..said(1, "Jane Doe", "yes") };
+        let reply = Message {
+            kind: "im".into(),
+            ..said(1, "Jane Doe", "yes")
+        };
         rec.push(Channel::Im, reply, T0 + 2, now);
         assert_eq!(rec.take_lookups(), [id(1)], "one lookup serves both");
         rec.names_resolved(vec![(id(1), jane())], vec![], now);
         let expected = [
             im_record("im_out", "Jane Doe", "JD", "are you there?"),
-            Record { time: T0 + 2, ..im_record("im", "Jane Doe", "JD", "yes") },
+            Record {
+                time: T0 + 2,
+                ..im_record("im", "Jane Doe", "JD", "yes")
+            },
         ];
         assert_eq!(rec.flush(now), expected);
     }
@@ -452,7 +516,17 @@ mod tests {
         rec.push(Channel::Chat, said(2, "John Roe", "second"), T0, now);
         assert_eq!(rec.take_lookups(), [id(2)]);
 
-        rec.names_resolved(vec![(id(2), Names { legacy: "John Roe".into(), display: "Johnny".into() })], vec![], now);
+        rec.names_resolved(
+            vec![(
+                id(2),
+                Names {
+                    legacy: "John Roe".into(),
+                    display: "Johnny".into(),
+                },
+            )],
+            vec![],
+            now,
+        );
         assert_eq!(rec.flush(now), []);
         rec.names_resolved(vec![(id(1), jane())], vec![], now);
         assert_eq!(texts(&rec.flush(now)), ["first", "second"]);
@@ -514,11 +588,22 @@ mod tests {
     fn grid_messages_need_no_lookup() {
         let now = Instant::now();
         let mut rec = Recorder::default();
-        let source = Source::System { name: "Second Life".into() };
-        let message = Message { kind: "im".into(), source, sent_at: None, text: "notice".into() };
+        let source = Source::System {
+            name: "Second Life".into(),
+        };
+        let message = Message {
+            kind: "im".into(),
+            source,
+            sent_at: None,
+            text: "notice".into(),
+        };
         rec.push(Channel::Im, message, T0, now);
         assert!(!rec.has_lookups());
-        let expected = Record { channel: Channel::Im, kind: "im".into(), ..record("Second Life", "", "notice") };
+        let expected = Record {
+            channel: Channel::Im,
+            kind: "im".into(),
+            ..record("Second Life", "", "notice")
+        };
         assert_eq!(rec.flush(now), [expected]);
     }
 
@@ -564,7 +649,10 @@ mod tests {
         rec.push(Channel::Chat, said(1, "John Roe", "first"), T0, now);
         rec.push(Channel::Chat, said(2, "Jane Doe", "second"), T0, now);
         assert_eq!(rec.flush(now), []);
-        assert_eq!(rec.flush_all(now), [record("John Roe", "", "first"), record("Jane Doe", "JD", "second")]);
+        assert_eq!(
+            rec.flush_all(now),
+            [record("John Roe", "", "first"), record("Jane Doe", "JD", "second")]
+        );
         assert_eq!(rec.flush_all(now), []);
     }
 
@@ -625,7 +713,11 @@ mod tests {
         let dir = temp_dir("split");
         let (chat_path, im_path) = (dir.join("chat.tsv"), dir.join("im.tsv"));
         let chat = record("Jane Doe", "JD", "hello");
-        let im = Record { channel: Channel::Im, kind: "im".into(), ..record("Jane Doe", "JD", "psst") };
+        let im = Record {
+            channel: Channel::Im,
+            kind: "im".into(),
+            ..record("Jane Doe", "JD", "psst")
+        };
 
         let mut logs = Logs::open(Some(&chat_path), Some(&im_path)).unwrap();
         logs.write(&chat);
@@ -660,7 +752,10 @@ mod tests {
         if !full.exists() {
             return;
         }
-        let mut file = LogFile { path: full.to_path_buf(), file: OpenOptions::new().append(true).open(full).unwrap() };
+        let mut file = LogFile {
+            path: full.to_path_buf(),
+            file: OpenOptions::new().append(true).open(full).unwrap(),
+        };
         file.append("row\n");
         file.append("row\n");
     }

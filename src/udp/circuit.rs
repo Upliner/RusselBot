@@ -158,7 +158,13 @@ mod tests {
 
     fn incoming(sequence: u32, reliable: bool) -> Packet {
         let flags = if reliable { FLAG_RELIABLE } else { 0 };
-        Packet { flags, sequence, acks: Vec::new(), id: high(1), body: vec![0; 5] }
+        Packet {
+            flags,
+            sequence,
+            acks: Vec::new(),
+            id: high(1),
+            body: vec![0; 5],
+        }
     }
 
     #[test]
