@@ -50,19 +50,47 @@ clothing commands can only be refused. On Second Life, checked by hand on
   it had reported at one login, and that the Current Outfit folder still
   listed, it did not report at the next login seven minutes later, and an
   `attach` of that item was then carried out and confirmed, not refused. So
-  on Second Life the bot can miss an attachment that is there, and
+  on Second Life an attachment can be missing after a login, and
   `inventory -a`, `detach BODY PART` and the refusal to attach a thing twice
-  are only as good as what it has seen. Why it missed that one the log does
-  not tell. A likely cause is that Second Life mentioned the object as one
-  the viewer has cached, and the bot asks about cached objects only when it
-  is looking for one to touch.
+  are only as good as what the simulator shows.
+- Six more logins in the same region later that day, all with `--verbose`,
+  to find out why. They were made with a build that asked the simulator at
+  once about objects it only mentions, as ones a viewer has cached, and
+  marks as the account's own; the miss was first taken for such a mention.
+  At each login the simulator mentioned more than 2,100 objects that way
+  and marked none of them as the account's own, so that was not the cause,
+  and the bot does not ask so any more.
+- In the first two of them, a minute and a half apart, the bot reported
+  the same five attachments within four seconds each time, all described
+  by the simulator without being asked. The object missed in the first
+  check had been taken off in between, so its absence was right; beyond
+  that the five were not compared with what a viewer shows. `inventory`
+  listed 338 entries in three seconds and `inventory -a` the five
+  attachments; `attach` of one of them was refused as attached already;
+  `detach` by body part answered within a second, and the link was removed
+  from the Current Outfit folder.
+- The other four show the gap again and what goes before it. An object was
+  attached to `Right Hand` and was reported at the next two logins. Then
+  another object was attached to the same point and detached again, and at
+  the login after that the first one was not reported. The miss in the
+  first check had come about the same way. Most likely the simulator
+  itself no longer has the object on the avatar after such a login: in the
+  first check it attached that object again when asked. Why it loses it is
+  not known. A viewer attaches at every login whatever the Current Outfit
+  folder lists and the simulator did not bring, which would hide this; the
+  bot does not do that.
+- In those four also: the simulator took 21 and 15 seconds to carry out an
+  `attach`. The bot waits 15, so the first was answered as refused; the
+  object came six seconds later and was reported, and got no link in the
+  Current Outfit folder.
 
-Not tried there, or not recorded: `inventory` in any form and its listing
-against what a viewer shows, `attach` with a body part named, `detach` by
-body part, `unwear` by kind of clothing, `wear` of a body part, a grid that
-refuses the new outfit, `anim`, `sound`, the points the bot reported
-compared with a viewer, and a viewer login afterwards to see whether it
-finds the avatar as the bot left it.
+Not tried there, or not recorded: the listing of `inventory` against what a
+viewer shows, `attach` with a body part named, `unwear` by kind of
+clothing, `wear` of a body part, a grid that refuses the new outfit,
+`anim`, `sound`, the points the bot reported compared with a viewer, a
+viewer login afterwards to see whether it finds the avatar as the bot left
+it, and whether an object missing after a login is on the avatar for other
+people.
 
 ## Build
 
@@ -584,9 +612,13 @@ to find out. So the bot also knows of things attached before it started, or
 attached and detached by a script, and notes on standard error whatever
 comes or goes without a command of its own. After a teleport to another
 region or a new login it learns it again from the new simulator, which may
-take a moment. On Second Life it has been seen to miss an attachment that
-was there (see [Status](#status)); the bot then answers as if the thing were
-not attached.
+take a moment.
+
+On Second Life an attachment that was there at one login can be missing at
+the next: seen each time after another object had been attached to the same
+point and detached again (see [Status](#status)). The Current Outfit folder
+may still list such an object; the bot does not attach it again by itself.
+An attachment the simulator does not show the bot treats as not attached.
 
 None of these commands moves the avatar or changes whether the bot is
 holding its place.

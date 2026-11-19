@@ -178,11 +178,13 @@ the UUID it prints.
 | 55 | `scan_distance = 5000`; `requesttp_timeout = 0` | Error naming the key, status 2 | Pass, both |
 | 56 | Items 3 and 9 again, with no command given since `home` | The bot sits again and teleports back as before | Pass |
 
-Not covered on this rig: what the scan costs and finds. OpenSim describes
-every object in full and never as cached, so the bot had nothing to ask
-about and sent no `RequestMultipleObjects` even after a scan started; that
-path, and the effect of the scan distance, are covered by unit tests only
-until tried on Second Life. Also not covered: an avatar's request to be
+Not covered on this rig: what the scan costs and finds. In these runs
+OpenSim described every object in full and none as cached, so the bot had
+nothing to ask about and sent no `RequestMultipleObjects` even after a scan
+started; that path, and the effect of the scan distance, are covered by
+unit tests only until tried on Second Life. (OpenSim does mention an object
+as cached once it has stood unchanged for five minutes, though never an
+attachment; no scan was run against such objects.) Also not covered: an avatar's request to be
 teleported to the bot (unit tests only). A ground sit as seen by others
 is covered by item 57.
 
@@ -316,6 +318,8 @@ two objects and the folder.
 | 102 | `kick user Sit Bot bye`, then before the next login `ctl inventory`, `attach`, `wear`, `detach` of an item and of a body part, `unwear shirt`, `anim play`, `sound` | Status 1, `the avatar is not connected to a region`, for each; nothing is done after the bot is back | Pass, all eight; `inventory -a` after the re-login printed nothing |
 | 103 | Two folders `Bot gear` at the top (left by an earlier `stock.py`), `ctl inventory "Bot gear"` | Status 1; the error lists the folders' UUIDs | Pass, with three of them, while `stock.py` did not yet clear up after itself (debug build): `My Inventory holds 3 folders named "Bot gear": ...; name one by its UUID` |
 | 104 | `--verbose`, no inventory command given: items 1, 3 and 9 | As before; no line starting `inventory:` in the log (each request to the inventory service writes one), and no message sent that was not sent before | Pass: login, seated; re-sit after `stand user`; back from `Home` and seated. Sent: `AgentUpdate`, `CompletePingCheck`, `UseCircuitCode`, `CompleteAgentMovement`, `RegionHandshakeReply`, `AgentThrottle`, `AgentRequestSit`, `AgentSit`, `RequestMultipleObjects` (one per sit), `MapNameRequest`, `TeleportLocationRequest` |
+| 105 | What loses an attachment on Second Life (README, Status): `attach "Bot gear/Radio" Right Hand`, 20 s, `quit`; log in; `attach "Bot gear/Watch" Right Hand`, 15 s, `detach "Bot gear/Watch"`, 20 s, `quit`; log in; `inventory -a` | `Radio` is listed on `Right Hand` at both logins | Pass: listed both times, and `attachment: item ... is on Right Hand` in each login's log. OpenSim does not lose it |
+| 106 | `attach "Bot gear/Watch" Left Hand` and `quit` within the same second; log in; `inventory -a` | Not known beforehand | `Watch` is not attached after the login, twice out of two tries (the other with `Radio`). OpenSim saves a changed appearance five seconds after the change (`DelayBeforeAppearanceSave`), and a logout before that loses it. Not a fault of the bot; a wait of 20 s before `quit` kept the attachment every time |
 
 Not covered on this rig, because OpenSim has neither service: wearing and
 taking off clothing and body parts, and the bookkeeping in the Current
