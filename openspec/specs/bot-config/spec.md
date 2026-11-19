@@ -20,7 +20,7 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `start` | no, and only without `region` and `position` | Where a login places the avatar while the bot holds no location: `"home"` for the avatar's home location, `"latest"` for the location it was last at. Defaults to `"latest"` |
 | `sit` | no | Sit state of the config placement: the UUID of an object, or the word `ground`. When absent the config placement's sit state is `stand` and the bot does not seat the avatar at startup |
 | `object` | no | Deprecated spelling of `sit`, accepting a UUID only |
-| `persist` | no | What the bot holds once it has reached the config placement after startup (see `placement-persist`); the forms are given below. Defaults to `"off"` |
+| `persist` | no | What the bot holds once it has reached the config placement after startup (see `placement-persist`), and in its table form also what a forced RLV movement does to the held placement (see `rlv-commands`); the forms are given below. Defaults to `"off"` |
 | `log_chat` | no | Path of the TSV file that receives local chat; no chat file is written when absent |
 | `log_im` | no | Path of the TSV file that receives instant messages; no IM file is written when absent |
 | `fetch_offline_im` | no | Boolean; when true the bot fetches instant messages stored while the avatar was offline. Defaults to false |
@@ -28,6 +28,7 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `requesttp_timeout` | no | Number of minutes, greater than zero, during which the bot accepts a teleport offer from an avatar it has asked with `requesttp`. Defaults to 10 |
 | `scan_distance` | no | Number of metres, from 1 to 1024. When present the bot learns the objects within that distance from the moment it enters a region, for the `touch` command. When absent it learns them only when `touch` is first used, within 32 metres |
 | `restore_attachments` | no | Boolean; when true the bot attaches again, after each login, the objects the avatar's Current Outfit folder lists and the simulator did not bring (see `avatar-outfit`, "Restoring attachments after a login"). Defaults to true |
+| `rlv` | no | Boolean; when true the bot starts with RLV on and reads the RLV commands of the objects the avatar owns (see `rlv-commands`). Defaults to false |
 
 `persist` SHALL be accepted in these forms:
 
@@ -37,7 +38,9 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `"cfg"` | Location and sit state both `cfg`: keep holding the config placement |
 | `"off"` or `false` | Hold nothing: switch to manual mode once the config placement is reached. The two spellings are equivalent, and a config without the key behaves the same |
 | An array of two strings, each `"cur"` or `"cfg"` | The first is the value for the location, the second the value for the sit state |
-| A table with the keys `position` and `sit`, each `"cur"` or `"cfg"` | `position` is the value for the location, `sit` the value for the sit state; a key that is left out of the table is `"cur"` |
+| A table with any of the keys `atstart`, `position`, `sit` and `rlv` | As described below the table |
+
+In the table form, `atstart` is a boolean that says whether the bot holds anything once the config placement is reached; `position` and `sit`, each `"cur"` or `"cfg"`, are the values for the location and for the sit state; and `rlv`, `"drop"` or `"follow"`, is the RLV persist setting the bot starts with (see `rlv-commands`, "RLV persist setting"). `atstart` SHALL default to true when the table has `position` or `sit`, and to false otherwise. While `atstart` is true, a `position` or `sit` that is left out of the table is `"cur"`, so `atstart = true` alone is the same as `persist = "cur"`. While `atstart` is false the bot holds nothing once the config placement is reached, as with `persist = "off"`. The `rlv` key SHALL NOT affect `atstart`. The RLV persist setting SHALL be `"drop"` when the table has no `rlv` key, with every other form of `persist`, and without `persist`.
 
 A relative `log_chat` or `log_im` path SHALL be taken relative to the directory the bot was started in. A config that uses `object` SHALL behave exactly as the same config with that value under `sit`, and the bot SHALL write a line to standard error at startup that names `object` as deprecated and `sit` as its replacement.
 
@@ -129,8 +132,36 @@ A relative `log_chat` or `log_im` path SHALL be taken relative to the directory 
 - **WHEN** the config contains `restore_attachments = false`
 - **THEN** the bot starts normally and never asks the grid about the Current Outfit folder unless a command needs it
 
+#### Scenario: Persist table with atstart alone
+- **WHEN** the config ends with a `[persist]` table containing only `atstart = true`
+- **THEN** the bot behaves as with `persist = "cur"`
+
+#### Scenario: Persist table with only the RLV setting
+- **WHEN** the config ends with a `[persist]` table containing only `rlv = "follow"`
+- **THEN** the bot is in manual mode once the config placement is reached, as with `persist = "off"`, and its RLV persist setting is `follow`
+
+#### Scenario: Empty persist table
+- **WHEN** the config ends with a `[persist]` table that has no keys
+- **THEN** the bot behaves as with `persist = "off"`
+
+#### Scenario: Persist table with a value and the RLV setting
+- **WHEN** the config ends with a `[persist]` table containing `sit = "cfg"` and `rlv = "follow"`
+- **THEN** the location value is `cur`, the sit state value is `cfg`, and the RLV persist setting is `follow`
+
+#### Scenario: RLV persist setting not mentioned
+- **WHEN** the config contains `persist = "cfg"`, or a `[persist]` table without `rlv`, or no `persist` at all
+- **THEN** the RLV persist setting is `drop`
+
+#### Scenario: RLV not mentioned
+- **WHEN** the config has no `rlv` key or has `rlv = false`
+- **THEN** the bot starts with RLV off, as `rlv-commands` describes
+
+#### Scenario: RLV enabled
+- **WHEN** the config contains `rlv = true`
+- **THEN** the bot starts with RLV on
+
 ### Requirement: Config validation before any network activity
-The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `position` and `sit` or with a value other than `"cur"` and `"cfg"`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, a `restore_attachments` that is not a boolean, and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
+The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `atstart`, `position`, `sit` and `rlv`, with a `position` or `sit` other than `"cur"` and `"cfg"`, with an `atstart` that is not a boolean, with an `rlv` other than `"drop"` and `"follow"`, or with `atstart = false` together with `position` or `sit`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, a `restore_attachments` that is not a boolean, an `rlv` that is not a boolean, and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
 
 #### Scenario: Both password forms given
 - **WHEN** the config contains both `password` and `password_hash`
@@ -207,6 +238,22 @@ The bot SHALL validate the whole config before contacting any server. It SHALL r
 #### Scenario: Restore option of the wrong type
 - **WHEN** the config contains `restore_attachments = "no"`
 - **THEN** the bot prints an error naming `restore_attachments` and exits with status 2
+
+#### Scenario: Persist table that contradicts itself
+- **WHEN** the config has a `[persist]` table containing `atstart = false` and `sit = "cfg"`
+- **THEN** the bot prints an error naming `persist`, `atstart` and `sit`, and exits with status 2
+
+#### Scenario: Bad atstart
+- **WHEN** the config has a `[persist]` table containing `atstart = "yes"`
+- **THEN** the bot prints an error naming `persist` and `atstart`, and exits with status 2
+
+#### Scenario: Bad RLV persist setting
+- **WHEN** the config has a `[persist]` table containing `rlv = "keep"` or `rlv = true`
+- **THEN** the bot prints an error naming `persist`, `rlv` and the two accepted values, and exits with status 2
+
+#### Scenario: RLV option of the wrong type
+- **WHEN** the config contains `rlv = "on"`
+- **THEN** the bot prints an error naming `rlv` and exits with status 2
 
 ### Requirement: Password hash subcommand
 The bot SHALL provide a `hash` subcommand that reads a password from standard input and prints the corresponding hash on standard output as `$1$` followed by the 32 lowercase hexadecimal digits of the MD5 digest of the password. The password SHALL NOT be accepted as a command-line argument. When standard input is a terminal the password SHALL NOT be echoed. A trailing line ending SHALL NOT be part of the hashed password. An empty password SHALL be rejected with a non-zero exit status.
