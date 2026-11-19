@@ -13,7 +13,11 @@ stand, sit elsewhere, teleport, exchange teleport offers and touch objects,
 and to use what the avatar owns: list its inventory, attach and detach
 objects, play animations and sounds, and (on Second Life) change clothing.
 With [RLV](#rlv) switched on, scripted objects the avatar owns can ask for
-some of the same: sit, stand, teleport, take things off.
+some of the same: sit, stand, teleport, take things off. And it can answer
+what a viewer answers with a dialog: teleport offers, inventory offers and
+scripts' requests for permissions are [accepted by
+itself](#permission-requests) from the avatars and objects the config
+names, and wait for a command otherwise.
 
 ## Status
 
@@ -181,6 +185,22 @@ people, a login with `restore_attachments = false`, a login at which the
 folder lists nothing that is missing, and an `attach` the simulator takes
 longer than 15 seconds over, now that the bot waits 30.
 
+[Permission requests](#permission-requests) are verified by unit tests and
+on the local OpenSim (`docs/test-rig.md`, items 125 to 141, 2026-11-20),
+with scripted boxes of another avatar that ask the bot for script
+permissions and give it inventory: the rules from the config and from the
+`perms` commands, exceptions, a request for two permissions at once, a
+request for money that is never granted, inventory offers from an object
+and from an avatar accepted by rule and by hand, teleport offers accepted
+by rule, with `accept tp` and with `accepttp`, and what a lost session and
+a change of region do to the requests that wait. Not produced on the rig
+and covered by unit tests only: an object owned by a group, a simulator
+that does not say who owns an object, a grid that does not know an owner's
+name, a simulator without an inventory service, and more than 100 requests
+waiting. Nothing of this has been tried on Second Life: that it takes the
+bot's answers to an inventory offer and to a script's permission request
+as the bot builds them is known from the viewer's source only.
+
 ## Build
 
 Needs Rust 1.100 (pinned in `rust-toolchain.toml`; rustup picks it up).
@@ -276,6 +296,7 @@ One TOML file; see `russelbot.example.toml`.
 | `requesttp_timeout` | no | Minutes after `requesttp` during which the asked avatar's teleport offer is accepted. Default: `10` |
 | `scan_distance` | no | Metres (1 to 1024) within which objects are learned from the start, for `touch`; see [Touching objects](#touching-objects). Default: learn within 32 m when `touch` is first used |
 | `restore_attachments` | no | `false` to keep the bot from attaching again, after each login, what the Current Outfit folder lists and the simulator did not bring; see [Attachments](#attachments). Default: `true` |
+| `perms` | no | Two tables, `[perms.autoaccept]` and `[perms.except]`, that say which teleport offers, inventory offers and scripts' permission requests the bot accepts by itself, see [Permission requests](#permission-requests). Default: none |
 | `rlv` | no | `true` to start with RLV on: the bot then reads the `@` commands of scripted objects the avatar owns, see [RLV](#rlv). Default: `false` |
 
 `persist` takes these forms:
@@ -296,7 +317,7 @@ One TOML file; see `russelbot.example.toml`.
 
 ### Upgrading
 
-Configs written for earlier versions still load, but three things changed:
+Configs written for earlier versions still load, but these things changed:
 
 * The bot used to hold `position` and the `sit` UUID for as long as it
   ran: it teleported back when the avatar was moved to another region and
@@ -313,6 +334,15 @@ Configs written for earlier versions still load, but three things changed:
 * A `[persist]` table holds something at the start only when it has
   `position`, `sit` or `atstart = true`. An empty `[persist]` table used to
   mean `"cur"` for both; write `atstart = true` into it to keep that.
+* `rslbot ctl accepttp AVATAR` is now `rslbot ctl accept tp [AVATAR]`. The
+  old name still works. Under either name the avatar is no longer looked
+  up on the grid: it is compared with the avatars whose offers wait, so a
+  name nobody offered under is answered with "there is no teleport offer
+  from ..." where it used to be "the grid knows no avatar named ...".
+* Inventory offers and scripts' requests for permissions, which the bot
+  used to drop unread, are written to the log and wait for
+  `rslbot ctl accept`. Nothing is accepted by itself without a `perms`
+  table.
 
 To keep the plain password out of the file:
 
@@ -405,7 +435,8 @@ target/release/rslbot ctl rlv cmd @versionnum=5     # an RLV command, by hand
 | `sit ground` | Sit on the ground |
 | `tp X Y [Z] [REGION...]` | Teleport. Without `REGION`, inside the current region; without `Z`, at the current height. Answers on arrival or with the reason it failed |
 | `requesttp AVATAR [MESSAGE...]` | Ask the avatar to teleport the bot to them; when they agree, the bot goes |
-| `accepttp AVATAR` | Accept a teleport offer the avatar has sent, and go |
+| `accept KIND [WHO]` | Accept a request that waits: `accept tp` a teleport offer (and go), `accept inventory` an inventory offer, `accept anim`, `attach`, `controls` or `camera` a script's request for permissions. Without `WHO`, the one that came last. See [Permission requests](#permission-requests) |
+| `accepttp [AVATAR]` | The older name of `accept tp [AVATAR]`; deprecated |
 | `sendtp AVATAR [MESSAGE...]` | Offer the avatar a teleport to the bot |
 | `touch UUID` | Click that object once |
 | `inventory [-a] [-n] [FOLDER]` | List the avatar's inventory: everything, or what is under `FOLDER`. See [Inventory](#inventory) |
@@ -416,6 +447,8 @@ target/release/rslbot ctl rlv cmd @versionnum=5     # an RLV command, by hand
 | `sound ITEM` | Play a sound from the inventory once, where the avatar is |
 | `persist [LOCATION] [SIT]` | Hold a place from now on: return to `LOCATION` whenever the avatar is in another region, and sit as `SIT` says. Without arguments: where the avatar is and how it sits now. See [Holding a place](#holding-a-place) |
 | `home` | The same as `persist last last`: hold the place last persisted again, or the configured one when nothing was persisted |
+| `perms autoaccept KIND WHO...`, `perms revoke KIND WHO...` | Add to, or take away from, the requests of a kind the bot accepts by itself; `WHO` is `all`, or avatars and objects. See [Permission requests](#permission-requests) |
+| `perms status` | Print what is accepted by itself for each kind, and the requests that wait |
 | `rlv mode on`, `rlv mode off` | Switch [RLV](#rlv) on or off |
 | `rlv persist follow`, `rlv persist drop` | What a sit, stand or teleport forced through RLV does to the place the bot holds |
 | `rlv status` | Print whether RLV is on, and the `rlv persist` setting |
@@ -450,7 +483,8 @@ for a leading `/1`, which it would otherwise turn into a path.
 A bot that holds a place, because the config has `persist` or a `persist`
 or `home` command was given, returns to the region and the seat it holds
 whenever it finds the avatar elsewhere. `stand`, `unsit`, `sit`, `tp`,
-`requesttp` and `accepttp` switch that off. From then on the bot is in
+`requesttp` and `accept tp` switch that off, and so does a teleport offer
+the bot accepts by itself. From then on the bot is in
 manual mode, as it is without `persist` in the config once the avatar has
 got to the configured place: it stays logged in, and logs in again after a
 kick or an outage (at the avatar's last location), but it no longer
@@ -520,7 +554,7 @@ What holding means:
   `Target`. It knows that of objects the avatar sat on in this run and of
   objects it has learned in the current region.
 * `last_cmd` goes by the commands as given, whether or not the teleport or
-  sit succeeded. `stand`, `requesttp` and `accepttp` do not count, and
+  sit succeeded. `stand`, `requesttp` and `accept tp` do not count, and
   neither does anything carried out for [RLV](#rlv).
 * With `rlv persist follow`, a sit, stand or teleport forced through RLV
   is a persist of its own: it replaces what the bot holds, and `home`
@@ -571,10 +605,16 @@ Teleport". If that avatar answers with an offer within `requesttp_timeout`
 minutes (10 unless configured), the bot accepts it and goes; one request,
 one acceptance. `persist` and `home` cancel the wait.
 
-Any other teleport offer is not accepted by itself. It is noted on
-standard error and kept, the latest one per avatar, until the session
-ends; `accepttp AVATAR` accepts it. Whether an old offer still works is up
-to the grid, and its refusal is what the command prints.
+Any other teleport offer is for the rules of [Permission
+requests](#permission-requests) to decide. From an avatar that `tp` is
+auto-accepted for, the bot accepts it and goes, and is in manual mode from
+then on, as after `accept tp`: it stays where it was brought until
+`persist` or `home`. Any other offer is noted on standard error and kept,
+the latest one per avatar, until the session ends. `accept tp` accepts the
+offer that came last, `accept tp AVATAR` that avatar's; the avatar is
+compared with the names the offers came with and is not looked up on the
+grid. Whether an old offer still works is up to the grid, and its refusal
+is what the command prints. `accepttp` is the older name of `accept tp`.
 
 When an avatar asks to be teleported to the bot, that is noted on standard
 error as well, and `sendtp AVATAR` is the answer if you want to give one.
@@ -995,6 +1035,162 @@ was carried out and 1 otherwise, as for the last example, whose second line
 is `detach=n: not supported`. `rlv cmd` does not wait for a sit, a
 teleport or a detach to end; that is in the log. It is refused while RLV
 is off, and `@detachme` has no meaning in it.
+
+### Permission requests
+
+Avatars and scripted objects ask an avatar for things that a viewer
+answers with a dialog. The bot reads three sorts of them, and each request
+has one or more kinds:
+
+| Kind | Request |
+|---|---|
+| `tp` | An avatar offers a teleport |
+| `inventory` | An avatar or an object offers an inventory item or a folder |
+| `anim` | A script asks for permission to animate the avatar (trigger or override animations) |
+| `attach` | A script asks for permission to attach its object to the avatar |
+| `controls` | A script asks for permission to take the avatar's controls |
+| `camera` | A script asks for permission to track or control the camera |
+
+A script may ask for several permissions at once, and such a request has
+all their kinds. A script that asks for anything else (to take money from
+the avatar, to teleport it, ...) is never granted anything, by itself or
+on command; the log says which permission stood in the way.
+
+Without a `perms` table in the config the bot accepts nothing by itself,
+except a teleport offer it asked for with `requesttp`. Every request is
+written to the log and waits. The table says what is accepted without you:
+
+```toml
+[perms.autoaccept]
+tp = ["Jane Doe"]
+inventory = ["Owner Resident", "11111111-2222-3333-4444-555555555555"]
+anim = "all"
+attach = true
+
+[perms.except]
+anim = ["01234567-9abc-defe-dcba-987654321000"]
+```
+
+Under `[perms.autoaccept]` a kind is `"all"`, or a list of avatars and
+objects; `true` is another spelling of `"all"` and `false` of an empty
+list. Under `[perms.except]` a kind is a list of avatars and objects that
+are never accepted by themselves, whatever `autoaccept` says: the
+exceptions to `"all"`, or one object of an avatar that is listed. Both are
+TOML tables and have to come after all other keys.
+
+An entry is an avatar's name (`"First Last"`, `first.last` or a single
+word) or a UUID:
+
+| Request from | A name matches | A UUID matches |
+|---|---|---|
+| An avatar (teleport offer, inventory offer) | that avatar | that avatar |
+| An object that gives inventory | its owner | its owner |
+| An object whose script asks for permissions | its owner | the object, or its owner |
+
+So an avatar's name or UUID stands for the avatar and for everything it
+owns, and an object's UUID for that object. Names are compared, in any
+letter case, with the name the grid gives with the request; they are not
+looked up, so a misspelt name simply matches nobody. An avatar that
+changes its name keeps its UUID.
+
+Two things follow from what the grid tells the bot:
+
+* An inventory offer from an object does not say which object it came
+  from, only who owns it and what the object is called. An object's UUID
+  under `inventory` therefore never matches; name the owner.
+* A script's request names the owner as text, and for an object deeded to
+  a group that text is the group's name. Before the bot decides, it asks
+  the simulator who owns the object, and only an avatar counts: a group
+  that calls itself like an avatar you trust gets nothing. An object owned
+  by a group is matched by the object's own UUID, or by `"all"`. When the
+  simulator does not answer within 10 seconds the same holds.
+
+A request with several kinds is accepted by itself only when every one of
+them is auto-accepted for its sender, and then whole. The bot never grants
+part of what a script asked for: a dance ball that asks to animate the
+avatar and to take its controls needs `anim` and `controls`.
+
+What accepting does:
+
+* A teleport offer: the bot goes, and is in manual mode from then on (see
+  [Teleport offers](#teleport-offers)).
+* An inventory offer: the giver is told it was accepted, and the item is
+  filed in the folder for its type (Objects, Notecards, Scripts, ...) at
+  the top of My Inventory, as a viewer does. The grids put the item into
+  the inventory when it is offered, so one that is never accepted is there
+  all the same; accepting is the answer to the giver. The bot reads the
+  top level of the inventory for this, so a simulator without an inventory
+  service leaves the offer waiting.
+* A script's request: the script is granted every permission it asked for.
+
+Neither of the last two moves the avatar or changes what the bot holds.
+
+#### Requests that wait
+
+A request that was not accepted by itself is kept until the session ends:
+the latest teleport offer of each avatar, every inventory offer, and the
+latest request of each script, which is also forgotten when the script
+asks again or the avatar leaves the region. The log names the command
+that accepts it:
+
+```
+permission request (anim, controls) from Dance Ball <uuid> of Jane Doe <uuid>: waits, as controls is not auto-accepted for it; `rslbot ctl accept anim` accepts it
+```
+
+```sh
+rslbot ctl accept anim                    # the latest request that asks for anim
+rslbot ctl accept anim "Jane Doe"         # the latest from an object of Jane Doe's
+rslbot ctl accept attach 01234567-9abc-defe-dcba-987654321000   # from that object
+rslbot ctl accept inventory               # the latest inventory offer
+rslbot ctl accept tp                      # the latest teleport offer
+```
+
+`WHO` is one argument, and matches as an entry does. A script's request
+is found under each of its kinds, and accepting it grants everything it
+asked for; the answer says what that was. There is no command to refuse a
+request: one that is left alone ends with the session.
+
+#### Changing the rules while the bot runs
+
+```sh
+rslbot ctl perms autoaccept anim all
+rslbot ctl perms autoaccept inventory 01234567-9abc-defe-dcba-987654321000 Avatar1
+rslbot ctl perms revoke inventory all
+rslbot ctl perms revoke anim 01234567-9abc-defe-dcba-987654321000
+rslbot ctl perms status
+```
+
+`perms autoaccept KIND` adds avatars and objects to a kind's list, or with
+`all` accepts everyone; an entry that was an exception stops being one.
+`perms revoke KIND` takes entries off the list, or with `all` empties it.
+While a kind accepts everyone, revoking an entry makes it an exception.
+Each is answered with one line per entry. An entry that was in that state
+already gets a line starting with `warning:`, and the command still
+succeeds:
+
+```
+$ rslbot ctl perms autoaccept inventory Avatar1
+warning: Avatar1 was auto-accepted for inventory already
+```
+
+An exception to a list (one object of an avatar that is listed) can be
+written in the config only. `perms status` prints one line per kind, and
+then the requests that wait, oldest first:
+
+```
+tp: Jane Doe
+inventory: none
+anim: all except 01234567-9abc-defe-dcba-987654321000
+attach: none
+controls: none
+camera: none
+waiting: tp from John Roe <uuid>
+```
+
+These commands work whether or not the avatar is connected. Like `rlv
+mode`, they are not saved: a restarted bot starts from its config. A
+change of the rules does not accept what waits already, and it does not
+take back what a script was granted.
 
 ### Exit status and limits
 

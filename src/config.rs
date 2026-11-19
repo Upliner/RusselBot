@@ -1,5 +1,6 @@
 //! The single TOML config file: model, defaults and validation.
 
+use crate::perms::{Entry, Kind, Rule, Rules, KINDS};
 use md5::{Digest, Md5};
 use serde::Deserialize;
 use std::fmt;
@@ -93,6 +94,8 @@ pub struct Config {
     pub rlv: bool,
     /// The RLV persist setting the bot starts with.
     pub rlv_persist: RlvPersist,
+    /// Which requests the bot accepts by itself when it starts.
+    pub perms: Rules,
 }
 
 #[derive(Debug, PartialEq)]
@@ -126,6 +129,7 @@ struct Raw {
     scan_distance: Option<toml::Value>,
     restore_attachments: Option<toml::Value>,
     rlv: Option<toml::Value>,
+    perms: Option<toml::Value>,
 }
 
 /// Hashes a plain password into the form grids accept: `$1$` + MD5 hex.
@@ -215,6 +219,78 @@ fn persist(value: Option<toml::Value>) -> Result<(Persist, RlvPersist), ConfigEr
         Some(_) => return err(PERSIST_FORMS),
     };
     Ok((setting, RlvPersist::Drop))
+}
+
+/// The entries of one array under `perms`, each of them once.
+fn perms_entries(key: &str, values: &[toml::Value]) -> Result<Vec<Entry>, ConfigError> {
+    let mut entries = Vec::new();
+    for value in values {
+        let Some(text) = value.as_str() else {
+            return err(format!("`{key}` must hold avatar names and UUIDs as strings"));
+        };
+        if text.trim().eq_ignore_ascii_case("all") {
+            let kind = key.rsplit('.').next().unwrap_or(key);
+            return err(match key.starts_with("perms.autoaccept") {
+                true => format!("`{key}` has \"all\" among its entries; write `{kind} = \"all\"`"),
+                false => format!("`{key}` has the entry \"all\", which names nobody: exceptions are avatars and objects"),
+            });
+        }
+        let entry = Entry::parse(text).map_err(|reason| ConfigError(format!("`{key}`: {reason}")))?;
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+/// The `perms` table: under `autoaccept` the rule of each kind of request,
+/// under `except` its exceptions.
+fn perms(value: Option<toml::Value>) -> Result<Rules, ConfigError> {
+    let mut rules = Rules::default();
+    let Some(value) = value else {
+        return Ok(rules);
+    };
+    let toml::Value::Table(table) = value else {
+        return err("`perms` must be a table with the tables `autoaccept` and `except`");
+    };
+    for (name, value) in &table {
+        if name != "autoaccept" && name != "except" {
+            return err(format!("`perms` has no key `{name}`; its keys are `autoaccept` and `except`"));
+        }
+        let toml::Value::Table(kinds) = value else {
+            return err(format!("`perms.{name}` must be a table whose keys are kinds of request: {KINDS}"));
+        };
+        for (kind_name, value) in kinds {
+            let key = format!("perms.{name}.{kind_name}");
+            let Some(kind) = Kind::parse(kind_name) else {
+                return err(format!("`{key}` is no kind of request; the kinds are {KINDS}"));
+            };
+            match (name.as_str(), value) {
+                ("autoaccept", toml::Value::String(all)) if all == "all" => rules.set_rule(kind, Rule::All),
+                ("autoaccept", toml::Value::Boolean(true)) => rules.set_rule(kind, Rule::All),
+                ("autoaccept", toml::Value::Boolean(false)) => rules.set_rule(kind, Rule::List(Vec::new())),
+                ("autoaccept", toml::Value::Array(values)) => rules.set_rule(kind, Rule::List(perms_entries(&key, values)?)),
+                ("autoaccept", _) => {
+                    return err(format!(
+                        "`{key}` must be \"all\", true, false or an array of avatar names and UUIDs"
+                    ))
+                }
+                (_, toml::Value::Array(values)) => rules.set_exceptions(kind, perms_entries(&key, values)?),
+                _ => return err(format!("`{key}` must be an array of avatar names and UUIDs")),
+            }
+        }
+    }
+    for kind in Kind::ALL {
+        let Rule::List(entries) = rules.rule(kind) else {
+            continue;
+        };
+        if let Some(both) = entries.iter().find(|entry| rules.exceptions(kind).contains(entry)) {
+            return err(format!(
+                "`perms.autoaccept.{kind}` and `perms.except.{kind}` both have the entry \"{both}\"; leave it out of one"
+            ));
+        }
+    }
+    Ok(rules)
 }
 
 /// The table form of `persist`. `atstart` says whether anything is held
@@ -368,6 +444,7 @@ impl Config {
         };
         let restore_attachments = flag_or(raw.restore_attachments, "restore_attachments", true)?;
         let rlv = flag(raw.rlv, "rlv")?;
+        let perms = perms(raw.perms)?;
 
         Ok(Config {
             login_url,
@@ -387,6 +464,7 @@ impl Config {
             restore_attachments,
             rlv,
             rlv_persist,
+            perms,
         })
     }
 }
@@ -839,6 +917,130 @@ mod tests {
         );
         assert!(cfg.rlv);
         assert_eq!(cfg.rlv_persist, RlvPersist::Follow);
+    }
+
+    fn perms_of(tables: &str) -> Rules {
+        Config::parse(&format!("{}{tables}", base())).unwrap().perms
+    }
+
+    fn entry(text: &str) -> Entry {
+        Entry::parse(text).unwrap()
+    }
+
+    #[test]
+    fn without_a_perms_table_nothing_is_auto_accepted() {
+        assert_eq!(perms_of(""), Rules::default());
+        assert_eq!(perms_of("[perms]\n"), Rules::default());
+        assert_eq!(perms_of("[perms.autoaccept]\n[perms.except]\n"), Rules::default());
+    }
+
+    #[test]
+    fn perms_tables_give_the_rules_and_the_exceptions() {
+        let rules = perms_of(&format!(
+            "[perms.autoaccept]\ntp = [\"Avatar1\", \"Avatar2\"]\n\
+             inventory = [\"Owner Resident\", \"{OBJECT}\"]\n"
+        ));
+        assert_eq!(*rules.rule(Kind::Tp), Rule::List(vec![entry("Avatar1"), entry("Avatar2")]));
+        assert_eq!(
+            *rules.rule(Kind::Inventory),
+            Rule::List(vec![entry("Owner Resident"), entry(OBJECT)])
+        );
+        for kind in [Kind::Anim, Kind::Attach, Kind::Controls, Kind::Camera] {
+            assert_eq!(*rules.rule(kind), Rule::List(vec![]), "{kind}");
+        }
+
+        // Everyone, with an exception.
+        let rules = perms_of(&format!(
+            "[perms.autoaccept]\nanim = \"all\"\n[perms.except]\nanim = [\"{OBJECT}\"]\n"
+        ));
+        assert_eq!(*rules.rule(Kind::Anim), Rule::All);
+        assert_eq!(rules.exceptions(Kind::Anim), [entry(OBJECT)]);
+
+        // Booleans are other spellings of "all" and of an empty list.
+        let rules = perms_of("[perms.autoaccept]\nattach = true\ncontrols = false\ncamera = []\n");
+        assert_eq!(*rules.rule(Kind::Attach), Rule::All);
+        assert_eq!(*rules.rule(Kind::Controls), Rule::List(vec![]));
+        assert_eq!(*rules.rule(Kind::Camera), Rule::List(vec![]));
+
+        // Exceptions alone, and an entry written twice.
+        let rules = perms_of("[perms.except]\ntp = [\"Jane Doe\", \"jane.doe\", \"John Roe\"]\n");
+        assert_eq!(*rules.rule(Kind::Tp), Rule::List(vec![]));
+        assert_eq!(rules.exceptions(Kind::Tp), [entry("Jane Doe"), entry("John Roe")]);
+
+        // An exception to a list is fine as long as it is another entry.
+        let rules = perms_of(&format!(
+            "[perms.autoaccept]\nanim = [\"Jane Doe\"]\n[perms.except]\nanim = [\"{OBJECT}\"]\n"
+        ));
+        assert_eq!(*rules.rule(Kind::Anim), Rule::List(vec![entry("Jane Doe")]));
+        assert_eq!(rules.exceptions(Kind::Anim), [entry(OBJECT)]);
+    }
+
+    #[test]
+    fn a_malformed_perms_table_is_rejected_with_its_key() {
+        let rejected = |tables: &str| rejected(&format!("{}{tables}", base()));
+        assert!(rejected("perms = true\n").contains("`perms` must be a table"));
+        assert!(rejected("[perms]\nautoaccept = \"all\"\n").contains("`perms.autoaccept` must be a table"));
+        assert!(rejected("[perms.accept]\ntp = \"all\"\n").contains("`perms` has no key `accept`"));
+        let unknown = rejected("[perms.autoaccept]\nmoney = \"all\"\n");
+        assert!(unknown.contains("`perms.autoaccept.money` is no kind of request"), "{unknown}");
+        assert!(
+            unknown.contains("`tp`, `inventory`, `anim`, `attach`, `controls` and `camera`"),
+            "{unknown}"
+        );
+        assert!(rejected("[perms.except]\nmoney = []\n").contains("`perms.except.money` is no kind"));
+
+        let malformed = rejected("[perms.autoaccept]\ntp = [\"Jane van Doe\"]\n");
+        assert!(malformed.contains("`perms.autoaccept.tp`"), "{malformed}");
+        assert!(malformed.contains("\"Jane van Doe\" is neither a UUID nor"), "{malformed}");
+        assert!(rejected("[perms.except]\ntp = [\"\"]\n").contains("`perms.except.tp`"));
+        assert!(rejected("[perms.autoaccept]\ntp = [7]\n").contains("`perms.autoaccept.tp` must hold"));
+        for wrong in ["\"everyone\"", "7", "\"Jane Doe\""] {
+            let message = rejected(&format!("[perms.autoaccept]\ntp = {wrong}\n"));
+            assert!(
+                message.contains("`perms.autoaccept.tp` must be \"all\", true, false or an array"),
+                "{message}"
+            );
+        }
+
+        let inside = rejected("[perms.autoaccept]\nanim = [\"all\"]\n");
+        assert!(inside.contains("`perms.autoaccept.anim`"), "{inside}");
+        assert!(inside.contains("write `anim = \"all\"`"), "{inside}");
+        assert!(rejected("[perms.except]\nanim = [\"all\"]\n").contains("`perms.except.anim` has the entry \"all\""));
+        for wrong in ["\"all\"", "true", "false"] {
+            let message = rejected(&format!("[perms.except]\nanim = {wrong}\n"));
+            assert!(message.contains("`perms.except.anim` must be an array"), "{message}");
+        }
+
+        let both = rejected("[perms.autoaccept]\nanim = [\"Jane Doe\"]\n[perms.except]\nanim = [\"jane.doe\"]\n");
+        assert!(both.contains("`perms.autoaccept.anim` and `perms.except.anim`"), "{both}");
+        assert!(both.contains("\"Jane Doe\""), "{both}");
+    }
+
+    #[test]
+    fn example_file_is_valid_with_its_perms_tables_enabled() {
+        let text = include_str!("../russelbot.example.toml");
+        let mut enabled = text.to_string();
+        for line in [
+            "# [perms.autoaccept]",
+            "# tp = [\"Jane Doe\"]",
+            "# inventory = [\"Owner Resident\", \"11111111-2222-3333-4444-555555555555\"]",
+            "# anim = \"all\"",
+            "# attach = true",
+            "# [perms.except]",
+            "# anim = [\"01234567-9abc-defe-dcba-987654321000\"]",
+        ] {
+            assert_eq!(text.matches(&format!("\n{line}\n")).count(), 1, "{line} is not once in the example");
+            enabled = enabled.replace(&format!("\n{line}\n"), &format!("\n{}\n", &line[2..]));
+        }
+        let rules = Config::parse(&enabled).unwrap().perms;
+        assert_eq!(*rules.rule(Kind::Tp), Rule::List(vec![entry("Jane Doe")]));
+        assert_eq!(
+            *rules.rule(Kind::Inventory),
+            Rule::List(vec![entry("Owner Resident"), entry(OBJECT)])
+        );
+        assert_eq!(*rules.rule(Kind::Anim), Rule::All);
+        assert_eq!(*rules.rule(Kind::Attach), Rule::All);
+        assert_eq!(rules.exceptions(Kind::Anim), [entry("01234567-9abc-defe-dcba-987654321000")]);
     }
 
     #[test]

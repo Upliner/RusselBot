@@ -168,8 +168,8 @@ the UUID it prints.
 | 45 | `ctl tp 128 128 25 Home`, `ctl tp 128 128 25 Nowhere`, `ctl tp 120 126 Target` | `arrived in Home` without a new login; `region "Nowhere" not found`, status 1; `arrived in Target` | Pass |
 | 46 | `ctl requesttp "Rig Owner" please bring me over` | `asked Rig Owner <uuid> for a teleport`; the helper gets the request and offers; the log says the offer was accepted as requested; the avatar is at the helper's position | Pass |
 | 47 | `ctl sendtp rig.owner come and see` | `offered Rig Owner <uuid> a teleport`; the helper prints the offer with the text | Pass |
-| 48 | `ctl accepttp "Rig Owner"` with no offer waiting | `there is no teleport offer from Rig Owner`, status 1 | Pass |
-| 49 | The helper's unasked offer, then `ctl accepttp "Rig Owner"` twice | The log notes the offer and that `accepttp` accepts it; the avatar stays; the first `accepttp` prints `arrived in Target`; the second is refused | Pass |
+| 48 | `ctl accept tp "Rig Owner"` with no offer waiting (`accepttp "Rig Owner"` is the same command under its older name) | `there is no teleport offer from Rig Owner`, status 1 | Pass (as `accepttp`; run again on 2026-11-20 as item 138) |
+| 49 | The helper's unasked offer, then `ctl accept tp "Rig Owner"` twice | The log notes the offer and that `rslbot ctl accept tp` accepts it; the avatar stays; the first `accept tp` prints `arrived in Target`; the second is refused | Pass (as `accepttp`; run again on 2026-11-20 as items 138 and 139, with `accept tp` and with `accepttp`) |
 | 50 | `kick user Sit Bot bye` in manual mode | Login after 10 s with `start: last`; no teleport and no sit afterwards; `mode: manual` | Pass |
 | 51 | `ctl home` in the target region, and again after `ctl tp 128 128 25 Home` | `placement: holding`; the bot sits, or teleports to `Target` and sits; `seat: target`, `mode: holding` | Pass, both |
 | 52 | `ctl shout over here`, `ctl whisper psst` | The helper hears the shout; `chat [shout]` and `chat [whisper]` rows from the echo | Pass; the whisper was out of the helper's earshot at 20 m |
@@ -393,6 +393,75 @@ version by itself when it is rezzed, `@remoutfit` carried out (OpenSim
 offers no outfit service), a region larger than 256 metres for the global
 `@tpto`, and `@detachme` from a child prim. Nothing of RLV has been tried on
 Second Life.
+
+## Permission requests
+
+`test-rig/asker.py` gives the rig what asks the bot for things. It logs in
+as `Rig Owner`, uploads one script and rezzes two boxes with it next to
+the seat, `Asker box` and `Asker box 2`, which stay in the region. Each
+does what anyone tells it on its channel, 78 for the first box and 79 for
+the second, to whoever spoke:
+
+```sh
+test-rig/asker.py              # prints the two boxes' UUIDs
+rslbot ctl say /78 ask 16      # the first box asks the bot for permission to trigger animations
+rslbot ctl say /79 give        # the second box gives the bot a copy of its script
+test-rig/asker.py 14 give=4 nobox   # Rig Owner itself gives the bot the script, and prints the answer
+```
+
+The number after `ask` is the permission bits: 16 trigger animations, 4
+take controls, 32 attach, 2 debit. A box says `granted: <bits>` on channel
+0 when the bot has answered, which the bot hears and logs. `Rig Owner`
+cannot be logged in twice, so `asker.py` and `listen.py` take turns. Boxes
+from an earlier run have to go first, or every request is made twice: on
+the OpenSim console `change region Target`, `delete object name "Asker
+box"`, `y`, and the same for `"Asker box 2"`.
+
+The items below were run with the config of item 1 plus `socket = true`,
+`log_chat`, `--verbose`, the release build, a `RUSSELBOT_SOCK` of the
+run's own, and these tables, `<box 2>` being the second box's UUID:
+
+```toml
+[perms.autoaccept]
+tp = ["Rig Owner"]
+anim = ["Rig Owner"]
+inventory = ["Rig Owner"]
+
+[perms.except]
+anim = ["<box 2>"]
+```
+
+`say /78 X` stands for `rslbot ctl say /78 X`, and the other commands for
+`rslbot ctl` with them.
+
+| # | Inject | Expected | Result (2026-11-20, OpenSim 9d00a55552) |
+|---|---|---|---|
+| 125 | `perms status` | `tp: Rig Owner`, `inventory: Rig Owner`, `anim: Rig Owner except <box 2>`, `attach: none`, `controls: none`, `camera: none` | Pass |
+| 126 | `say /78 ask 16` | With `--verbose`: `received ScriptQuestion`, `sending RequestObjectPropertiesFamily`, `received ObjectPropertiesFamily`, `sending ScriptAnswerYes`. `permission request (anim) from Asker box <uuid> of Rig Owner <uuid>: accepted by itself`; the box says `granted: 16`; the bot stays seated, `mode: holding` | Pass, all four messages within the second |
+| 127 | `say /79 ask 16` (the excepted box); `perms status`; `accept anim` | `...: waits; \`rslbot ctl accept anim\` accepts it`; a `waiting: anim from Asker box 2 <uuid> of Rig Owner <uuid>` line; `granted Asker box 2 ...: trigger animations`, and the box says `granted: 16` | Pass |
+| 128 | `say /78 ask 20` (animations and controls); `accept anim Nobody`; `accept controls "Rig Owner"`; `accept anim` | `permission request (anim, controls) ...: waits, as controls is not auto-accepted for it`; status 1 for `Nobody`; `granted ...: take controls, trigger animations` and `granted: 20` from the box; status 1, `no request of kind \`anim\` waits` | Pass |
+| 129 | `say /78 ask 18` (debit and animations) | `... cannot be accepted: it asks for permission to take money from the avatar, which the bot never grants`; nothing is sent, and nothing waits | Pass |
+| 130 | `perms autoaccept anim "Rig Owner"`; `perms revoke anim rig.owner`; `perms revoke anim <box 1>`; `perms autoaccept anim <box 1>`; `perms autoaccept money all`; `perms autoaccept anim all "Rig Owner"`; `perms revoke anim`; then `say /78 ask 16` | `warning: Rig Owner was auto-accepted for anim already`, status 0; `anim: rig.owner is not auto-accepted any more`; `warning: <box 1> was not auto-accepted for anim already`; `anim: <box 1> is auto-accepted`; status 1 naming the kinds; status 1, `\`all\` stands alone`; status 1 with the usage; the box, now listed by its UUID, is granted | Pass |
+| 131 | `perms autoaccept controls all`; `perms autoaccept anim all`; `say /78 ask 20`; `say /79 ask 16` | `anim: everyone is auto-accepted except <box 2>`; the first box gets `granted: 20` by itself; the second box's request waits | Pass |
+| 132 | `perms autoaccept anim <box 2>`; `say /79 ask 4`; `perms revoke controls <box 2>`; `say /79 ask 4`; `perms status` | The exception to `anim` is gone; `granted: 4` by itself; `controls: <box 2> is not auto-accepted any more (an exception to \`all\`)`; the second request waits; `controls: all except <box 2>` | Pass |
+| 133 | With `controls` not accepted: `say /78 ask 4`, then `say /78 ask 16` | The first waits; the second is accepted by itself, and no request of that script waits any more | Pass. An earlier build of the same day kept a script's older request waiting when a newer one was accepted (seen after item 132, where `anim` from the second box still waited); fixed before this item was run |
+| 134 | `say /78 give` | `inventory offer from the object "Asker box" of Rig Owner <uuid> (script 'Asker script'. ...): accepted by itself`; `inventory` lists `Scripts/Asker script` | Pass: the owner's name was looked up, the top level of the inventory read, and the answer sent, within the second |
+| 135 | `test-rig/asker.py 14 give=4 nobox` | `inventory offer from Rig Owner <uuid> (script Asker script): accepted by itself`; the helper prints `answer 5 from Sit Bot`; a second `Scripts/Asker script` | Pass |
+| 136 | `perms revoke inventory all`, twice; `say /78 give`; `say /79 give`; `accept inventory "Somebody Else"`; `accept inventory "Rig Owner"`; `accept inventory` | `inventory: nothing is auto-accepted any more`, then the warning; two `waiting: inventory from the object "..." of Rig Owner <uuid>` lines; status 1; the second box's offer accepted, then the first's | Pass, in two runs. With an earlier build of the same day the owner's name was looked up only where a rule had a name in it: both offers waited as `of the avatar <uuid>`, `accept inventory "Rig Owner"` found nothing, and `accept inventory <owner's uuid>` and `accept inventory` accepted them. The name is now always looked up; with that build one offer from the first box waited with its owner's name and was accepted with `accept inventory "Rig Owner"` |
+| 137 | `test-rig/listen.py 16 offer=5`; `status`; `home` | `teleport offer from Rig Owner <uuid>: accepted by itself`, `placement: manual`, `teleport arrived`; the avatar is at the helper's position, `seat: none`, `mode: manual`, the seat still on the `persist` line; `home` sits again | Pass |
+| 138 | `perms revoke tp all`; `accept tp`; `accepttp "Rig Owner"`; the helper's offer; `accept tp "Nobody Here"`; `accept tp`, twice | `no teleport offer waits`, status 1; `there is no teleport offer from Rig Owner`, status 1; the offer `waits`, the avatar stays seated; status 1 for `Nobody Here` at once; `arrived in Target`, `mode: manual`; the second is refused | Pass |
+| 139 | `home`; the helper's offer; `accepttp rig.owner`; `accepttp` | `arrived in Target`; `no teleport offer waits`, status 1 | Pass |
+| 140 | With a script's request and an inventory offer waiting: `kick user Sit Bot` on the console | The bot logs in again and sits; `perms status` shows the rules as the commands left them and no `waiting:` line | Pass |
+| 141 | With a script's request and an inventory offer waiting: `tp 100 100 25 Home`; `perms status`; `accept inventory`; `home` | The script's request is gone; the inventory offer still waits and is accepted from `Home` | Pass |
+
+Not covered here: an object owned by a group (the rig has no group), a
+simulator that does not answer the question about an object's owner, a
+grid that does not know or does not give the owner's name, a simulator
+without an inventory service, more than 100 requests waiting, and the
+`attach` and `camera` kinds, which go the way of `anim` and `controls`.
+All of these are unit-tested. OpenSim sends the debit request of item 129
+to an avatar that is not the object's owner; whether Second Life does is
+not known. Nothing of this has been tried on Second Life.
 
 Not covered: Windows, where the socket is TCP. On Second Life, looking a
 name up through `AvatarPickerRequest` found nobody (2026-11-18, an avatar

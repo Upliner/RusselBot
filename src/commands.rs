@@ -5,10 +5,12 @@
 //! the simulator to say how they ended.
 
 use crate::config::DEFAULT_REQUESTTP_TIMEOUT;
-use crate::control::{Request, Response};
+use crate::control::{PermsRequest, Request, Response};
 use crate::inventory::{self, Clothes, Entry, Failed, Item, ListArgs, Outcome, Removal, What};
+use crate::names::Names;
+use crate::perms::{self, Ask, Kind, Owner, Rules};
 use crate::persist::{Location, SitState};
-use crate::session::{Touch, ATTACH_LIMIT, DETACH_LIMIT, NOT_CONNECTED};
+use crate::session::{InventoryOffer, Touch, ATTACH_LIMIT, DETACH_LIMIT, NOT_CONNECTED};
 use crate::udp::messages::{Vector3, MAX_TEXT};
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
@@ -22,8 +24,6 @@ pub const LOOKUP_LIMIT: Duration = Duration::from_secs(10);
 /// answer from the worker, which keeps the deadline itself.
 const JOB_GRACE: Duration = Duration::from_secs(3);
 
-/// Teleport offers kept for `accepttp`, one per avatar.
-const MAX_OFFERS: usize = 100;
 /// A teleport offer's message travels in a one-byte-length field.
 const MAX_OFFER_TEXT: usize = 254;
 
@@ -149,15 +149,9 @@ pub fn parse_recipient(given: &str) -> Result<Recipient, String> {
     if let Ok(id) = Uuid::parse_str(given) {
         return Ok(Recipient::Id(id));
     }
-    let spaced = given.replace('.', " ").to_lowercase();
-    let words: Vec<&str> = spaced.split_whitespace().collect();
-    match words[..] {
-        [first] => Ok(Recipient::Name(format!("{first} resident"))),
-        [first, last] => Ok(Recipient::Name(format!("{first} {last}"))),
-        _ => Err(format!(
-            "\"{given}\" is not an avatar name (`First Last`, `first.last` or one word) or a UUID"
-        )),
-    }
+    crate::names::full_name(given)
+        .map(Recipient::Name)
+        .ok_or_else(|| format!("\"{given}\" is not an avatar name (`First Last`, `first.last` or one word) or a UUID"))
 }
 
 /// What to ask the grid's avatar search for. The search matches the start
@@ -240,6 +234,45 @@ pub trait Grid {
     fn detach(&mut self, item: Uuid, now: Instant) -> Result<(), String>;
     fn animate(&mut self, animation: Uuid, start: bool, now: Instant) -> Result<(), String>;
     fn play_sound(&mut self, sound: Uuid, now: Instant) -> Result<(), String>;
+    /// Asks the simulator who owns `object`, to be answered through
+    /// `Commands::object_owner`.
+    fn object_owner(&mut self, object: Uuid, now: Instant) -> Result<(), String>;
+    /// Grants the script `item` in `object` the permissions it asked for.
+    fn grant_permissions(&mut self, object: Uuid, item: Uuid, permissions: i32, now: Instant) -> Result<(), String>;
+    /// Accepts the inventory offer `transaction` of `to`, an avatar or the
+    /// owner of the giving object, and has the item filed in `folder`.
+    fn accept_inventory(&mut self, to: Uuid, from_object: bool, transaction: Uuid, folder: Uuid, now: Instant) -> Result<(), String>;
+}
+
+/// An inventory offer that is being accepted: the grid is being asked
+/// which folder it goes into.
+struct Filing {
+    request: perms::Request,
+    /// The `accept` command that waits for it; nobody for an offer the
+    /// bot accepts by itself.
+    reply: Option<Sender<Response>>,
+    deadline: Instant,
+}
+
+/// What a request still needs to be known before the rules can decide it.
+#[derive(Debug, PartialEq)]
+enum Needs {
+    /// Who owns this object.
+    Owner(Uuid),
+    /// The name of this avatar.
+    Name(Uuid),
+}
+
+/// A request that waits for the grid to say who is behind it.
+struct Undecided {
+    request: perms::Request,
+    needs: Needs,
+    /// When it is decided with what is known.
+    deadline: Instant,
+}
+
+fn parse_kind(kind: &str) -> Result<Kind, String> {
+    Kind::parse(kind).ok_or_else(|| format!("`{kind}` is no kind of request; the kinds are {}", perms::KINDS))
 }
 
 /// What a command does once the inventory has answered.
@@ -348,7 +381,6 @@ pub struct SentIm {
 enum After {
     Im(String),
     RequestTp(String),
-    AcceptTp,
     SendTp(String),
 }
 
@@ -357,7 +389,6 @@ impl After {
         match self {
             After::Im(_) => "im",
             After::RequestTp(_) => "requesttp",
-            After::AcceptTp => "accepttp",
             After::SendTp(_) => "sendtp",
         }
     }
@@ -420,11 +451,21 @@ pub struct Commands {
     offer_timeout: Duration,
     /// The avatars asked for a teleport, and when.
     asked: HashMap<Uuid, Instant>,
-    /// The latest teleport offer of each avatar that was not accepted.
-    offers: HashMap<Uuid, Uuid>,
+    /// Which requests are accepted without the operator.
+    rules: Rules,
+    /// The requests that were not, and can still be accepted on command.
+    requests: perms::Waiting,
+    /// Requests the rules cannot decide before the grid has said who is
+    /// behind them.
+    undecided: Vec<Undecided>,
+    /// Inventory offers being accepted, by the id of the inventory job
+    /// that finds their folder.
+    filing: HashMap<u64, Filing>,
+    /// Avatars whose names `undecided` requests wait for, not asked yet.
+    wanted_names: Vec<Uuid>,
     /// The `sit` command waiting for the simulator's verdict.
     pending_sit: Option<(Sender<Response>, Origin)>,
-    /// The `tp` or `accepttp` command waiting for the teleport to end.
+    /// The `tp` or `accept tp` command waiting for the teleport to end.
     pending_teleport: Option<(Sender<Response>, Origin)>,
     /// `touch` commands waiting for their object to turn up.
     touches: Vec<(Uuid, Sender<Response>)>,
@@ -487,7 +528,11 @@ impl Commands {
             queries: 0,
             offer_timeout,
             asked: HashMap::new(),
-            offers: HashMap::new(),
+            rules: Rules::default(),
+            requests: perms::Waiting::default(),
+            undecided: Vec::new(),
+            filing: HashMap::new(),
+            wanted_names: Vec::new(),
             pending_sit: None,
             pending_teleport: None,
             touches: Vec::new(),
@@ -550,7 +595,8 @@ impl Commands {
             Request::Sit(_) => "sit",
             Request::Tp(_) => "tp",
             Request::AskTp { .. } => "requesttp",
-            Request::AcceptTp(_) => "accepttp",
+            Request::Accept { .. } => "accept",
+            Request::Perms(_) => "perms",
             Request::SendTp { .. } => "sendtp",
             Request::Touch(_) => "touch",
             Request::Persist { .. } => "persist",
@@ -577,7 +623,8 @@ impl Commands {
             Request::AskTp { to, message } => {
                 check_length(&message, MAX_TEXT).and_then(|()| self.with_avatar(&to, After::RequestTp(message), &reply, grid, now))
             }
-            Request::AcceptTp(to) => self.with_avatar(&to, After::AcceptTp, &reply, grid, now),
+            Request::Accept { kind, who } => self.accept_command(&kind, who.as_deref(), &reply, grid, now),
+            Request::Perms(request) => self.perms(request),
             Request::SendTp { to, message } => {
                 check_length(&message, MAX_OFFER_TEXT).and_then(|()| self.with_avatar(&to, After::SendTp(message), &reply, grid, now))
             }
@@ -906,6 +953,23 @@ impl Commands {
         if self.restore == Restore::Reading(id) {
             self.restore_missing(result, grid, now);
             return;
+        }
+        if let Some(filing) = self.filing.remove(&id) {
+            let sent = match (result, grid) {
+                (Ok(Outcome::Folder(folder)), Some(grid)) => match &filing.request.ask {
+                    Ask::Inventory {
+                        to,
+                        from_object,
+                        transaction,
+                        ..
+                    } => grid.accept_inventory(*to, *from_object, *transaction, folder, now),
+                    _ => Err("not an inventory offer".to_string()),
+                },
+                (Ok(Outcome::Folder(_)), None) => Err(NOT_CONNECTED.to_string()),
+                (Ok(_), _) => Err("the inventory answered something else than a folder".to_string()),
+                (Err(failed), _) => Err(no_folder(failed)),
+            };
+            return self.filed(filing, sent);
         }
         if let Some(what) = self.notes.remove(&id) {
             match result {
@@ -1333,6 +1397,9 @@ impl Commands {
     /// one's inventory service will not be used.
     pub fn simulator_changed(&mut self) {
         self.fail_jobs("the avatar changed simulator while the inventory was being read");
+        // The scripts that asked for permissions stayed behind.
+        self.requests.clear_scripts();
+        self.undecided.retain(|waiting| !matches!(waiting.needs, Needs::Owner(_)));
     }
 
     fn fail_jobs(&mut self, reason: &str) {
@@ -1340,6 +1407,10 @@ impl Commands {
             refuse(pending.origin.tag(), pending.command, &pending.reply, reason.to_string());
         }
         self.notes.clear();
+        // An inventory offer on its way to being accepted waits again.
+        for (_, filing) in std::mem::take(&mut self.filing) {
+            self.filed(filing, Err(reason.to_string()));
+        }
     }
 
     /// Does `then` with the avatar `to` names if it is known, and otherwise
@@ -1355,11 +1426,11 @@ impl Commands {
         let recipient = parse_recipient(to)?;
         let grid = grid.ok_or(NOT_CONNECTED)?;
         let name = match recipient {
-            Recipient::Id(id) => return self.act(grid, id, String::new(), then, reply, now),
+            Recipient::Id(id) => return self.act(grid, id, String::new(), then, now),
             Recipient::Name(name) => name,
         };
         if let Some((id, proper)) = self.known.get(&name).cloned() {
-            return self.act(grid, id, proper, then, reply, now);
+            return self.act(grid, id, proper, then, now);
         }
         let query = match self.waiting.iter().find(|w| w.name == name) {
             Some(same) => same.query,
@@ -1384,15 +1455,7 @@ impl Commands {
     }
 
     /// What a command does once its avatar is known to be `id`.
-    fn act<G: Grid>(
-        &mut self,
-        grid: &mut G,
-        id: Uuid,
-        name: String,
-        then: After,
-        reply: &Sender<Response>,
-        now: Instant,
-    ) -> Result<Done, String> {
+    fn act<G: Grid>(&mut self, grid: &mut G, id: Uuid, name: String, then: After, now: Instant) -> Result<Done, String> {
         let who = whom(id, &name);
         match then {
             After::Im(text) => {
@@ -1414,17 +1477,6 @@ impl Commands {
                 grid.offer_teleport(id, &message, now)?;
                 crate::info!("control: offered {who} a teleport");
                 Ok(Done::Answer(Some(format!("offered {who} a teleport"))))
-            }
-            After::AcceptTp => {
-                let Some(lure) = self.offers.get(&id).copied() else {
-                    return Err(format!("there is no teleport offer from {who}"));
-                };
-                grid.accept_teleport(lure, now)?;
-                self.offers.remove(&id);
-                self.went_manual = true;
-                crate::info!("control: accepting the teleport offer from {who}");
-                self.park_teleport(reply);
-                Ok(Done::Parked)
             }
         }
     }
@@ -1451,7 +1503,7 @@ impl Commands {
                 (Some(_), None) => Err(NOT_CONNECTED.to_string()),
                 (Some((id, proper)), Some(grid)) => {
                     self.known.insert(name, (*id, proper.clone()));
-                    self.act(grid, *id, proper.clone(), then, &reply, now)
+                    self.act(grid, *id, proper.clone(), then, now)
                 }
             };
             sent.extend(finish(CONTROL, what, done, &reply));
@@ -1496,6 +1548,17 @@ impl Commands {
                 refuse(job.origin.tag(), job.command, &job.reply, job.then.failure(Failed::TimedOut));
             }
         }
+        let late: Vec<u64> = self
+            .filing
+            .iter()
+            .filter(|(_, filing)| now >= filing.deadline + JOB_GRACE)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in late {
+            if let Some(filing) = self.filing.remove(&id) {
+                self.filed(filing, Err(no_folder(Failed::TimedOut)));
+            }
+        }
     }
 
     /// The session is gone, and with it any answer the commands waited for
@@ -1524,18 +1587,28 @@ impl Commands {
         self.restore = Restore::Idle;
         self.restoring.clear();
         self.gave_up.clear();
-        self.offers.clear();
+        // Nothing that waited can be answered through another session.
+        for (_, filing) in std::mem::take(&mut self.filing) {
+            if let Some(reply) = filing.reply {
+                refuse(CONTROL, "accept", &reply, "the session was lost".to_string());
+            }
+        }
+        self.requests.clear();
+        self.undecided.clear();
+        self.wanted_names.clear();
     }
 
     /// When `tick` next has something to do.
     pub fn next_deadline(&self) -> Option<Instant> {
         let lookups = self.waiting.iter().map(|w| w.deadline);
         let jobs = self.jobs.values().map(|job| job.deadline + JOB_GRACE);
+        let filing = self.filing.values().map(|filing| filing.deadline + JOB_GRACE);
+        let undecided = self.undecided.iter().map(|waiting| waiting.deadline);
         let restore = match self.restore {
             Restore::Due(at) => Some(at),
             _ => None,
         };
-        lookups.chain(jobs).chain(restore).min()
+        lookups.chain(jobs).chain(filing).chain(undecided).chain(restore).min()
     }
 
     // ------------------------------------------- what the session reports
@@ -1600,34 +1673,388 @@ impl Commands {
         }
     }
 
+    // ------------------------------------------- requests and their rules
+
+    /// The auto-accept rules the bot starts with: the config's.
+    pub fn set_rules(&mut self, rules: Rules) {
+        self.rules = rules;
+    }
+
+    /// `perms autoaccept`, `perms revoke` and `perms status`. None of them
+    /// needs the grid.
+    fn perms(&mut self, request: PermsRequest) -> Result<Done, String> {
+        let (kind, who, add) = match request {
+            PermsRequest::Status => {
+                let mut lines = vec![self.rules.status()];
+                lines.extend(self.requests.status());
+                return Ok(Done::Answer(Some(lines.join("\n"))));
+            }
+            PermsRequest::Autoaccept { kind, who } => (kind, who, true),
+            PermsRequest::Revoke { kind, who } => (kind, who, false),
+        };
+        let kind = parse_kind(&kind)?;
+        let is_all = |who: &String| who.trim().eq_ignore_ascii_case("all");
+        let changes = match &who[..] {
+            [] => return Err("say whom: `all`, or avatars' names and UUIDs".to_string()),
+            [all] if is_all(all) => vec![match add {
+                true => self.rules.autoaccept_all(kind),
+                false => self.rules.revoke_all(kind),
+            }],
+            who if who.iter().any(is_all) => {
+                return Err("`all` stands alone: it cannot be given together with a name or a UUID".to_string())
+            }
+            who => {
+                // All of them are read before any of them changes a rule.
+                let entries = who.iter().map(|who| perms::Entry::parse(who)).collect::<Result<Vec<_>, _>>()?;
+                let change = |entry| match add {
+                    true => self.rules.autoaccept(kind, entry),
+                    false => self.rules.revoke(kind, entry),
+                };
+                entries.into_iter().map(change).collect()
+            }
+        };
+        let lines: Vec<String> = changes.into_iter().map(|change| change.line).collect();
+        for line in &lines {
+            self.tell(format!("control: perms: {line}"));
+        }
+        Ok(Done::Answer(Some(lines.join("\n"))))
+    }
+
+    /// `accept KIND [WHO]`: accepts the request of that kind that came
+    /// last, among those of `who` when one is named.
+    fn accept_command<G: Grid>(
+        &mut self,
+        kind: &str,
+        who: Option<&str>,
+        reply: &Sender<Response>,
+        grid: Option<&mut G>,
+        now: Instant,
+    ) -> Result<Done, String> {
+        let kind = parse_kind(kind)?;
+        let who = who.map(perms::Entry::parse).transpose()?;
+        let grid = grid.ok_or(NOT_CONNECTED)?;
+        let Some(request) = self.requests.take(kind, who.as_ref()) else {
+            return Err(match (kind, &who) {
+                (Kind::Tp, None) => "no teleport offer waits".to_string(),
+                (Kind::Tp, Some(who)) => format!("there is no teleport offer from {who}"),
+                (_, None) => format!("no request of kind `{kind}` waits"),
+                (_, Some(who)) => format!("no request of kind `{kind}` from {who} waits"),
+            });
+        };
+        let done = self.accept(&request, Some(reply), grid, now);
+        match &done {
+            // It keeps its place among the waiting ones.
+            Err(_) => {
+                self.requests.push(request);
+            }
+            // Said when the answer has gone out.
+            Ok(Done::Parked) if kind == Kind::Inventory => {}
+            Ok(_) => self.tell(format!("control: accept {kind}: {}: accepted", request.describe())),
+        }
+        done
+    }
+
+    /// Does what a viewer does when its user accepts the dialog. A
+    /// teleport offer and an inventory offer end later: the command that
+    /// accepts one is parked.
+    fn accept<G: Grid>(
+        &mut self,
+        request: &perms::Request,
+        reply: Option<&Sender<Response>>,
+        grid: &mut G,
+        now: Instant,
+    ) -> Result<Done, String> {
+        match &request.ask {
+            Ask::Tp { lure } => {
+                grid.accept_teleport(*lure, now)?;
+                self.went_manual = true;
+                match reply {
+                    Some(reply) => {
+                        self.park_teleport(reply);
+                        Ok(Done::Parked)
+                    }
+                    None => Ok(Done::Answer(None)),
+                }
+            }
+            Ask::Script { object, item, mask } => {
+                grid.grant_permissions(*object, *item, *mask, now)?;
+                let granted = perms::permission_names(*mask);
+                Ok(Done::Answer(Some(format!("granted {}: {granted}", request.sender))))
+            }
+            Ask::Inventory { asset_type, .. } => {
+                self.job_ids += 1;
+                let deadline = now + inventory::LIMIT;
+                grid.inventory(self.job_ids, deadline, What::SystemFolder(*asset_type))?;
+                let filing = Filing {
+                    request: request.clone(),
+                    reply: reply.cloned(),
+                    deadline,
+                };
+                self.filing.insert(self.job_ids, filing);
+                Ok(Done::Parked)
+            }
+        }
+    }
+
+    /// An inventory offer's answer went out, or could not: the command
+    /// that accepted it is answered, and an offer that could not be
+    /// accepted waits again.
+    fn filed(&mut self, filing: Filing, sent: Result<(), String>) {
+        let Filing { request, reply, .. } = filing;
+        let what = request.describe();
+        match (sent, reply) {
+            (Ok(()), Some(reply)) => {
+                self.tell(format!("control: accept inventory: {what}: accepted"));
+                let offered = request.offered().unwrap_or_default();
+                let _ = reply.send(Response::Ok(Some(format!("accepted {offered} from {}", request.sender))));
+            }
+            (Ok(()), None) => self.tell(format!("{what}: accepted by itself")),
+            (Err(reason), Some(reply)) => {
+                self.requests.push(request);
+                refuse(CONTROL, "accept", &reply, reason);
+            }
+            (Err(reason), None) => self.wait(request, &format!("cannot be accepted now: {reason}")),
+        }
+    }
+
+    /// Accepts a request if the rules say so, and otherwise leaves it to
+    /// the operator.
+    fn decide<G: Grid>(&mut self, request: perms::Request, grid: Option<&mut G>, now: Instant) {
+        let kinds = request.kinds();
+        if let Err(kind) = self.rules.decide(&kinds, &request.sender) {
+            let why = match kinds.len() {
+                1 => "waits".to_string(),
+                _ => format!("waits, as {kind} is not auto-accepted for it"),
+            };
+            return self.wait(request, &why);
+        }
+        let done = match grid {
+            Some(grid) => self.accept(&request, None, grid, now),
+            None => Err(NOT_CONNECTED.to_string()),
+        };
+        match done {
+            // Said when the answer has gone out.
+            Ok(Done::Parked) => {}
+            Ok(_) => self.tell(format!("{}: accepted by itself", request.describe())),
+            Err(reason) => self.wait(request, &format!("cannot be accepted now: {reason}")),
+        }
+    }
+
+    /// Keeps a request for `accept`, and says so.
+    fn wait(&mut self, request: perms::Request, why: &str) {
+        self.tell(format!("{}: {why}; `{}` accepts it", request.describe(), request.accept_command()));
+        if let Some(oldest) = self.requests.push(request) {
+            self.tell(format!("{}: forgotten, too many requests wait", oldest.describe()));
+        }
+    }
+
     /// An avatar offers the bot a teleport. One the bot asked for recently
-    /// is accepted; any other is kept for `accepttp`.
+    /// is accepted; any other is for the rules to decide.
     pub fn teleport_offer<G: Grid>(&mut self, from: Uuid, name: &str, lure: Uuid, grid: Option<&mut G>, now: Instant) {
-        let who = whom(from, name);
         let full_name = name.split_whitespace().collect::<Vec<_>>().join(" ");
         if !full_name.is_empty() {
             // The offer says who it is from: no lookup needed to answer it.
-            self.known.insert(full_name.to_lowercase(), (from, full_name));
+            self.known.insert(full_name.to_lowercase(), (from, full_name.clone()));
         }
+        let sender = perms::Sender::Avatar { id: from, name: full_name };
+        let request = perms::Request::new(sender, Ask::Tp { lure });
         let asked = self
             .asked
             .remove(&from)
             .is_some_and(|at| now.duration_since(at) <= self.offer_timeout);
-        if asked {
-            match grid
-                .ok_or(NOT_CONNECTED.to_string())
-                .and_then(|grid| grid.accept_teleport(lure, now))
-            {
-                Ok(()) => return crate::info!("accepting the teleport offer from {who}, as requested"),
-                Err(reason) => crate::info!("cannot accept the teleport offer from {who} now: {reason}"),
-            }
+        if !asked {
+            return self.decide(request, grid, now);
         }
-        if self.offers.len() < MAX_OFFERS || self.offers.contains_key(&from) {
-            self.offers.insert(from, lure);
-            crate::info!("teleport offer from {who} not accepted; `rslbot ctl accepttp` accepts it");
+        match grid
+            .ok_or(NOT_CONNECTED.to_string())
+            .and_then(|grid| grid.accept_teleport(lure, now))
+        {
+            Ok(()) => self.tell(format!("{}: accepted, as requested", request.describe())),
+            Err(reason) => self.wait(request, &format!("cannot be accepted now: {reason}")),
+        }
+    }
+
+    /// An avatar or an object offers the avatar an inventory item.
+    pub fn inventory_offer<G: Grid>(&mut self, offer: InventoryOffer, grid: Option<&mut G>, now: Instant) {
+        let name = offer.name.trim().to_string();
+        let sender = match (offer.from_object, offer.from_group) {
+            (false, _) => perms::Sender::Avatar { id: offer.from, name },
+            (true, true) => perms::Sender::Object {
+                id: None,
+                name,
+                owner: Owner::Group,
+            },
+            (true, false) => perms::Sender::Object {
+                id: None,
+                name,
+                owner: Owner::Avatar {
+                    id: Some(offer.from),
+                    name: None,
+                },
+            },
+        };
+        let ask = Ask::Inventory {
+            to: offer.from,
+            from_object: offer.from_object,
+            transaction: offer.transaction,
+            asset_type: offer.asset_type,
+            text: offer.text.trim().to_string(),
+        };
+        let request = perms::Request::new(sender, ask);
+        // An object's offer names its owner by UUID only. The name is
+        // looked up first: a rule may go by it, and so may the operator
+        // who accepts an offer that waits.
+        if offer.from_object && !offer.from_group {
+            self.wanted_names.push(offer.from);
+            self.undecided.push(Undecided {
+                request,
+                needs: Needs::Name(offer.from),
+                deadline: now + LOOKUP_LIMIT,
+            });
         } else {
-            crate::info!("teleport offer from {who} ignored: too many offers are waiting");
+            self.decide(request, grid, now);
         }
+    }
+
+    /// A script asks the avatar for permissions. The request names its
+    /// owner as text only, which may as well be a group's name: before
+    /// the rules decide, the simulator is asked who owns the object.
+    #[allow(clippy::too_many_arguments)]
+    pub fn permission_request<G: Grid>(
+        &mut self,
+        object: Uuid,
+        item: Uuid,
+        object_name: &str,
+        owner_name: &str,
+        permissions: i32,
+        grid: Option<&mut G>,
+        now: Instant,
+    ) {
+        let sender = perms::Sender::Object {
+            id: Some(object),
+            name: object_name.trim().to_string(),
+            owner: Owner::Unconfirmed(owner_name.trim().to_string()),
+        };
+        // What the script asked before is closed by its asking again.
+        self.requests.forget_script(object, item);
+        self.undecided
+            .retain(|waiting| !matches!(waiting.request.ask, Ask::Script { object: o, item: i, .. } if o == object && i == item));
+        if permissions == 0 {
+            return crate::debug!("permission request from {sender} asks for nothing");
+        }
+        if let Err(what) = perms::script_kinds(permissions) {
+            return self.tell(format!(
+                "permission request from {sender} cannot be accepted: it asks for {what}, which the bot never grants"
+            ));
+        }
+        let ask = Ask::Script {
+            object,
+            item,
+            mask: permissions,
+        };
+        let request = perms::Request::new(sender, ask);
+        let Some(grid) = grid else {
+            return self.decide(request, None::<&mut G>, now);
+        };
+        match grid.object_owner(object, now) {
+            Ok(()) => self.undecided.push(Undecided {
+                request,
+                needs: Needs::Owner(object),
+                deadline: now + LOOKUP_LIMIT,
+            }),
+            Err(_) => self.decide(request, Some(grid), now),
+        }
+    }
+
+    /// Decides the requests that waited for `needs`, after `learn` has
+    /// put into each what the grid said.
+    fn settle<G: Grid>(&mut self, needs: &Needs, learn: impl Fn(&mut perms::Sender), mut grid: Option<&mut G>, now: Instant) {
+        let (ready, undecided) = std::mem::take(&mut self.undecided)
+            .into_iter()
+            .partition(|waiting| waiting.needs == *needs);
+        self.undecided = undecided;
+        for mut waiting in ready {
+            learn(&mut waiting.request.sender);
+            self.decide(waiting.request, grid.as_deref_mut(), now);
+        }
+    }
+
+    /// The simulator said who owns `object`: an avatar, or (no owner, or
+    /// the group itself as the owner) a group.
+    pub fn object_owner<G: Grid>(&mut self, object: Uuid, owner: Uuid, group: Uuid, grid: Option<&mut G>, now: Instant) {
+        let learn = |sender: &mut perms::Sender| {
+            let perms::Sender::Object { owner: slot, .. } = sender else {
+                return;
+            };
+            let claimed = match slot {
+                Owner::Unconfirmed(name) if !name.is_empty() => Some(name.clone()),
+                _ => None,
+            };
+            *slot = match owner.is_nil() || owner == group {
+                true => Owner::Group,
+                false => Owner::Avatar {
+                    id: Some(owner),
+                    name: claimed,
+                },
+            };
+        };
+        self.settle(&Needs::Owner(object), learn, grid, now);
+    }
+
+    /// The avatars whose names requests wait for, to be looked up; each is
+    /// handed out once.
+    pub fn take_name_lookups(&mut self) -> Vec<Uuid> {
+        std::mem::take(&mut self.wanted_names)
+    }
+
+    /// The grid answered a name lookup: the requests that waited for one
+    /// of these names are decided, those of avatars it does not know
+    /// without a name.
+    pub fn names_resolved<G: Grid>(&mut self, found: &[(Uuid, Names)], missing: &[Uuid], mut grid: Option<&mut G>, now: Instant) {
+        for (id, names) in found {
+            let learn = |sender: &mut perms::Sender| {
+                if let perms::Sender::Object {
+                    owner: Owner::Avatar { name, .. },
+                    ..
+                } = sender
+                {
+                    *name = Some(names.legacy.clone());
+                }
+            };
+            self.settle(&Needs::Name(*id), learn, grid.as_deref_mut(), now);
+        }
+        self.names_failed(missing, grid, now);
+    }
+
+    /// A name lookup came to nothing: the requests that waited for it are
+    /// decided without the name.
+    pub fn names_failed<G: Grid>(&mut self, ids: &[Uuid], mut grid: Option<&mut G>, now: Instant) {
+        for id in ids {
+            self.settle(&Needs::Name(*id), |_| {}, grid.as_deref_mut(), now);
+        }
+    }
+
+    /// Decides the requests the grid has not said in time who is behind,
+    /// with what is known.
+    pub fn requests_due<G: Grid>(&mut self, mut grid: Option<&mut G>, now: Instant) {
+        let (late, undecided) = std::mem::take(&mut self.undecided)
+            .into_iter()
+            .partition(|waiting| now >= waiting.deadline);
+        self.undecided = undecided;
+        for waiting in late {
+            self.decide(waiting.request, grid.as_deref_mut(), now);
+        }
+    }
+}
+
+/// Why an inventory offer's folder was not found.
+fn no_folder(failed: Failed) -> String {
+    match failed {
+        Failed::Reason(reason) => reason,
+        Failed::TimedOut => format!(
+            "the grid did not say within {} s which folder the offer goes into",
+            inventory::LIMIT.as_secs()
+        ),
     }
 }
 
@@ -1813,6 +2240,13 @@ pub(crate) mod tests {
         Detach(Uuid),
         Animate(Uuid, bool),
         Sound(Uuid),
+        /// A question about who owns this object.
+        OwnerOf(Uuid),
+        /// A grant of these permission bits to this object's script.
+        Grant(Uuid, Uuid, i32),
+        /// An accepted inventory offer: whom it is answered to, whether an
+        /// object gave, the transaction and the folder.
+        AcceptInventory(Uuid, bool, Uuid, Uuid),
     }
 
     pub(crate) struct FakeGrid {
@@ -1964,6 +2398,21 @@ pub(crate) mod tests {
         fn animate(&mut self, animation: Uuid, start: bool, _: Instant) -> Result<(), String> {
             self.check()?;
             self.calls.push(Call::Animate(animation, start));
+            Ok(())
+        }
+        fn object_owner(&mut self, object: Uuid, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::OwnerOf(object));
+            Ok(())
+        }
+        fn grant_permissions(&mut self, object: Uuid, item: Uuid, permissions: i32, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::Grant(object, item, permissions));
+            Ok(())
+        }
+        fn accept_inventory(&mut self, to: Uuid, from_object: bool, transaction: Uuid, folder: Uuid, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::AcceptInventory(to, from_object, transaction, folder));
             Ok(())
         }
         fn play_sound(&mut self, sound: Uuid, _: Instant) -> Result<(), String> {
@@ -2326,6 +2775,13 @@ pub(crate) mod tests {
         fn offer(&mut self, from: Uuid, name: &str, lure: Uuid) {
             self.commands.teleport_offer(from, name, lure, Some(&mut self.grid), self.now);
         }
+
+        fn accept(&mut self, kind: &str, who: Option<&str>) -> Receiver<Response> {
+            self.command(Request::Accept {
+                kind: kind.to_string(),
+                who: who.map(str::to_string),
+            })
+        }
     }
 
     #[test]
@@ -2460,7 +2916,7 @@ pub(crate) mod tests {
         // Neither is a `tp` or a `sit`.
         rig.command(Request::Stand);
         rig.offer(jane(), "Jane Doe", Uuid::from_bytes([0x44; 16]));
-        rig.command(Request::AcceptTp(jane().to_string()));
+        rig.accept("tp", Some(&jane().to_string()));
         rig.command(Request::AskTp {
             to: jane().to_string(),
             message: String::new(),
@@ -2613,7 +3069,7 @@ pub(crate) mod tests {
         assert_eq!(rig.calls(), [], "neither is accepted by itself");
 
         // The operator accepts by name; the offer said who it was from.
-        let answer = rig.command(Request::AcceptTp("john.roe".into()));
+        let answer = rig.accept("tp", Some("john.roe"));
         assert_eq!(rig.calls(), [Call::AcceptTp(lure(5))]);
         assert!(rig.commands.take_manual());
         assert!(answer.try_recv().is_err());
@@ -2621,8 +3077,8 @@ pub(crate) mod tests {
         assert_eq!(ok(&answer), Some("arrived in Elsewhere".to_string()));
 
         // Used once.
-        let again = rig.command(Request::AcceptTp("john.roe".into()));
-        assert!(error(&again).contains("no teleport offer from John Roe"));
+        let again = rig.accept("tp", Some("John Roe"));
+        assert_eq!(error(&again), "there is no teleport offer from John Roe");
         assert_eq!(rig.calls(), []);
         assert!(!rig.commands.take_manual());
     }
@@ -2644,10 +3100,10 @@ pub(crate) mod tests {
     #[test]
     fn accepttp_takes_the_latest_offer_and_reports_a_refusal() {
         let mut rig = Rig::new();
-        assert!(error(&rig.command(Request::AcceptTp(jane().to_string()))).contains("no teleport offer"));
+        assert!(error(&rig.accept("tp", Some(&jane().to_string()))).contains("no teleport offer"));
         rig.offer(jane(), "Jane Doe", lure(1));
         rig.offer(jane(), "Jane Doe", lure(2));
-        let answer = rig.command(Request::AcceptTp("Jane Doe".into()));
+        let answer = rig.accept("tp", Some("Jane Doe"));
         assert_eq!(rig.calls(), [Call::AcceptTp(lure(2))]);
         assert!(rig.commands.teleport_failed("the offer has expired"));
         assert_eq!(error(&answer), "the offer has expired");
@@ -2663,7 +3119,7 @@ pub(crate) mod tests {
         rig.commands.session_lost();
         assert!(error(&waiting).contains("session was lost"));
         assert!(error(&sitting).contains("session was lost"));
-        assert!(error(&rig.command(Request::AcceptTp("Jane Doe".into()))).contains("no teleport offer"));
+        assert!(error(&rig.accept("tp", Some("Jane Doe"))).contains("no teleport offer"));
 
         // Sent home after asking: the answer must not take the bot away.
         rig.command(Request::AskTp {
@@ -2687,7 +3143,835 @@ pub(crate) mod tests {
         rig.grid.offline = true;
         rig.offer(jane(), "Jane Doe", lure(1));
         rig.grid.offline = false;
-        rig.command(Request::AcceptTp("Jane Doe".into()));
+        rig.accept("tp", Some("Jane Doe"));
+        assert_eq!(rig.calls(), [Call::AcceptTp(lure(1))]);
+    }
+
+    // ------------------------------------------- requests and their rules
+
+    const ANIM: i32 = 0x10;
+    const ATTACH: i32 = 0x20;
+    const CONTROLS: i32 = 0x4;
+
+    fn ball() -> Uuid {
+        Uuid::from_bytes([0xBA; 16])
+    }
+
+    fn other_ball() -> Uuid {
+        Uuid::from_bytes([0xBB; 16])
+    }
+
+    fn john() -> Uuid {
+        Uuid::from_bytes([9; 16])
+    }
+
+    fn group() -> Uuid {
+        Uuid::from_bytes([0x66; 16])
+    }
+
+    /// The script in an object: one per object here.
+    fn script_of(object: Uuid) -> Uuid {
+        Uuid::from_u128(object.as_u128() ^ 0xFF)
+    }
+
+    fn transaction(byte: u8) -> Uuid {
+        Uuid::from_bytes([byte; 16])
+    }
+
+    fn notecards() -> Uuid {
+        Uuid::from_bytes([0x70; 16])
+    }
+
+    impl Rig {
+        fn perms(&mut self, command: &str, kind: &str, who: &[&str]) -> Receiver<Response> {
+            let (kind, who) = (kind.to_string(), Rig::words(who));
+            self.command(Request::Perms(match command {
+                "autoaccept" => PermsRequest::Autoaccept { kind, who },
+                _ => PermsRequest::Revoke { kind, who },
+            }))
+        }
+
+        fn allow(&mut self, kind: &str, who: &[&str]) {
+            ok(&self.perms("autoaccept", kind, who));
+            self.told();
+        }
+
+        fn perms_status(&mut self) -> Vec<String> {
+            let status = ok(&self.command(Request::Perms(PermsRequest::Status))).unwrap();
+            status.lines().map(str::to_string).collect()
+        }
+
+        /// The requests that wait, as `perms status` shows them.
+        fn waiting(&mut self) -> Vec<String> {
+            self.perms_status()
+                .into_iter()
+                .filter(|line| line.starts_with("waiting:"))
+                .collect()
+        }
+
+        /// A script in `object`, which says Jane Doe owns it, asks.
+        fn asks(&mut self, object: Uuid, permissions: i32) {
+            let item = script_of(object);
+            self.commands
+                .permission_request(object, item, "Dance Ball", "Jane Doe", permissions, Some(&mut self.grid), self.now);
+        }
+
+        /// The simulator says who owns `object`.
+        fn owned(&mut self, object: Uuid, owner: Uuid, group: Uuid) {
+            self.commands.object_owner(object, owner, group, Some(&mut self.grid), self.now);
+        }
+
+        /// A script in an object of Jane Doe's asks, and the simulator
+        /// confirms the owner.
+        fn janes_asks(&mut self, object: Uuid, permissions: i32) {
+            self.asks(object, permissions);
+            self.owned(object, jane(), Uuid::nil());
+            self.grid.calls.retain(|call| !matches!(call, Call::OwnerOf(_)));
+        }
+
+        fn gives(&mut self, from: Uuid, name: &str, from_object: bool, from_group: bool, byte: u8) {
+            let offer = InventoryOffer {
+                from,
+                name: name.to_string(),
+                from_group,
+                from_object,
+                transaction: transaction(byte),
+                asset_type: inventory::ASSET_NOTECARD,
+                text: "Rules".to_string(),
+            };
+            self.commands.inventory_offer(offer, Some(&mut self.grid), self.now);
+        }
+
+        /// The inventory worker says where notecards go.
+        fn files(&mut self) {
+            let (id, what) = self.job();
+            assert_eq!(what, What::SystemFolder(inventory::ASSET_NOTECARD));
+            self.answer(id, Ok(Outcome::Folder(notecards())));
+        }
+
+        fn janes_name(&mut self) {
+            let names = Names {
+                legacy: "Jane Doe".to_string(),
+                display: "Jane".to_string(),
+            };
+            self.commands
+                .names_resolved(&[(jane(), names)], &[], Some(&mut self.grid), self.now);
+        }
+
+        fn decide_late(&mut self) {
+            self.commands.requests_due(Some(&mut self.grid), self.now);
+        }
+    }
+
+    #[test]
+    fn a_teleport_offer_from_a_listed_avatar_is_accepted_by_itself() {
+        let mut rig = Rig::new();
+        rig.allow("tp", &["Jane Doe"]);
+        rig.offer(jane(), "Jane Doe", lure(1));
+        assert_eq!(rig.calls(), [Call::AcceptTp(lure(1))]);
+        assert!(rig.commands.take_manual(), "as a command that moves the avatar");
+        assert_eq!(
+            rig.told(),
+            [format!("teleport offer from Jane Doe <{}>: accepted by itself", jane())]
+        );
+        assert_eq!(rig.waiting(), [] as [&str; 0]);
+
+        // Anybody else's waits, and the bot stays as it is.
+        rig.offer(john(), "John Roe", lure(5));
+        assert_eq!(rig.calls(), []);
+        assert!(!rig.commands.take_manual());
+        assert_eq!(
+            rig.told(),
+            [format!(
+                "teleport offer from John Roe <{}>: waits; `rslbot ctl accept tp` accepts it",
+                john()
+            )]
+        );
+        assert_eq!(rig.waiting(), [format!("waiting: tp from John Roe <{}>", john())]);
+
+        // A rule made later does not accept what waits already.
+        rig.allow("tp", &["John Roe"]);
+        assert_eq!(rig.calls(), []);
+        assert!(!rig.commands.take_manual());
+        assert_eq!(rig.waiting().len(), 1);
+        rig.accept("tp", None);
+        assert_eq!(rig.calls(), [Call::AcceptTp(lure(5))]);
+    }
+
+    #[test]
+    fn accept_tp_takes_the_latest_offer_or_the_named_avatars() {
+        let mut rig = Rig::new();
+        assert_eq!(error(&rig.accept("tp", None)), "no teleport offer waits");
+        rig.offer(john(), "John Roe", lure(5));
+        rig.offer(jane(), "Jane Doe", lure(1));
+        rig.told();
+
+        // A name the grid may not know is compared, not looked up.
+        assert_eq!(
+            error(&rig.accept("tp", Some("Nobody Here"))),
+            "there is no teleport offer from Nobody Here"
+        );
+        assert_eq!(rig.calls(), []);
+        assert!(!rig.commands.take_manual());
+
+        // Without a name: the one that came last. The other still waits.
+        let answer = rig.accept("tp", None);
+        assert_eq!(rig.calls(), [Call::AcceptTp(lure(1))]);
+        assert!(rig.commands.take_manual());
+        assert_eq!(
+            rig.told(),
+            [format!("control: accept tp: teleport offer from Jane Doe <{}>: accepted", jane())]
+        );
+        rig.commands.arrived("Elsewhere");
+        assert_eq!(ok(&answer), Some("arrived in Elsewhere".to_string()));
+        assert_eq!(rig.waiting(), [format!("waiting: tp from John Roe <{}>", john())]);
+
+        // By UUID.
+        rig.accept("tp", Some(&john().to_string()));
+        assert_eq!(rig.calls(), [Call::AcceptTp(lure(5))]);
+        assert_eq!(error(&rig.accept("tp", None)), "no teleport offer waits");
+    }
+
+    #[test]
+    fn an_exception_does_not_stop_an_offer_the_bot_asked_for() {
+        let mut rig = Rig::new();
+        rig.allow("tp", &["all"]);
+        ok(&rig.perms("revoke", "tp", &["Jane Doe"]));
+        rig.command(Request::AskTp {
+            to: jane().to_string(),
+            message: String::new(),
+        });
+        rig.calls();
+        rig.told();
+        rig.offer(jane(), "Jane Doe", lure(1));
+        assert_eq!(rig.calls(), [Call::AcceptTp(lure(1))]);
+        assert_eq!(
+            rig.told(),
+            [format!("teleport offer from Jane Doe <{}>: accepted, as requested", jane())]
+        );
+        // Unasked, the exception holds, and everyone else is accepted.
+        rig.offer(jane(), "Jane Doe", lure(2));
+        assert_eq!(rig.calls(), []);
+        rig.offer(john(), "John Roe", lure(5));
+        assert_eq!(rig.calls(), [Call::AcceptTp(lure(5))]);
+    }
+
+    #[test]
+    fn an_offer_the_rules_accept_waits_when_it_cannot_be_accepted_now() {
+        let mut rig = Rig::new();
+        rig.allow("tp", &["all"]);
+        rig.grid.offline = true;
+        rig.offer(jane(), "Jane Doe", lure(1));
+        assert!(!rig.commands.take_manual());
+        let told = rig.told();
+        assert!(
+            told[0].contains("cannot be accepted now") && told[0].contains("`rslbot ctl accept tp`"),
+            "{told:?}"
+        );
+        rig.grid.offline = false;
+        rig.accept("tp", None);
+        assert_eq!(rig.calls(), [Call::AcceptTp(lure(1))]);
+    }
+
+    #[test]
+    fn a_permission_request_is_decided_once_the_owner_is_known() {
+        let mut rig = Rig::new();
+        rig.allow("anim", &["Jane Doe"]);
+        rig.asks(ball(), ANIM);
+        // First the simulator is asked who owns the object.
+        assert_eq!(rig.calls(), [Call::OwnerOf(ball())]);
+        assert_eq!(rig.commands.next_deadline(), Some(rig.now + LOOKUP_LIMIT));
+        assert_eq!(rig.told(), [] as [&str; 0]);
+        rig.owned(ball(), jane(), Uuid::nil());
+        assert_eq!(rig.calls(), [Call::Grant(ball(), script_of(ball()), ANIM)]);
+        assert_eq!(
+            rig.told(),
+            [format!(
+                "permission request (anim) from Dance Ball <{}> of Jane Doe <{}>: accepted by itself",
+                ball(),
+                jane()
+            )]
+        );
+        assert!(!rig.commands.take_manual(), "nothing moved the avatar");
+        assert_eq!(rig.commands.next_deadline(), None);
+
+        // The owner's UUID does as well as the name, for another kind.
+        rig.allow("attach", &[&jane().to_string()]);
+        rig.janes_asks(other_ball(), ATTACH);
+        assert_eq!(rig.calls(), [Call::Grant(other_ball(), script_of(other_ball()), ATTACH)]);
+        // And the object's own UUID, whoever owns it.
+        rig.allow("controls", &[&ball().to_string()]);
+        rig.asks(ball(), CONTROLS);
+        rig.owned(ball(), john(), Uuid::nil());
+        assert!(rig.calls().contains(&Call::Grant(ball(), script_of(ball()), CONTROLS)));
+    }
+
+    #[test]
+    fn a_group_with_an_avatars_name_is_not_the_avatar() {
+        let mut rig = Rig::new();
+        rig.allow("anim", &["Jane Doe", &jane().to_string()]);
+        // Deeded: no owner, or the group as the owner.
+        for owner in [Uuid::nil(), group()] {
+            rig.asks(ball(), ANIM);
+            rig.owned(ball(), owner, group());
+            assert_eq!(rig.calls(), [Call::OwnerOf(ball())], "nothing is granted");
+            let told = rig.told();
+            assert!(told[0].contains(&format!("Dance Ball <{}> of a group: waits", ball())), "{told:?}");
+        }
+        // Set to a group and owned by an avatar is the avatar's.
+        rig.asks(other_ball(), ANIM);
+        rig.owned(other_ball(), jane(), group());
+        assert!(rig.calls().contains(&Call::Grant(other_ball(), script_of(other_ball()), ANIM)));
+    }
+
+    #[test]
+    fn without_the_simulators_word_only_the_object_itself_matches() {
+        let mut rig = Rig::new();
+        rig.allow("anim", &["Jane Doe"]);
+        rig.asks(ball(), ANIM);
+        rig.calls();
+        rig.now += LOOKUP_LIMIT - Duration::from_millis(1);
+        rig.decide_late();
+        assert_eq!(rig.waiting(), [] as [&str; 0], "still undecided");
+        rig.now += Duration::from_millis(1);
+        rig.decide_late();
+        assert_eq!(rig.calls(), []);
+        let told = rig.told();
+        assert!(told[0].contains("said to be of Jane Doe (not confirmed): waits"), "{told:?}");
+        assert_eq!(rig.waiting().len(), 1);
+        // An answer that comes after all changes nothing.
+        rig.owned(ball(), jane(), Uuid::nil());
+        assert_eq!(rig.calls(), []);
+
+        // The object's UUID needs no owner.
+        rig.allow("anim", &[&other_ball().to_string()]);
+        rig.asks(other_ball(), ANIM);
+        rig.calls();
+        rig.now += LOOKUP_LIMIT;
+        rig.decide_late();
+        assert_eq!(rig.calls(), [Call::Grant(other_ball(), script_of(other_ball()), ANIM)]);
+
+        // A simulator that cannot be asked: decided at once, the same way.
+        rig.grid.offline = true;
+        rig.asks(other_ball(), ANIM);
+        assert_eq!(rig.commands.next_deadline(), None);
+        assert!(rig.told().last().unwrap().contains("cannot be accepted now"));
+    }
+
+    #[test]
+    fn a_request_with_two_kinds_is_accepted_whole_or_waits_whole() {
+        let mut rig = Rig::new();
+        rig.allow("anim", &["all"]);
+        rig.janes_asks(ball(), ANIM | CONTROLS);
+        assert_eq!(rig.calls(), [], "neither permission is granted");
+        let told = rig.told();
+        assert!(
+            told[0].contains("permission request (anim, controls)")
+                && told[0].contains("waits, as controls is not auto-accepted for it; `rslbot ctl accept anim` accepts it"),
+            "{told:?}"
+        );
+        assert_eq!(
+            rig.waiting(),
+            [format!(
+                "waiting: anim, controls from Dance Ball <{}> of Jane Doe <{}>",
+                ball(),
+                jane()
+            )]
+        );
+
+        // Found under either kind; accepting grants everything it asked.
+        let answer = rig.accept("controls", None);
+        assert_eq!(rig.calls(), [Call::Grant(ball(), script_of(ball()), ANIM | CONTROLS)]);
+        assert_eq!(
+            ok(&answer),
+            Some(format!(
+                "granted Dance Ball <{}> of Jane Doe <{}>: take controls, trigger animations",
+                ball(),
+                jane()
+            ))
+        );
+        assert!(!rig.commands.take_manual());
+        assert_eq!(error(&rig.accept("anim", None)), "no request of kind `anim` waits");
+
+        // With both kinds auto-accepted the request is.
+        rig.allow("controls", &["all"]);
+        rig.janes_asks(ball(), ANIM | CONTROLS);
+        assert_eq!(rig.calls(), [Call::Grant(ball(), script_of(ball()), ANIM | CONTROLS)]);
+    }
+
+    #[test]
+    fn an_exception_is_not_accepted_under_all_or_under_its_owner() {
+        let mut rig = Rig::new();
+        rig.allow("anim", &["all"]);
+        ok(&rig.perms("revoke", "anim", &[&ball().to_string()]));
+        rig.janes_asks(ball(), ANIM);
+        assert_eq!(rig.calls(), []);
+        rig.janes_asks(other_ball(), ANIM);
+        assert_eq!(rig.calls(), [Call::Grant(other_ball(), script_of(other_ball()), ANIM)]);
+        // Taken off the exceptions, it is accepted again.
+        rig.allow("anim", &[&ball().to_string()]);
+        rig.janes_asks(ball(), ANIM);
+        assert_eq!(rig.calls(), [Call::Grant(ball(), script_of(ball()), ANIM)]);
+    }
+
+    #[test]
+    fn a_request_for_money_is_never_accepted() {
+        let mut rig = Rig::new();
+        for kind in ["anim", "attach", "controls", "camera"] {
+            rig.allow(kind, &["all"]);
+        }
+        rig.asks(ball(), 0x2 | ANIM);
+        assert_eq!(rig.calls(), [], "not even the owner is asked for");
+        let told = rig.told();
+        assert!(
+            told[0].contains("cannot be accepted: it asks for permission to take money from the avatar"),
+            "{told:?}"
+        );
+        assert_eq!(rig.waiting(), [] as [&str; 0]);
+        assert_eq!(error(&rig.accept("anim", None)), "no request of kind `anim` waits");
+        // Nor a request for nothing.
+        rig.asks(ball(), 0);
+        assert_eq!(rig.calls(), []);
+    }
+
+    #[test]
+    fn a_script_that_asks_again_has_one_request_waiting() {
+        let mut rig = Rig::new();
+        // Twice before the owner is known, and once more after.
+        rig.asks(ball(), ANIM);
+        rig.asks(ball(), ANIM);
+        rig.owned(ball(), jane(), Uuid::nil());
+        assert_eq!(rig.waiting().len(), 1);
+        rig.janes_asks(ball(), ANIM | CONTROLS);
+        assert_eq!(
+            rig.waiting(),
+            [format!(
+                "waiting: anim, controls from Dance Ball <{}> of Jane Doe <{}>",
+                ball(),
+                jane()
+            )]
+        );
+        // Another object's is another request.
+        rig.janes_asks(other_ball(), ANIM);
+        assert_eq!(rig.waiting().len(), 2);
+        // A newer request that is accepted closes the one that waited, and
+        // so does one that can never be.
+        rig.allow("attach", &["all"]);
+        rig.janes_asks(ball(), ATTACH);
+        assert_eq!(rig.calls(), [Call::Grant(ball(), script_of(ball()), ATTACH)]);
+        assert_eq!(rig.waiting().len(), 1);
+        rig.asks(other_ball(), 0x2);
+        assert_eq!(rig.waiting(), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn accept_finds_a_request_by_its_object_or_its_owner() {
+        let mut rig = Rig::new();
+        rig.janes_asks(ball(), ANIM);
+        rig.janes_asks(other_ball(), ANIM);
+        // And an object of John Roe's.
+        let johns = Uuid::from_bytes([0xBC; 16]);
+        rig.commands
+            .permission_request(johns, script_of(johns), "Lamp", "John Roe", ATTACH, Some(&mut rig.grid), rig.now);
+        rig.owned(johns, john(), Uuid::nil());
+        rig.calls();
+        rig.told();
+
+        // The object that asked first, though another asked later.
+        ok(&rig.accept("anim", Some(&ball().to_string())));
+        assert_eq!(rig.calls(), [Call::Grant(ball(), script_of(ball()), ANIM)]);
+        assert_eq!(rig.waiting().len(), 2);
+        // An owner by name; not one who owns nothing that asked for it.
+        assert_eq!(
+            error(&rig.accept("attach", Some("Jane Doe"))),
+            "no request of kind `attach` from Jane Doe waits"
+        );
+        ok(&rig.accept("anim", Some("jane.doe")));
+        assert_eq!(rig.calls(), [Call::Grant(other_ball(), script_of(other_ball()), ANIM)]);
+        // Used once.
+        assert_eq!(error(&rig.accept("anim", None)), "no request of kind `anim` waits");
+        let told = rig.told();
+        assert!(
+            told[0].starts_with("control: accept anim: permission request (anim) from Dance Ball"),
+            "{told:?}"
+        );
+    }
+
+    #[test]
+    fn accept_is_refused_before_anything_is_looked_for() {
+        let mut rig = Rig::new();
+        rig.janes_asks(ball(), ANIM);
+        let unknown = error(&rig.accept("money", None));
+        assert!(
+            unknown.contains("`money` is no kind of request") && unknown.contains("`camera`"),
+            "{unknown}"
+        );
+        assert!(error(&rig.accept("anim", Some("Jane van Doe"))).contains("neither a UUID nor"));
+        // Not connected: the request still waits afterwards.
+        let (reply, answer) = mpsc::channel();
+        let request = Request::Accept {
+            kind: "anim".to_string(),
+            who: None,
+        };
+        rig.commands.handle(request, reply, None::<&mut FakeGrid>, rig.now);
+        assert_eq!(error(&answer), NOT_CONNECTED);
+        rig.grid.offline = true;
+        assert_eq!(error(&rig.accept("anim", None)), NOT_CONNECTED);
+        rig.grid.offline = false;
+        assert_eq!(rig.waiting().len(), 1);
+        ok(&rig.accept("anim", None));
+    }
+
+    #[test]
+    fn an_inventory_offer_is_accepted_into_the_folder_for_its_type() {
+        let mut rig = Rig::new();
+        rig.allow("inventory", &["all"]);
+        rig.gives(jane(), "Jane Doe", false, false, 1);
+        // Nothing is answered before the folder is known.
+        assert_eq!(rig.calls(), []);
+        assert_eq!(rig.told(), [] as [&str; 0]);
+        rig.files();
+        assert_eq!(rig.calls(), [Call::AcceptInventory(jane(), false, transaction(1), notecards())]);
+        assert_eq!(
+            rig.told(),
+            [format!(
+                "inventory offer from Jane Doe <{}> (notecard Rules): accepted by itself",
+                jane()
+            )]
+        );
+        assert!(!rig.commands.take_manual());
+        assert_eq!(rig.waiting(), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn an_inventory_offer_that_waits_asks_the_grid_nothing_until_it_is_accepted() {
+        let mut rig = Rig::new();
+        for byte in 1..=3 {
+            rig.gives(jane(), "Jane Doe", false, false, byte);
+        }
+        rig.gives(john(), "John Roe", false, false, 9);
+        assert!(rig.grid.jobs.is_empty(), "the inventory is not read for an offer that waits");
+        assert_eq!(rig.calls(), []);
+        assert_eq!(rig.waiting().len(), 4, "every offer waits");
+        assert_eq!(
+            rig.told()[0],
+            format!(
+                "inventory offer from Jane Doe <{}> (notecard Rules): waits; `rslbot ctl accept inventory` accepts it",
+                jane()
+            )
+        );
+
+        // The latest of the named avatar.
+        let answer = rig.accept("inventory", Some("Jane Doe"));
+        assert!(answer.try_recv().is_err(), "not answered before the answer has gone out");
+        rig.files();
+        assert_eq!(rig.calls(), [Call::AcceptInventory(jane(), false, transaction(3), notecards())]);
+        assert_eq!(ok(&answer), Some(format!("accepted notecard Rules from Jane Doe <{}>", jane())));
+        assert_eq!(rig.waiting().len(), 3);
+        assert!(rig.told()[0].starts_with("control: accept inventory: inventory offer from Jane Doe"));
+        // The latest of all.
+        rig.accept("inventory", None);
+        rig.files();
+        assert_eq!(rig.calls(), [Call::AcceptInventory(john(), false, transaction(9), notecards())]);
+        assert_eq!(
+            error(&rig.accept("inventory", Some("John Roe"))),
+            "no request of kind `inventory` from John Roe waits"
+        );
+    }
+
+    #[test]
+    fn an_offer_whose_folder_cannot_be_found_keeps_waiting() {
+        let mut rig = Rig::new();
+        rig.allow("inventory", &["all"]);
+        // No inventory service: nothing is answered, and the log says why.
+        rig.grid.no_inventory = true;
+        rig.gives(jane(), "Jane Doe", false, false, 1);
+        assert_eq!(rig.calls(), []);
+        let told = rig.told();
+        assert!(
+            told[0].contains(&format!("cannot be accepted now: {}", inventory::NO_SERVICE))
+                && told[0].contains("`rslbot ctl accept inventory` accepts it"),
+            "{told:?}"
+        );
+        assert_eq!(error(&rig.accept("inventory", None)), inventory::NO_SERVICE);
+        assert_eq!(rig.waiting().len(), 1);
+
+        // The grid does not answer the command's question.
+        rig.grid.no_inventory = false;
+        let answer = rig.accept("inventory", None);
+        let (id, _) = rig.job();
+        rig.answer(id, Err(Failed::TimedOut));
+        assert!(error(&answer).contains("did not say within 50 s which folder"));
+        assert_eq!(rig.calls(), []);
+        assert_eq!(rig.waiting().len(), 1);
+
+        // Nor the bot's own, for an offer it was about to accept.
+        rig.gives(john(), "John Roe", false, false, 2);
+        let (id, _) = rig.job();
+        rig.answer(id, Err(Failed::Reason("the inventory request failed".to_string())));
+        assert_eq!(rig.calls(), []);
+        assert_eq!(rig.waiting().len(), 2);
+        // A worker that never answers is given up on.
+        let answer = rig.accept("inventory", None);
+        assert_eq!(rig.commands.next_deadline(), Some(rig.now + inventory::LIMIT + JOB_GRACE));
+        rig.commands.tick(rig.now + inventory::LIMIT + JOB_GRACE);
+        assert!(error(&answer).contains("which folder"));
+        assert_eq!(rig.waiting().len(), 2);
+        // A change of simulator while the folder is looked for.
+        rig.gives(john(), "John Roe", false, false, 3);
+        rig.commands.simulator_changed();
+        assert_eq!(rig.waiting().len(), 3);
+        // And the end of the session, which also ends the waiting.
+        let answer = rig.accept("inventory", None);
+        rig.commands.session_lost();
+        assert!(error(&answer).contains("session was lost"));
+        assert_eq!(rig.waiting(), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn an_objects_offer_is_matched_by_its_owner() {
+        let mut rig = Rig::new();
+        rig.allow("inventory", &["Jane Doe"]);
+        // The offer names the owner by UUID: the name is looked up first.
+        rig.gives(jane(), "Vendor", true, false, 1);
+        assert_eq!(rig.commands.take_name_lookups(), [jane()]);
+        assert_eq!(rig.commands.take_name_lookups(), Vec::<Uuid>::new(), "asked for once");
+        assert!(rig.grid.jobs.is_empty());
+        assert_eq!(rig.commands.next_deadline(), Some(rig.now + LOOKUP_LIMIT));
+        rig.janes_name();
+        rig.files();
+        assert_eq!(rig.calls(), [Call::AcceptInventory(jane(), true, transaction(1), notecards())]);
+        assert_eq!(
+            rig.told(),
+            [format!(
+                "inventory offer from the object \"Vendor\" of Jane Doe <{}> (notecard Rules): accepted by itself",
+                jane()
+            )]
+        );
+
+        // A name the grid does not give in time: the offer waits.
+        rig.gives(jane(), "Vendor", true, false, 2);
+        rig.now += LOOKUP_LIMIT;
+        rig.decide_late();
+        assert!(rig.grid.jobs.is_empty());
+        assert_eq!(
+            rig.waiting(),
+            [format!(
+                "waiting: inventory from the object \"Vendor\" of the avatar {}: notecard Rules",
+                jane()
+            )]
+        );
+        // Nor one the grid says it does not know, or cannot look up.
+        rig.gives(jane(), "Vendor", true, false, 3);
+        rig.commands.names_resolved(&[], &[jane()], Some(&mut rig.grid), rig.now);
+        rig.gives(jane(), "Vendor", true, false, 4);
+        rig.commands.names_failed(&[jane()], Some(&mut rig.grid), rig.now);
+        assert_eq!(rig.waiting().len(), 3);
+        assert!(rig.grid.jobs.is_empty());
+        // The operator can still name the owner by UUID.
+        rig.accept("inventory", Some(&jane().to_string()));
+        rig.files();
+        assert_eq!(rig.calls(), [Call::AcceptInventory(jane(), true, transaction(4), notecards())]);
+    }
+
+    #[test]
+    fn an_objects_offer_is_also_matched_by_its_owners_uuid() {
+        let mut rig = Rig::new();
+        rig.allow("inventory", &[&jane().to_string(), &ball().to_string()]);
+        // The name is asked for all the same; the UUID does without it.
+        rig.gives(jane(), "Vendor", true, false, 1);
+        assert_eq!(rig.commands.take_name_lookups(), [jane()]);
+        rig.commands.names_failed(&[jane()], Some(&mut rig.grid), rig.now);
+        rig.files();
+        assert_eq!(rig.calls(), [Call::AcceptInventory(jane(), true, transaction(1), notecards())]);
+        // The UUID of an object stands for nobody who gives inventory.
+        rig.gives(john(), "Dance Ball", true, false, 2);
+        rig.commands.take_name_lookups();
+        rig.commands.names_failed(&[john()], Some(&mut rig.grid), rig.now);
+        assert!(rig.grid.jobs.is_empty());
+        // A group's object has no avatar to look up, and is matched by
+        // nothing but `all`.
+        rig.gives(jane(), "Vendor", true, true, 3);
+        assert_eq!(rig.commands.take_name_lookups(), Vec::<Uuid>::new());
+        assert!(rig.grid.jobs.is_empty());
+        assert_eq!(rig.waiting().len(), 2);
+        rig.allow("inventory", &["all"]);
+        rig.gives(group(), "Vendor", true, true, 4);
+        rig.files();
+        assert_eq!(rig.calls(), [Call::AcceptInventory(group(), true, transaction(4), notecards())]);
+    }
+
+    #[test]
+    fn an_objects_offer_that_waits_can_be_accepted_by_its_owners_name() {
+        let mut rig = Rig::new();
+        rig.gives(jane(), "Vendor", true, false, 1);
+        assert_eq!(rig.commands.take_name_lookups(), [jane()]);
+        rig.janes_name();
+        assert_eq!(
+            rig.waiting(),
+            [format!(
+                "waiting: inventory from the object \"Vendor\" of Jane Doe <{}>: notecard Rules",
+                jane()
+            )]
+        );
+        assert_eq!(
+            error(&rig.accept("inventory", Some("John Roe"))),
+            "no request of kind `inventory` from John Roe waits"
+        );
+        rig.accept("inventory", Some("Jane Doe"));
+        rig.files();
+        assert_eq!(rig.calls(), [Call::AcceptInventory(jane(), true, transaction(1), notecards())]);
+    }
+
+    #[test]
+    fn waiting_requests_end_with_the_session_and_scripts_with_the_region() {
+        let mut rig = Rig::new();
+        rig.offer(jane(), "Jane Doe", lure(1));
+        rig.gives(jane(), "Jane Doe", false, false, 1);
+        rig.janes_asks(ball(), ANIM);
+        rig.asks(other_ball(), ANIM);
+        assert_eq!(rig.waiting().len(), 3);
+        // Another simulator: the scripts stayed behind, decided or not.
+        rig.commands.simulator_changed();
+        assert_eq!(rig.waiting().len(), 2);
+        rig.owned(other_ball(), jane(), Uuid::nil());
+        assert_eq!(rig.waiting().len(), 2);
+        assert_eq!(rig.commands.next_deadline(), None);
+        rig.commands.session_lost();
+        assert_eq!(rig.waiting(), [] as [&str; 0]);
+    }
+
+    #[test]
+    fn perms_commands_change_the_rules_and_warn_when_nothing_changes() {
+        let mut rig = Rig::new();
+        let object = "01234567-9abc-defe-dcba-987654321000";
+        let added = rig.perms("autoaccept", "inventory", &[object, "Avatar1"]);
+        assert_eq!(
+            ok(&added),
+            Some(format!("inventory: {object} is auto-accepted\ninventory: Avatar1 is auto-accepted"))
+        );
+        assert_eq!(
+            rig.told(),
+            [
+                format!("control: perms: inventory: {object} is auto-accepted"),
+                "control: perms: inventory: Avatar1 is auto-accepted".to_string()
+            ]
+        );
+        assert_eq!(rig.perms_status()[1], format!("inventory: {object}, Avatar1"));
+        // Already there: a warning, and still a success.
+        assert_eq!(
+            ok(&rig.perms("autoaccept", "inventory", &["Avatar1"])),
+            Some("warning: Avatar1 was auto-accepted for inventory already".to_string())
+        );
+        assert_eq!(rig.perms_status()[1], format!("inventory: {object}, Avatar1"));
+
+        // Revoking one, then one that is not there, then everything.
+        assert_eq!(
+            ok(&rig.perms("revoke", "inventory", &[object])),
+            Some(format!("inventory: {object} is not auto-accepted any more"))
+        );
+        assert_eq!(
+            ok(&rig.perms("revoke", "inventory", &[object])),
+            Some(format!("warning: {object} was not auto-accepted for inventory already"))
+        );
+        assert_eq!(
+            ok(&rig.perms("revoke", "inventory", &["all"])),
+            Some("inventory: nothing is auto-accepted any more".to_string())
+        );
+        assert_eq!(rig.perms_status()[1], "inventory: none");
+        rig.told();
+
+        // Everyone, and then an exception to it.
+        assert_eq!(
+            ok(&rig.perms("autoaccept", "anim", &["all"])),
+            Some("anim: everyone is auto-accepted".to_string())
+        );
+        ok(&rig.perms("revoke", "anim", &[object]));
+        assert_eq!(rig.perms_status()[2], format!("anim: all except {object}"));
+        ok(&rig.perms("autoaccept", "anim", &[object]));
+        assert_eq!(rig.perms_status()[2], "anim: all");
+        ok(&rig.perms("revoke", "anim", &["all"]));
+        assert_eq!(
+            rig.told().last().unwrap(),
+            "control: perms: anim: nothing is auto-accepted any more"
+        );
+    }
+
+    #[test]
+    fn malformed_perms_commands_change_nothing() {
+        let mut rig = Rig::new();
+        let unknown = error(&rig.perms("autoaccept", "money", &["all"]));
+        assert!(
+            unknown.contains("`money` is no kind of request") && unknown.contains("`tp`, `inventory`"),
+            "{unknown}"
+        );
+        assert!(error(&rig.perms("autoaccept", "anim", &["all", "Avatar1"])).contains("`all` stands alone"));
+        assert!(error(&rig.perms("revoke", "anim", &["Avatar1", "All"])).contains("`all` stands alone"));
+        // One bad name: the good one before it is not added either.
+        assert!(error(&rig.perms("autoaccept", "anim", &["Avatar1", "Jane van Doe"])).contains("neither a UUID nor"));
+        assert!(error(&rig.perms("autoaccept", "anim", &[])).contains("say whom"));
+        assert_eq!(
+            rig.perms_status(),
+            [
+                "tp: none",
+                "inventory: none",
+                "anim: none",
+                "attach: none",
+                "controls: none",
+                "camera: none"
+            ]
+        );
+        assert!(!rig.commands.take_manual());
+    }
+
+    #[test]
+    fn perms_commands_need_no_session() {
+        let mut commands = Commands::default();
+        let now = Instant::now();
+        let run = |commands: &mut Commands, request| {
+            let (reply, answer) = mpsc::channel();
+            commands.handle(request, reply, None::<&mut FakeGrid>, now);
+            ok(&answer).unwrap()
+        };
+        let added = run(
+            &mut commands,
+            Request::Perms(PermsRequest::Autoaccept {
+                kind: "tp".to_string(),
+                who: vec!["Jane Doe".to_string()],
+            }),
+        );
+        assert_eq!(added, "tp: Jane Doe is auto-accepted");
+        let status = run(&mut commands, Request::Perms(PermsRequest::Status));
+        assert!(status.starts_with("tp: Jane Doe\ninventory: none\n"), "{status}");
+        assert_eq!(status.lines().count(), 6);
+        // The rules outlive a session.
+        commands.session_lost();
+        assert!(run(&mut commands, Request::Perms(PermsRequest::Status)).starts_with("tp: Jane Doe\n"));
+    }
+
+    #[test]
+    fn the_configs_rules_are_what_the_bot_starts_with() {
+        let mut rig = Rig::new();
+        let mut rules = Rules::default();
+        rules.set_rule(Kind::Tp, perms::Rule::List(vec![perms::Entry::parse("Jane Doe").unwrap()]));
+        rules.set_rule(Kind::Anim, perms::Rule::All);
+        rules.set_exceptions(
+            Kind::Anim,
+            vec![perms::Entry::parse("01234567-9abc-defe-dcba-987654321000").unwrap()],
+        );
+        rig.commands.set_rules(rules);
+        assert_eq!(
+            rig.perms_status(),
+            [
+                "tp: Jane Doe",
+                "inventory: none",
+                "anim: all except 01234567-9abc-defe-dcba-987654321000",
+                "attach: none",
+                "controls: none",
+                "camera: none"
+            ]
+        );
+        rig.offer(jane(), "Jane Doe", lure(1));
         assert_eq!(rig.calls(), [Call::AcceptTp(lure(1))]);
     }
 

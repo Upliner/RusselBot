@@ -131,6 +131,49 @@ pub enum SessionEvent {
     AttachFailed(Uuid),
     /// A `detach` did not make the object go within `DETACH_LIMIT`.
     DetachFailed(Uuid),
+    /// An avatar or an object offers the avatar an inventory item or folder.
+    InventoryOffer(InventoryOffer),
+    /// A script asks the avatar for permissions.
+    PermissionRequest {
+        object: Uuid,
+        /// The script, as an item of the object's inventory.
+        item: Uuid,
+        object_name: String,
+        /// The owner as the request names it: an avatar's name, or a
+        /// group's for a group's object.
+        owner_name: String,
+        /// The permission bits asked for (`PERMISSION_*` in LSL).
+        permissions: i32,
+    },
+    /// The answer to `request_object_owner`. A group's object has no
+    /// owner, or the group as its owner.
+    ObjectOwner {
+        object: Uuid,
+        owner: Uuid,
+        group: Uuid,
+    },
+}
+
+/// An inventory offer as it arrived. The item is in the avatar's inventory
+/// already; accepting files it and tells the giver.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InventoryOffer {
+    /// The giving avatar; for an object's offer its owner, which is a
+    /// group when `from_group` is set.
+    pub from: Uuid,
+    /// The giving avatar's name, or the giving object's.
+    pub name: String,
+    pub from_group: bool,
+    /// An object gives. The offer does not say which.
+    pub from_object: bool,
+    /// What the answer has to name.
+    pub transaction: Uuid,
+    /// The asset type of what is offered; `inventory::ASSET_FOLDER` for a
+    /// folder.
+    pub asset_type: i32,
+    /// What the offer says about the item: its name, and for an object's
+    /// offer where the object is.
+    pub text: String,
 }
 
 /// A chat or instant message as the simulator delivered it; the names that
@@ -172,6 +215,21 @@ const CHAT_TYPE_STOP_TYPING: u8 = 5;
 const CHAT_NOT_AUDIBLE: i8 = -1;
 const IM_NOTHING_SPECIAL: u8 = messages::IM_PLAIN;
 const IM_FROM_TASK: u8 = 19;
+
+/// The asset type an inventory offer's binary bucket names. An avatar's
+/// offer carries the type and the item's UUID; an object's the type alone,
+/// which older simulators wrote as text in front of a `|`.
+fn offered_type(bucket: &[u8], from_object: bool) -> Option<i32> {
+    match (from_object, bucket) {
+        (false, [asset_type, item @ ..]) if item.len() == 16 => Some(i32::from(*asset_type as i8)),
+        (false, _) => None,
+        (true, [asset_type]) => Some(i32::from(*asset_type as i8)),
+        (true, text) => {
+            let digits = text.iter().take_while(|byte| byte.is_ascii_digit()).count();
+            std::str::from_utf8(&text[..digits]).ok()?.parse().ok()
+        }
+    }
+}
 
 /// A confirmed sit on an object.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -638,6 +696,36 @@ impl<N: Net> Session<N> {
             phase: TeleportPhase::Requested,
             deadline: now + TELEPORT_LIMIT,
         });
+        Ok(())
+    }
+
+    /// Asks the simulator who owns `object`; an `ObjectOwner` follows if
+    /// it knows the object.
+    pub fn request_object_owner(&mut self, object: Uuid, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::request_object_properties_family(&self.agent, object), true, now);
+        Ok(())
+    }
+
+    /// Grants the script `item` in `object` the permissions it asked for
+    /// with a `PermissionRequest`.
+    pub fn grant_permissions(&mut self, object: Uuid, item: Uuid, permissions: i32, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::script_answer_yes(&self.agent, object, item, permissions), true, now);
+        Ok(())
+    }
+
+    /// Accepts an inventory offer: tells whoever gave, `to`, and has the
+    /// item filed in `folder`.
+    pub fn accept_inventory(&mut self, to: Uuid, from_object: bool, transaction: Uuid, folder: Uuid, now: Instant) -> Result<(), String> {
+        self.present()?;
+        let position = self.sim.position.unwrap_or_default();
+        let offered = match from_object {
+            true => messages::IM_TASK_INVENTORY_OFFERED,
+            false => messages::IM_INVENTORY_OFFERED,
+        };
+        let message = messages::inventory_accepted(&self.agent, &self.agent_name, to, position, offered, transaction, folder);
+        self.send(message, true, now);
         Ok(())
     }
 
@@ -1144,12 +1232,14 @@ impl<N: Net> Session<N> {
             }
             Incoming::InstantMessage {
                 from_agent,
+                from_group,
                 from_name,
                 dialog,
                 id,
                 offline,
                 timestamp,
                 text,
+                bucket,
             } => {
                 let (kind, source) = match dialog {
                     IM_NOTHING_SPECIAL if from_agent.is_nil() => ("im", Source::System { name: from_name }),
@@ -1188,6 +1278,22 @@ impl<N: Net> Session<N> {
                         };
                         return self.events.push(request);
                     }
+                    messages::IM_INVENTORY_OFFERED | messages::IM_TASK_INVENTORY_OFFERED => {
+                        let from_object = dialog == messages::IM_TASK_INVENTORY_OFFERED;
+                        let Some(asset_type) = offered_type(&bucket, from_object) else {
+                            return crate::debug!("ignoring a malformed inventory offer from {from_name} <{from_agent}>");
+                        };
+                        let offer = InventoryOffer {
+                            from: from_agent,
+                            name: from_name,
+                            from_group,
+                            from_object,
+                            transaction: id,
+                            asset_type,
+                            text,
+                        };
+                        return self.events.push(SessionEvent::InventoryOffer(offer));
+                    }
                     other => return crate::debug!("ignoring instant message with dialog {other}"),
                 };
                 let sent_at = (offline && timestamp != 0).then_some(timestamp);
@@ -1201,6 +1307,22 @@ impl<N: Net> Session<N> {
             }
             Incoming::AvatarPickerReply { query, avatars } => {
                 self.events.push(SessionEvent::AvatarsFound { query, avatars });
+            }
+            Incoming::ScriptQuestion {
+                object,
+                item,
+                object_name,
+                owner_name,
+                questions,
+            } => self.events.push(SessionEvent::PermissionRequest {
+                object,
+                item,
+                object_name,
+                owner_name,
+                permissions: questions,
+            }),
+            Incoming::ObjectPropertiesFamily { object, owner, group } => {
+                self.events.push(SessionEvent::ObjectOwner { object, owner, group });
             }
             Incoming::LogoutReply => {
                 if self.logout_deadline.take().is_some() {
@@ -2251,11 +2373,99 @@ mod tests {
     #[test]
     fn other_instant_message_traffic_is_dropped() {
         let mut rig = Rig::entered();
-        // Inventory offer, group notice, session message, auto response, typing.
-        for dialog in [4, 32, 17, 20, 41, 42] {
+        // Group notice, session message, auto response, typing, and the
+        // answers to offers the bot does not make.
+        for dialog in [5, 6, 32, 17, 20, 41, 42] {
             rig.im(Uuid::from_bytes([0x77; 16]), dialog, Uuid::nil(), None, "x");
         }
         assert_eq!(rig.events(), []);
+    }
+
+    #[test]
+    fn inventory_offers_are_reported_and_not_recorded_as_messages() {
+        let mut rig = Rig::entered();
+        let (giver, transaction, item) = (Uuid::from_bytes([0x77; 16]), Uuid::from_bytes([0x66; 16]), [0x55; 16]);
+        let offer = |rig: &mut Rig, group, dialog, text: &str, bucket: &[u8]| {
+            let body = wire::instant_message_with_bucket(giver, group, "Sender", dialog, transaction, None, text, bucket);
+            rig.receive(messages::IMPROVED_INSTANT_MESSAGE, &body);
+            rig.events()
+        };
+        let offered = |from_group, from_object, asset_type, text: &str| {
+            SessionEvent::InventoryOffer(InventoryOffer {
+                from: giver,
+                name: "Sender".into(),
+                from_group,
+                from_object,
+                transaction,
+                asset_type,
+                text: text.into(),
+            })
+        };
+        // An avatar gives a notecard.
+        let bucket = [vec![7], item.to_vec()].concat();
+        assert_eq!(offer(&mut rig, false, 4, "Rules", &bucket), [offered(false, false, 7, "Rules")]);
+        // An object gives one, and a group's object a folder.
+        assert_eq!(offer(&mut rig, false, 9, "'Rules'", &[7]), [offered(false, true, 7, "'Rules'")]);
+        assert_eq!(offer(&mut rig, true, 9, "'Kit'", &[8]), [offered(true, true, 8, "'Kit'")]);
+        // The older form of an object's offer.
+        assert_eq!(offer(&mut rig, false, 9, "'Rules'", b"7|x\0"), [offered(false, true, 7, "'Rules'")]);
+        // Malformed offers are dropped.
+        assert_eq!(offer(&mut rig, false, 4, "Rules", &[7]), []);
+        assert_eq!(offer(&mut rig, false, 9, "'Rules'", b"x|y"), []);
+        assert_eq!(offer(&mut rig, false, 9, "'Rules'", &[]), []);
+    }
+
+    #[test]
+    fn script_permission_requests_and_object_owners_are_reported() {
+        let mut rig = Rig::entered();
+        let (object, item, owner, group) = (
+            Uuid::from_bytes([0x91; 16]),
+            Uuid::from_bytes([0x92; 16]),
+            Uuid::from_bytes([0x93; 16]),
+            Uuid::from_bytes([0x94; 16]),
+        );
+        let body = wire::script_question(object, item, "Dance Ball", "Jane Doe", 0x14, true);
+        rig.receive(messages::SCRIPT_QUESTION, &body);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::PermissionRequest {
+                object,
+                item,
+                object_name: "Dance Ball".into(),
+                owner_name: "Jane Doe".into(),
+                permissions: 0x14,
+            }]
+        );
+        rig.receive(
+            messages::OBJECT_PROPERTIES_FAMILY,
+            &wire::object_properties_family(object, owner, group),
+        );
+        assert_eq!(rig.events(), [SessionEvent::ObjectOwner { object, owner, group }]);
+    }
+
+    #[test]
+    fn requests_are_answered_with_their_own_messages() {
+        let mut rig = Rig::entered();
+        rig.sent();
+        let now = rig.now;
+        let (object, item, folder) = (
+            Uuid::from_bytes([0x91; 16]),
+            Uuid::from_bytes([0x92; 16]),
+            Uuid::from_bytes([0x95; 16]),
+        );
+        assert_eq!(rig.session.request_object_owner(object, now), Ok(()));
+        assert_eq!(rig.session.grant_permissions(object, item, 0x14, now), Ok(()));
+        assert_eq!(rig.session.accept_inventory(object, false, item, folder, now), Ok(()));
+        assert_eq!(rig.session.accept_inventory(object, true, item, folder, now), Ok(()));
+        assert_eq!(
+            rig.sent_ids(),
+            [
+                messages::REQUEST_OBJECT_PROPERTIES_FAMILY,
+                messages::SCRIPT_ANSWER_YES,
+                messages::IMPROVED_INSTANT_MESSAGE,
+                messages::IMPROVED_INSTANT_MESSAGE
+            ]
+        );
     }
 
     #[test]

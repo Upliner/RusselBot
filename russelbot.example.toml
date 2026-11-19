@@ -103,3 +103,30 @@ sit = "00000000-0000-0000-0000-000000000000"
 # position = "cur"
 # sit = "cfg"
 # rlv = "follow"
+
+# Which requests the bot accepts by itself; without this it accepts none and
+# every request waits for `rslbot ctl accept KIND`. These are tables too.
+# The kinds of request:
+#   tp         an avatar's teleport offer (the bot goes, and stays there)
+#   inventory  an inventory offer from an avatar or an object
+#   anim       a script asks to animate the avatar
+#   attach     a script asks to attach its object to the avatar
+#   controls   a script asks to take the avatar's controls
+#   camera     a script asks to track or control the camera
+# Under `autoaccept` a kind is "all" (or `true`), or a list of avatar names
+# and UUIDs. An avatar's name or UUID stands for the avatar and for every
+# object it owns; an object's UUID stands for that object. For `inventory`
+# name the owner: an offer does not say which object it came from.
+# Under `except` a kind lists who is never accepted by itself, whatever
+# `autoaccept` says. A script that asks for several things at once is
+# accepted only when all of them are auto-accepted for it.
+# `rslbot ctl perms autoaccept` and `perms revoke` change this while the bot
+# runs.
+# [perms.autoaccept]
+# tp = ["Jane Doe"]
+# inventory = ["Owner Resident", "11111111-2222-3333-4444-555555555555"]
+# anim = "all"
+# attach = true
+#
+# [perms.except]
+# anim = ["01234567-9abc-defe-dcba-987654321000"]

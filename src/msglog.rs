@@ -99,6 +99,7 @@ impl Recorder {
     }
 
     /// Whether any ids are waiting to be looked up.
+    #[cfg(test)]
     pub fn has_lookups(&self) -> bool {
         !self.wanted.is_empty()
     }

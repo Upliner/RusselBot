@@ -21,6 +21,19 @@ pub struct Names {
     pub display: String,
 }
 
+/// The full name `given` stands for, in lower case: `First Last`,
+/// `first.last`, or a single word, whose last name is `Resident`. `None`
+/// for anything else.
+pub fn full_name(given: &str) -> Option<String> {
+    let spaced = given.replace('.', " ").to_lowercase();
+    let words: Vec<&str> = spaced.split_whitespace().collect();
+    match words[..] {
+        [first] => Some(format!("{first} resident")),
+        [first, last] => Some(format!("{first} {last}")),
+        _ => None,
+    }
+}
+
 /// A request to the worker: look these avatars up at this capability URL.
 #[derive(Debug, PartialEq)]
 pub struct Lookup {

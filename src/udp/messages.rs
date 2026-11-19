@@ -48,6 +48,10 @@ pub const REZ_SINGLE_ATTACHMENT_FROM_INV: MessageId = low(395);
 pub const DETACH_ATTACHMENT_INTO_INV: MessageId = low(397);
 pub const MAP_NAME_REQUEST: MessageId = low(408);
 pub const MAP_BLOCK_REPLY: MessageId = low(409);
+pub const SCRIPT_ANSWER_YES: MessageId = low(132);
+pub const SCRIPT_QUESTION: MessageId = low(188);
+pub const REQUEST_OBJECT_PROPERTIES_FAMILY: MessageId = medium(5);
+pub const OBJECT_PROPERTIES_FAMILY: MessageId = medium(10);
 pub const PACKET_ACK: MessageId = 0xFFFF_FFFB;
 /// Sent by the bot to play a sound, and by simulators when one plays.
 pub const SOUND_TRIGGER: MessageId = high(29);
@@ -86,6 +90,10 @@ pub fn name(id: MessageId) -> String {
         AGENT_SIT => "AgentSit",
         OBJECT_UPDATE => "ObjectUpdate",
         AVATAR_SIT_RESPONSE => "AvatarSitResponse",
+        SCRIPT_ANSWER_YES => "ScriptAnswerYes",
+        SCRIPT_QUESTION => "ScriptQuestion",
+        REQUEST_OBJECT_PROPERTIES_FAMILY => "RequestObjectPropertiesFamily",
+        OBJECT_PROPERTIES_FAMILY => "ObjectPropertiesFamily",
         USE_CIRCUIT_CODE => "UseCircuitCode",
         AVATAR_PICKER_REQUEST => "AvatarPickerRequest",
         AVATAR_PICKER_REPLY => "AvatarPickerReply",
@@ -360,6 +368,11 @@ pub const IM_PLAIN: u8 = 0;
 pub const IM_TELEPORT_OFFER: u8 = 22;
 /// Instant-message dialog: a request to be teleported to the recipient.
 pub const IM_TELEPORT_REQUEST: u8 = 26;
+/// Instant-message dialog: an avatar offers an inventory item or folder.
+/// The answer that accepts an offer is the dialog one higher.
+pub const IM_INVENTORY_OFFERED: u8 = 4;
+/// Instant-message dialog: an object offers an inventory item or folder.
+pub const IM_TASK_INVENTORY_OFFERED: u8 = 9;
 /// TeleportFlags: the teleport answers an offer.
 const TELEPORT_VIA_LURE: u32 = 1 << 2;
 
@@ -372,6 +385,37 @@ pub fn instant_message(agent: &Agent, from_name: &str, to: Uuid, position: Vecto
         IM_PLAIN => Uuid::from_u128(agent.agent_id.as_u128() ^ to.as_u128()),
         _ => Uuid::nil(),
     };
+    instant_message_with(agent, from_name, to, position, dialog, conversation, text, &[0])
+}
+
+/// The answer that accepts the inventory offer `transaction`, which came
+/// with the dialog `offered`: the dialog one higher, with the folder the
+/// item is to be filed in as the binary bucket. It goes to the avatar the
+/// offer came from, which for an object's offer is the object's owner.
+pub fn inventory_accepted(
+    agent: &Agent,
+    from_name: &str,
+    to: Uuid,
+    position: Vector3,
+    offered: u8,
+    transaction: Uuid,
+    folder: Uuid,
+) -> Outgoing {
+    instant_message_with(agent, from_name, to, position, offered + 1, transaction, "", folder.as_bytes())
+}
+
+/// ImprovedInstantMessage with the id and the binary bucket given.
+#[allow(clippy::too_many_arguments)]
+fn instant_message_with(
+    agent: &Agent,
+    from_name: &str,
+    to: Uuid,
+    position: Vector3,
+    dialog: u8,
+    id: Uuid,
+    text: &str,
+    bucket: &[u8],
+) -> Outgoing {
     Writer::agent(agent)
         .u8(0) // FromGroup
         .uuid(to)
@@ -380,14 +424,35 @@ pub fn instant_message(agent: &Agent, from_name: &str, to: Uuid, position: Vecto
         .vector3(position)
         .u8(0) // Offline
         .u8(dialog)
-        .uuid(conversation)
+        .uuid(id)
         .u32(0) // Timestamp
         .text1(from_name)
         .text2(text)
-        .variable2(&[0]) // BinaryBucket
+        .variable2(bucket) // BinaryBucket
         .u32(0) // EstateBlock
         .u8(0) // MetaData block count
         .finish(IMPROVED_INSTANT_MESSAGE, true)
+}
+
+/// ScriptAnswerYes, Low 132: TaskID, ItemID, Questions S32. Grants the
+/// script `item` in the object `object` the permissions `questions`, the
+/// bits of its ScriptQuestion.
+pub fn script_answer_yes(agent: &Agent, object: Uuid, item: Uuid, questions: i32) -> Outgoing {
+    Writer::agent(agent)
+        .uuid(object)
+        .uuid(item)
+        .i32(questions)
+        .finish(SCRIPT_ANSWER_YES, false)
+}
+
+/// RequestObjectPropertiesFamily, Medium 5, Zerocoded: RequestFlags U32,
+/// ObjectID. Asks who owns the object; answered with
+/// ObjectPropertiesFamily.
+pub fn request_object_properties_family(agent: &Agent, object: Uuid) -> Outgoing {
+    Writer::agent(agent)
+        .u32(0) // RequestFlags
+        .uuid(object)
+        .finish(REQUEST_OBJECT_PROPERTIES_FAMILY, true)
 }
 
 /// AvatarPickerRequest, Low 26: QueryID LLUUID, Name Variable 1. Asks for
@@ -768,6 +833,8 @@ pub enum Incoming {
     InstantMessage {
         /// The sending avatar; for an object's IM, the object's owner.
         from_agent: Uuid,
+        /// The sender is a group: the owner of the object that sent it.
+        from_group: bool,
         from_name: String,
         dialog: u8,
         /// Meaning depends on `dialog`; the object for an object's IM.
@@ -777,6 +844,26 @@ pub enum Incoming {
         /// When a stored message was sent, in seconds since the Unix epoch.
         timestamp: u32,
         text: String,
+        /// Data whose meaning depends on `dialog`.
+        bucket: Vec<u8>,
+    },
+    /// A script asks the avatar for permissions.
+    ScriptQuestion {
+        /// The object the script is in.
+        object: Uuid,
+        /// The script, as an item of the object's inventory.
+        item: Uuid,
+        object_name: String,
+        /// The owner's name as text; a group's name for a group's object.
+        owner_name: String,
+        /// The permission bits asked for.
+        questions: i32,
+    },
+    /// Who owns an object, in answer to RequestObjectPropertiesFamily.
+    ObjectPropertiesFamily {
+        object: Uuid,
+        owner: Uuid,
+        group: Uuid,
     },
     /// The answer to an avatar search: the avatars found, as id and
     /// `First Last`.
@@ -987,18 +1074,47 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
         // Message Variable 2, BinaryBucket Variable 2, ...
         IMPROVED_INSTANT_MESSAGE => {
             let from_agent = r.uuid()?;
-            r.skip(16 + 1 + 16 + 4 + 16 + 12)?;
+            r.skip(16)?;
+            let from_group = r.u8()? != 0;
+            r.skip(16 + 4 + 16 + 12)?;
             let (offline, dialog) = (r.u8()? != 0, r.u8()?);
             let (id, timestamp) = (r.uuid()?, r.u32()?);
             let from_name = text(r.variable1()?);
+            let text = text(r.variable2()?);
             Incoming::InstantMessage {
                 from_agent,
+                from_group,
                 from_name,
                 dialog,
                 id,
                 offline,
                 timestamp,
-                text: text(r.variable2()?),
+                text,
+                bucket: r.variable2()?.to_vec(),
+            }
+        }
+        // ScriptQuestion, Low 188: TaskID, ItemID, ObjectName Variable 1,
+        // ObjectOwner Variable 1, Questions S32, then the Experience block,
+        // which older simulators leave out.
+        SCRIPT_QUESTION => {
+            let (object, item) = (r.uuid()?, r.uuid()?);
+            let (object_name, owner_name) = (text(r.variable1()?), text(r.variable1()?));
+            Incoming::ScriptQuestion {
+                object,
+                item,
+                object_name,
+                owner_name,
+                questions: r.u32()? as i32,
+            }
+        }
+        // ObjectPropertiesFamily, Medium 10: RequestFlags U32, ObjectID,
+        // OwnerID, GroupID, then masks, sale data, names.
+        OBJECT_PROPERTIES_FAMILY => {
+            r.skip(4)?;
+            Incoming::ObjectPropertiesFamily {
+                object: r.uuid()?,
+                owner: r.uuid()?,
+                group: r.uuid()?,
             }
         }
         // AvatarPickerReply, Low 28: AgentID, QueryID, then Data Variable
@@ -1290,16 +1406,59 @@ pub mod testing {
         stored: Option<u32>,
         message: &str,
     ) -> Vec<u8> {
+        instant_message_with_bucket(from_agent, false, from_name, dialog, id, stored, message, &[0])
+    }
+
+    /// An ImprovedInstantMessage with the sender's group flag and the
+    /// binary bucket given, as offers carry them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn instant_message_with_bucket(
+        from_agent: Uuid,
+        from_group: bool,
+        from_name: &str,
+        dialog: u8,
+        id: Uuid,
+        stored: Option<u32>,
+        message: &str,
+        bucket: &[u8],
+    ) -> Vec<u8> {
         let mut body = from_agent.as_bytes().to_vec();
-        body.extend([0; 16 + 1 + 16 + 4 + 16 + 12]); // SessionID .. Position
+        body.extend([0; 16]); // SessionID
+        body.push(u8::from(from_group));
+        body.extend([0; 16 + 4 + 16 + 12]); // ToAgentID .. Position
         body.extend([u8::from(stored.is_some()), dialog]);
         body.extend(id.as_bytes());
         body.extend(stored.unwrap_or(0).to_le_bytes());
         body.extend(string1(from_name));
         body.extend(string2(message));
-        body.extend([1, 0, 0]); // BinaryBucket
+        body.extend((bucket.len() as u16).to_le_bytes()); // BinaryBucket
+        body.extend(bucket);
         body.extend([0; 4]); // EstateID
         body.push(0); // MetaData block count
+        body
+    }
+
+    /// A ScriptQuestion, with the Experience block newer simulators add.
+    pub fn script_question(object: Uuid, item: Uuid, object_name: &str, owner_name: &str, questions: i32, experience: bool) -> Vec<u8> {
+        let mut body = object.as_bytes().to_vec();
+        body.extend(item.as_bytes());
+        body.extend(string1(object_name));
+        body.extend(string1(owner_name));
+        body.extend(questions.to_le_bytes());
+        if experience {
+            body.extend([0; 16]);
+        }
+        body
+    }
+
+    pub fn object_properties_family(object: Uuid, owner: Uuid, group: Uuid) -> Vec<u8> {
+        let mut body = vec![0; 4]; // RequestFlags
+        for id in [object, owner, group] {
+            body.extend(id.as_bytes());
+        }
+        body.extend([0; 5 * 4 + 4 + 1 + 4 + 4 + 16]); // masks .. LastOwnerID
+        body.extend(string1("Dance Ball"));
+        body.extend(string1(""));
         body
     }
 
@@ -2077,12 +2236,14 @@ mod tests {
         let (sender, session, object) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
         let im = |dialog, id, offline, timestamp, from_name: &str, text: &str| Incoming::InstantMessage {
             from_agent: sender,
+            from_group: false,
             from_name: from_name.into(),
             dialog,
             id,
             offline,
             timestamp,
             text: text.into(),
+            bucket: vec![0],
         };
         assert_eq!(
             decode(low(254), &improved_instant_message(sender, "Jane Doe", 0, session, None, "hi")),
@@ -2098,6 +2259,107 @@ mod tests {
             Ok(im(0, session, true, 1_700_000_000, "Jane Doe", "later"))
         );
         assert_eq!(decode(low(254), &body[..80]), Err(DecodeError));
+    }
+
+    #[test]
+    fn decodes_the_group_flag_and_the_bucket_of_an_inventory_offer() {
+        let (owner, transaction, item) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
+        // An avatar's offer: the asset type and the item.
+        let bucket = [vec![7], item.as_bytes().to_vec()].concat();
+        let body = instant_message_with_bucket(owner, false, "Jane Doe", 4, transaction, None, "Rules", &bucket);
+        let Ok(Incoming::InstantMessage {
+            from_group,
+            dialog,
+            id,
+            bucket: read,
+            ..
+        }) = decode(low(254), &body)
+        else {
+            panic!("not an instant message")
+        };
+        assert_eq!((from_group, dialog, id, read), (false, 4, transaction, bucket));
+        // A group's object: the type alone, and the group as the sender.
+        let body = instant_message_with_bucket(owner, true, "Vendor", 9, transaction, None, "'Rules'", &[7]);
+        let Ok(Incoming::InstantMessage { from_group, bucket, .. }) = decode(low(254), &body) else {
+            panic!("not an instant message")
+        };
+        assert_eq!((from_group, bucket), (true, vec![7]));
+    }
+
+    #[test]
+    fn decodes_script_question_with_and_without_the_experience_block() {
+        let (object, item) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]));
+        for experience in [false, true] {
+            let body = script_question(object, item, "Dance Ball", "Jane Doe", 0x8010, experience);
+            assert_eq!(
+                decode(low(188), &body),
+                Ok(Incoming::ScriptQuestion {
+                    object,
+                    item,
+                    object_name: "Dance Ball".into(),
+                    owner_name: "Jane Doe".into(),
+                    questions: 0x8010,
+                })
+            );
+        }
+        let body = script_question(object, item, "Dance Ball", "Jane Doe", 0x10, false);
+        assert_eq!(decode(low(188), &body[..body.len() - 1]), Err(DecodeError));
+    }
+
+    #[test]
+    fn decodes_object_properties_family() {
+        let (object, owner, group) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
+        let body = object_properties_family(object, owner, group);
+        assert_eq!(
+            decode(medium(10), &body),
+            Ok(Incoming::ObjectPropertiesFamily { object, owner, group })
+        );
+        assert_eq!(decode(medium(10), &body[..40]), Err(DecodeError));
+    }
+
+    #[test]
+    fn encodes_script_answer_and_owner_request() {
+        let (object, item) = (Uuid::from_bytes([0x0B; 16]), Uuid::from_bytes([0x0C; 16]));
+        let msg = script_answer_yes(&agent(), object, item, 0x14);
+        assert_eq!((msg.id, msg.zerocoded), (low(132), false));
+        assert_eq!(
+            msg.body,
+            [agent_prefix(), vec![0x0B; 16], vec![0x0C; 16], vec![0x14, 0, 0, 0]].concat()
+        );
+        let msg = request_object_properties_family(&agent(), object);
+        assert_eq!((msg.id, msg.zerocoded), (medium(5), true));
+        assert_eq!(msg.body, [agent_prefix(), vec![0; 4], vec![0x0B; 16]].concat());
+    }
+
+    #[test]
+    fn an_accepted_inventory_offer_names_the_transaction_and_the_folder() {
+        let (to, transaction, folder) = (
+            Uuid::from_bytes([0x0F; 16]),
+            Uuid::from_bytes([0x0D; 16]),
+            Uuid::from_bytes([0x0E; 16]),
+        );
+        for (offered, accepted) in [(IM_INVENTORY_OFFERED, 5), (IM_TASK_INVENTORY_OFFERED, 10)] {
+            let msg = inventory_accepted(&agent(), "Sit Bot", to, [1.0, 2.0, 3.0], offered, transaction, folder);
+            assert_eq!((msg.id, msg.zerocoded), (low(254), true));
+            let expected = [
+                agent_prefix(),
+                vec![0],         // FromGroup
+                vec![0x0F; 16],  // ToAgentID
+                vec![0; 4 + 16], // ParentEstateID, RegionID
+                [1.0f32, 2.0, 3.0].iter().flat_map(|f| f.to_le_bytes()).collect(),
+                vec![0, accepted], // Offline, Dialog
+                vec![0x0D; 16],    // ID
+                vec![0; 4],        // Timestamp
+                vec![8],
+                b"Sit Bot\0".to_vec(),
+                vec![1, 0, 0], // Message
+                vec![16, 0],   // BinaryBucket
+                vec![0x0E; 16],
+                vec![0, 0, 0, 0, 0], // EstateID, MetaData block count
+            ]
+            .concat();
+            assert_eq!(msg.body, expected);
+        }
     }
 
     #[test]

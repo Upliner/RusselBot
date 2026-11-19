@@ -734,6 +734,9 @@ pub enum What {
     /// Wear this piece of clothing or body part.
     Wear(Item),
     TakeOff(Clothes),
+    /// The folder an item of this asset type is filed in when it is given
+    /// to the avatar. Answered with `Outcome::Folder`.
+    SystemFolder(i32),
 }
 
 /// One command's work for the worker.
@@ -772,6 +775,7 @@ pub enum Outcome {
     /// The Current Outfit folder was changed as asked; for `Wear` and
     /// `TakeOff`, the items put on or taken off.
     Outfit(Vec<Item>),
+    Folder(Uuid),
 }
 
 const LLSD: &str = "application/llsd+xml";
@@ -1020,6 +1024,19 @@ impl Service<'_> {
             .ok_or_else(|| Failed::Reason("the inventory has no Current Outfit folder".to_string()))
     }
 
+    /// Where a viewer files an item of this asset type that is given to
+    /// the avatar: the folder of that type at the top of My Inventory
+    /// (Objects, Notecards, ...), or the top itself where there is none,
+    /// as for a folder. Reads the top level and nothing below it.
+    fn system_folder(&self, asset_type: i32) -> Result<Uuid, Failed> {
+        if asset_type == ASSET_FOLDER || asset_type < 0 {
+            return Ok(self.root);
+        }
+        let top = self.folder(self.root, true, false)?;
+        let found = top.folders.iter().find(|folder| folder.folder_type == asset_type);
+        Ok(found.map_or(self.root, |folder| folder.id))
+    }
+
     /// The links in the Current Outfit folder.
     fn outfit_links(&self, folder: Uuid) -> Result<Vec<Item>, Failed> {
         let contents = self.folder(folder, false, true)?;
@@ -1228,6 +1245,7 @@ impl Service<'_> {
             What::OutfitObjects => Outcome::Items(self.outfit_objects()?),
             What::Wear(item) => Outcome::Outfit(self.wear(item)?),
             What::TakeOff(clothes) => Outcome::Outfit(self.take_off(clothes)?),
+            What::SystemFolder(asset_type) => Outcome::Folder(self.system_folder(*asset_type)?),
         })
     }
 }
@@ -3099,6 +3117,34 @@ mod grid_tests {
         // No folder: the reason the other outfit jobs give.
         rig.grid().folders.retain(|folder| folder.0 != OUTFIT);
         assert!(objects(&rig).unwrap_err().contains("no Current Outfit folder"));
+    }
+
+    #[test]
+    fn an_offered_item_goes_into_the_system_folder_for_its_type() {
+        let rig = Rig::new();
+        let notecards = Uuid::from_u128(0x707);
+        rig.grid().folders.push((notecards, ROOT, "Notecards".to_string(), ASSET_NOTECARD));
+        // One of that type further down is not what is looked for.
+        let objects = rig.grid().folders.iter().find(|folder| folder.2 == "Objects").unwrap().0;
+        rig.grid()
+            .folders
+            .push((Uuid::from_u128(0x708), objects, "Old sounds".to_string(), ASSET_SOUND));
+        let folder = |asset_type| match rig.run(What::SystemFolder(asset_type)) {
+            Ok(Outcome::Folder(folder)) => folder,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(folder(ASSET_NOTECARD), notecards);
+        // The top level is read, and nothing below it.
+        assert_eq!(rig.asked(), ["folders: My Inventory folders"]);
+        // No system folder for the type: the top of My Inventory.
+        assert_eq!(folder(ASSET_SOUND), ROOT);
+        assert_eq!(rig.asked(), ["folders: My Inventory folders"]);
+        // A folder that is given goes to the top without a look.
+        assert_eq!(folder(ASSET_FOLDER), ROOT);
+        assert_eq!(rig.asked(), [] as [&str; 0]);
+        // A grid that does not answer is the job's failure.
+        rig.grid().fail_reads = true;
+        assert!(rig.run(What::SystemFolder(ASSET_NOTECARD)).is_err());
     }
 
     #[test]

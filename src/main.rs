@@ -13,6 +13,7 @@ mod login;
 mod msglog;
 mod names;
 mod net;
+mod perms;
 mod persist;
 mod reconciler;
 mod rlv;
@@ -340,6 +341,15 @@ impl Grid for Live<'_> {
     fn play_sound(&mut self, sound: Uuid, now: Instant) -> Result<(), String> {
         self.session.play_sound(sound, now)
     }
+    fn object_owner(&mut self, object: Uuid, now: Instant) -> Result<(), String> {
+        self.session.request_object_owner(object, now)
+    }
+    fn grant_permissions(&mut self, object: Uuid, item: Uuid, permissions: i32, now: Instant) -> Result<(), String> {
+        self.session.grant_permissions(object, item, permissions, now)
+    }
+    fn accept_inventory(&mut self, to: Uuid, from_object: bool, transaction: Uuid, folder: Uuid, now: Instant) -> Result<(), String> {
+        self.session.accept_inventory(to, from_object, transaction, folder, now)
+    }
 }
 
 /// The session, if there is one, for commands to act on.
@@ -370,6 +380,7 @@ impl Bot {
         let book = Book::new(config_placement(&config));
         let mut commands = Commands::new(config.requesttp_timeout);
         commands.set_restore(config.restore_attachments);
+        commands.set_rules(config.perms.clone());
         Bot {
             rlv: Rlv::new(config.rlv, config.rlv_persist),
             follow: Follow::default(),
@@ -468,6 +479,14 @@ impl Bot {
     fn restore_attachments(&mut self, now: Instant) {
         let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
         self.commands.restore_due(live.as_mut(), now);
+    }
+
+    /// Decides the requests that waited too long for the grid to say who
+    /// is behind them (see `Commands::requests_due`).
+    fn decide_requests(&mut self, now: Instant) {
+        let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
+        self.commands.requests_due(live.as_mut(), now);
+        self.follow_commands();
     }
 
     /// Notices a hand-over to another simulator: the inventory services
@@ -862,28 +881,43 @@ impl Bot {
     /// Sends pending name lookups on their way and writes the messages
     /// whose names are settled.
     fn service_messages(&mut self) {
-        if self.recorder.has_lookups() {
-            match &self.names_url {
-                // The simulator has not said yet; the messages wait.
-                None => {}
-                Some(None) => {
-                    let ids = self.recorder.take_lookups();
-                    self.recorder.lookup_failed(&ids);
-                }
-                Some(Some(url)) => {
-                    let lookup = Lookup {
-                        url: url.clone(),
-                        ids: self.recorder.take_lookups(),
-                    };
-                    if let Err(unsent) = self.name_lookups.send(lookup) {
-                        self.recorder.lookup_failed(&unsent.0.ids);
-                    }
-                }
+        // The simulator has not said yet whether it knows names: the
+        // messages wait, and so do the requests, which give up by themselves.
+        if let Some(url) = self.names_url.clone() {
+            // The names the message log wants, and those of the owners of
+            // objects that offered inventory.
+            let mut ids = self.recorder.take_lookups();
+            ids.extend(self.commands.take_name_lookups());
+            let unanswered = match url {
+                _ if ids.is_empty() => Vec::new(),
+                None => ids,
+                Some(url) => match self.name_lookups.send(Lookup { url, ids }) {
+                    Ok(()) => Vec::new(),
+                    Err(unsent) => unsent.0.ids,
+                },
+            };
+            if !unanswered.is_empty() {
+                self.names_failed(&unanswered, Instant::now());
             }
         }
         for record in self.recorder.flush(Instant::now()) {
             self.logs.write(&record);
         }
+    }
+
+    /// The grid named these avatars and does not know those: the message
+    /// log and the requests that waited for a name go on.
+    fn names_resolved(&mut self, found: Vec<(Uuid, names::Names)>, missing: Vec<Uuid>, now: Instant) {
+        let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
+        self.commands.names_resolved(&found, &missing, live.as_mut(), now);
+        self.recorder.names_resolved(found, missing, now);
+    }
+
+    /// A name lookup came to nothing.
+    fn names_failed(&mut self, ids: &[Uuid], now: Instant) {
+        let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
+        self.commands.names_failed(ids, live.as_mut(), now);
+        self.recorder.lookup_failed(ids);
     }
 
     /// Writes every message still waiting for names; for use on the way out.
@@ -990,6 +1024,27 @@ impl Bot {
             SessionEvent::TeleportOffer { from, name, lure } => {
                 let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
                 self.commands.teleport_offer(from, &name, lure, live.as_mut(), now);
+                // One accepted by rule moves the avatar as a command does.
+                self.follow_commands();
+            }
+            SessionEvent::InventoryOffer(offer) => {
+                let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
+                self.commands.inventory_offer(offer, live.as_mut(), now);
+            }
+            SessionEvent::PermissionRequest {
+                object,
+                item,
+                object_name,
+                owner_name,
+                permissions,
+            } => {
+                let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
+                self.commands
+                    .permission_request(object, item, &object_name, &owner_name, permissions, live.as_mut(), now);
+            }
+            SessionEvent::ObjectOwner { object, owner, group } => {
+                let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
+                self.commands.object_owner(object, owner, group, live.as_mut(), now);
             }
             SessionEvent::TeleportRequested { from, name, text } => {
                 info!("{name} <{from}> asks to be teleported here ({text}); `rslbot ctl sendtp` offers it");
@@ -1150,8 +1205,8 @@ impl Bot {
             (Event::AvatarSearchFailed { query, reason }, _) => self.commands.lookup_failed(query, &reason),
             (Event::Datagram { generation, data }, Some(session)) => session.handle_datagram(generation, &data, now),
             (Event::Caps { generation, event }, Some(session)) => session.handle_caps(generation, event, now),
-            (Event::Names { found, missing }, _) => self.recorder.names_resolved(found, missing, now),
-            (Event::NamesFailed(ids), _) => self.recorder.lookup_failed(&ids),
+            (Event::Names { found, missing }, _) => self.names_resolved(found, missing, now),
+            (Event::NamesFailed(ids), _) => self.names_failed(&ids, now),
             // An answer about another simulator's inventory service is of
             // no use: the commands that asked were told so.
             (Event::Inventory { generation, .. }, Some(session)) if generation != session.generation() => {}
@@ -1356,6 +1411,7 @@ fn run_loop(bot: &mut Bot, incoming: &Receiver<Event>) -> i32 {
             return code;
         }
         bot.commands.tick(Instant::now());
+        bot.decide_requests(Instant::now());
         bot.restore_attachments(Instant::now());
         bot.service_messages();
         let mut wake = Instant::now() + IDLE_WAIT;
@@ -2304,5 +2360,117 @@ mod tests {
         assert!(!bot.rlv.has_waiting());
         // All of it is recorded as what it is.
         assert_eq!(bot.recorder.flush_all(Instant::now()).len(), 5);
+    }
+    // ------------------------------------------------ permission requests
+
+    fn holder(perms: &str) -> Bot {
+        bot(full(&format!("persist = \"cfg\"\n{perms}")))
+    }
+
+    fn janes_offer(byte: u8) -> SessionEvent {
+        SessionEvent::TeleportOffer {
+            from: Uuid::from_bytes([2; 16]),
+            name: "Jane Doe".to_string(),
+            lure: Uuid::from_bytes([byte; 16]),
+        }
+    }
+
+    #[test]
+    fn the_configs_perms_are_the_rules_the_bot_starts_with() {
+        let mut bot = holder(
+            "[perms.autoaccept]\ntp = [\"Jane Doe\"]\nanim = \"all\"\n\
+             [perms.except]\nanim = [\"01234567-9abc-defe-dcba-987654321000\"]\n",
+        );
+        assert_eq!(
+            ok(&mut bot, "perms\tstatus"),
+            "tp: Jane Doe\ninventory: none\nanim: all except 01234567-9abc-defe-dcba-987654321000\n\
+             attach: none\ncontrols: none\ncamera: none"
+        );
+        // Without the table nothing is accepted by itself.
+        let mut bot = holder("");
+        assert!(ok(&mut bot, "perms\tstatus").starts_with("tp: none\ninventory: none\n"));
+    }
+
+    #[test]
+    fn perms_commands_work_between_logins_and_leave_the_placement_mode() {
+        let mut bot = holder("");
+        assert_eq!(ok(&mut bot, "perms\tautoaccept\ttp\tJane Doe"), "tp: Jane Doe is auto-accepted");
+        assert_eq!(
+            ok(&mut bot, "perms\tautoaccept\ttp\tjane.doe"),
+            "warning: jane.doe was auto-accepted for tp already"
+        );
+        assert_eq!(ok(&mut bot, "perms\trevoke\ttp\tall"), "tp: nothing is auto-accepted any more");
+        assert!(refused(&mut bot, "perms\tautoaccept\tmoney\tall").contains("no kind of request"));
+        assert!(!bot.reconciler.is_manual());
+        // `accept` needs the avatar in a region, under either name.
+        for line in ["accept\ttp", "accepttp", "accept\tanim", "accepttp\tJane Doe"] {
+            assert_eq!(refused(&mut bot, line), session::NOT_CONNECTED, "{line}");
+        }
+        assert!(!bot.reconciler.is_manual());
+    }
+
+    #[test]
+    fn a_teleport_offer_that_waits_leaves_the_bot_holding() {
+        let mut bot = holder("");
+        assert!(matches!(bot.apply(janes_offer(1), Instant::now()), Flow::Continue));
+        assert!(!bot.reconciler.is_manual());
+        assert_eq!(
+            ok(&mut bot, "perms\tstatus").lines().last(),
+            Some("waiting: tp from Jane Doe <02020202-0202-0202-0202-020202020202>")
+        );
+        // The session's end takes the offer with it.
+        bot.drop_session();
+        assert_eq!(ok(&mut bot, "perms\tstatus").lines().count(), 6);
+    }
+
+    #[test]
+    fn a_teleport_offer_accepted_by_rule_puts_a_holding_bot_in_manual_mode() {
+        let mut bot = holder("[perms.autoaccept]\ntp = [\"Jane Doe\"]\n");
+        let held = bot.book.held().clone();
+        assert!(!bot.reconciler.is_manual());
+        // On a simulator that takes everything, as in `apply`.
+        let mut grid = commands::tests::FakeGrid::default();
+        let (jane, lure) = (Uuid::from_bytes([2; 16]), Uuid::from_bytes([1; 16]));
+        bot.commands.teleport_offer(jane, "Jane Doe", lure, Some(&mut grid), Instant::now());
+        bot.follow_commands();
+        assert_eq!(grid.calls, [commands::tests::Call::AcceptTp(lure)]);
+        assert!(bot.reconciler.is_manual());
+        // What was held is what `home` returns to.
+        assert_eq!(bot.book.held(), &held);
+        assert_eq!(ok(&mut bot, "home"), held.to_string());
+        assert!(!bot.reconciler.is_manual());
+
+        // An avatar that is not listed changes nothing.
+        let mut grid = commands::tests::FakeGrid::default();
+        bot.commands
+            .teleport_offer(Uuid::from_bytes([3; 16]), "John Roe", lure, Some(&mut grid), Instant::now());
+        bot.follow_commands();
+        assert!(grid.calls.is_empty());
+        assert!(!bot.reconciler.is_manual());
+    }
+
+    #[test]
+    fn granting_a_script_or_accepting_inventory_leaves_the_bot_holding() {
+        let mut bot = holder("[perms.autoaccept]\nanim = \"all\"\ninventory = \"all\"\n");
+        let mut grid = commands::tests::FakeGrid::default();
+        let (ball, script, jane) = (Uuid::from_bytes([7; 16]), Uuid::from_bytes([8; 16]), Uuid::from_bytes([2; 16]));
+        let now = Instant::now();
+        bot.commands
+            .permission_request(ball, script, "Dance Ball", "Jane Doe", 0x10, Some(&mut grid), now);
+        bot.commands.object_owner(ball, jane, Uuid::nil(), Some(&mut grid), now);
+        let offer = session::InventoryOffer {
+            from: jane,
+            name: "Jane Doe".to_string(),
+            from_group: false,
+            from_object: false,
+            transaction: Uuid::from_bytes([9; 16]),
+            asset_type: inventory::ASSET_NOTECARD,
+            text: "Rules".to_string(),
+        };
+        bot.commands.inventory_offer(offer, Some(&mut grid), now);
+        bot.follow_commands();
+        assert!(grid.calls.contains(&commands::tests::Call::Grant(ball, script, 0x10)));
+        assert_eq!(grid.jobs.len(), 1, "the folder for the notecard is being looked for");
+        assert!(!bot.reconciler.is_manual());
     }
 }

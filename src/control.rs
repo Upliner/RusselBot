@@ -41,7 +41,8 @@ Usage: rslbot ctl say MESSAGE...
        rslbot ctl sit UUID | ground
        rslbot ctl tp X Y [Z] [REGION...]
        rslbot ctl requesttp AVATAR [MESSAGE...]
-       rslbot ctl accepttp AVATAR
+       rslbot ctl accept KIND [WHO]
+       rslbot ctl accepttp [AVATAR]
        rslbot ctl sendtp AVATAR [MESSAGE...]
        rslbot ctl touch UUID
        rslbot ctl inventory [-a] [-n] [FOLDER]
@@ -53,6 +54,9 @@ Usage: rslbot ctl say MESSAGE...
        rslbot ctl persist [LOCATION] [SIT]
        rslbot ctl home
        rslbot ctl status
+       rslbot ctl perms autoaccept KIND all | WHO...
+       rslbot ctl perms revoke KIND all | WHO...
+       rslbot ctl perms status
        rslbot ctl rlv mode on | off
        rslbot ctl rlv persist follow | drop
        rslbot ctl rlv status
@@ -64,13 +68,29 @@ Sends a command to a running bot that has `socket = true` in its config.
 so `/1 hello` goes to channel 1. `im` sends an instant message. AVATAR is
 one argument: \"First Last\", first.last, a single word or a UUID.
 
-`stand`, `sit`, `tp`, `requesttp` and `accepttp` move the avatar, and the
+`stand`, `sit`, `tp`, `requesttp` and `accept tp` move the avatar, and the
 bot then leaves it where it is until `persist` or `home`. `tp` without
 REGION stays in the current region, and without Z keeps the current height.
-`requesttp` asks AVATAR to teleport the bot to them; `accepttp` accepts an
-offer AVATAR has sent; `sendtp` offers AVATAR a teleport to the bot. `touch`
-clicks an object. `status` shows where the avatar is; `quit` logs out and
-stops the bot.
+`requesttp` asks AVATAR to teleport the bot to them; `sendtp` offers AVATAR
+a teleport to the bot. `touch` clicks an object. `status` shows where the
+avatar is; `quit` logs out and stops the bot.
+
+`accept` accepts a request that waits because the bot did not accept it by
+itself. KIND is what was asked: `tp` (a teleport offer), `inventory` (an
+inventory offer), or what a script asked permission for: `anim`, `attach`,
+`controls`, `camera`. Without WHO the request received last is accepted,
+with WHO the last one from that avatar, that object, or an object of that
+avatar. WHO is one argument, an avatar as above or an object's UUID. A
+script that asked for several permissions is granted all of them.
+`accepttp [AVATAR]` is the older name of `accept tp [AVATAR]` and is
+deprecated.
+
+`perms autoaccept` and `perms revoke` change which requests of a KIND the
+bot accepts by itself: `all`, or the avatars and objects named. An avatar
+stands for its objects too. While everyone is accepted, revoking a WHO
+makes it an exception. `perms status` prints what is accepted for each
+kind, and the requests that wait. These changes are not saved; the config's
+`[perms.autoaccept]` and `[perms.except]` tables are.
 
 `persist` tells the bot what to hold from now on: it returns to LOCATION
 when the avatar ends up in another region, and keeps it seated as SIT says.
@@ -133,7 +153,12 @@ pub enum Request {
         to: String,
         message: String,
     },
-    AcceptTp(String),
+    /// `accept KIND [WHO]`, both still to be read. `accepttp [AVATAR]` is
+    /// `accept tp [AVATAR]`.
+    Accept {
+        kind: String,
+        who: Option<String>,
+    },
     SendTp {
         to: String,
         message: String,
@@ -168,7 +193,24 @@ pub enum Request {
     Home,
     Status,
     Rlv(RlvRequest),
+    Perms(PermsRequest),
     Quit,
+}
+
+/// The `perms` commands. Kinds and entries are still to be read.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PermsRequest {
+    /// `perms autoaccept KIND all|WHO...`
+    Autoaccept {
+        kind: String,
+        who: Vec<String>,
+    },
+    /// `perms revoke KIND all|WHO...`
+    Revoke {
+        kind: String,
+        who: Vec<String>,
+    },
+    Status,
 }
 
 /// The `rlv` commands.
@@ -261,9 +303,55 @@ impl Request {
                 let (to, message) = avatar_and_message(fields);
                 Ok(Request::AskTp { to, message })
             }
+            "accept" => {
+                if given == 0 || given > 2 {
+                    return Err(
+                        "`accept` takes a kind of request and, if wanted, who sent it: `accept KIND [WHO]`; \
+                                a name of two words has to be quoted"
+                            .to_string(),
+                    );
+                }
+                let mut fields = fields.into_iter();
+                Ok(Request::Accept {
+                    kind: fields.next().unwrap_or_default(),
+                    who: fields.next(),
+                })
+            }
+            // The older name of `accept tp`.
             "accepttp" => {
-                arguments(1)?;
-                Ok(Request::AcceptTp(fields.remove(0)))
+                if given > 1 {
+                    return Err(format!(
+                        "`accepttp` takes at most 1 argument, an avatar, not {given}; a name of two words has to be quoted"
+                    ));
+                }
+                Ok(Request::Accept {
+                    kind: "tp".to_string(),
+                    who: fields.pop(),
+                })
+            }
+            "perms" => {
+                let usage = |command: &str| {
+                    format!("`perms {command}` takes a kind of request and whom it is about: `perms {command} KIND all|WHO...`")
+                };
+                let mut fields = fields.into_iter();
+                let perms = match fields.next().as_deref() {
+                    Some("status") if given == 1 => PermsRequest::Status,
+                    Some("status") => return Err("`perms status` takes no arguments".to_string()),
+                    Some(command @ ("autoaccept" | "revoke")) => {
+                        let (Some(kind), who) = (fields.next(), fields.collect::<Vec<_>>()) else {
+                            return Err(usage(command));
+                        };
+                        if who.is_empty() {
+                            return Err(usage(command));
+                        }
+                        match command {
+                            "autoaccept" => PermsRequest::Autoaccept { kind, who },
+                            _ => PermsRequest::Revoke { kind, who },
+                        }
+                    }
+                    _ => return Err("`perms` takes `autoaccept KIND all|WHO...`, `revoke KIND all|WHO...` or `status`".to_string()),
+                };
+                Ok(Request::Perms(perms))
             }
             "sendtp" => {
                 at_least(1)?;
@@ -667,7 +755,13 @@ mod tests {
                 message: text("come and see")
             })
         );
-        assert_eq!(Request::decode(b"accepttp\tjane.doe"), Ok(Request::AcceptTp(text("jane.doe"))));
+        assert_eq!(
+            Request::decode(b"accepttp\tjane.doe"),
+            Ok(Request::Accept {
+                kind: text("tp"),
+                who: Some(text("jane.doe"))
+            })
+        );
         assert_eq!(Request::decode(b"touch\tabc"), Ok(Request::Touch(text("abc"))));
         assert_eq!(Request::decode(b"home"), Ok(Request::Home));
         assert_eq!(Request::decode(b"persist"), Ok(Request::Persist { location: None, sit: None }));
@@ -840,6 +934,67 @@ mod tests {
         }
         assert_eq!(refused("rlv\tstatus\tnow"), "`rlv status` takes no arguments");
         assert!(refused("rlv\tcmd").contains("`rlv cmd` takes an RLV command"));
+    }
+
+    #[test]
+    fn accept_and_perms_requests_are_read_from_their_lines() {
+        let read = |line: &str| Request::decode(line.as_bytes());
+        let accept = |kind: &str, who: Option<&str>| {
+            Ok(Request::Accept {
+                kind: kind.to_string(),
+                who: who.map(str::to_string),
+            })
+        };
+        assert_eq!(read("accept\ttp"), accept("tp", None));
+        assert_eq!(read("accept\ttp\tJane Doe\n"), accept("tp", Some("Jane Doe")));
+        assert_eq!(
+            read("accept\tanim\t01234567-9abc-defe-dcba-987654321000"),
+            accept("anim", Some("01234567-9abc-defe-dcba-987654321000"))
+        );
+        // The kind is read later, where the kinds are known.
+        assert_eq!(read("accept\tmoney"), accept("money", None));
+        // The older name of `accept tp`, with its avatar optional now.
+        assert_eq!(read("accepttp"), accept("tp", None));
+        assert_eq!(read("accepttp\tJane Doe"), accept("tp", Some("Jane Doe")));
+
+        assert_eq!(read("perms\tstatus"), Ok(Request::Perms(PermsRequest::Status)));
+        assert_eq!(
+            read("perms\tautoaccept\tinventory\t01234567-9abc-defe-dcba-987654321000\tAvatar1"),
+            Ok(Request::Perms(PermsRequest::Autoaccept {
+                kind: "inventory".to_string(),
+                who: strings(&["01234567-9abc-defe-dcba-987654321000", "Avatar1"]),
+            }))
+        );
+        assert_eq!(
+            read("perms\trevoke\tanim\tall"),
+            Ok(Request::Perms(PermsRequest::Revoke {
+                kind: "anim".to_string(),
+                who: strings(&["all"]),
+            }))
+        );
+    }
+
+    #[test]
+    fn malformed_accept_and_perms_requests_are_refused() {
+        let refused = |line: &str| Request::decode(line.as_bytes()).unwrap_err();
+        for line in ["accept", "accept\ttp\tJane\tDoe"] {
+            assert!(refused(line).contains("`accept KIND [WHO]`"), "{line}");
+        }
+        assert!(refused("accepttp\ta\tb").contains("`accepttp` takes at most 1 argument"));
+        for line in ["perms", "perms\tlist", "perms\tStatus"] {
+            let reason = refused(line);
+            assert!(
+                reason.contains("`autoaccept KIND all|WHO...`") && reason.contains("`status`"),
+                "{line}: {reason}"
+            );
+        }
+        assert_eq!(refused("perms\tstatus\tnow"), "`perms status` takes no arguments");
+        for line in ["perms\tautoaccept", "perms\tautoaccept\tanim"] {
+            assert!(refused(line).contains("`perms autoaccept KIND all|WHO...`"), "{line}");
+        }
+        for line in ["perms\trevoke", "perms\trevoke\tanim"] {
+            assert!(refused(line).contains("`perms revoke KIND all|WHO...`"), "{line}");
+        }
     }
 
     #[test]
