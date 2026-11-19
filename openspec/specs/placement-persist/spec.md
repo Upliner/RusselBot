@@ -175,14 +175,14 @@ A persist carried out because of the config's `persist` setting counts as a pers
 - **THEN** the command is carried out
 
 ### Requirement: Config persist setting applied after startup
-The config's `persist` setting (see `bot-config`) names `cur` or `cfg` for the location and for the sit state, or is off. The bot SHALL start in holding mode with the config placement and work towards it. The config placement counts as reached when the avatar is connected and in the held location's region and, according to the config's `sit`: with an object, the simulator has confirmed the avatar seated on it; with `ground`, the ground sit has been handed to the simulator connection; without `sit`, nothing more.
+The config's `persist` setting (see `bot-config`) names `cur` or `cfg` for the location and for the sit state, or is off; a config without the setting counts as off. The bot SHALL start in holding mode with the config placement and work towards it. The config placement counts as reached when the avatar is connected and in the held location's region and, according to the config's `sit`: with an object, the simulator has confirmed the avatar seated on it; with `ground`, the ground sit has been handed to the simulator connection; without `sit`, nothing more.
 
 The first time the config placement is reached, the bot SHALL carry out a persist with the setting's two values, exactly as the `persist` command with those arguments would, and log it with the placement that results; when the setting is off it SHALL switch to manual mode instead and log that. When the location value is `cur` and the avatar has just been seated on an object, the bot SHALL wait for the avatar's seated position to be known, for at most 10 seconds, before carrying the persist out; after 10 seconds it SHALL carry it out with the position it has and say so in the log.
 
 The setting SHALL be applied at most once in a run of the bot. It SHALL NOT be applied when, before the config placement was reached, a `persist` or `home` command or a command that puts the bot in manual mode was carried out. A session loss before the config placement is reached SHALL NOT cancel it: the bot keeps working towards the config placement after the next login.
 
-#### Scenario: Default setting with a full config
-- **WHEN** the config has `region`, `position` and `sit` with the UUID of a child prim, no `persist` key, and the simulator seats the avatar on the root prim of that linkset
+#### Scenario: Setting cur with a full config
+- **WHEN** the config has `region`, `position`, `sit` with the UUID of a child prim and `persist = "cur"`, and the simulator seats the avatar on the root prim of that linkset
 - **THEN** after sitting the bot holds the avatar's seated position as its location and the root prim as its sit state, and `status` shows both on its `persist` line
 
 #### Scenario: Setting cfg
@@ -190,16 +190,24 @@ The setting SHALL be applied at most once in a run of the bot. It SHALL NOT be a
 - **THEN** the bot holds the configured `position` and the configured `sit` UUID: it logs in there, teleports there and sits on that UUID, before and after the setting is applied
 
 #### Scenario: Seat without a region
-- **WHEN** the config has `sit` with an object's UUID, neither `region` nor `persist`, and the login places the avatar in `Target`, where the object is
+- **WHEN** the config has `sit` with an object's UUID, `persist = "cur"` and no `region`, and the login places the avatar in `Target`, where the object is
 - **THEN** the bot sits on the object, then holds the seated position in `Target`; when the avatar is later teleported to `Home`, the bot teleports back to that position and sits again
 
 #### Scenario: Account alone
-- **WHEN** the config names neither `region`, `sit` nor `persist`, and the login places the avatar in `Home`
+- **WHEN** the config has `persist = "cur"` and names neither `region` nor `sit`, and the login places the avatar in `Home`
 - **THEN** the bot holds the position it arrived at in `Home` with sit state `stand`: it does not sit, and it teleports back there when the avatar is moved to another region
 
 #### Scenario: Setting off
 - **WHEN** the config has `region`, `position`, `sit` with an object's UUID and `persist = "off"`
 - **THEN** the bot logs in at the configured place and sits on the object, then switches to manual mode: when unseated it does not sit again, and after a kick it logs in at the last location and neither teleports nor sits
+
+#### Scenario: No setting
+- **WHEN** the config has `region`, `position`, `sit` with an object's UUID and no `persist` key
+- **THEN** the bot behaves as with `persist = "off"`: it sits on the object once and then is in manual mode
+
+#### Scenario: No setting and nothing but the account
+- **WHEN** the config names neither `region`, `sit` nor `persist`, and the login places the avatar in `Home`
+- **THEN** the bot switches to manual mode as soon as the avatar is connected: it does not sit, and it does not teleport back when the avatar is moved to another region
 
 #### Scenario: Different values for location and sit state
 - **WHEN** the config has `region`, `position`, `sit` with an object's UUID and a `[persist]` table with `position = "cfg"` and `sit = "cur"`

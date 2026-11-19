@@ -46,22 +46,21 @@ target/release/rslbot path/to/other.toml
 target/release/rslbot --verbose     # also log every simulator message
 ```
 
-The bot keeps working towards "logged in", "in the region it holds" and
-"seated as it holds". It logs in again after a kick, a region restart or a
-network outage, teleports back when moved to another region, and sits again
-when unseated, each with growing delays between attempts. Everything it
-does is logged to standard error with UTC timestamps.
+The bot logs in, takes the avatar to the place the config describes, and
+keeps it online: it logs in again after a kick, a region restart or a
+network outage, with growing delays between attempts. Everything it does is
+logged to standard error with UTC timestamps.
 
-What it holds is a placement: a location (a region and coordinates in it)
-and a sit state (an object, the ground, standing, or "leave it alone"). It
-starts out with the placement the config describes:
+The place is a placement: a location (a region and coordinates in it) and a
+sit state (an object, the ground, standing, or "leave it alone"). The
+config describes it like this:
 
 * `region` and `position`: the bot logs in there and teleports there when
   the login lands in another region. Without them the first login goes
   where `start` says, and the place it arrives at is the location.
-* `sit` with an object's UUID: the bot sits on that object and sits again
-  when unseated. After three failed sits it teleports to the location and
-  tries from there.
+* `sit` with an object's UUID: the bot sits on that object, trying again
+  with growing delays when a sit fails. After three failed sits it
+  teleports to the location and tries from there.
 * `sit = "ground"`: the bot sits the avatar on the ground. The simulator
   does not confirm a ground sit, so the bot sends it once each time the
   avatar arrives somewhere, stands up from an object, or a placement is
@@ -69,21 +68,28 @@ starts out with the placement the config describes:
 * Without `sit` the bot does not sit the avatar.
 
 Once the avatar is there (logged in, and seated when `sit` names an
-object), `persist` decides what the bot holds from then on:
+object), `persist` decides whether the bot holds a placement from then on,
+and which:
 
-* `persist = "cur"`, the default: the position and the seat the simulator
-  reported at that moment. The position is where the avatar really is,
-  on its seat when it sits, and the seat is the prim the simulator sat it
-  on, which in a linkset may not be the one `sit` names.
+* Without `persist`, or with `persist = "off"`: none. The bot goes to
+  manual mode and leaves the avatar alone; it only keeps it logged in. An
+  avatar that is unseated or moved away stays that way, and after a kick
+  the bot logs in at the avatar's last location.
 * `persist = "cfg"`: `position` and `sit` exactly as the config has them.
-* `persist = "off"`: nothing. The bot goes to manual mode and leaves the
-  avatar alone; it only keeps it logged in.
+* `persist = "cur"`: the position and the seat the simulator reported at
+  that moment. The position is where the avatar really is, on its seat
+  when it sits, and the seat is the prim the simulator sat it on, which in
+  a linkset may not be the one `sit` names.
 
-Inside the region it holds, the bot does not put the avatar back where it
-was: it reacts to a change of region, and to being unseated from a held
-object. `rslbot ctl persist` changes the held placement while the bot runs,
-see [Holding a place](#holding-a-place). Nothing of it is saved: a
-restarted bot starts from the config again.
+A bot that holds a placement keeps working towards "in the region it
+holds" and "seated as it holds": it logs in there after a kick, teleports
+back when the avatar is moved to another region, and sits again when
+unseated, each with growing delays between attempts. Inside the region it
+holds, it does not put the avatar back where it was: it reacts to a change
+of region, and to being unseated from a held object. `rslbot ctl persist`
+sets or changes the held placement while the bot runs, see
+[Holding a place](#holding-a-place). Nothing of it is saved: a restarted
+bot starts from the config again.
 
 Stop it with Ctrl-C or SIGTERM: it logs out and exits. A second signal exits
 immediately.
@@ -104,12 +110,12 @@ One TOML file; see `russelbot.example.toml`.
 | `user` | yes | `First Last`, or a single word (last name `Resident`) |
 | `password` | one of the two | Plain password |
 | `password_hash` | one of the two | Output of `rslbot hash` |
-| `region` | no, but only with `position` | Region the avatar starts out in; the bot logs in there and holds it until a persist names another |
+| `region` | no, but only with `position` | Region the avatar starts out in; the bot logs in there, and returns there when `persist` says to hold the configured place |
 | `position` | no, but only with `region` | `[x, y, z]` inside the region; pick a spot close to the object to sit on |
-| `start` | no, and only without `region` and `position` | Where a login puts the avatar while the bot holds no location, which is the first login: `"home"` (its home location) or `"latest"` (where it was last). Default: `"latest"` |
+| `start` | no, and only without `region` and `position` | Where the first login puts the avatar: `"home"` (its home location) or `"latest"` (where it was last). Default: `"latest"` |
 | `sit` | no | What to sit on at the start: the UUID of an object, or `"ground"`. Default: the avatar stands, and the bot does not sit it |
 | `object` | no | Deprecated spelling of `sit`, for a UUID only; the bot logs a warning. Not together with `sit` |
-| `persist` | no | What the bot holds once the avatar is at the place above: `"cur"`, `"cfg"`, `"off"` or `false`, an array, or a table; see below. Default: `"cur"` |
+| `persist` | no | What the bot holds once the avatar is at the place above, if anything: `"off"` or `false`, `"cfg"`, `"cur"`, an array, or a table; see below. Default: `"off"` |
 | `log_chat` | no | File that receives local chat, see [Chat and IM logs](#chat-and-im-logs) |
 | `log_im` | no | File that receives instant messages |
 | `fetch_offline_im` | no | `true` to also fetch IMs stored while the avatar was offline. Default: `false` |
@@ -121,23 +127,26 @@ One TOML file; see `russelbot.example.toml`.
 
 | Form | Meaning |
 |---|---|
-| `"cur"` | Hold the position and the seat the simulator reported |
+| `"off"` or `false` | Hold nothing: manual mode once the avatar is in place. The same as leaving `persist` out |
 | `"cfg"` | Keep holding `position` and `sit` as configured |
-| `"off"` or `false` | Hold nothing: manual mode once the avatar is in place |
+| `"cur"` | Hold the position and the seat the simulator reported |
 | `["cfg", "cur"]` | An array of two, each `"cur"` or `"cfg"`: the first for the position, the second for the seat |
-| `[persist]` with `position` and `sit` | The same as a table, each `"cur"` or `"cfg"`; a key left out is `"cur"`. As a TOML table it has to come after all other keys |
+| `[persist]` with `position` and `sit` | The same as a table, each `"cur"` or `"cfg"`; a key left out of the table is `"cur"`. As a TOML table it has to come after all other keys |
 
 ### Upgrading
 
 Configs written for earlier versions still load, but three things changed:
 
-* The bot used to hold `position` and the `sit` UUID exactly as configured.
-  It now holds what the simulator reported after it sat (`persist = "cur"`).
-  Add `persist = "cfg"` to keep the old behaviour.
-* A config without `region` used to mean "never teleport". Now the bot
-  returns to where it settled when the avatar is moved to another region,
-  and logs in there after a kick. Add `persist = "off"` for a bot that
-  does not move the avatar by itself.
+* The bot used to hold `position` and the `sit` UUID for as long as it
+  ran: it teleported back when the avatar was moved to another region and
+  sat again when unseated. Now it goes there and sits once, and then
+  leaves the avatar alone unless `persist` is set. Add `persist = "cfg"`
+  to keep the old behaviour.
+* A config without `region` used to mean "never teleport". With `persist`
+  set, the bot now returns to the place the first login arrived at when
+  the avatar is moved to another region, and logs in there after a kick.
+  Without `persist` it still does not move the avatar by itself, but it
+  does not sit it again either.
 * `rslbot ctl home` returns to the last persisted placement, which need not
   be the configured one; `rslbot ctl persist cfg cfg` returns to the config.
 
@@ -259,13 +268,15 @@ for a leading `/1`, which it would otherwise turn into a path.
 
 ### Moving, and staying put
 
-Left alone the bot holds its place: it returns to the region and the seat
-it holds whenever it finds the avatar elsewhere. `stand`, `unsit`, `sit`,
-`tp`, `requesttp` and `accepttp` switch that off. From then on the bot is
-in manual mode: it stays logged in, and logs in again after a kick or an
-outage (at the avatar's last location), but it no longer teleports or sits
-by itself. `persist` and `home` switch holding back on, and the bot acts
-at once. `home` is not the avatar's home location: it is the place the bot
+A bot that holds a place, because the config has `persist` or a `persist`
+or `home` command was given, returns to the region and the seat it holds
+whenever it finds the avatar elsewhere. `stand`, `unsit`, `sit`, `tp`,
+`requesttp` and `accepttp` switch that off. From then on the bot is in
+manual mode, as it is without `persist` in the config once the avatar has
+got to the configured place: it stays logged in, and logs in again after a
+kick or an outage (at the avatar's last location), but it no longer
+teleports or sits by itself. `persist` and `home` switch holding on, and
+the bot acts at once. `home` is not the avatar's home location: it is the place the bot
 held last. Manual mode ends with the bot process too; a restarted bot
 starts from its config. `sendtp`, `touch` and the talking commands leave
 the mode alone.

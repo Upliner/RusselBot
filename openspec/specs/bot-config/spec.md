@@ -20,7 +20,7 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `start` | no, and only without `region` and `position` | Where a login places the avatar while the bot holds no location: `"home"` for the avatar's home location, `"latest"` for the location it was last at. Defaults to `"latest"` |
 | `sit` | no | Sit state of the config placement: the UUID of an object, or the word `ground`. When absent the config placement's sit state is `stand` and the bot does not seat the avatar at startup |
 | `object` | no | Deprecated spelling of `sit`, accepting a UUID only |
-| `persist` | no | What the bot holds once it has reached the config placement after startup (see `placement-persist`); the forms are given below. Defaults to `"cur"` |
+| `persist` | no | What the bot holds once it has reached the config placement after startup (see `placement-persist`); the forms are given below. Defaults to `"off"` |
 | `log_chat` | no | Path of the TSV file that receives local chat; no chat file is written when absent |
 | `log_im` | no | Path of the TSV file that receives instant messages; no IM file is written when absent |
 | `fetch_offline_im` | no | Boolean; when true the bot fetches instant messages stored while the avatar was offline. Defaults to false |
@@ -34,19 +34,19 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 |---|---|
 | `"cur"` | Location and sit state both `cur`: hold what the simulator reports once the config placement is reached |
 | `"cfg"` | Location and sit state both `cfg`: keep holding the config placement |
-| `"off"` or `false` | Hold nothing: switch to manual mode once the config placement is reached. The two spellings are equivalent |
+| `"off"` or `false` | Hold nothing: switch to manual mode once the config placement is reached. The two spellings are equivalent, and a config without the key behaves the same |
 | An array of two strings, each `"cur"` or `"cfg"` | The first is the value for the location, the second the value for the sit state |
-| A table with the keys `position` and `sit`, each `"cur"` or `"cfg"` | `position` is the value for the location, `sit` the value for the sit state; a key that is left out is `"cur"` |
+| A table with the keys `position` and `sit`, each `"cur"` or `"cfg"` | `position` is the value for the location, `sit` the value for the sit state; a key that is left out of the table is `"cur"` |
 
 A relative `log_chat` or `log_im` path SHALL be taken relative to the directory the bot was started in. A config that uses `object` SHALL behave exactly as the same config with that value under `sit`, and the bot SHALL write a line to standard error at startup that names `object` as deprecated and `sit` as its replacement.
 
 #### Scenario: Minimal config for Second Life
 - **WHEN** the config contains only `user` and `password_hash`
-- **THEN** the bot starts, uses the Second Life Agni login URL, logs in at the avatar's last location, does not sit the avatar, and from then on holds the location it arrived at
+- **THEN** the bot starts, uses the Second Life Agni login URL, logs in at the avatar's last location, does not sit the avatar, and is in manual mode from then on
 
 #### Scenario: Full placement
 - **WHEN** the config contains `region`, `position` and `sit` with the UUID of an object
-- **THEN** the bot logs in at that position, sits on that object, and from then on holds the location and seat the simulator reported
+- **THEN** the bot logs in at that position, sits on that object, and is in manual mode from then on: it neither teleports nor sits again by itself
 
 #### Scenario: Ground sit
 - **WHEN** the config contains `sit = "ground"`
@@ -62,7 +62,11 @@ A relative `log_chat` or `log_im` path SHALL be taken relative to the directory 
 
 #### Scenario: Persist not mentioned
 - **WHEN** the config has no `persist` key
-- **THEN** the bot behaves as with `persist = "cur"`
+- **THEN** the bot behaves as with `persist = "off"`
+
+#### Scenario: Persist as the simulator reports
+- **WHEN** the config contains `region`, `position`, `sit` with the UUID of an object and `persist = "cur"`
+- **THEN** the bot logs in at that position, sits on that object, and from then on holds the location and seat the simulator reported
 
 #### Scenario: Persist as the config says
 - **WHEN** the config contains `region`, `position`, `sit` and `persist = "cfg"`

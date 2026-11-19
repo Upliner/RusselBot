@@ -166,7 +166,7 @@ To touch an object the bot must have learned of it from the simulator. Until a s
 - **THEN** the objects of the old region are forgotten, and without `scan_distance` nothing is asked of the new simulator until the next `touch` or sit
 
 ### Requirement: Commands that suspend automatic placement
-The bot SHALL be in one of two placement modes: holding, in which it works towards the held placement (see `placement-persist`), and manual, in which it does not move or seat the avatar by itself. It SHALL start in holding mode. A `stand`, `unsit`, `sit`, `tp`, `requesttp` or `accepttp` command that is carried out SHALL put the bot in manual mode before it acts; a command that is refused SHALL NOT change the mode. `sendtp`, `touch`, `status`, `say`, `shout`, `whisper` and `im` SHALL NOT change the mode. Manual mode SHALL last until a `persist` or `home` command is carried out or until the bot process ends, across session losses and logins. Besides those commands, the bot enters manual mode by itself only once, after startup, when the config says `persist = "off"`. The held placement SHALL NOT be changed by entering or being in manual mode.
+The bot SHALL be in one of two placement modes: holding, in which it works towards the held placement (see `placement-persist`), and manual, in which it does not move or seat the avatar by itself. It SHALL start in holding mode. A `stand`, `unsit`, `sit`, `tp`, `requesttp` or `accepttp` command that is carried out SHALL put the bot in manual mode before it acts; a command that is refused SHALL NOT change the mode. `sendtp`, `touch`, `status`, `say`, `shout`, `whisper` and `im` SHALL NOT change the mode. Manual mode SHALL last until a `persist` or `home` command is carried out or until the bot process ends, across session losses and logins. Besides those commands, the bot enters manual mode by itself only once, after startup, when the config's `persist` setting is off, which it is when the config says `persist = "off"` or has no `persist` key. The held placement SHALL NOT be changed by entering or being in manual mode.
 
 #### Scenario: Staying where it was put
 - **WHEN** `rslbot ctl tp 128 128 25 Home` has been carried out and an hour passes
@@ -204,7 +204,7 @@ The bot SHALL be in one of two placement modes: holding, in which it works towar
 - **THEN** the bot teleports to the configured region and position and sits as configured
 
 #### Scenario: Home without a configured region
-- **WHEN** the config has `start = "home"`, `sit = "ground"` and no `region`, the bot has settled in `Target` and holds its place there, and `rslbot ctl home` is run after a `tp` command took the avatar to another region
+- **WHEN** the config has `start = "home"`, `sit = "ground"` and no `region`, the first login placed the avatar in `Target`, and `rslbot ctl home` is run after a `tp` command took the avatar to another region
 - **THEN** the bot teleports back to the place it holds in `Target` and sits the avatar on the ground there
 
 #### Scenario: Home prints the placement
@@ -215,7 +215,7 @@ The bot SHALL be in one of two placement modes: holding, in which it works towar
 `status` SHALL be answered with success and a text of one `name: value` line each for: `connected` (`yes` or `no`); `region` (the region's name); `position` (the avatar's current position as the bot knows it, as `x, y, z`); `seat` (`target` when seated on the object that is the held sit state, `object <uuid>` when seated on another object, naming the prim the simulator seated the avatar on, `other` when attached to something the simulator did not name, `none` when not seated on an object, `unknown` when not yet learned); `persist` (the held placement as `<location> <sit state>` in the forms the `persist` command accepts, with `unknown` in place of a location that is not known yet); and `mode` (`holding` or `manual`). A ground sit, held or commanded, is not a seat on an object and SHALL show as `none`. `region`, `position` and `seat` SHALL be left out while not connected to a region. `status` SHALL work in every state of the bot. In manual mode the `persist` line shows the placement a `home` command would return to.
 
 #### Scenario: Seated on the target
-- **WHEN** `rslbot ctl status` is run while the avatar is seated on the held object in `Target` and no movement command was given
+- **WHEN** `rslbot ctl status` is run in holding mode while the avatar is seated on the held object in `Target`
 - **THEN** it prints `connected: yes`, `region: Target`, a `position` line, `seat: target`, a `persist` line naming a location in `Target` and that object, and `mode: holding`, and exits with status 0
 
 #### Scenario: Between logins
@@ -223,7 +223,7 @@ The bot SHALL be in one of two placement modes: holding, in which it works towar
 - **THEN** it prints `connected: no`, the `persist` line and the `mode` line, and exits with status 0
 
 #### Scenario: Configured ground sit
-- **WHEN** `rslbot ctl status` is run after the bot has sat the avatar on the ground as the held sit state `ground` asks
+- **WHEN** `rslbot ctl status` is run in holding mode after the bot has sat the avatar on the ground as the held sit state `ground` asks
 - **THEN** it prints `seat: none`, a `persist` line ending in `ground`, and `mode: holding`
 
 #### Scenario: Seated elsewhere in manual mode

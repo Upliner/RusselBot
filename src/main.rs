@@ -1475,7 +1475,7 @@ mod tests {
             assert!(!bot.reconciler.is_manual());
         }
         // A refused one does not.
-        let mut bot = bot(full(""));
+        let mut bot = bot(full("persist = \"cur\"\n"));
         assert!(matches!(command(&mut bot, "persist"), Response::Error(_)));
         assert_eq!(bot.startup, Some(CUR));
     }

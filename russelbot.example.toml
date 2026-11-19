@@ -16,7 +16,8 @@ password = "secret"
 # Optional: where the avatar starts out: region name and coordinates inside
 # it, always both. The bot logs in there and teleports there when the login
 # lands elsewhere. With a `sit` object, pick coordinates close to it, or the
-# sit may fail. What the bot holds afterwards is up to `persist`, below.
+# sit may fail. Whether the bot holds the place afterwards is up to `persist`,
+# below.
 region = "Target"
 position = [128.0, 128.0, 25.0]
 
@@ -32,17 +33,17 @@ sit = "00000000-0000-0000-0000-000000000000"
 
 # Optional: what the bot holds once it has got to the place above (logged in,
 # and seated when `sit` is set). It returns to what it holds after a kick, a
-# region restart or being moved to another region, and `rslbot ctl persist`
-# changes it while the bot runs.
-#   "cur"  the position and the seat the simulator reported at that moment.
-#          This is the default.
+# region restart or being moved to another region, and sits again when
+# unseated. `rslbot ctl persist` sets or changes it while the bot runs.
+#   "off"  (or false) nothing: the bot goes to the place above once and
+#          leaves the avatar alone from then on. This is the default.
 #   "cfg"  `position` and `sit` exactly as written above; without `position`,
 #          the place the first login arrived at.
-#   "off"  (or false) nothing: the bot leaves the avatar alone from then on.
+#   "cur"  the position and the seat the simulator reported at that moment.
 # An array gives the position and the seat separately, as does the [persist]
 # table at the end of this file.
 # persist = "cfg"
-#   persist = "off"
+#   persist = "cur"
 #   persist = ["cfg", "cur"]
 
 # Optional: record what the avatar hears and is told. Every message is also
@@ -73,7 +74,7 @@ sit = "00000000-0000-0000-0000-000000000000"
 # scan_distance = 64
 
 # The same as `persist = ["cur", "cfg"]`, as a table. A key that is left out
-# is "cur". A table has to come after all the keys above.
+# of the table is "cur". A table has to come after all the keys above.
 # [persist]
 # position = "cur"
 # sit = "cfg"

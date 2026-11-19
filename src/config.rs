@@ -174,7 +174,7 @@ fn persist(value: Option<toml::Value>) -> Result<Persist, ConfigError> {
         sit: source,
     };
     match value {
-        None => Ok(both(Source::Cur)),
+        None => Ok(Persist::Off),
         Some(toml::Value::Boolean(false)) => Ok(Persist::Off),
         Some(toml::Value::String(word)) if word == "off" => Ok(Persist::Off),
         Some(word @ toml::Value::String(_)) => source(&word).map(both).ok_or(ConfigError(PERSIST_FORMS.to_string())),
@@ -441,8 +441,8 @@ mod tests {
     }
 
     #[test]
-    fn persist_defaults_to_the_current_values() {
-        assert_eq!(Config::parse(&base()).unwrap().persist, held(Source::Cur, Source::Cur));
+    fn persist_is_off_by_default() {
+        assert_eq!(Config::parse(&base()).unwrap().persist, Persist::Off);
     }
 
     #[test]
@@ -659,13 +659,7 @@ mod tests {
         );
         assert_eq!(cfg.sit, Some(Sit::Object(Uuid::nil())));
         assert!(!cfg.deprecated_object);
-        assert_eq!(
-            cfg.persist,
-            Persist::On {
-                position: Source::Cur,
-                sit: Source::Cur
-            }
-        );
+        assert_eq!(cfg.persist, Persist::Off);
     }
 
     #[test]

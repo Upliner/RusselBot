@@ -27,15 +27,15 @@ At most one action SHALL be in progress at a time. The bot SHALL NOT assume the 
 - **THEN** the bot teleports to the target region and then sits on the target object
 
 #### Scenario: Kicked while seated
-- **WHEN** the avatar is seated on the target and gets kicked
+- **WHEN** the bot is in holding mode, the avatar is seated on the target and gets kicked
 - **THEN** the bot logs in again asking for the held location, gets to the target region, and sits on the target object again without operator action
 
 #### Scenario: Region restart
-- **WHEN** the target region is restarted while the avatar is seated
+- **WHEN** the bot is in holding mode and the target region is restarted while the avatar is seated
 - **THEN** once the region is back online the avatar ends up seated on the target object again without operator action
 
 #### Scenario: Moved to another region
-- **WHEN** the avatar is teleported away to a different region while it stays connected
+- **WHEN** the bot is in holding mode and the avatar is teleported away to a different region while it stays connected
 - **THEN** the bot teleports back to the held location and sits again
 
 #### Scenario: Moved inside the target region
@@ -44,6 +44,10 @@ At most one action SHALL be in progress at a time. The bot SHALL NOT assume the 
 
 #### Scenario: Nothing configured but the account
 - **WHEN** the config names neither a region, a seat nor `persist`
+- **THEN** the bot logs in at the avatar's last location, is in manual mode once the avatar is connected, logs in at the last location again whenever the session is lost, and never teleports or sits the avatar by itself
+
+#### Scenario: Holding the place it arrived at
+- **WHEN** the config has `persist = "cur"` and names neither a region nor a seat
 - **THEN** the bot logs in at the avatar's last location, holds the location it arrived at, logs in there again whenever the session is lost, teleports back there when the avatar is moved to another region, and never sits the avatar by itself
 
 #### Scenario: Moved while no region is configured

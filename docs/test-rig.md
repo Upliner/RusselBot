@@ -61,7 +61,9 @@ echo 'show regions' > /tmp/sim.in
    (Build > Edit > General > Copy Keys).
 3. Create `russelbot.toml` from `russelbot.example.toml`: keep `login_url`, `user` and
    `password`, set `sit` to the UUID and `position` to a spot next to the
-   prim (`[128.0, 128.0, 25.0]` for the helper's prim).
+   prim (`[128.0, 128.0, 25.0]` for the helper's prim), and add
+   `persist = "cfg"`: the checklists below expect the bot to return to that
+   place and sit again, which it does not do without `persist`.
 
 Run the bot with `cargo run -- russelbot.toml`. Add `--verbose` to see every
 message name it receives and sends.
@@ -212,7 +214,13 @@ entry takes effect there.
 Since `add-persist-command` the bot holds a placement that `persist` in the
 config and `rslbot ctl persist` choose. The items above were run with what
 is now `persist = "cfg"`; items 58, 61 and 62 describe the behaviour before
-this change and are superseded by items 70 to 72.
+this change and are superseded by items 71 and 72.
+
+Items 65, 67, 71 and 72 were run without a `persist` key, when that meant
+`persist = "cur"`; the key is written out below, as it has to be now. A
+config without `persist` has since become the same as `persist = "off"`
+(item 69). That default was not run on the rig again: the key being
+absent is covered by unit tests only.
 
 The configs here have `position = [120.0, 120.0, 25.0]`, ten metres from
 the seat prim (at 130, 128, 25.55 in `Target`), so that a held position
@@ -225,14 +233,14 @@ region when it stands) and the prim's location from the console's
 
 | # | Inject | Expected | Result (2026-11-19, OpenSim 9d00a55552) |
 |---|---|---|---|
-| 65 | `region`, `position`, `sit`, no `persist`; then `ctl status` | After `seated`: `config: persist cur cur` and `placement: holding` with the seated position and the seat; the same on the `persist` line; `seat: target` | Pass: `Target/129.33/127.6/26.45 <uuid>`, persisted in the second of the sit. The simulator answered the request about the seat with an `ObjectUpdateCompressed` |
+| 65 | `region`, `position`, `sit`, `persist = "cur"`; then `ctl status` | After `seated`: `config: persist cur cur` and `placement: holding` with the seated position and the seat; the same on the `persist` line; `seat: target` | Pass: `Target/129.33/127.6/26.45 <uuid>`, persisted in the second of the sit. The simulator answered the request about the seat with an `ObjectUpdateCompressed` |
 | 66 | `ctl stand`, `ctl sit <uuid>`, `ctl status`, with `listen.py` running | The bot's position is the prim's plus the offset the helper sees | Pass: the helper saw `-0.7 -0.2 0.9` on the prim; 130, 128, 25.55 plus that is the bot's `129.33, 127.85, 26.45`. Standing, the helper's one full update said z 27.1 and the bot, following the avatar down, 26.01 |
 | 67 | `kick user Sit Bot bye` after item 65 | Login asking for the persisted location, then seated again | Pass: `start: uri:Target&129&128&26`, seated in the same second |
 | 68 | `persist = "cfg"`; items 3, 5 and 9 again; then the same config with a `sit` UUID that does not exist (in place of item 8, which deletes the prim) | Holds `Target/120/120/25 <uuid>` before and after sitting; re-sit after 5 s; login at `uri:Target&120&120&25`; return from `Home` to 120, 120, 25; three failed sits, then a teleport to 120, 120, 25, and no `config: persist` line | Pass, all of it |
 | 69 | `persist = "off"`; `stand user`, `kick user`, then `ctl home` | Sits once, `the avatar is in place and persist is off`, `mode: manual`; no re-sit; login with `start: last` and no sit; `home` sits on the configured object | Pass |
 | 70 | `persist = ["cfg", "cur"]`; a `[persist]` table with `position = "cur"`, `sit = "cfg"` | `config: persist cfg cur` holding `Target/120/120/25 ...`; `config: persist cur cfg` holding the seated position | Pass, both; with the array, `teleport user ... Home/...` was answered by a teleport to 120, 120, 25 and a sit |
-| 71 | Account only, avatar last in `Target` (was item 58) | `start: last`; holds the place it arrived at with `stand`; teleports back after `teleport user ... Home/...`; after a kick logs in asking for that place; never sits | Pass: `persist: Target/129.33/127.6/26.45 stand`. The location is the one the login reported; the avatar then settled 0.5 m lower |
-| 72 | `sit = <uuid>` without `region`: avatar last in `Target` (was item 61), then last in `Home` (was item 62) | In `Target`: sits, holds the seated position, returns and sits again after `teleport user`. In `Home`: holds `Home/...`, three failed sits, then a teleport to that place, and sitting goes on | Pass, both: failures at 15 s with delays of 5, 10 and 20 s, then `teleporting to "Home" at 128, 128, 25.96` |
+| 71 | Account and `persist = "cur"` only, avatar last in `Target` (was item 58) | `start: last`; holds the place it arrived at with `stand`; teleports back after `teleport user ... Home/...`; after a kick logs in asking for that place; never sits | Pass: `persist: Target/129.33/127.6/26.45 stand`. The location is the one the login reported; the avatar then settled 0.5 m lower |
+| 72 | `sit = <uuid>` and `persist = "cur"` without `region`: avatar last in `Target` (was item 61), then last in `Home` (was item 62) | In `Target`: sits, holds the seated position, returns and sits again after `teleport user`. In `Home`: holds `Home/...`, three failed sits, then a teleport to that place, and sitting goes on | Pass, both: failures at 15 s with delays of 5, 10 and 20 s, then `teleporting to "Home" at 128, 128, 25.96` |
 | 73 | During item 72 in `Home`: `ctl tp 128 128 25 Target`, `ctl sit <uuid>` | `mode: manual`, and no `config: persist` line afterwards although the avatar now sits on the configured object | Pass |
 | 74 | `ctl tp 100 100 25 Home`, `ctl sit <home prim>`, `ctl persist`; then `teleport user Sit Bot Target/128/128/25` | The command prints the place in `Home` and the prim, exit status 0, no new sit request; the bot teleports back to `Home` and sits again | Pass: `Home/129.33/127.53/26.34 <home prim>` |
 | 75 | From `Home`, seated: `ctl persist "Target/128/128/25" ground`, with `listen.py` running | Status 0 at once; `standing up`, a teleport to `Target`, `sitting on the ground`; `bot ground sit: yes` | Pass |
