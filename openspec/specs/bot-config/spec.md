@@ -15,11 +15,12 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `user` | yes | Avatar name, either `First Last` or a single word (the last name is then `Resident`) |
 | `password` | one of the two | Plain password |
 | `password_hash` | one of the two | Password hash as produced by the `hash` subcommand |
-| `region` | no, but only together with `position` | Target region name. When present the bot keeps the avatar in that region |
-| `position` | no, but only together with `region` | Target coordinates inside the region, as an array of three numbers `[x, y, z]` |
-| `start` | no, and only without `region` and `position` | Where a login places the avatar when no region is configured: `"home"` for the avatar's home location, `"latest"` for the location it was last at. Defaults to `"latest"` |
-| `sit` | no | What the bot seats the avatar on: the UUID of an object, or the word `ground`. When absent the bot does not seat the avatar by itself |
+| `region` | no, but only together with `position` | Region of the config placement. When present the bot logs in there at startup and holds that region until a persist changes the held placement |
+| `position` | no, but only together with `region` | Coordinates of the config placement inside the region, as an array of three numbers `[x, y, z]` |
+| `start` | no, and only without `region` and `position` | Where a login places the avatar while the bot holds no location: `"home"` for the avatar's home location, `"latest"` for the location it was last at. Defaults to `"latest"` |
+| `sit` | no | Sit state of the config placement: the UUID of an object, or the word `ground`. When absent the config placement's sit state is `stand` and the bot does not seat the avatar at startup |
 | `object` | no | Deprecated spelling of `sit`, accepting a UUID only |
+| `persist` | no | What the bot holds once it has reached the config placement after startup (see `placement-persist`); the forms are given below. Defaults to `"cur"` |
 | `log_chat` | no | Path of the TSV file that receives local chat; no chat file is written when absent |
 | `log_im` | no | Path of the TSV file that receives instant messages; no IM file is written when absent |
 | `fetch_offline_im` | no | Boolean; when true the bot fetches instant messages stored while the avatar was offline. Defaults to false |
@@ -27,15 +28,25 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `requesttp_timeout` | no | Number of minutes, greater than zero, during which the bot accepts a teleport offer from an avatar it has asked with `requesttp`. Defaults to 10 |
 | `scan_distance` | no | Number of metres, from 1 to 1024. When present the bot learns the objects within that distance from the moment it enters a region, for the `touch` command. When absent it learns them only when `touch` is first used, within 32 metres |
 
+`persist` SHALL be accepted in these forms:
+
+| Form | Meaning |
+|---|---|
+| `"cur"` | Location and sit state both `cur`: hold what the simulator reports once the config placement is reached |
+| `"cfg"` | Location and sit state both `cfg`: keep holding the config placement |
+| `"off"` or `false` | Hold nothing: switch to manual mode once the config placement is reached. The two spellings are equivalent |
+| An array of two strings, each `"cur"` or `"cfg"` | The first is the value for the location, the second the value for the sit state |
+| A table with the keys `position` and `sit`, each `"cur"` or `"cfg"` | `position` is the value for the location, `sit` the value for the sit state; a key that is left out is `"cur"` |
+
 A relative `log_chat` or `log_im` path SHALL be taken relative to the directory the bot was started in. A config that uses `object` SHALL behave exactly as the same config with that value under `sit`, and the bot SHALL write a line to standard error at startup that names `object` as deprecated and `sit` as its replacement.
 
 #### Scenario: Minimal config for Second Life
 - **WHEN** the config contains only `user` and `password_hash`
-- **THEN** the bot starts, uses the Second Life Agni login URL, logs in at the avatar's last location, and neither teleports nor sits by itself
+- **THEN** the bot starts, uses the Second Life Agni login URL, logs in at the avatar's last location, does not sit the avatar, and from then on holds the location it arrived at
 
 #### Scenario: Full placement
 - **WHEN** the config contains `region`, `position` and `sit` with the UUID of an object
-- **THEN** the bot keeps the avatar in that region, seated on that object
+- **THEN** the bot logs in at that position, sits on that object, and from then on holds the location and seat the simulator reported
 
 #### Scenario: Ground sit
 - **WHEN** the config contains `sit = "ground"`
@@ -43,11 +54,35 @@ A relative `log_chat` or `log_im` path SHALL be taken relative to the directory 
 
 #### Scenario: Start at home
 - **WHEN** the config contains `start = "home"` and neither `region` nor `position`
-- **THEN** the bot logs in asking for the avatar's home location and does not teleport by itself afterwards
+- **THEN** the first login asks for the avatar's home location, and later logins ask for the location the bot holds
 
 #### Scenario: Old key
 - **WHEN** the config contains `object` with a UUID and no `sit`
 - **THEN** the bot behaves as with `sit` set to that UUID and its log names `object` as deprecated in favour of `sit`
+
+#### Scenario: Persist not mentioned
+- **WHEN** the config has no `persist` key
+- **THEN** the bot behaves as with `persist = "cur"`
+
+#### Scenario: Persist as the config says
+- **WHEN** the config contains `region`, `position`, `sit` and `persist = "cfg"`
+- **THEN** the bot keeps holding the configured position and the configured `sit` UUID after it has sat
+
+#### Scenario: Persist off
+- **WHEN** the config contains `persist = "off"` or `persist = false`
+- **THEN** the bot reaches the config placement once and then is in manual mode
+
+#### Scenario: Persist as an array
+- **WHEN** the config contains `persist = ["cfg", "cur"]`
+- **THEN** the bot holds the configured position and the seat the simulator reported
+
+#### Scenario: Persist as a table
+- **WHEN** the config ends with a `[persist]` table containing `position = "cur"` and `sit = "cfg"`
+- **THEN** the bot holds the location the simulator reported and the configured `sit`
+
+#### Scenario: Persist table with one key
+- **WHEN** the config ends with a `[persist]` table containing only `sit = "cfg"`
+- **THEN** the location value is `cur` and the sit state value is `cfg`
 
 #### Scenario: Config path from the command line
 - **WHEN** the bot is started with a file path as its first argument
@@ -82,7 +117,7 @@ A relative `log_chat` or `log_im` path SHALL be taken relative to the directory 
 - **THEN** the bot starts learning the objects within 64 metres as soon as it has entered a region
 
 ### Requirement: Config validation before any network activity
-The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
+The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `position` and `sit` or with a value other than `"cur"` and `"cfg"`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
 
 #### Scenario: Both password forms given
 - **WHEN** the config contains both `password` and `password_hash`
@@ -111,6 +146,18 @@ The bot SHALL validate the whole config before contacting any server. It SHALL r
 #### Scenario: Unknown start value
 - **WHEN** the config contains `start = "last"`
 - **THEN** the bot prints an error naming `start` and the two accepted values, and exits with status 2
+
+#### Scenario: Persist value that only the command takes
+- **WHEN** the config contains `persist = "last"`, `persist = "Target/128/128/25"` or `persist = true`
+- **THEN** the bot prints an error naming `persist` and its accepted forms, and exits with status 2
+
+#### Scenario: Malformed persist array
+- **WHEN** the config contains `persist = ["cur"]`, `persist = ["cur", "cfg", "cur"]` or `persist = ["cur", "off"]`
+- **THEN** the bot prints an error naming `persist` and exits with status 2
+
+#### Scenario: Malformed persist table
+- **WHEN** the config has a `[persist]` table containing `location = "cur"` or `sit = "ground"`
+- **THEN** the bot prints an error naming `persist` and the offending key, and exits with status 2
 
 #### Scenario: Unknown key
 - **WHEN** the config contains a key the bot does not define, such as `regoin`
