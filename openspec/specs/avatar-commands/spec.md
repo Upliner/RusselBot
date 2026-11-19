@@ -1,10 +1,10 @@
-# Spec Delta
+# avatar-commands Specification
 
 ## Purpose
 
 Defines the control-socket commands that move the avatar and make it interact with the world on the operator's command, the commands that report on and stop the bot, and how those commands relate to the bot's automatic placement.
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Commands need the avatar in a region
 The commands `stand`, `unsit`, `sit`, `tp`, `requesttp`, `accepttp`, `sendtp` and `touch` SHALL be answered with an error, and SHALL send nothing and change nothing, when the avatar is not connected to a region or is in the middle of a teleport or a logout. A command SHALL be carried out at once or not at all; it SHALL NOT be kept for later.
@@ -71,7 +71,7 @@ The `stand` command, also available under the name `unsit`, SHALL make the avata
 - **THEN** the command exits with status 1 and nothing is sent
 
 ### Requirement: Request a teleport from an avatar
-`requesttp <avatar> [<message>]` SHALL send that avatar a request to teleport the bot's avatar to them, with the message if one is given. The avatar SHALL be given and resolved as for the `im` command. The command SHALL be answered with success, naming the avatar, once the request has been handed to the simulator connection; success does not mean the avatar agreed. When that avatar sends the bot a teleport offer within the configured `requesttp_timeout` (10 minutes unless configured) of the request, the bot SHALL accept it and follow the teleport. It SHALL accept at most one offer per request. The bot SHALL NOT by itself accept a teleport offer from an avatar it has not asked within that time; such an offer is kept for the `accepttp` command.
+`requesttp <avatar> [<message>]` SHALL send that avatar a request to teleport the bot's avatar to them, with the message if one is given. The avatar SHALL be given and resolved as for the `im` command. The command SHALL be answered with success, naming the avatar, once the request has been handed to the simulator connection; success does not mean the avatar agreed. When that avatar sends the bot a teleport offer within the configured `requesttp_timeout` (10 minutes unless configured) of the request, the bot SHALL accept it and follow the teleport. It SHALL accept at most one offer per request. A `home` command SHALL end the wait: an offer that arrives after it is not accepted by itself. The bot SHALL NOT by itself accept a teleport offer from an avatar it has not asked within that time; such an offer is kept for the `accepttp` command.
 
 #### Scenario: Request accepted
 - **WHEN** `rslbot ctl requesttp "Jane Doe"` is run and Jane Doe accepts the request in her viewer
@@ -88,6 +88,10 @@ The `stand` command, also available under the name `unsit`, SHALL make the avata
 #### Scenario: Longer time limit
 - **WHEN** `requesttp_timeout = 30` is configured and Jane Doe answers a request 15 minutes after it was sent
 - **THEN** the bot accepts the offer and goes
+
+#### Scenario: Sent home while waiting
+- **WHEN** `rslbot ctl home` is run after a `requesttp`, and the asked avatar's offer arrives a minute later
+- **THEN** the avatar stays on its seat and the offer is kept for `accepttp`
 
 #### Scenario: Unknown avatar
 - **WHEN** `rslbot ctl requesttp "Nobody Here"` is run and the grid has no such avatar

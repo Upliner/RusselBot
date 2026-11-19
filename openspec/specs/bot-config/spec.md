@@ -22,6 +22,8 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `log_im` | no | Path of the TSV file that receives instant messages; no IM file is written when absent |
 | `fetch_offline_im` | no | Boolean; when true the bot fetches instant messages stored while the avatar was offline. Defaults to false |
 | `socket` | no | Boolean; when true the bot listens on the control socket. Defaults to false |
+| `requesttp_timeout` | no | Number of minutes, greater than zero, during which the bot accepts a teleport offer from an avatar it has asked with `requesttp`. Defaults to 10 |
+| `scan_distance` | no | Number of metres, from 1 to 1024. When present the bot learns the objects within that distance from the moment it enters a region, for the `touch` command. When absent it learns them only when `touch` is first used, within 32 metres |
 
 A relative `log_chat` or `log_im` path SHALL be taken relative to the directory the bot was started in.
 
@@ -53,8 +55,16 @@ A relative `log_chat` or `log_im` path SHALL be taken relative to the directory 
 - **WHEN** the config has no `socket` key or has `socket = false`
 - **THEN** the bot does not listen on any control socket
 
+#### Scenario: Teleport request timeout configured
+- **WHEN** the config contains `requesttp_timeout = 30`
+- **THEN** a teleport offer from an avatar the bot asked 20 minutes ago is accepted
+
+#### Scenario: Scan distance configured
+- **WHEN** the config contains `scan_distance = 64`
+- **THEN** the bot starts learning the objects within 64 metres as soon as it has entered a region
+
 ### Requirement: Config validation before any network activity
-The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, an `object` that is not a UUID, a `login_url` that is not an `http` or `https` URL, a `position` that is not three finite numbers, a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
+The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, an `object` that is not a UUID, a `login_url` that is not an `http` or `https` URL, a `position` that is not three finite numbers, a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
 
 #### Scenario: Both password forms given
 - **WHEN** the config contains both `password` and `password_hash`
@@ -87,6 +97,14 @@ The bot SHALL validate the whole config before contacting any server. It SHALL r
 #### Scenario: No home directory
 - **WHEN** `socket = true` on Unix and neither `RUSSELBOT_SOCK` nor `HOME` is set
 - **THEN** the bot prints an error naming `socket` and `RUSSELBOT_SOCK` and exits with status 2
+
+#### Scenario: Bad teleport request timeout
+- **WHEN** the config contains `requesttp_timeout = 0` or `requesttp_timeout = "soon"`
+- **THEN** the bot prints an error naming `requesttp_timeout` and exits with status 2
+
+#### Scenario: Scan distance out of range
+- **WHEN** the config contains `scan_distance = 5000`
+- **THEN** the bot prints an error naming `scan_distance` and exits with status 2
 
 ### Requirement: Password hash subcommand
 The bot SHALL provide a `hash` subcommand that reads a password from standard input and prints the corresponding hash on standard output as `$1$` followed by the 32 lowercase hexadecimal digits of the MD5 digest of the password. The password SHALL NOT be accepted as a command-line argument. When standard input is a terminal the password SHALL NOT be echoed. A trailing line ending SHALL NOT be part of the hashed password. An empty password SHALL be rejected with a non-zero exit status.
