@@ -7,7 +7,7 @@ Covers knowing which region the avatar is in and moving it to the configured reg
 ## Requirements
 
 ### Requirement: Know the current region
-While connected, the bot SHALL know the name of the region the avatar is currently in, as reported by the simulator. The avatar SHALL be considered to be in the target region when that name equals the configured `region`, compared without regard to letter case or surrounding whitespace.
+While connected, the bot SHALL know the name of the region the avatar is currently in, as reported by the simulator. When a region is configured, the avatar SHALL be considered to be in the target region when that name equals the configured `region`, compared without regard to letter case or surrounding whitespace. When no region is configured there is no target region: the avatar is in place in whatever region it is in, and the bot SHALL NOT request a teleport of its own accord.
 
 #### Scenario: Already in the target region
 - **WHEN** the bot is connected to a region whose name differs from the configured `region` only in letter case
@@ -16,6 +16,10 @@ While connected, the bot SHALL know the name of the region the avatar is current
 #### Scenario: In another region
 - **WHEN** the bot is connected to a region with a different name
 - **THEN** the avatar is considered not to be in the target region
+
+#### Scenario: No region configured
+- **WHEN** the config has no `region` and the bot is connected to any region
+- **THEN** no teleport is requested, and the log names the region without calling it the target or not the target
 
 ### Requirement: Teleport to the target region
 The bot SHALL be able to teleport the avatar to the configured `position` in the configured `region`. It SHALL look the region up by name on the grid, request the teleport, and follow the session to the destination simulator so that the avatar ends up connected there and the previous simulator connection is dropped. A teleport attempt SHALL end in exactly one reported outcome: arrived, or failed with a reason.

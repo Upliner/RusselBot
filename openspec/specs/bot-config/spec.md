@@ -15,9 +15,11 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `user` | yes | Avatar name, either `First Last` or a single word (the last name is then `Resident`) |
 | `password` | one of the two | Plain password |
 | `password_hash` | one of the two | Password hash as produced by the `hash` subcommand |
-| `region` | yes | Target region name |
-| `position` | yes | Target coordinates inside the region, as an array of three numbers `[x, y, z]` |
-| `object` | yes | UUID of the object to sit on |
+| `region` | no, but only together with `position` | Target region name. When present the bot keeps the avatar in that region |
+| `position` | no, but only together with `region` | Target coordinates inside the region, as an array of three numbers `[x, y, z]` |
+| `start` | no, and only without `region` and `position` | Where a login places the avatar when no region is configured: `"home"` for the avatar's home location, `"latest"` for the location it was last at. Defaults to `"latest"` |
+| `sit` | no | What the bot seats the avatar on: the UUID of an object, or the word `ground`. When absent the bot does not seat the avatar by itself |
+| `object` | no | Deprecated spelling of `sit`, accepting a UUID only |
 | `log_chat` | no | Path of the TSV file that receives local chat; no chat file is written when absent |
 | `log_im` | no | Path of the TSV file that receives instant messages; no IM file is written when absent |
 | `fetch_offline_im` | no | Boolean; when true the bot fetches instant messages stored while the avatar was offline. Defaults to false |
@@ -25,11 +27,27 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `requesttp_timeout` | no | Number of minutes, greater than zero, during which the bot accepts a teleport offer from an avatar it has asked with `requesttp`. Defaults to 10 |
 | `scan_distance` | no | Number of metres, from 1 to 1024. When present the bot learns the objects within that distance from the moment it enters a region, for the `touch` command. When absent it learns them only when `touch` is first used, within 32 metres |
 
-A relative `log_chat` or `log_im` path SHALL be taken relative to the directory the bot was started in.
+A relative `log_chat` or `log_im` path SHALL be taken relative to the directory the bot was started in. A config that uses `object` SHALL behave exactly as the same config with that value under `sit`, and the bot SHALL write a line to standard error at startup that names `object` as deprecated and `sit` as its replacement.
 
 #### Scenario: Minimal config for Second Life
-- **WHEN** the config contains `user`, `password_hash`, `region`, `position` and `object` and no `login_url`
-- **THEN** the bot starts and uses the Second Life Agni login URL
+- **WHEN** the config contains only `user` and `password_hash`
+- **THEN** the bot starts, uses the Second Life Agni login URL, logs in at the avatar's last location, and neither teleports nor sits by itself
+
+#### Scenario: Full placement
+- **WHEN** the config contains `region`, `position` and `sit` with the UUID of an object
+- **THEN** the bot keeps the avatar in that region, seated on that object
+
+#### Scenario: Ground sit
+- **WHEN** the config contains `sit = "ground"`
+- **THEN** the bot sits the avatar on the ground
+
+#### Scenario: Start at home
+- **WHEN** the config contains `start = "home"` and neither `region` nor `position`
+- **THEN** the bot logs in asking for the avatar's home location and does not teleport by itself afterwards
+
+#### Scenario: Old key
+- **WHEN** the config contains `object` with a UUID and no `sit`
+- **THEN** the bot behaves as with `sit` set to that UUID and its log names `object` as deprecated in favour of `sit`
 
 #### Scenario: Config path from the command line
 - **WHEN** the bot is started with a file path as its first argument
@@ -64,15 +82,35 @@ A relative `log_chat` or `log_im` path SHALL be taken relative to the directory 
 - **THEN** the bot starts learning the objects within 64 metres as soon as it has entered a region
 
 ### Requirement: Config validation before any network activity
-The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, an `object` that is not a UUID, a `login_url` that is not an `http` or `https` URL, a `position` that is not three finite numbers, a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
+The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
 
 #### Scenario: Both password forms given
 - **WHEN** the config contains both `password` and `password_hash`
 - **THEN** the bot prints an error naming both keys and exits with status 2 without contacting the login server
 
+#### Scenario: Malformed sit value
+- **WHEN** `sit` is neither a valid UUID nor `ground`
+- **THEN** the bot prints an error naming `sit` and exits with status 2
+
 #### Scenario: Malformed object UUID
 - **WHEN** `object` is not a valid UUID
 - **THEN** the bot prints an error naming `object` and exits with status 2
+
+#### Scenario: Both seat keys
+- **WHEN** the config contains both `sit` and `object`
+- **THEN** the bot prints an error naming both keys and exits with status 2
+
+#### Scenario: Region without position
+- **WHEN** the config contains `region` and no `position`
+- **THEN** the bot prints an error naming `region` and `position` and exits with status 2
+
+#### Scenario: Start together with a region
+- **WHEN** the config contains `start = "home"` together with `region` and `position`
+- **THEN** the bot prints an error naming `start` and `region` and exits with status 2
+
+#### Scenario: Unknown start value
+- **WHEN** the config contains `start = "last"`
+- **THEN** the bot prints an error naming `start` and the two accepted values, and exits with status 2
 
 #### Scenario: Unknown key
 - **WHEN** the config contains a key the bot does not define, such as `regoin`
