@@ -8,7 +8,7 @@ use crate::config::DEFAULT_REQUESTTP_TIMEOUT;
 use crate::control::{Request, Response};
 use crate::inventory::{self, Clothes, Entry, Failed, Item, ListArgs, Outcome, Removal, What};
 use crate::persist::{Location, SitState};
-use crate::session::{Touch, ATTACH_LIMIT, NOT_CONNECTED};
+use crate::session::{Touch, ATTACH_LIMIT, DETACH_LIMIT, NOT_CONNECTED};
 use crate::udp::messages::{Vector3, MAX_TEXT};
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
@@ -201,6 +201,9 @@ pub trait Grid {
     /// Whether the grid makes the avatar's appearance from its Current
     /// Outfit folder, which is what clothing needs.
     fn outfit_service(&self) -> bool;
+    /// Whether the avatar is in a region whose simulator has said which
+    /// services it offers.
+    fn ready(&self) -> bool;
     /// The inventory items attached to the avatar now, and their points.
     fn attached(&self) -> Vec<(Uuid, u8)>;
     /// Ends in the session's `Attached` or `AttachFailed`. `point` 0
@@ -353,6 +356,28 @@ enum Done {
     Parked,
 }
 
+/// How long the simulator of a region the avatar has entered is given to
+/// show what is attached before the Current Outfit folder is compared with
+/// it. Second Life has shown everything within four seconds.
+pub const RESTORE_DELAY: Duration = Duration::from_secs(20);
+/// How soon to look again when the avatar is between regions at that time.
+const RESTORE_RETRY: Duration = Duration::from_secs(1);
+/// The most attaches remembered as given up on.
+const MAX_GAVE_UP: usize = 64;
+
+/// How far the restoring of attachments has got since the login.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Restore {
+    /// No region has been entered yet.
+    Idle,
+    /// Compare the Current Outfit folder with the avatar at this time.
+    Due(Instant),
+    /// The folder is being read, by the job with this id.
+    Reading(u64),
+    /// Compared; nothing more until the next login.
+    Done,
+}
+
 /// Carries out commands. Lives as long as the bot, across sessions.
 pub struct Commands {
     /// The channel `//` stands for.
@@ -388,6 +413,18 @@ pub struct Commands {
     notes: HashMap<u64, String>,
     attaching: Vec<Attaching>,
     detaching: Vec<Detaching>,
+    /// The config option `restore_attachments`.
+    restore_on: bool,
+    restore: Restore,
+    /// Objects the simulator was asked to attach because the Current
+    /// Outfit folder lists them, and has not shown yet. Nobody waits.
+    restoring: Vec<Item>,
+    /// Items whose `attach` was answered as not carried out in this
+    /// session: one that arrives after all still gets its link.
+    gave_up: Vec<Item>,
+    /// The lines `tell` wrote.
+    #[cfg(test)]
+    told: Vec<String>,
 }
 
 impl Default for Commands {
@@ -431,7 +468,26 @@ impl Commands {
             notes: HashMap::new(),
             attaching: Vec::new(),
             detaching: Vec::new(),
+            restore_on: true,
+            restore: Restore::Idle,
+            restoring: Vec::new(),
+            gave_up: Vec::new(),
+            #[cfg(test)]
+            told: Vec::new(),
         }
+    }
+
+    /// Whether attachments are restored after a login: the config option
+    /// `restore_attachments`.
+    pub fn set_restore(&mut self, on: bool) {
+        self.restore_on = on;
+    }
+
+    /// Writes a line of the bot's own doing to the operator log.
+    fn tell(&mut self, line: String) {
+        crate::info!("{line}");
+        #[cfg(test)]
+        self.told.push(line);
     }
 
     /// Carries out `request` on `grid` and answers on `reply`: now, or once
@@ -765,6 +821,10 @@ impl Commands {
     /// The inventory worker answered job `id`: the command that waited for
     /// it goes on. An answer nobody waits for any more is ignored.
     pub fn inventory_answer<G: Grid>(&mut self, id: u64, result: Result<Outcome, Failed>, grid: Option<&mut G>, now: Instant) {
+        if self.restore == Restore::Reading(id) {
+            self.restore_missing(result, grid, now);
+            return;
+        }
         if let Some(what) = self.notes.remove(&id) {
             match result {
                 Ok(_) => crate::debug!("Current Outfit folder: {what}"),
@@ -929,6 +989,9 @@ impl Commands {
         grid.attach(&item, point.unwrap_or(0), now)?;
         let place = point.map_or("the point it was last on".to_string(), inventory::point_name);
         crate::info!("control: attaching {} to {place}", item.show());
+        // The command's answer is now what this item's arrival is for.
+        self.restoring.retain(|restoring| restoring.id != item.id);
+        self.gave_up.retain(|gave_up| gave_up.id != item.id);
         let (same, others) = std::mem::take(&mut self.attaching)
             .into_iter()
             .partition(|earlier| earlier.item.id == item.id);
@@ -966,11 +1029,26 @@ impl Commands {
     }
 
     /// The simulator shows the object of `item` on the avatar. Returns
-    /// whether a command of the bot's put it there.
+    /// whether the bot asked for it, by a command or to restore it; the
+    /// log then has its line already.
     pub fn attached<G: Grid>(&mut self, item: Uuid, point: u8, grid: Option<&mut G>, now: Instant) -> bool {
         let (done, attaching): (Vec<_>, Vec<_>) = std::mem::take(&mut self.attaching).into_iter().partition(|a| a.item.id == item);
         self.attaching = attaching;
         let Some(attach) = done.into_iter().next() else {
+            let on = inventory::point_name(point);
+            if let Some(index) = self.restoring.iter().position(|restoring| restoring.id == item) {
+                // The link is what asked for it: nothing to add.
+                let restored = self.restoring.remove(index);
+                self.tell(format!("attachment: restored {} to {on}", restored.show()));
+                return true;
+            }
+            if let Some(index) = self.gave_up.iter().position(|gave_up| gave_up.id == item) {
+                let late = self.gave_up.remove(index);
+                self.tell(format!("attachment: {} arrived late, on {on}", late.show()));
+                let what = format!("adding {}", late.show());
+                self.note(grid, What::Link(late), what, now);
+                return true;
+            }
             return false;
         };
         let text = format!("{} is attached to {}", attach.item.show(), inventory::point_name(point));
@@ -985,6 +1063,22 @@ impl Commands {
     pub fn attach_failed(&mut self, item: Uuid) {
         let (failed, attaching): (Vec<_>, Vec<_>) = std::mem::take(&mut self.attaching).into_iter().partition(|a| a.item.id == item);
         self.attaching = attaching;
+        if let Some(index) = self.restoring.iter().position(|restoring| restoring.id == item) {
+            let lost = self.restoring.remove(index);
+            let limit = ATTACH_LIMIT.as_secs();
+            self.tell(format!(
+                "attachment: the simulator did not restore {} within {limit} s",
+                lost.show()
+            ));
+        }
+        if let Some(attach) = failed.first() {
+            // It may still come: its link is owed then.
+            self.gave_up.retain(|gave_up| gave_up.id != item);
+            if self.gave_up.len() == MAX_GAVE_UP {
+                self.gave_up.remove(0);
+            }
+            self.gave_up.push(attach.item.clone());
+        }
         for attach in failed {
             let mut reason = format!(
                 "the simulator did not attach {} within {} s",
@@ -1050,12 +1144,94 @@ impl Commands {
             let mut reason = format!(
                 "the simulator did not detach {} within {} s",
                 names(&detach.stuck),
-                ATTACH_LIMIT.as_secs()
+                DETACH_LIMIT.as_secs()
             );
             if !detach.gone.is_empty() {
                 reason.push_str(&format!("; detached {}", names(&detach.gone)));
             }
             refuse("detach", &detach.reply, reason);
+        }
+    }
+
+    // ------------------------------------- restoring attachments after login
+
+    /// The avatar has entered a region. Until the Current Outfit folder
+    /// has been compared with the avatar once since the login, that is
+    /// due `RESTORE_DELAY` from now: the new simulator has yet to show
+    /// what is attached, also when the folder is being read already.
+    pub fn entered_region(&mut self, now: Instant) {
+        if self.restore_on && self.restore != Restore::Done {
+            self.restore = Restore::Due(now + RESTORE_DELAY);
+        }
+    }
+
+    /// Asks for the Current Outfit folder when the time has come. For the
+    /// main loop, beside `tick`.
+    pub fn restore_due<G: Grid>(&mut self, grid: Option<&mut G>, now: Instant) {
+        let Restore::Due(at) = self.restore else {
+            return;
+        };
+        if now < at {
+            return;
+        }
+        let Some(grid) = grid.filter(|grid| grid.ready()) else {
+            // Between regions: the next region entry sets the time anew.
+            self.restore = Restore::Due(now + RESTORE_RETRY);
+            return;
+        };
+        self.restore = Restore::Done;
+        if !grid.outfit_service() {
+            // The folder is not kept here, so it says nothing.
+            return;
+        }
+        self.job_ids += 1;
+        match grid.inventory(self.job_ids, now + inventory::LIMIT, What::OutfitObjects) {
+            Ok(()) => self.restore = Restore::Reading(self.job_ids),
+            Err(reason) => self.tell(format!("attachments not restored: {reason}")),
+        }
+    }
+
+    /// The Current Outfit folder's objects are known: asks the simulator
+    /// for those that are not on the avatar.
+    fn restore_missing<G: Grid>(&mut self, result: Result<Outcome, Failed>, grid: Option<&mut G>, now: Instant) {
+        self.restore = Restore::Done;
+        let listed = match result {
+            Ok(Outcome::Items(listed)) => listed,
+            Ok(_) => return,
+            Err(Failed::Reason(reason)) => return self.tell(format!("attachments not restored: {reason}")),
+            Err(Failed::TimedOut) => return self.tell("attachments not restored: the grid did not answer in time".to_string()),
+        };
+        let Some(grid) = grid.filter(|grid| grid.ready()) else {
+            // Left the region meanwhile: what is attached is not known.
+            self.restore = Restore::Due(now + RESTORE_RETRY);
+            return;
+        };
+        let attached = grid.attached();
+        let missing: Vec<Item> = listed
+            .iter()
+            .filter(|item| !attached.iter().any(|(on, _)| *on == item.id))
+            .filter(|item| !self.attaching.iter().any(|attach| attach.item.id == item.id))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            crate::debug!(
+                "attachments: all {} objects of the Current Outfit folder are on the avatar",
+                listed.len()
+            );
+            return;
+        }
+        for item in missing {
+            match grid.attach(&item, 0, now) {
+                Ok(()) => {
+                    self.tell(format!(
+                        "attachment: restoring {}, listed in the Current Outfit folder and not on the avatar",
+                        item.show()
+                    ));
+                    self.gave_up.retain(|gave_up| gave_up.id != item.id);
+                    self.restoring.push(item);
+                }
+                Err(reason) => self.tell(format!("attachment: {} not restored: {reason}", item.show())),
+            }
         }
     }
 
@@ -1245,6 +1421,10 @@ impl Commands {
         for detach in std::mem::take(&mut self.detaching) {
             refuse("detach", &detach.reply, "the session was lost".to_string());
         }
+        // The next login compares anew, and owes this one's attaches nothing.
+        self.restore = Restore::Idle;
+        self.restoring.clear();
+        self.gave_up.clear();
         self.offers.clear();
     }
 
@@ -1252,7 +1432,11 @@ impl Commands {
     pub fn next_deadline(&self) -> Option<Instant> {
         let lookups = self.waiting.iter().map(|w| w.deadline);
         let jobs = self.jobs.values().map(|job| job.deadline + JOB_GRACE);
-        lookups.chain(jobs).min()
+        let restore = match self.restore {
+            Restore::Due(at) => Some(at),
+            _ => None,
+        };
+        lookups.chain(jobs).chain(restore).min()
     }
 
     // ------------------------------------------- what the session reports
@@ -1545,6 +1729,8 @@ mod tests {
         outfit: bool,
         /// What is attached to the avatar.
         attached: Vec<(Uuid, u8)>,
+        /// The simulator has not said yet which services it has.
+        settling: bool,
     }
 
     impl Default for FakeGrid {
@@ -1559,6 +1745,7 @@ mod tests {
                 no_inventory: false,
                 outfit: false,
                 attached: Vec::new(),
+                settling: false,
             }
         }
     }
@@ -1645,6 +1832,9 @@ mod tests {
         }
         fn outfit_service(&self) -> bool {
             self.outfit
+        }
+        fn ready(&self) -> bool {
+            !self.offline && !self.settling
         }
         fn attached(&self) -> Vec<(Uuid, u8)> {
             self.attached.clone()
@@ -2791,7 +2981,7 @@ mod tests {
         not_answered(&answer);
         rig.commands.attach_failed(radio().id);
         let reason = error(&answer);
-        assert!(reason.contains("did not attach \"Radio\"") && reason.contains("15 s"), "{reason}");
+        assert!(reason.contains("did not attach \"Radio\"") && reason.contains("30 s"), "{reason}");
         assert!(!reason.contains("it said"), "{reason}");
         // What the simulator said meanwhile is likely the reason.
         let request = rig.attach("Objects/Radio", None);
@@ -3201,5 +3391,357 @@ mod tests {
         assert!(rig.sim_detached(&radio()));
         ok(&answer);
         assert_eq!(rig.grid.jobs.len(), 0);
+    }
+    // ---------------------------------------------- attaches that come late
+
+    impl Rig {
+        fn told(&mut self) -> Vec<String> {
+            std::mem::take(&mut self.commands.told)
+        }
+
+        /// An `attach` of the radio that the simulator did not carry out
+        /// in time.
+        fn give_up_on_radio(&mut self) {
+            let request = self.attach("Objects/Radio", None);
+            let answer = self.with_item(request, &radio());
+            self.commands.attach_failed(radio().id);
+            assert!(error(&answer).contains("did not attach"));
+            self.calls();
+        }
+    }
+
+    #[test]
+    fn an_attach_that_arrives_after_the_answer_still_gets_its_link() {
+        let mut rig = Rig::new();
+        rig.grid.outfit = true;
+        rig.give_up_on_radio();
+        assert_eq!(rig.grid.jobs.len(), 0);
+        // Six seconds later, as on Second Life.
+        assert!(rig.sim_attached(&radio(), 5));
+        assert_eq!(
+            rig.told(),
+            ["attachment: \"Radio\" <".to_string() + &radio().id.to_string() + "> arrived late, on Left Hand"]
+        );
+        assert_eq!(rig.job().1, What::Link(radio()));
+        // Once: the same object shown again is nobody's.
+        rig.grid.attached.clear();
+        assert!(!rig.sim_attached(&radio(), 5));
+        assert_eq!(rig.grid.jobs.len(), 0);
+    }
+
+    #[test]
+    fn a_late_attach_is_only_noted_where_the_folder_is_not_kept() {
+        let mut rig = Rig::new();
+        rig.give_up_on_radio();
+        assert!(rig.sim_attached(&radio(), 5));
+        assert_eq!(rig.told().len(), 1);
+        assert_eq!(rig.grid.jobs.len(), 0);
+    }
+
+    #[test]
+    fn a_second_attach_answers_for_an_object_that_was_given_up_on() {
+        let mut rig = Rig::new();
+        rig.grid.outfit = true;
+        rig.give_up_on_radio();
+        let request = rig.attach("Objects/Radio", None);
+        let answer = rig.with_item(request, &radio());
+        assert!(rig.sim_attached(&radio(), 5));
+        assert!(ok(&answer).unwrap().contains("attached to Left Hand"));
+        // One link, and it did not come late for the command that waited.
+        assert_eq!(rig.job().1, What::Link(radio()));
+        assert_eq!(rig.told(), [] as [String; 0]);
+    }
+
+    #[test]
+    fn what_was_given_up_on_is_forgotten_with_the_session() {
+        let mut rig = Rig::new();
+        rig.grid.outfit = true;
+        rig.give_up_on_radio();
+        rig.commands.session_lost();
+        assert!(!rig.sim_attached(&radio(), 5));
+        assert_eq!(rig.grid.jobs.len(), 0);
+        // Only so many are remembered.
+        for n in 0..(MAX_GAVE_UP as u128 + 1) {
+            let item = Item {
+                id: Uuid::from_u128(0xF00 + n),
+                ..radio()
+            };
+            let request = rig.attach(&item.id.to_string(), None);
+            let _ = rig.with_item(request, &item);
+            rig.commands.attach_failed(item.id);
+        }
+        assert_eq!(rig.commands.gave_up.len(), MAX_GAVE_UP);
+        assert_eq!(rig.commands.gave_up[0].id, Uuid::from_u128(0xF01));
+    }
+
+    // ------------------------------------- restoring attachments after login
+
+    impl Rig {
+        /// A login on a grid that keeps the Current Outfit folder: the
+        /// region is entered and the time to compare has come. Returns
+        /// the id of the job that reads the folder.
+        fn compare(&mut self) -> u64 {
+            self.grid.outfit = true;
+            self.commands.entered_region(self.now);
+            self.due();
+            assert_eq!(self.grid.jobs.len(), 0, "asked before the simulator had its time");
+            assert_eq!(self.commands.next_deadline(), Some(self.now + RESTORE_DELAY));
+            self.now += RESTORE_DELAY;
+            self.due();
+            let (id, what) = self.job();
+            assert_eq!(what, What::OutfitObjects);
+            id
+        }
+
+        fn due(&mut self) {
+            self.commands.restore_due(Some(&mut self.grid), self.now);
+        }
+
+        fn listed(&mut self, id: u64, items: &[Item]) {
+            self.answer(id, Ok(Outcome::Items(items.to_vec())));
+        }
+    }
+
+    #[test]
+    fn an_object_the_outfit_folder_lists_and_the_simulator_did_not_bring_is_attached_again() {
+        let mut rig = Rig::new();
+        rig.grid.attached = vec![(hat().id, 2)];
+        let id = rig.compare();
+        rig.listed(id, &[radio(), hat()]);
+        // To the point it was last on, and nothing is taken off.
+        assert_eq!(rig.calls(), [Call::Attach(radio(), 0)]);
+        let told = rig.told();
+        assert_eq!(told.len(), 1);
+        assert!(
+            told[0].starts_with("attachment: restoring \"Radio\" <") && told[0].contains("Current Outfit folder"),
+            "{told:?}"
+        );
+        // The simulator shows it: said so, and no link is added.
+        assert!(rig.sim_attached(&radio(), 5));
+        let told = rig.told();
+        assert!(
+            told.len() == 1 && told[0].starts_with("attachment: restored \"Radio\" <") && told[0].ends_with("to Left Hand"),
+            "{told:?}"
+        );
+        assert_eq!(rig.grid.jobs.len(), 0);
+        // It is attached like any other.
+        let request = rig.attach("Objects/Radio", None);
+        assert!(error(&rig.with_item(request, &radio())).contains("attached to Left Hand already"));
+        // Not again in this login, whatever happens.
+        rig.grid.attached.clear();
+        assert_eq!(rig.commands.next_deadline(), None);
+        rig.commands.entered_region(rig.now);
+        rig.now += RESTORE_DELAY * 3;
+        rig.due();
+        assert_eq!(rig.grid.jobs.len(), 0);
+        assert_eq!(rig.calls(), []);
+    }
+
+    #[test]
+    fn nothing_is_asked_of_the_simulator_when_nothing_is_missing() {
+        let mut rig = Rig::new();
+        rig.grid.attached = vec![(hat().id, 2), (radio().id, 5), (watch().id, 5)];
+        let id = rig.compare();
+        // The watch is worn and not listed: it stays, and so does the folder.
+        rig.listed(id, &[radio(), hat()]);
+        assert_eq!(rig.calls(), []);
+        assert_eq!(rig.grid.jobs.len(), 0);
+        assert_eq!(rig.told(), [] as [String; 0]);
+        // An empty folder takes nothing off either.
+        let mut rig = Rig::new();
+        rig.grid.attached = vec![(watch().id, 5)];
+        let id = rig.compare();
+        rig.listed(id, &[]);
+        assert_eq!(rig.calls(), []);
+        assert_eq!(rig.grid.attached, [(watch().id, 5)]);
+    }
+
+    #[test]
+    fn nothing_is_restored_when_switched_off_or_without_the_outfit_service() {
+        // Switched off: the folder is not asked about.
+        let mut rig = Rig::new();
+        rig.grid.outfit = true;
+        rig.commands.set_restore(false);
+        rig.commands.entered_region(rig.now);
+        assert_eq!(rig.commands.next_deadline(), None);
+        rig.now += RESTORE_DELAY;
+        rig.due();
+        assert_eq!(rig.grid.jobs.len(), 0);
+        // A grid that does not keep the folder, as OpenSimulator.
+        let mut rig = Rig::new();
+        rig.commands.entered_region(rig.now);
+        rig.now += RESTORE_DELAY;
+        rig.due();
+        assert_eq!(rig.grid.jobs.len(), 0);
+        assert_eq!(rig.commands.next_deadline(), None);
+        // And not later in that login either.
+        rig.grid.outfit = true;
+        rig.now += RESTORE_DELAY;
+        rig.due();
+        assert_eq!(rig.grid.jobs.len(), 0);
+        assert_eq!(rig.told(), [] as [String; 0]);
+    }
+
+    #[test]
+    fn the_folder_is_compared_once_per_login() {
+        let mut rig = Rig::new();
+        let id = rig.compare();
+        rig.listed(id, &[]);
+        // A teleport to another region afterwards.
+        rig.commands.simulator_changed();
+        rig.commands.entered_region(rig.now);
+        rig.now += RESTORE_DELAY;
+        rig.due();
+        assert_eq!(rig.grid.jobs.len(), 0);
+        // The session is lost and the bot logs in again.
+        rig.commands.session_lost();
+        rig.due();
+        assert_eq!(rig.commands.next_deadline(), None);
+        let id = rig.compare();
+        rig.listed(id, &[radio()]);
+        assert_eq!(rig.calls(), [Call::Attach(radio(), 0)]);
+    }
+
+    #[test]
+    fn a_command_given_meanwhile_is_not_doubled_by_the_restore() {
+        // The object is on its way for a command when the folder is read.
+        let mut rig = Rig::new();
+        rig.grid.outfit = true;
+        rig.commands.entered_region(rig.now);
+        let request = rig.attach("Objects/Radio", None);
+        let answer = rig.with_item(request, &radio());
+        assert_eq!(rig.calls(), [Call::Attach(radio(), 0)]);
+        rig.now += RESTORE_DELAY;
+        rig.due();
+        let (id, _) = rig.job();
+        rig.listed(id, &[radio()]);
+        assert_eq!(rig.calls(), []);
+        assert!(rig.sim_attached(&radio(), 5));
+        assert!(ok(&answer).unwrap().contains("attached to Left Hand"));
+        assert_eq!(rig.told(), [] as [String; 0]);
+        // A command for an object that is being restored takes it over.
+        let mut rig = Rig::new();
+        let id = rig.compare();
+        rig.listed(id, &[radio()]);
+        rig.told();
+        let request = rig.attach("Objects/Radio", Some("Chest"));
+        let answer = rig.with_item(request, &radio());
+        assert_eq!(rig.calls(), [Call::Attach(radio(), 0), Call::Attach(radio(), 1)]);
+        assert!(rig.sim_attached(&radio(), 1));
+        assert!(ok(&answer).unwrap().contains("attached to Chest"));
+        assert_eq!(rig.told(), [] as [String; 0]);
+        // The command's attach is noted in the folder as always.
+        assert_eq!(rig.job().1, What::Link(radio()));
+    }
+
+    #[test]
+    fn the_comparison_waits_for_a_region_that_has_shown_its_attachments() {
+        // Between regions when the time comes.
+        let mut rig = Rig::new();
+        rig.grid.outfit = true;
+        rig.commands.entered_region(rig.now);
+        rig.now += RESTORE_DELAY;
+        rig.grid.offline = true;
+        rig.due();
+        assert_eq!(rig.grid.jobs.len(), 0);
+        assert_eq!(rig.commands.next_deadline(), Some(rig.now + RESTORE_RETRY));
+        // The new region gets its twenty seconds too: its simulator has
+        // not shown anything yet.
+        rig.grid.offline = false;
+        rig.commands.entered_region(rig.now);
+        rig.now += RESTORE_RETRY;
+        rig.due();
+        assert_eq!(rig.grid.jobs.len(), 0);
+        rig.now += RESTORE_DELAY;
+        rig.due();
+        let (id, _) = rig.job();
+        // The same when the region changes while the folder is read: the
+        // answer is not compared with an avatar nobody has described.
+        rig.commands.simulator_changed();
+        rig.commands.entered_region(rig.now);
+        rig.listed(id, &[radio()]);
+        assert_eq!(rig.calls(), []);
+        rig.now += RESTORE_DELAY;
+        rig.due();
+        let (id, _) = rig.job();
+        // And when the avatar leaves just as the answer comes.
+        rig.grid.offline = true;
+        rig.listed(id, &[radio()]);
+        assert_eq!(rig.calls(), []);
+        rig.grid.offline = false;
+        rig.commands.entered_region(rig.now);
+        rig.now += RESTORE_DELAY;
+        rig.due();
+        let (id, _) = rig.job();
+        rig.listed(id, &[radio()]);
+        assert_eq!(rig.calls(), [Call::Attach(radio(), 0)]);
+        // A simulator that has not said yet what it offers is waited for.
+        let mut rig = Rig::new();
+        rig.grid.outfit = true;
+        rig.grid.settling = true;
+        rig.commands.entered_region(rig.now);
+        rig.now += RESTORE_DELAY;
+        rig.due();
+        assert_eq!(rig.grid.jobs.len(), 0);
+        rig.grid.settling = false;
+        rig.now += RESTORE_RETRY;
+        rig.due();
+        assert_eq!(rig.job().1, What::OutfitObjects);
+    }
+
+    #[test]
+    fn a_restore_that_comes_to_nothing_is_said_once_and_not_tried_again() {
+        // The simulator does not bring the object.
+        let mut rig = Rig::new();
+        let id = rig.compare();
+        rig.listed(id, &[radio(), hat()]);
+        rig.told();
+        rig.commands.attach_failed(radio().id);
+        let told = rig.told();
+        assert!(
+            told.len() == 1 && told[0].contains("did not restore \"Radio\"") && told[0].ends_with("within 30 s"),
+            "{told:?}"
+        );
+        // The other one still counts when it comes.
+        assert!(rig.sim_attached(&hat(), 2));
+        assert_eq!(rig.told().len(), 1);
+        // One that comes after that is an attachment like any other.
+        assert!(!rig.sim_attached(&radio(), 5));
+        rig.now += RESTORE_DELAY * 3;
+        rig.due();
+        assert_eq!(rig.grid.jobs.len(), 0);
+        assert_eq!(rig.calls().len(), 2);
+
+        // The folder cannot be read.
+        for (failure, reason) in [
+            (
+                Failed::Reason("the inventory has no Current Outfit folder".into()),
+                "no Current Outfit folder",
+            ),
+            (Failed::TimedOut, "did not answer in time"),
+        ] {
+            let mut rig = Rig::new();
+            let id = rig.compare();
+            rig.answer(id, Err(failure));
+            let told = rig.told();
+            assert!(
+                told.len() == 1 && told[0].starts_with("attachments not restored: ") && told[0].contains(reason),
+                "{told:?}"
+            );
+            rig.now += RESTORE_DELAY * 3;
+            rig.due();
+            assert_eq!(rig.grid.jobs.len(), 0);
+            assert_eq!(rig.calls(), []);
+        }
+        // Or not even asked for.
+        let mut rig = Rig::new();
+        rig.grid.outfit = true;
+        rig.grid.no_inventory = true;
+        rig.commands.entered_region(rig.now);
+        rig.now += RESTORE_DELAY;
+        rig.due();
+        let told = rig.told();
+        assert!(told.len() == 1 && told[0].starts_with("attachments not restored: "), "{told:?}");
+        assert_eq!(rig.commands.next_deadline(), None);
     }
 }

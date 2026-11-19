@@ -77,12 +77,15 @@ clothing commands can only be refused. On Second Life, checked by hand on
   itself no longer has the object on the avatar after such a login: in the
   first check it attached that object again when asked. Why it loses it is
   not known. A viewer attaches at every login whatever the Current Outfit
-  folder lists and the simulator did not bring, which would hide this; the
-  bot does not do that.
+  folder lists and the simulator did not bring, which would hide this. The
+  bot now does the same (`restore_attachments`, see
+  [Attachments](#attachments)); that is verified by unit tests only and
+  has not been tried on Second Life yet.
 - In those four also: the simulator took 21 and 15 seconds to carry out an
   `attach`. The bot waits 15, so the first was answered as refused; the
   object came six seconds later and was reported, and got no link in the
-  Current Outfit folder.
+  Current Outfit folder. The bot now waits 30 seconds and gives an object
+  that comes later still its link; unit tests only so far.
 
 Not tried there, or not recorded: the listing of `inventory` against what a
 viewer shows, `attach` with a body part named, `unwear` by kind of
@@ -186,6 +189,7 @@ One TOML file; see `russelbot.example.toml`.
 | `socket` | no | `true` to listen on the control socket, see [Control socket](#control-socket). Default: `false` |
 | `requesttp_timeout` | no | Minutes after `requesttp` during which the asked avatar's teleport offer is accepted. Default: `10` |
 | `scan_distance` | no | Metres (1 to 1024) within which objects are learned from the start, for `touch`; see [Touching objects](#touching-objects). Default: learn within 32 m when `touch` is first used |
+| `restore_attachments` | no | `false` to keep the bot from attaching again, after each login, what the Current Outfit folder lists and the simulator did not bring; see [Attachments](#attachments). Default: `true` |
 
 `persist` takes these forms:
 
@@ -544,7 +548,9 @@ other's way.
 
 Nothing is kept: every command asks the grid for the folders it needs, one
 folder for each name of a path, and a bot that is never given one of these
-commands asks the grid nothing about the inventory. A change made with a
+commands asks the grid nothing about the inventory, except once after each
+login for the Current Outfit folder where `restore_attachments` applies
+(see [Attachments](#attachments)). A change made with a
 viewer is seen by the next command. A folder given by UUID is looked for
 from the top of My Inventory, to print the paths, so on a large inventory a
 path is the quicker way to name one.
@@ -569,8 +575,9 @@ target/release/rslbot ctl wear "Bot gear/Radio"        # an object: the same as 
 point. Without one the simulator puts it where the inventory says it was
 attached last, and chooses for itself when the inventory records nothing.
 The command answers with the item and the point once the simulator shows
-the object on the avatar, or with an error after 15 seconds. Nothing is
-taken off to make room: several objects can share a point, so repeating an
+the object on the avatar, or with an error after 30 seconds. (An object
+that arrives later still is noted in the log, and in the Current Outfit
+folder like any other the bot attached.) Nothing is taken off to make room: several objects can share a point, so repeating an
 `attach` with other items piles them up; `inventory -a` shows what is on
 and `detach BODY PART` clears a point. An item that is attached already is
 refused, with the point it is on. `wear ITEM` on an object does exactly what
@@ -616,9 +623,33 @@ take a moment.
 
 On Second Life an attachment that was there at one login can be missing at
 the next: seen each time after another object had been attached to the same
-point and detached again (see [Status](#status)). The Current Outfit folder
-may still list such an object; the bot does not attach it again by itself.
-An attachment the simulator does not show the bot treats as not attached.
+point and detached again (see [Status](#status)). A viewer makes up for
+that at every login, and so does the bot. Once after each login, when the
+avatar has been in a region for 20 seconds, it reads the Current Outfit
+folder and asks the simulator to attach every object the folder lists that
+is not on the avatar, to the point it was last on. It takes nothing off,
+whether the folder lists it or not, and it does this once: not again after
+a teleport, and not a second time for an object the simulator does not
+bring within 30 seconds. The log says what it asked for and what came of
+it:
+
+```
+attachment: restoring "Radio" <UUID>, listed in the Current Outfit folder and not on the avatar
+attachment: restored "Radio" <UUID> to Left Hand
+```
+
+So the folder is what counts: an object taken off by something that does
+not update it, a script for instance, is back after the next login.
+`restore_attachments = false` in the config switches all of this off; the
+bot then asks the grid nothing about the folder unless a command needs it.
+On a grid without the outfit service (see [Clothing](#clothing)) the option
+does nothing either way, because the bot does not keep the folder there.
+That is the case on the local OpenSimulator, where the loss was not seen
+either (`docs/test-rig.md`, item 105), so there it makes no difference
+whether the option is on or off.
+
+Until that moment, and until a restored object has arrived, the bot treats
+an attachment the simulator does not show as not attached.
 
 None of these commands moves the avatar or changes whether the bot is
 holding its place.

@@ -291,6 +291,9 @@ impl Grid for Live<'_> {
     fn outfit_service(&self) -> bool {
         self.inventory.urls.as_ref().is_some_and(caps::InventoryUrls::outfit_service)
     }
+    fn ready(&self) -> bool {
+        self.session.present().is_ok() && self.inventory.urls.is_some()
+    }
     fn attached(&self) -> Vec<(Uuid, u8)> {
         self.session.attached()
     }
@@ -344,6 +347,8 @@ impl Bot {
     /// A bot that holds the config placement and has not logged in yet.
     fn new(config: Config, logs: Logs, events: Sender<Event>) -> Bot {
         let book = Book::new(config_placement(&config));
+        let mut commands = Commands::new(config.requesttp_timeout);
+        commands.set_restore(config.restore_attachments);
         Bot {
             reconciler: Reconciler::new(goal(book.held(), config_start(&config))),
             book,
@@ -353,7 +358,7 @@ impl Bot {
             logs,
             name_lookups: names::spawn(events.clone()),
             names_url: None,
-            commands: Commands::new(config.requesttp_timeout),
+            commands,
             avatar_searches: names::spawn_search(events.clone()),
             search_url: None,
             inventory: Inventory {
@@ -429,6 +434,13 @@ impl Bot {
         self.inventory.urls = None;
         self.inventory.generation = None;
         self.commands.session_lost();
+    }
+
+    /// Reads the Current Outfit folder when it is time to compare it with
+    /// what is attached (see `Commands::entered_region`).
+    fn restore_attachments(&mut self, now: Instant) {
+        let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
+        self.commands.restore_due(live.as_mut(), now);
     }
 
     /// Notices a hand-over to another simulator: the inventory services
@@ -702,6 +714,7 @@ impl Bot {
                     (Some(_), false) => info!("connected, in region \"{name}\" (not the target region)"),
                 }
                 self.commands.arrived(&name);
+                self.commands.entered_region(now);
             }
             SessionEvent::Lost(reason) => {
                 let delay = self.reconciler.session_lost(now);
@@ -1124,6 +1137,7 @@ fn run_loop(bot: &mut Bot, incoming: &Receiver<Event>) -> i32 {
             return code;
         }
         bot.commands.tick(Instant::now());
+        bot.restore_attachments(Instant::now());
         bot.service_messages();
         let mut wake = Instant::now() + IDLE_WAIT;
         if !bot.stopping {

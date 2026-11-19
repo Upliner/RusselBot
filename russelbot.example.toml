@@ -73,6 +73,12 @@ sit = "00000000-0000-0000-0000-000000000000"
 # objects within 32 metres when `touch` is first used.
 # scan_distance = 64
 
+# Optional: after each login the bot reads the avatar's Current Outfit folder
+# and attaches again the objects it lists that the simulator did not bring,
+# as a viewer does. Only where the grid keeps that folder up to date (Second
+# Life); elsewhere this does nothing. On by default; `false` switches it off.
+# restore_attachments = false
+
 # The same as `persist = ["cur", "cfg"]`, as a table. A key that is left out
 # of the table is "cur". A table has to come after all the keys above.
 # [persist]

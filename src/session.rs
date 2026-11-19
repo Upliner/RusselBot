@@ -24,8 +24,12 @@ const AGENT_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 /// How long a touch waits for a scan to turn its object up.
 pub const TOUCH_WAIT: Duration = Duration::from_secs(10);
 /// How long the simulator has to show an object on the avatar after an
-/// attach, or gone from it after a detach.
-pub const ATTACH_LIMIT: Duration = Duration::from_secs(15);
+/// attach. Second Life has been seen to take 21 seconds; a viewer gives up
+/// after 30.
+pub const ATTACH_LIMIT: Duration = Duration::from_secs(30);
+/// How long the simulator has to show an object gone from the avatar
+/// after a detach.
+pub const DETACH_LIMIT: Duration = Duration::from_secs(15);
 /// Most objects remembered in one region; more are not learned.
 const MAX_OBJECTS: usize = 50_000;
 /// Most objects remembered as mentioned but not described.
@@ -125,7 +129,7 @@ pub enum SessionEvent {
     },
     /// An `attach` was not followed by the object within `ATTACH_LIMIT`.
     AttachFailed(Uuid),
-    /// A `detach` did not make the object go within `ATTACH_LIMIT`.
+    /// A `detach` did not make the object go within `DETACH_LIMIT`.
     DetachFailed(Uuid),
 }
 
@@ -805,13 +809,13 @@ impl<N: Net> Session<N> {
     }
 
     /// Detaches the object of an inventory item into the inventory. Ends
-    /// in `Detached` for the item or, after `ATTACH_LIMIT`, in
+    /// in `Detached` for the item or, after `DETACH_LIMIT`, in
     /// `DetachFailed`.
     pub fn detach(&mut self, item: Uuid, now: Instant) -> Result<(), String> {
         self.present()?;
         self.send(messages::detach_attachment_into_inv(&self.agent, item), true, now);
         self.sim.awaited_detach.retain(|(awaited, _)| *awaited != item);
-        self.sim.awaited_detach.push((item, now + ATTACH_LIMIT));
+        self.sim.awaited_detach.push((item, now + DETACH_LIMIT));
         Ok(())
     }
 
@@ -3281,7 +3285,7 @@ mod tests {
     }
 
     #[test]
-    fn an_attach_that_shows_nothing_fails_after_fifteen_seconds() {
+    fn an_attach_that_shows_nothing_fails_after_thirty_seconds() {
         let mut rig = Rig::standing();
         rig.session.attach(&radio(), 0, rig.now).unwrap();
         rig.ack_all();
@@ -3295,6 +3299,32 @@ mod tests {
         rig.advance(secs(5));
         assert_eq!(rig.events(), []);
         assert_eq!(rig.session.present(), Ok(()));
+    }
+
+    #[test]
+    fn a_slow_attach_is_waited_for_longer_than_a_detach() {
+        // Second Life has taken 21 seconds over an attach.
+        let mut rig = Rig::standing();
+        rig.session.attach(&radio(), 0, rig.now).unwrap();
+        rig.ack_all();
+        rig.advance(secs(21));
+        assert_eq!(rig.events(), []);
+        rig.attachment(radio_object(), RADIO_LOCAL, OWN_LOCAL, 5, radio_item());
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::Attached {
+                item: radio_item(),
+                point: 5
+            }]
+        );
+        rig.advance(ATTACH_LIMIT);
+        assert_eq!(rig.events(), []);
+        // A detach is given up on after fifteen.
+        rig.session.detach(radio_item(), rig.now).unwrap();
+        rig.ack_all();
+        rig.advance(secs(15));
+        assert_eq!(rig.events(), [SessionEvent::DetachFailed(radio_item())]);
+        assert_eq!((ATTACH_LIMIT, DETACH_LIMIT), (secs(30), secs(15)));
     }
 
     #[test]
@@ -3320,7 +3350,7 @@ mod tests {
                 point: 5
             }]
         );
-        rig.advance(ATTACH_LIMIT);
+        rig.advance(DETACH_LIMIT);
         assert_eq!(rig.events(), []);
 
         // One the simulator leaves on.
@@ -3328,7 +3358,7 @@ mod tests {
         rig.events();
         rig.session.detach(radio_item(), rig.now).unwrap();
         rig.ack_all();
-        rig.advance(ATTACH_LIMIT - secs(1));
+        rig.advance(DETACH_LIMIT - secs(1));
         assert_eq!(rig.events(), []);
         rig.advance(secs(1));
         assert_eq!(rig.events(), [SessionEvent::DetachFailed(radio_item())]);

@@ -3,7 +3,7 @@
 ## ADDED Requirements
 
 ### Requirement: Restoring attachments after a login
-While the config option `restore_attachments` is on, which it is unless the config says otherwise, the bot SHALL make sure after every login that the objects listed in the avatar's Current Outfit folder are attached. Once per login, when 20 seconds have passed since the avatar entered a region for the first time after that login, the bot SHALL read the links in the Current Outfit folder and SHALL ask the simulator to attach every object a link points to that the simulator does not show on the avatar at that moment: each to the point the inventory records for it, without taking anything off. If the avatar is not in a region when the 20 seconds are over, the bot SHALL do this as soon as it is in one again.
+While the config option `restore_attachments` is on, which it is unless the config says otherwise, the bot SHALL make sure after every login that the objects listed in the avatar's Current Outfit folder are attached. Once per login, the first time the avatar has been in one region for 20 seconds after that login, the bot SHALL read the links in the Current Outfit folder and SHALL ask the simulator to attach every object a link points to that the simulator does not show on the avatar at that moment: each to the point the inventory records for it, without taking anything off. A change of region before the comparison is made SHALL start the 20 seconds anew, since the new simulator has yet to show what is attached.
 
 The bot SHALL do this only where the simulator offers the outfit service; elsewhere, and with `restore_attachments = false`, it SHALL do nothing of it and ask the grid nothing. It SHALL NOT take off anything, whether the folder lists it or not. It SHALL leave alone links to anything but objects and links whose item the inventory does not have. It SHALL NOT add a link for an object it attaches this way. It SHALL NOT repeat the comparison in the same login: not after a teleport, and not when an object it asked for does not arrive.
 
@@ -48,6 +48,10 @@ The bot SHALL write to its operator log one line for every object it asks the si
 #### Scenario: Logged in again after losing the session
 - **WHEN** the session is lost, the bot logs in again, and 20 seconds have passed in the region
 - **THEN** the bot compares the folder with the avatar again
+
+#### Scenario: Teleported before the comparison
+- **WHEN** the avatar teleports to another region ten seconds after the login
+- **THEN** the bot reads the Current Outfit folder 20 seconds after it has entered that region, and not before
 
 #### Scenario: Command during the wait
 - **WHEN** `rslbot ctl attach Objects/Radio` is run ten seconds after the login and `Radio` is one of the objects the simulator did not bring

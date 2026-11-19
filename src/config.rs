@@ -76,6 +76,9 @@ pub struct Config {
     /// How far around the avatar objects are learned from the start, in
     /// metres; without it they are learned when first needed.
     pub scan_distance: Option<f32>,
+    /// After each login, attach again what the Current Outfit folder lists
+    /// and the simulator did not bring.
+    pub restore_attachments: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -107,6 +110,7 @@ struct Raw {
     socket: Option<toml::Value>,
     requesttp_timeout: Option<toml::Value>,
     scan_distance: Option<toml::Value>,
+    restore_attachments: Option<toml::Value>,
 }
 
 /// Hashes a plain password into the form grids accept: `$1$` + MD5 hex.
@@ -133,8 +137,13 @@ fn required<T>(value: Option<T>, key: &str) -> Result<T, ConfigError> {
 }
 
 fn flag(value: Option<toml::Value>, key: &str) -> Result<bool, ConfigError> {
+    flag_or(value, key, false)
+}
+
+/// A boolean key that is `default` when left out.
+fn flag_or(value: Option<toml::Value>, key: &str, default: bool) -> Result<bool, ConfigError> {
     match value {
-        None => Ok(false),
+        None => Ok(default),
         Some(toml::Value::Boolean(on)) => Ok(on),
         Some(_) => err(format!("`{key}` must be true or false")),
     }
@@ -300,6 +309,7 @@ impl Config {
             Some(Some(metres)) if (1.0..=MAX_SCAN_DISTANCE).contains(&metres) => Some(metres as f32),
             Some(_) => return err("`scan_distance` must be a number of metres from 1 to 1024"),
         };
+        let restore_attachments = flag_or(raw.restore_attachments, "restore_attachments", true)?;
 
         Ok(Config {
             login_url,
@@ -316,6 +326,7 @@ impl Config {
             socket,
             requesttp_timeout,
             scan_distance,
+            restore_attachments,
         })
     }
 }
@@ -614,6 +625,25 @@ mod tests {
         for bad in ["0", "-5", "\"soon\"", "true", "inf", "nan", "1e9"] {
             let text = base() + &format!("requesttp_timeout = {bad}\n");
             assert!(rejected(&text).contains("`requesttp_timeout`"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn restore_attachments_is_on_unless_switched_off() {
+        assert!(Config::parse(&base()).unwrap().restore_attachments);
+        assert!(
+            Config::parse(&(base() + "restore_attachments = true\n"))
+                .unwrap()
+                .restore_attachments
+        );
+        assert!(
+            !Config::parse(&(base() + "restore_attachments = false\n"))
+                .unwrap()
+                .restore_attachments
+        );
+        for bad in ["\"no\"", "0", "[false]"] {
+            let text = base() + &format!("restore_attachments = {bad}\n");
+            assert!(rejected(&text).contains("`restore_attachments`"), "{bad}");
         }
     }
 

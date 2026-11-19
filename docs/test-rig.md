@@ -319,17 +319,21 @@ two objects and the folder.
 | 103 | Two folders `Bot gear` at the top (left by an earlier `stock.py`), `ctl inventory "Bot gear"` | Status 1; the error lists the folders' UUIDs | Pass, with three of them, while `stock.py` did not yet clear up after itself (debug build): `My Inventory holds 3 folders named "Bot gear": ...; name one by its UUID` |
 | 104 | `--verbose`, no inventory command given: items 1, 3 and 9 | As before; no line starting `inventory:` in the log (each request to the inventory service writes one), and no message sent that was not sent before | Pass: login, seated; re-sit after `stand user`; back from `Home` and seated. Sent: `AgentUpdate`, `CompletePingCheck`, `UseCircuitCode`, `CompleteAgentMovement`, `RegionHandshakeReply`, `AgentThrottle`, `AgentRequestSit`, `AgentSit`, `RequestMultipleObjects` (one per sit), `MapNameRequest`, `TeleportLocationRequest` |
 | 105 | What loses an attachment on Second Life (README, Status): `attach "Bot gear/Radio" Right Hand`, 20 s, `quit`; log in; `attach "Bot gear/Watch" Right Hand`, 15 s, `detach "Bot gear/Watch"`, 20 s, `quit`; log in; `inventory -a` | `Radio` is listed on `Right Hand` at both logins | Pass: listed both times, and `attachment: item ... is on Right Hand` in each login's log. OpenSim does not lose it |
-| 106 | `attach "Bot gear/Watch" Left Hand` and `quit` within the same second; log in; `inventory -a` | Not known beforehand | `Watch` is not attached after the login, twice out of two tries (the other with `Radio`). OpenSim saves a changed appearance five seconds after the change (`DelayBeforeAppearanceSave`), and a logout before that loses it. Not a fault of the bot; a wait of 20 s before `quit` kept the attachment every time |
+| 106 | `attach "Bot gear/Watch" Left Hand` and `quit` within the same second; log in; `inventory -a` | As in item 96: OpenSim has not saved it | `Watch` is not attached after the login, twice out of two tries (the other with `Radio`). OpenSim saves a changed appearance five seconds after the change (`DelayBeforeAppearanceSave`), and a logout before that loses it. Not a fault of the bot, and not what `restore_attachments` is for |
+| 107 | `restore_attachments` at its default (on), `--verbose`: items 1, 3 and 9, half a minute without a command after the login, then items 88 to 94 and 96 | As before. OpenSim offers no outfit service, so nothing is restored: no line starting `inventory:` before the first command, and none with `restor` at all | Pass: seated at login, again 5 s after `stand user`, back from `Home` and seated 10 s after the teleport; the log's only word on the matter is `the simulator has no outfit service`. Attach and detach answers as in items 88 to 94 (`attach` of the attached radio, of an animation and to `elbow` refused; both objects on `Left Hand` detached by body part). After item 96's new login the radio was reported on `Right Hand` and 31 s passed without an `inventory:` line until `inventory -a` was run |
 
 Not covered on this rig, because OpenSim has neither service: wearing and
 taking off clothing and body parts, and the bookkeeping in the Current
 Outfit folder after an attach or a detach (unit tests against a local HTTP
-listener only; what the bot sends is taken from viewer source). Also not
+listener only; what the bot sends is taken from viewer source). For the
+same reason the rig cannot show an attachment being restored after a login,
+or an attach that arrives late getting its link: unit tests only until
+tried on Second Life. Also not
 covered: an attachment described in the compressed form or as a cached
 object (OpenSim describes attachments in full; unit tests only for the
 compressed form, and a cached one the bot would not learn of), an
 attachment detached by its own script, an attach the simulator refuses
-(the 15-second error and the simulator's alert in it are in unit tests
+(the 30-second error and the simulator's alert in it are in unit tests
 only), a listing that takes longer than 50 seconds, and a link in a path
 (OpenSim's default inventory has links only in `Current Outfit`, where they
 were listed as `link`). What was tried on Second Life is under Status in

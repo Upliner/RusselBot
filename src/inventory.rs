@@ -728,6 +728,9 @@ pub enum What {
     Link(Item),
     /// Remove the Current Outfit folder's links to this item.
     Unlink(Uuid),
+    /// The objects the Current Outfit folder has links to: what should be
+    /// attached. Answered with `Outcome::Items`.
+    OutfitObjects,
     /// Wear this piece of clothing or body part.
     Wear(Item),
     TakeOff(Clothes),
@@ -1113,6 +1116,21 @@ impl Service<'_> {
         Ok((links, targets))
     }
 
+    /// The objects the Current Outfit folder links to. Links to clothing
+    /// and body parts are left out, and so are links to items the grid no
+    /// longer has, which it does not return.
+    fn outfit_objects(&self) -> Result<Vec<Item>, Failed> {
+        let folder = self.outfit_folder()?;
+        let (_, targets) = self.outfit(folder)?;
+        let mut objects: Vec<Item> = Vec::new();
+        for target in targets.into_iter().filter(|target| target.asset_type == ASSET_OBJECT) {
+            if !objects.iter().any(|known| known.id == target.id) {
+                objects.push(target);
+            }
+        }
+        Ok(objects)
+    }
+
     fn wear(&self, item: &Item) -> Result<Vec<Item>, Failed> {
         let folder = self.outfit_folder()?;
         let (links, targets) = self.outfit(folder)?;
@@ -1207,6 +1225,7 @@ impl Service<'_> {
                 self.unlink(*item)?;
                 Outcome::Outfit(Vec::new())
             }
+            What::OutfitObjects => Outcome::Items(self.outfit_objects()?),
             What::Wear(item) => Outcome::Outfit(self.wear(item)?),
             What::TakeOff(clothes) => Outcome::Outfit(self.take_off(clothes)?),
         })
@@ -3045,6 +3064,41 @@ mod grid_tests {
         // A refusal is the job's failure, for the log.
         rig.grid().refuse_links = true;
         assert!(rig.outfit(What::Link(radio)).unwrap_err().contains("Outfit folder is full"));
+    }
+
+    #[test]
+    fn the_objects_the_outfit_folder_lists_are_what_should_be_attached() {
+        let rig = Rig::new();
+        let objects = |rig: &Rig| match rig.run(What::OutfitObjects) {
+            Ok(Outcome::Items(items)) => Ok(items),
+            Err(Failed::Reason(reason)) => Err(reason),
+            other => panic!("unexpected {other:?}"),
+        };
+        // Clothing and body parts only: nothing to attach, and the folder
+        // is not changed by the asking.
+        assert_eq!(objects(&rig), Ok(vec![]));
+        assert_eq!(
+            rig.asked(),
+            [
+                "folders: My Inventory folders",
+                "folders: Current Outfit items",
+                "items: White shirt, Pale skin, Round shape"
+            ]
+        );
+        // Links to two objects, one of them twice, and to an object that
+        // is no longer in the inventory.
+        let (radio, antenna) = (rig.named("Radio"), rig.named("Antenna"));
+        for target in [radio.id, antenna.id, radio.id, Uuid::from_u128(0xDEAD)] {
+            rig.grid().link(OUTFIT, target, ASSET_LINK);
+        }
+        assert_eq!(objects(&rig), Ok(vec![radio, antenna]));
+        assert_eq!(rig.worn().len(), 7);
+        // An empty folder.
+        rig.grid().items.retain(|item| item.parent != OUTFIT);
+        assert_eq!(objects(&rig), Ok(vec![]));
+        // No folder: the reason the other outfit jobs give.
+        rig.grid().folders.retain(|folder| folder.0 != OUTFIT);
+        assert!(objects(&rig).unwrap_err().contains("no Current Outfit folder"));
     }
 
     #[test]
