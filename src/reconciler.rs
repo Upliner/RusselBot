@@ -31,6 +31,26 @@ pub enum Action {
     Login(Start),
     Teleport,
     Sit,
+    /// Unlike the others this one is over as soon as it is sent: the
+    /// simulator does not answer a ground sit.
+    SitGround,
+}
+
+/// What the bot seats the avatar on by itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SeatGoal {
+    Object,
+    Ground,
+}
+
+/// What the config asks the bot to hold.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Goal {
+    /// The region to stay in; without one every region will do.
+    pub region: Option<String>,
+    /// Where a login asks to be placed.
+    pub start: Start,
+    pub seat: Option<SeatGoal>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -64,6 +84,11 @@ pub struct Memory {
     seated_since: Option<Instant>,
     sit_failures: u32,
     reposition: bool,
+    /// The ground sit the goal asks for has been sent since the avatar last
+    /// arrived, stood up from an object, or came back to holding mode.
+    ground_done: bool,
+    /// The avatar has been seen seated on an object since that ground sit.
+    on_object: bool,
     fatal: Option<String>,
     /// The operator placed the avatar by hand: stay connected, and leave
     /// region and seat alone.
@@ -81,10 +106,10 @@ fn gate(not_before: Option<Instant>, action: Action, now: Instant) -> Decision {
     }
 }
 
-/// Chooses the next step from the current state and the placement mode
-/// alone, by the first rule that applies: log in, nothing (manual mode),
-/// teleport, sit, or nothing.
-pub fn decide(observed: &Observed, memory: &Memory, target_region: &str, now: Instant) -> Decision {
+/// Chooses the next step from the current state, the placement mode and
+/// the goal alone, by the first rule that applies: log in, nothing (manual
+/// mode), teleport, sit on the object, sit on the ground, or nothing.
+pub fn decide(observed: &Observed, memory: &Memory, goal: &Goal, now: Instant) -> Decision {
     if let Some(message) = &memory.fatal {
         return Decision::Exit { code: 1, message: message.clone() };
     }
@@ -92,32 +117,38 @@ pub fn decide(observed: &Observed, memory: &Memory, target_region: &str, now: In
         return Decision::Wait(None);
     }
     let Some(region) = &observed.region else {
-        let start = if memory.last_login_refused || memory.manual { Start::Last } else { Start::Target };
+        let start = if memory.last_login_refused || memory.manual { Start::Last } else { goal.start };
         return gate(memory.next_login, Action::Login(start), now);
     };
     if memory.manual {
         return Decision::Wait(None);
     }
-    if !same_region(region, target_region) {
+    if goal.region.as_deref().is_some_and(|target| !same_region(region, target)) {
         return gate(memory.next_teleport, Action::Teleport, now);
     }
-    match observed.seat {
-        Seat::SeatedOnTarget => Decision::Wait(None),
-        _ if memory.reposition => gate(memory.next_teleport, Action::Teleport, now),
-        _ => gate(memory.next_sit, Action::Sit, now),
+    match (goal.seat, observed.seat) {
+        (Some(SeatGoal::Object), Seat::SeatedOnTarget) => Decision::Wait(None),
+        // Without a region there is no position to go back to.
+        (Some(SeatGoal::Object), _) if memory.reposition && goal.region.is_some() => {
+            gate(memory.next_teleport, Action::Teleport, now)
+        }
+        (Some(SeatGoal::Object), _) => gate(memory.next_sit, Action::Sit, now),
+        (Some(SeatGoal::Ground), _) if !memory.ground_done => Decision::Start(Action::SitGround),
+        _ => Decision::Wait(None),
     }
 }
 
 pub struct Reconciler {
-    target_region: String,
+    goal: Goal,
     observed: Observed,
     memory: Memory,
 }
 
 impl Reconciler {
-    pub fn new(target_region: &str) -> Reconciler {
+    pub fn new(goal: Goal) -> Reconciler {
+        let start = goal.start;
         Reconciler {
-            target_region: target_region.to_string(),
+            goal,
             observed: Observed { region: None, seat: Seat::Unknown },
             memory: Memory {
                 in_flight: None,
@@ -129,11 +160,13 @@ impl Reconciler {
                 next_sit: None,
                 had_successful_login: false,
                 last_login_refused: false,
-                last_start: Start::Target,
+                last_start: start,
                 connected_since: None,
                 seated_since: None,
                 sit_failures: 0,
                 reposition: false,
+                ground_done: false,
+                on_object: false,
                 fatal: None,
                 manual: false,
             },
@@ -141,7 +174,7 @@ impl Reconciler {
     }
 
     pub fn decide(&self, now: Instant) -> Decision {
-        decide(&self.observed, &self.memory, &self.target_region, now)
+        decide(&self.observed, &self.memory, &self.goal, now)
     }
 
     #[cfg(test)]
@@ -172,18 +205,36 @@ impl Reconciler {
             self.memory.next_sit = None;
             self.memory.sit_failures = 0;
             self.memory.reposition = false;
+            self.memory.ground_done = false;
         }
     }
 
-    pub fn in_target_region(&self) -> bool {
-        self.observed.region.as_deref().is_some_and(|r| same_region(r, &self.target_region))
+    pub fn goal(&self) -> &Goal {
+        &self.goal
     }
 
-    /// An action returned by `decide` is now in progress.
+    /// Whether the avatar is in the region it is to stay in; without a
+    /// configured region every region is.
+    pub fn in_target_region(&self) -> bool {
+        self.observed.region.as_deref().is_some_and(|r| match &self.goal.region {
+            Some(target) => same_region(r, target),
+            None => true,
+        })
+    }
+
+    /// An action returned by `decide` is now in progress, or in the case of
+    /// a ground sit already over.
     pub fn started(&mut self, action: Action) {
-        self.memory.in_flight = Some(action);
-        if let Action::Login(start) = action {
-            self.memory.last_start = start;
+        match action {
+            Action::SitGround => {
+                self.memory.ground_done = true;
+                self.memory.on_object = false;
+            }
+            Action::Login(start) => {
+                self.memory.in_flight = Some(action);
+                self.memory.last_start = start;
+            }
+            Action::Teleport | Action::Sit => self.memory.in_flight = Some(action),
         }
     }
 
@@ -249,6 +300,8 @@ impl Reconciler {
         self.memory.seated_since = None;
         self.memory.sit_failures = 0;
         self.memory.reposition = false;
+        self.memory.ground_done = false;
+        self.memory.on_object = false;
     }
 
     /// The session ended, whatever the cause. Returns the delay before the
@@ -276,6 +329,8 @@ impl Reconciler {
         self.memory.seated_since = None;
         self.memory.sit_failures = 0;
         self.memory.reposition = false;
+        self.memory.ground_done = false;
+        self.memory.on_object = false;
     }
 
     /// Returns the delay before the next teleport attempt.
@@ -292,6 +347,7 @@ impl Reconciler {
             self.memory.in_flight = None;
         }
         self.observed.seat = Seat::SeatedOnTarget;
+        self.memory.on_object = true;
         self.memory.seated_since = Some(now);
         self.memory.sit_failures = 0;
         self.memory.reposition = false;
@@ -307,9 +363,22 @@ impl Reconciler {
         self.sit_delay(now)
     }
 
+    /// The avatar is seated on an object that is not the target: as good
+    /// as standing to the bot, except that getting up from it later undoes
+    /// a ground sit.
+    pub fn seated_elsewhere(&mut self, now: Instant) {
+        self.standing(now);
+        self.memory.on_object = true;
+    }
+
     /// The simulator reports the avatar standing. Returns the delay before
     /// sitting again when this ended a seat on the target.
     pub fn standing(&mut self, now: Instant) -> Option<Duration> {
+        // The first report after an arrival says "standing" too; only
+        // getting up from an object calls for another ground sit.
+        if std::mem::take(&mut self.memory.on_object) {
+            self.memory.ground_done = false;
+        }
         let was_seated = self.observed.seat == Seat::SeatedOnTarget;
         self.observed.seat = Seat::NotSeated;
         if !was_seated {
@@ -339,6 +408,11 @@ mod tests {
 
     const TARGET: &str = "Target";
 
+    /// The goal of a full config: a region and an object to sit on.
+    fn holding() -> Goal {
+        Goal { region: Some(TARGET.to_string()), start: Start::Target, seat: Some(SeatGoal::Object) }
+    }
+
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
     }
@@ -362,7 +436,7 @@ mod tests {
 
     /// A reconciler that has logged in to `region`.
     fn logged_in(region: &str, now: Instant) -> Reconciler {
-        let mut rec = Reconciler::new(TARGET);
+        let mut rec = Reconciler::new(holding());
         assert_eq!(step(&mut rec, now), start(Action::Login(Start::Target)));
         rec.login_accepted();
         rec.region_entered(region, now);
@@ -379,7 +453,7 @@ mod tests {
     #[test]
     fn login_landing_in_target_region_sits_without_teleporting() {
         let now = Instant::now();
-        let mut rec = Reconciler::new(TARGET);
+        let mut rec = Reconciler::new(holding());
         assert_eq!(step(&mut rec, now), start(Action::Login(Start::Target)));
         // One action at a time.
         assert_eq!(rec.decide(now), Decision::Wait(None));
@@ -473,7 +547,7 @@ mod tests {
     #[test]
     fn going_manual_does_not_interrupt_a_login() {
         let now = Instant::now();
-        let mut rec = Reconciler::new(TARGET);
+        let mut rec = Reconciler::new(holding());
         assert_eq!(step(&mut rec, now), start(Action::Login(Start::Target)));
         rec.set_manual(true);
         assert_eq!(rec.decide(now), Decision::Wait(None));
@@ -534,7 +608,7 @@ mod tests {
     #[test]
     fn login_delay_doubles_up_to_five_minutes_while_the_grid_is_down() {
         let mut at = Instant::now();
-        let mut rec = Reconciler::new(TARGET);
+        let mut rec = Reconciler::new(holding());
         let mut delays = Vec::new();
         for _ in 0..8 {
             assert_eq!(step(&mut rec, at), start(Action::Login(Start::Target)));
@@ -553,7 +627,7 @@ mod tests {
     #[test]
     fn sessions_that_keep_dropping_slow_the_logins_down() {
         let mut at = Instant::now();
-        let mut rec = Reconciler::new(TARGET);
+        let mut rec = Reconciler::new(holding());
         let mut delays = Vec::new();
         for _ in 0..7 {
             assert_eq!(step(&mut rec, at), start(Action::Login(Start::Target)));
@@ -590,7 +664,7 @@ mod tests {
     #[test]
     fn loss_during_login_handshake_counts_as_a_failed_login() {
         let now = Instant::now();
-        let mut rec = Reconciler::new(TARGET);
+        let mut rec = Reconciler::new(holding());
         step(&mut rec, now);
         rec.login_accepted();
         assert_eq!(rec.session_lost(now + secs(30)), secs(10));
@@ -673,7 +747,7 @@ mod tests {
     #[test]
     fn wrong_password_at_startup_exits_after_two_attempts() {
         let now = Instant::now();
-        let mut rec = Reconciler::new(TARGET);
+        let mut rec = Reconciler::new(holding());
         assert_eq!(step(&mut rec, now), start(Action::Login(Start::Target)));
         assert_eq!(rec.login_refused(&failure("key"), now), Some(secs(10)));
         // The second attempt asks for the last location.
@@ -688,7 +762,7 @@ mod tests {
     #[test]
     fn target_region_down_at_startup_logs_in_at_last_location() {
         let now = Instant::now();
-        let mut rec = Reconciler::new(TARGET);
+        let mut rec = Reconciler::new(holding());
         step(&mut rec, now);
         rec.login_refused(&failure("key"), now);
         assert_eq!(step(&mut rec, now + secs(10)), start(Action::Login(Start::Last)));
@@ -720,7 +794,7 @@ mod tests {
     #[test]
     fn multi_factor_challenge_exits_without_retrying() {
         let now = Instant::now();
-        let mut rec = Reconciler::new(TARGET);
+        let mut rec = Reconciler::new(holding());
         step(&mut rec, now);
         rec.login_needs_operator(&failure("mfa_challenge"));
         match rec.decide(now + secs(3600)) {
@@ -735,5 +809,146 @@ mod tests {
     fn region_names_compare_without_case_or_padding() {
         assert!(same_region("Target", " target "));
         assert!(!same_region("Target", "Target 2"));
+    }
+
+    // ------------------------------------------------- partial goals
+
+    fn goal(region: Option<&str>, start: Start, seat: Option<SeatGoal>) -> Goal {
+        Goal { region: region.map(str::to_string), start, seat }
+    }
+
+    /// A reconciler with `goal` that has logged in to `region`.
+    fn arrived(goal: Goal, region: &str, now: Instant) -> Reconciler {
+        let start_at = goal.start;
+        let mut rec = Reconciler::new(goal);
+        assert_eq!(step(&mut rec, now), start(Action::Login(start_at)));
+        rec.login_accepted();
+        rec.region_entered(region, now);
+        rec
+    }
+
+    #[test]
+    fn without_region_and_seat_the_bot_only_stays_connected() {
+        let now = Instant::now();
+        let mut rec = arrived(goal(None, Start::Last, None), "Anywhere", now);
+        assert!(rec.in_target_region());
+        assert_eq!(rec.decide(now), Decision::Wait(None));
+        assert_eq!(rec.standing(now + secs(1)), None);
+        rec.region_entered("Elsewhere", now + secs(5));
+        assert_eq!(rec.decide(now + secs(4000)), Decision::Wait(None));
+        let lost = now + secs(5000);
+        assert_eq!(rec.session_lost(lost), secs(10));
+        assert_eq!(step(&mut rec, lost + secs(10)), start(Action::Login(Start::Last)));
+    }
+
+    #[test]
+    fn start_at_home_falls_back_to_the_last_location_when_refused() {
+        let now = Instant::now();
+        let mut rec = Reconciler::new(goal(None, Start::Home, None));
+        assert_eq!(step(&mut rec, now), start(Action::Login(Start::Home)));
+        assert_eq!(rec.login_refused(&failure("key"), now), Some(secs(10)));
+        assert_eq!(step(&mut rec, now + secs(10)), start(Action::Login(Start::Last)));
+        rec.login_accepted();
+        rec.region_entered("Last", now + secs(11));
+        assert_eq!(rec.decide(now + secs(11)), Decision::Wait(None));
+        // The next login asks for home again.
+        let lost = now + secs(1000);
+        let delay = rec.session_lost(lost);
+        assert_eq!(step(&mut rec, lost + delay), start(Action::Login(Start::Home)));
+    }
+
+    #[test]
+    fn first_refusal_at_the_last_location_is_fatal() {
+        let now = Instant::now();
+        let mut rec = Reconciler::new(goal(None, Start::Last, None));
+        assert_eq!(step(&mut rec, now), start(Action::Login(Start::Last)));
+        assert_eq!(rec.login_refused(&failure("key"), now), None);
+        assert!(matches!(rec.decide(now), Decision::Exit { code: 1, .. }));
+    }
+
+    #[test]
+    fn region_without_a_seat_teleports_and_then_rests() {
+        let now = Instant::now();
+        let mut rec = arrived(goal(Some(TARGET), Start::Target, None), "Home", now);
+        assert_eq!(step(&mut rec, now), start(Action::Teleport));
+        rec.region_entered(TARGET, now + secs(3));
+        assert_eq!(rec.decide(now + secs(3)), Decision::Wait(None));
+        assert_eq!(rec.standing(now + secs(4)), None);
+        assert_eq!(rec.decide(now + secs(4000)), Decision::Wait(None));
+    }
+
+    #[test]
+    fn seat_without_a_region_sits_anywhere_and_never_repositions() {
+        let now = Instant::now();
+        let mut rec = arrived(goal(None, Start::Last, Some(SeatGoal::Object)), "Anywhere", now);
+        let mut at = now;
+        for _ in 0..6 {
+            assert_eq!(step(&mut rec, at), start(Action::Sit));
+            at += rec.sit_failed(at);
+        }
+        // At the longest delay by now, and still sitting, not teleporting.
+        assert_eq!(rec.sit_failed(at), secs(60));
+        assert_eq!(step(&mut rec, at + secs(60)), start(Action::Sit));
+        rec.seated(at + secs(61));
+        assert_eq!(rec.decide(at + secs(4000)), Decision::Wait(None));
+    }
+
+    // ----------------------------------------------------- ground sit
+
+    fn ground(region: Option<&str>) -> Goal {
+        let start = if region.is_some() { Start::Target } else { Start::Last };
+        goal(region, start, Some(SeatGoal::Ground))
+    }
+
+    #[test]
+    fn ground_sit_is_sent_once_per_arrival() {
+        let now = Instant::now();
+        let mut rec = arrived(ground(None), "Anywhere", now);
+        assert_eq!(step(&mut rec, now), start(Action::SitGround));
+        // Over at once: nothing in flight, nothing more to do.
+        assert_eq!(rec.decide(now), Decision::Wait(None));
+        // The first report of the avatar after arriving says "standing".
+        assert_eq!(rec.standing(now + secs(1)), None);
+        assert_eq!(rec.decide(now + secs(4000)), Decision::Wait(None));
+
+        rec.teleport_arrived();
+        assert_eq!(step(&mut rec, now + secs(4001)), start(Action::SitGround));
+        rec.region_entered("Elsewhere", now + secs(4002));
+        assert_eq!(step(&mut rec, now + secs(4002)), start(Action::SitGround));
+        assert_eq!(rec.decide(now + secs(4003)), Decision::Wait(None));
+    }
+
+    #[test]
+    fn ground_sit_is_repeated_after_getting_up_from_an_object() {
+        let now = Instant::now();
+        let mut rec = arrived(ground(None), "Anywhere", now);
+        assert_eq!(step(&mut rec, now), start(Action::SitGround));
+        rec.seated_elsewhere(now + secs(10));
+        assert_eq!(rec.decide(now + secs(10)), Decision::Wait(None));
+        rec.standing(now + secs(20));
+        assert_eq!(step(&mut rec, now + secs(20)), start(Action::SitGround));
+        rec.standing(now + secs(21));
+        assert_eq!(rec.decide(now + secs(21)), Decision::Wait(None));
+    }
+
+    #[test]
+    fn ground_sit_waits_for_holding_mode_and_the_target_region() {
+        let now = Instant::now();
+        let mut rec = arrived(ground(Some(TARGET)), "Home", now);
+        assert_eq!(step(&mut rec, now), start(Action::Teleport));
+        rec.region_entered(TARGET, now + secs(3));
+        assert_eq!(step(&mut rec, now + secs(3)), start(Action::SitGround));
+        assert_eq!(rec.decide(now + secs(3)), Decision::Wait(None));
+
+        rec.set_manual(true);
+        rec.teleport_arrived();
+        assert_eq!(rec.decide(now + secs(10)), Decision::Wait(None));
+        rec.set_manual(false);
+        assert_eq!(step(&mut rec, now + secs(20)), start(Action::SitGround));
+        // Back in holding mode without having moved: sat down again once.
+        rec.set_manual(true);
+        rec.set_manual(false);
+        assert_eq!(step(&mut rec, now + secs(30)), start(Action::SitGround));
+        assert_eq!(rec.decide(now + secs(30)), Decision::Wait(None));
     }
 }

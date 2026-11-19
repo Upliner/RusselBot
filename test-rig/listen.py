@@ -4,8 +4,8 @@ exercise the bot's control socket. For SECONDS it prints every line of local
 chat it hears and every instant message it gets, and answers each instant
 message from the bot with "pong: <text>". It also prints where the bot's
 avatar is and what it is attached to whenever that changes, answers the
-bot's request for a teleport with an offer, and prints the offers the bot
-sends. Stands in for watching with a viewer. Start it while the bot is
+bot's request for a teleport with an offer, prints the offers the bot
+sends, and says when the bot's avatar starts or stops sitting on the ground. Stands in for watching with a viewer. Start it while the bot is
 seated in Target, then use `rslbot ctl`.
 
 Usage: listen.py [SECONDS] [prim] [offer=N]   (default: 30 seconds)
@@ -20,6 +20,7 @@ Output lines:
   bot at <x> <y> <z> parent <local id>   (parent 0: not sitting on an object)
   teleport request from <name>: <text>   teleport offer from <name>: <text>
   touch prim <uuid>
+  bot ground sit: yes|no                 (from the animations it plays)
 Chat on channels other than 0 reaches scripts only, so it never shows here."""
 import hashlib, re, socket, struct, sys, time, urllib.request, uuid
 
@@ -30,6 +31,9 @@ SECONDS = float(next((a for a in ARGS if a.replace(".", "").isdigit()), 30.0))
 PRIM = "prim" in ARGS
 OFFER_AFTER = next((float(a[6:]) for a in ARGS if a.startswith("offer=")), None)
 BOT = uuid.UUID("7e570000-0000-4000-8000-0000000000b0")
+# SIT_GROUND and SIT_GROUND_CONSTRAINED, from OpenSim's avataranimations.xml.
+GROUND_SITS = {uuid.UUID("1c7600d6-661f-b87b-efe2-d7421eb93c86").bytes,
+               uuid.UUID("1a2bd58e-87ff-0df8-0b4c-53e047b0bb6e").bytes}
 TOUCH_SCRIPT = uuid.UUID("9267e689-4f37-4ce5-b2c2-455ee2e1ab12")  # library item DefaultWithTouch
 
 
@@ -218,7 +222,7 @@ if PRIM:
     print("touch prim", prim[1], flush=True)
 
 print("listening", flush=True)
-started, bot_seen = time.time(), None
+started, bot_seen, bot_on_ground = time.time(), None, None
 deadline = started + SECONDS
 while time.time() < deadline:
     if OFFER_AFTER is not None and time.time() >= started + OFFER_AFTER:
@@ -236,6 +240,12 @@ while time.time() < deadline:
                 if (where, parent) != bot_seen:
                     bot_seen = (where, parent)
                     print("bot at %s %s %s parent %d" % (where + (parent,)), flush=True)
+    elif mid == ("H", 20) and payload[:16] == BOT.bytes:  # AvatarAnimation
+        playing = {payload[17 + 20 * i:33 + 20 * i] for i in range(payload[16])}
+        on_ground = bool(playing & GROUND_SITS)
+        if on_ground != bot_on_ground:
+            bot_on_ground = on_ground
+            print("bot ground sit: %s" % ("yes" if on_ground else "no"), flush=True)
     elif mid == ("L", 139):  # ChatFromSimulator
         name, at = text1(payload, 0)
         chat_type = payload[at + 33]

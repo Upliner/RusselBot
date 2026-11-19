@@ -22,12 +22,12 @@ mod udp {
 mod xml;
 
 use commands::{Commands, Grid, SentIm};
-use config::Config;
+use config::{Config, Place, Sit};
 use login::Outcome;
 use msglog::{Channel, Logs, Recorder};
 use names::{Lookup, Search};
 use net::{Event, RealNet};
-use reconciler::{Action, Decision, Reconciler};
+use reconciler::{Action, Decision, Goal, Reconciler, SeatGoal};
 use control::{Request, Response};
 use session::{Seat, Session, SessionEvent, Touch};
 use udp::messages::Vector3;
@@ -331,7 +331,18 @@ impl Bot {
         if manual {
             info!("placement: manual; the avatar stays where commands put it until `home`");
         } else {
-            info!("placement: holding; returning to the configured region and seat");
+            info!("placement: holding; {}", self.holding());
+        }
+    }
+
+    /// What holding mode does with this config, for the log.
+    fn holding(&self) -> &'static str {
+        let goal = self.reconciler.goal();
+        match (&goal.region, goal.seat) {
+            (Some(_), Some(_)) => "returning to the configured region and seat",
+            (Some(_), None) => "returning to the configured region",
+            (None, Some(_)) => "sitting as configured, where the avatar is",
+            (None, None) => "no region or seat is configured, the avatar stays where it is",
         }
     }
 
@@ -348,7 +359,7 @@ impl Bot {
             let seat = match session.seat() {
                 Seat::Unknown => "unknown".to_string(),
                 Seat::None => "none".to_string(),
-                Seat::Object(object) if object == self.config.object => "target".to_string(),
+                Seat::Object(object) if self.config.sit == Some(Sit::Object(object)) => "target".to_string(),
                 Seat::Object(object) => format!("object {object}"),
                 Seat::Other => "other".to_string(),
             };
@@ -435,12 +446,11 @@ impl Bot {
         match event {
             SessionEvent::RegionEntered(name) => {
                 self.reconciler.region_entered(&name, now);
-                let target = if self.reconciler.in_target_region() {
-                    "the target region"
-                } else {
-                    "not the target region"
-                };
-                info!("connected, in region \"{name}\" ({target})");
+                match (&self.reconciler.goal().region, self.reconciler.in_target_region()) {
+                    (None, _) => info!("connected, in region \"{name}\""),
+                    (Some(_), true) => info!("connected, in region \"{name}\" (the target region)"),
+                    (Some(_), false) => info!("connected, in region \"{name}\" (not the target region)"),
+                }
                 self.commands.arrived(&name);
             }
             SessionEvent::Lost(reason) => {
@@ -453,12 +463,12 @@ impl Bot {
                 info!("session lost: {reason}; next login in {}", seconds(delay));
             }
             SessionEvent::Seated(object) => {
-                if object == self.config.object {
+                if self.config.sit == Some(Sit::Object(object)) {
                     self.reconciler.seated(now);
                     info!("seated on {object}");
                 } else {
                     // Not the seat the bot holds: as good as standing to it.
-                    self.reconciler.standing(now);
+                    self.reconciler.seated_elsewhere(now);
                     info!("seated on {object}, which is not the target");
                 }
                 self.commands.seated(object);
@@ -466,7 +476,8 @@ impl Bot {
             SessionEvent::Standing => match self.reconciler.standing(now) {
                 Some(_) if manual => info!("unseated"),
                 Some(delay) => info!("unseated; sitting again in {}", seconds(delay)),
-                None => info!("not seated on the target"),
+                None if matches!(self.config.sit, Some(Sit::Object(_))) => info!("not seated on the target"),
+                None => info!("not seated on an object"),
             },
             SessionEvent::SitFailed(reason) => {
                 // A sit of the operator's is answered to the operator; only
@@ -562,17 +573,31 @@ impl Bot {
             match (action, &mut self.session) {
                 (Action::Login(start), _) => self.login(start),
                 (Action::Teleport, Some(session)) => {
-                    let cfg = &self.config;
-                    let [x, y, z] = cfg.position;
-                    info!("teleporting to \"{}\" at {x}, {y}, {z}", cfg.region);
-                    session.start_teleport(&cfg.region, cfg.position, now);
+                    // The reconciler asks for this only with a configured region.
+                    let Place::Region { name, position } = &self.config.place else {
+                        return Ok(None);
+                    };
+                    let [x, y, z] = *position;
+                    info!("teleporting to \"{name}\" at {x}, {y}, {z}");
+                    session.start_teleport(name, *position, now);
                 }
                 (Action::Sit, Some(session)) => {
-                    info!("sitting on {}", self.config.object);
-                    session.start_sit(self.config.object, now);
+                    // Likewise only with a configured object.
+                    let Some(Sit::Object(object)) = self.config.sit else {
+                        return Ok(None);
+                    };
+                    info!("sitting on {object}");
+                    session.start_sit(object, now);
+                }
+                (Action::SitGround, Some(session)) => {
+                    // The simulator does not answer this one; sent is done.
+                    match session.sit_ground(now) {
+                        Ok(()) => info!("sitting on the ground"),
+                        Err(reason) => info!("cannot sit on the ground: {reason}"),
+                    }
                 }
                 // The reconciler only asks for these while connected.
-                (Action::Teleport | Action::Sit, None) => return Ok(None),
+                (Action::Teleport | Action::Sit | Action::SitGround, None) => return Ok(None),
             }
         }
     }
@@ -617,6 +642,20 @@ impl Bot {
     }
 }
 
+/// What the config asks the reconciler to hold.
+fn goal(config: &Config) -> Goal {
+    let (region, start) = match &config.place {
+        Place::Region { name, .. } => (Some(name.clone()), login::Start::Target),
+        Place::Home => (None, login::Start::Home),
+        Place::Latest => (None, login::Start::Last),
+    };
+    let seat = config.sit.map(|sit| match sit {
+        Sit::Object(_) => SeatGoal::Object,
+        Sit::Ground => SeatGoal::Ground,
+    });
+    Goal { region, start, seat }
+}
+
 fn run_bot(config_path: &Path) -> i32 {
     let config = match Config::load(config_path) {
         Ok(config) => config,
@@ -648,6 +687,9 @@ fn run_bot(config_path: &Path) -> i32 {
         None
     };
     install_signal_handler(events.clone());
+    if config.deprecated_object {
+        info!("{}: `object` is deprecated; write the same value as `sit`", config_path.display());
+    }
     let mut bot = Bot {
         recorder: Recorder::default(),
         logs,
@@ -656,7 +698,7 @@ fn run_bot(config_path: &Path) -> i32 {
         commands: Commands::new(config.requesttp_timeout),
         avatar_searches: names::spawn_search(events.clone()),
         search_url: None,
-        reconciler: Reconciler::new(&config.region),
+        reconciler: Reconciler::new(goal(&config)),
         config,
         session: None,
         events,

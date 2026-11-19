@@ -12,6 +12,24 @@ pub const DEFAULT_CONFIG_PATH: &str = "russelbot.toml";
 pub const DEFAULT_REQUESTTP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_SCAN_DISTANCE: f64 = 1024.0;
 
+/// Where the avatar is to be.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Place {
+    /// Held in this region; logins and teleports go to `position`.
+    Region { name: String, position: [f32; 3] },
+    /// Wherever it is; logins ask for the home location.
+    Home,
+    /// Wherever it is; logins ask for the location it was last at.
+    Latest,
+}
+
+/// What the bot seats the avatar on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Sit {
+    Object(Uuid),
+    Ground,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub login_url: String,
@@ -19,9 +37,11 @@ pub struct Config {
     pub last_name: String,
     /// Always in `$1$<md5 hex>` form, whichever way it was configured.
     pub password_hash: String,
-    pub region: String,
-    pub position: [f32; 3],
-    pub object: Uuid,
+    pub place: Place,
+    /// Without it the bot seats the avatar only on command.
+    pub sit: Option<Sit>,
+    /// The seat came from the old key `object`.
+    pub deprecated_object: bool,
     /// TSV file for local chat, if any.
     pub log_chat: Option<PathBuf>,
     /// TSV file for instant messages, if any.
@@ -55,6 +75,8 @@ struct Raw {
     password_hash: Option<String>,
     region: Option<String>,
     position: Option<Vec<f64>>,
+    start: Option<String>,
+    sit: Option<String>,
     object: Option<String>,
     // Kept untyped so that a wrong type is reported with the key's name.
     log_chat: Option<toml::Value>,
@@ -163,20 +185,45 @@ impl Config {
             }
         };
 
-        let region = required(raw.region, "region")?.trim().to_string();
-        if region.is_empty() {
-            return err("`region` must not be empty");
-        }
-
-        let position = required(raw.position, "position")?;
-        let position = match position[..] {
-            [x, y, z] if position.iter().all(|v| v.is_finite()) => [x as f32, y as f32, z as f32],
-            _ => return err("`position` must be an array of three finite numbers [x, y, z]"),
+        let place = match (raw.region, raw.position, raw.start) {
+            (Some(_), Some(_), Some(_)) | (Some(_), None, Some(_)) | (None, Some(_), Some(_)) => {
+                return err("`start` cannot be combined with `region` and `position`; use one or the other")
+            }
+            (Some(_), None, None) => return err("`region` needs `position` as well"),
+            (None, Some(_), None) => return err("`position` needs `region` as well"),
+            (Some(region), Some(position), None) => {
+                let name = region.trim().to_string();
+                if name.is_empty() {
+                    return err("`region` must not be empty");
+                }
+                let position = match position[..] {
+                    [x, y, z] if position.iter().all(|v| v.is_finite()) => [x as f32, y as f32, z as f32],
+                    _ => return err("`position` must be an array of three finite numbers [x, y, z]"),
+                };
+                Place::Region { name, position }
+            }
+            (None, None, start) => match start.as_deref() {
+                None | Some("latest") => Place::Latest,
+                Some("home") => Place::Home,
+                Some(_) => return err("`start` must be \"home\" or \"latest\""),
+            },
         };
 
-        let object = required(raw.object, "object")?;
-        let object = Uuid::parse_str(object.trim())
-            .map_err(|_| ConfigError("`object` is not a valid UUID".to_string()))?;
+        let deprecated_object = raw.object.is_some();
+        let sit = match (raw.sit, raw.object) {
+            (Some(_), Some(_)) => return err("`sit` and `object` are both set; use only `sit`"),
+            (None, None) => None,
+            (Some(sit), None) => match sit.trim() {
+                "ground" => Some(Sit::Ground),
+                object => Some(Sit::Object(Uuid::parse_str(object).map_err(|_| {
+                    ConfigError("`sit` must be the UUID of an object or \"ground\"".to_string())
+                })?)),
+            },
+            (None, Some(object)) => Some(Sit::Object(
+                Uuid::parse_str(object.trim())
+                    .map_err(|_| ConfigError("`object` is not a valid UUID".to_string()))?,
+            )),
+        };
 
         let log_chat = log_path(raw.log_chat, "log_chat")?;
         let log_im = log_path(raw.log_im, "log_im")?;
@@ -199,9 +246,9 @@ impl Config {
             first_name,
             last_name,
             password_hash,
-            region,
-            position,
-            object,
+            place,
+            sit,
+            deprecated_object,
             log_chat,
             log_im,
             fetch_offline_im,
@@ -221,7 +268,7 @@ mod tests {
     fn base() -> String {
         format!(
             "user = \"Sit Bot\"\npassword = \"secret\"\nregion = \"Target\"\n\
-             position = [128.0, 128.5, 25]\nobject = \"{OBJECT}\"\n"
+             position = [128.0, 128.5, 25]\nsit = \"{OBJECT}\"\n"
         )
     }
 
@@ -235,8 +282,75 @@ mod tests {
         assert_eq!(cfg.login_url, DEFAULT_LOGIN_URL);
         assert_eq!((cfg.first_name.as_str(), cfg.last_name.as_str()), ("Sit", "Bot"));
         assert_eq!(cfg.password_hash, "$1$5ebe2294ecd0e0f08eab7690d2a6ee69");
-        assert_eq!(cfg.position, [128.0, 128.5, 25.0]);
-        assert_eq!(cfg.object, Uuid::parse_str(OBJECT).unwrap());
+        assert_eq!(cfg.place, Place::Region { name: "Target".to_string(), position: [128.0, 128.5, 25.0] });
+        assert_eq!(cfg.sit, Some(Sit::Object(Uuid::parse_str(OBJECT).unwrap())));
+        assert!(!cfg.deprecated_object);
+    }
+
+    /// `base()` without the lines of the given keys.
+    fn without(keys: &[&str]) -> String {
+        base().lines().filter(|l| !keys.iter().any(|k| l.starts_with(k))).map(|l| format!("{l}\n")).collect()
+    }
+
+    #[test]
+    fn account_alone_is_a_config() {
+        let cfg = Config::parse(&without(&["region", "position", "sit"])).unwrap();
+        assert_eq!((cfg.place, cfg.sit, cfg.deprecated_object), (Place::Latest, None, false));
+    }
+
+    #[test]
+    fn start_names_the_login_location() {
+        let bare = without(&["region", "position"]);
+        assert_eq!(Config::parse(&(bare.clone() + "start = \"latest\"\n")).unwrap().place, Place::Latest);
+        assert_eq!(Config::parse(&(bare.clone() + "start = \"home\"\n")).unwrap().place, Place::Home);
+        for bad in ["last", "Home", "", "uri:Target&1&2&3"] {
+            let msg = rejected(&(bare.clone() + &format!("start = \"{bad}\"\n")));
+            assert!(msg.contains("`start`") && msg.contains("\"home\"") && msg.contains("\"latest\""), "{msg}");
+        }
+    }
+
+    #[test]
+    fn rejects_start_with_a_region() {
+        for text in [base(), without(&["region"]), without(&["position"])] {
+            let msg = rejected(&(text + "start = \"home\"\n"));
+            assert!(msg.contains("`start`") && msg.contains("`region`"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn region_and_position_come_as_a_pair() {
+        for missing in ["region", "position"] {
+            let msg = rejected(&without(&[missing]));
+            assert!(msg.contains("`region`") && msg.contains("`position`"), "{msg}");
+        }
+        assert!(rejected(&base().replace("\"Target\"", "\"  \"")).contains("`region`"));
+    }
+
+    #[test]
+    fn sit_is_an_object_or_the_ground() {
+        let cfg = Config::parse(&base().replace(OBJECT, "ground")).unwrap();
+        assert_eq!(cfg.sit, Some(Sit::Ground));
+        for bad in ["not-a-uuid", "Ground", ""] {
+            let msg = rejected(&base().replace(OBJECT, bad));
+            assert!(msg.contains("`sit`") && !msg.contains("`object`"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn object_is_the_old_spelling_of_sit() {
+        let old = Config::parse(&base().replace("sit = ", "object = ")).unwrap();
+        assert!(old.deprecated_object);
+        let new = Config::parse(&base()).unwrap();
+        assert_eq!(Config { deprecated_object: false, ..old }, new);
+        // The new value belongs to the new key.
+        let msg = rejected(&base().replace("sit = ", "object = ").replace(OBJECT, "ground"));
+        assert!(msg.contains("`object`"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_both_seat_keys() {
+        let msg = rejected(&(base() + &format!("object = \"{OBJECT}\"\n")));
+        assert!(msg.contains("`sit`") && msg.contains("`object`"), "{msg}");
     }
 
     #[test]
@@ -280,15 +394,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_required_keys() {
-        for key in ["user", "region", "position", "object"] {
-            let text: String = base()
-                .lines()
-                .filter(|l| !l.starts_with(key))
-                .map(|l| format!("{l}\n"))
-                .collect();
-            assert!(rejected(&text).contains(&format!("`{key}`")), "{key}");
-        }
+    fn only_the_user_is_required_by_name() {
+        assert!(rejected(&without(&["user"])).contains("`user`"));
+        assert_eq!(Config::parse(&without(&["sit"])).unwrap().sit, None);
     }
 
     #[test]
@@ -298,7 +406,8 @@ mod tests {
 
     #[test]
     fn rejects_bad_object_uuid() {
-        assert!(rejected(&base().replace(OBJECT, "not-a-uuid")).contains("`object`"));
+        let msg = rejected(&base().replace("sit = ", "object = ").replace(OBJECT, "not-a-uuid"));
+        assert!(msg.contains("`object`"), "{msg}");
     }
 
     #[test]
@@ -383,6 +492,9 @@ mod tests {
     fn example_file_is_valid() {
         let cfg = Config::parse(include_str!("../russelbot.example.toml")).unwrap();
         assert_eq!(cfg.login_url, "http://127.0.0.1:9000/");
+        assert_eq!(cfg.place, Place::Region { name: "Target".to_string(), position: [128.0, 128.0, 25.0] });
+        assert_eq!(cfg.sit, Some(Sit::Object(Uuid::nil())));
+        assert!(!cfg.deprecated_object);
     }
 
     #[test]

@@ -59,7 +59,7 @@ echo 'show regions' > /tmp/sim.in
    `http://127.0.0.1:9000/`), rez a prim in `Target` and copy its UUID
    (Build > Edit > General > Copy Keys).
 3. Create `russelbot.toml` from `russelbot.example.toml`: keep `login_url`, `user` and
-   `password`, set `object` to the UUID and `position` to a spot next to the
+   `password`, set `sit` to the UUID and `position` to a spot next to the
    prim (`[128.0, 128.0, 25.0]` for the helper's prim).
 
 Run the bot with `cargo run -- russelbot.toml`. Add `--verbose` to see every
@@ -178,8 +178,33 @@ every object in full and never as cached, so the bot had nothing to ask
 about and sent no `RequestMultipleObjects` even after a scan started; that
 path, and the effect of the scan distance, are covered by unit tests only
 until tried on Second Life. Also not covered: an avatar's request to be
-teleported to the bot (unit tests only), and a ground sit as seen by
-others.
+teleported to the bot (unit tests only). A ground sit as seen by others
+is covered by item 57.
+
+## Optional region, seat and start
+
+These configs leave out `region`/`position` or the seat. `listen.py` prints
+`bot ground sit: yes|no` from the animations the bot's avatar plays. The
+bot account's home was never set on this rig; a login asking for `home`
+then lands at 128, 128 in `Home`, the grid's default region.
+
+| # | Inject | Expected | Result (2026-11-19, OpenSim 9d00a55552) |
+|---|---|---|---|
+| 57 | `ctl sit ground`, then `ctl stand`, with `listen.py` running | `bot ground sit: yes`, then `no` | Pass |
+| 58 | Config with only the account and `socket = true`; `ctl tp 100 100 25 Home`, `ctl home`, then five minutes left alone | `start: last`; `connected, in region "Target"` without "target region"; no teleport or sit of the bot's own; `seat: none`, `mode: holding`; after `home` still in `Home` | Pass: `placement: holding; no region or seat is configured, the avatar stays where it is` |
+| 59 | Avatar left in `Target`; `start = "latest"`, quit, then `start = "home"` | First `start: last` and `Target` at the position it left; then `start: home` and `Home` | Pass: 60, 70 in `Target`, then 128, 128 in `Home` |
+| 60 | `region`, `position` and `sit = "ground"`, with `listen.py` running; then `ctl stand`, `ctl home`, `ctl tp 100 100 25 Home`, `ctl home` | `sitting on the ground` once after login and `bot ground sit: yes`; `no` after `stand`; `yes` after `home`; after the second `home` a teleport to `Target` and a ground sit there; `seat: none` while sitting on the ground | Pass. The ground sit sent in the same second as the region entry took effect both after the login and after the teleport |
+| 61 | `sit = <uuid>` without `region`, avatar last in `Target` | `start: last`, no teleport, `seated on <uuid>`, `seat: target` | Pass: seated within 1 s |
+| 62 | The same config, avatar last in `Home` | Sit attempts fail at growing intervals; never a teleport | Pass: four failures, delays 5, 10, 20, 40 s, still in `Home` |
+| 63 | The config of item 1 with `object`; then with that key renamed to `sit` | Same behaviour; one line `` `object` is deprecated; write the same value as `sit` `` with the first only | Pass |
+| 64 | `start = "last"`; `start = "home"` with `region`/`position`; `sit` with `object` | Error naming the keys, status 2 | Pass, all three |
+
+Covered by unit tests only: a refused login with `start = "home"` falling
+back to the last location, the single login attempt with a wrong password
+and no `region`, the ground sit after standing up from an object, and the
+sit backoff's one-minute cap without a region. Not tried on Second Life:
+any of the above, in particular whether a ground sit sent right at region
+entry takes effect there.
 
 Not covered: Windows, where the socket is TCP. On Second Life, looking a
 name up through `AvatarPickerRequest` found nobody (2026-11-18, an avatar

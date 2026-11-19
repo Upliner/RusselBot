@@ -1,6 +1,6 @@
 //! Grid login over XML-RPC: request, reply parsing and outcome classification.
 
-use crate::config::Config;
+use crate::config::{Config, Place};
 use crate::xml::{self, Value};
 use md5::{Digest, Md5};
 use std::net::{IpAddr, SocketAddr};
@@ -14,6 +14,8 @@ const MAX_REDIRECTS: usize = 5;
 pub enum Start {
     /// The configured region and position.
     Target,
+    /// The avatar's home location.
+    Home,
     /// Wherever the avatar was last.
     Last,
 }
@@ -59,10 +61,16 @@ fn md5_hex(text: &str) -> String {
 pub fn start_location(cfg: &Config, start: Start) -> String {
     match start {
         Start::Last => "last".to_string(),
-        Start::Target => {
-            let [x, y, z] = cfg.position.map(|v| v.round() as i32);
-            format!("uri:{}&{x}&{y}&{z}", cfg.region)
-        }
+        Start::Home => "home".to_string(),
+        Start::Target => match &cfg.place {
+            Place::Region { name, position } => {
+                let [x, y, z] = position.map(|v| v.round() as i32);
+                format!("uri:{name}&{x}&{y}&{z}")
+            }
+            // Nothing to aim for: the reconciler asks for this only with a
+            // configured region.
+            Place::Home | Place::Latest => "last".to_string(),
+        },
     }
 }
 
@@ -188,7 +196,7 @@ mod tests {
     fn config() -> Config {
         Config::parse(
             "user = \"Sit Bot\"\npassword = \"secret\"\nregion = \"Target Region\"\n\
-             position = [128.4, 60.6, 25]\nobject = \"11111111-2222-3333-4444-555555555555\"\n",
+             position = [128.4, 60.6, 25]\nsit = \"11111111-2222-3333-4444-555555555555\"\n",
         )
         .unwrap()
     }
@@ -255,6 +263,10 @@ mod tests {
     #[test]
     fn request_for_last_location() {
         assert!(request_xml(&config(), Start::Last).contains("<string>last</string>"));
+        assert!(request_xml(&config(), Start::Home).contains("<string>home</string>"));
+        // Without a region there is nothing else to ask for.
+        let bare = Config::parse("user = \"Sit Bot\"\npassword = \"secret\"\n").unwrap();
+        assert!(request_xml(&bare, Start::Target).contains("<string>last</string>"));
     }
 
     #[test]

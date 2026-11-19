@@ -13,13 +13,22 @@ user = "Sit Bot"
 password = "secret"
 # password_hash = "$1$5ebe2294ecd0e0f08eab7690d2a6ee69"
 
-# Where the avatar should be: region name and coordinates inside it.
-# Pick coordinates close to the object, or the sit may fail.
+# Optional: where the avatar should be: region name and coordinates inside
+# it, always both. The bot logs in there and teleports back whenever it finds
+# the avatar in another region. With a `sit` object, pick coordinates close
+# to it, or the sit may fail.
 region = "Target"
 position = [128.0, 128.0, 25.0]
 
-# UUID of the object to sit on.
-object = "00000000-0000-0000-0000-000000000000"
+# Without `region` and `position` the bot stays wherever it is, and `start`
+# says where a login puts the avatar: "home" for its home location, "latest"
+# for the place it was last at. Default: "latest".
+# start = "home"
+
+# Optional: what to sit on: the UUID of an object, or "ground". Without it
+# the bot does not sit the avatar anywhere by itself.
+sit = "00000000-0000-0000-0000-000000000000"
+# sit = "ground"
 
 # Optional: record what the avatar hears and is told. Every message is also
 # written to standard error. The files are tab-separated, appended to, and
