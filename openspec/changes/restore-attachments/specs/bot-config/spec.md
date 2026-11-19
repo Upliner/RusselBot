@@ -1,0 +1,205 @@
+# Spec Delta
+
+## MODIFIED Requirements
+
+### Requirement: Single TOML config file
+The bot SHALL read all of its settings from one TOML file. The file path SHALL be taken from the first command-line argument and SHALL default to `russelbot.toml` in the current directory when no argument is given. The file SHALL support these keys:
+
+| Key | Required | Meaning |
+|---|---|---|
+| `login_url` | no | Grid login URL; defaults to the Second Life Agni login URL `https://login.agni.lindenlab.com/cgi-bin/login.cgi` |
+| `user` | yes | Avatar name, either `First Last` or a single word (the last name is then `Resident`) |
+| `password` | one of the two | Plain password |
+| `password_hash` | one of the two | Password hash as produced by the `hash` subcommand |
+| `region` | no, but only together with `position` | Region of the config placement. When present the bot logs in there at startup and holds that region until a persist changes the held placement |
+| `position` | no, but only together with `region` | Coordinates of the config placement inside the region, as an array of three numbers `[x, y, z]` |
+| `start` | no, and only without `region` and `position` | Where a login places the avatar while the bot holds no location: `"home"` for the avatar's home location, `"latest"` for the location it was last at. Defaults to `"latest"` |
+| `sit` | no | Sit state of the config placement: the UUID of an object, or the word `ground`. When absent the config placement's sit state is `stand` and the bot does not seat the avatar at startup |
+| `object` | no | Deprecated spelling of `sit`, accepting a UUID only |
+| `persist` | no | What the bot holds once it has reached the config placement after startup (see `placement-persist`); the forms are given below. Defaults to `"off"` |
+| `log_chat` | no | Path of the TSV file that receives local chat; no chat file is written when absent |
+| `log_im` | no | Path of the TSV file that receives instant messages; no IM file is written when absent |
+| `fetch_offline_im` | no | Boolean; when true the bot fetches instant messages stored while the avatar was offline. Defaults to false |
+| `socket` | no | Boolean; when true the bot listens on the control socket. Defaults to false |
+| `requesttp_timeout` | no | Number of minutes, greater than zero, during which the bot accepts a teleport offer from an avatar it has asked with `requesttp`. Defaults to 10 |
+| `scan_distance` | no | Number of metres, from 1 to 1024. When present the bot learns the objects within that distance from the moment it enters a region, for the `touch` command. When absent it learns them only when `touch` is first used, within 32 metres |
+| `restore_attachments` | no | Boolean; when true the bot attaches again, after each login, the objects the avatar's Current Outfit folder lists and the simulator did not bring (see `avatar-outfit`, "Restoring attachments after a login"). Defaults to true |
+
+`persist` SHALL be accepted in these forms:
+
+| Form | Meaning |
+|---|---|
+| `"cur"` | Location and sit state both `cur`: hold what the simulator reports once the config placement is reached |
+| `"cfg"` | Location and sit state both `cfg`: keep holding the config placement |
+| `"off"` or `false` | Hold nothing: switch to manual mode once the config placement is reached. The two spellings are equivalent, and a config without the key behaves the same |
+| An array of two strings, each `"cur"` or `"cfg"` | The first is the value for the location, the second the value for the sit state |
+| A table with the keys `position` and `sit`, each `"cur"` or `"cfg"` | `position` is the value for the location, `sit` the value for the sit state; a key that is left out of the table is `"cur"` |
+
+A relative `log_chat` or `log_im` path SHALL be taken relative to the directory the bot was started in. A config that uses `object` SHALL behave exactly as the same config with that value under `sit`, and the bot SHALL write a line to standard error at startup that names `object` as deprecated and `sit` as its replacement.
+
+#### Scenario: Minimal config for Second Life
+- **WHEN** the config contains only `user` and `password_hash`
+- **THEN** the bot starts, uses the Second Life Agni login URL, logs in at the avatar's last location, does not sit the avatar, and is in manual mode from then on
+
+#### Scenario: Full placement
+- **WHEN** the config contains `region`, `position` and `sit` with the UUID of an object
+- **THEN** the bot logs in at that position, sits on that object, and is in manual mode from then on: it neither teleports nor sits again by itself
+
+#### Scenario: Ground sit
+- **WHEN** the config contains `sit = "ground"`
+- **THEN** the bot sits the avatar on the ground
+
+#### Scenario: Start at home
+- **WHEN** the config contains `start = "home"` and neither `region` nor `position`
+- **THEN** the first login asks for the avatar's home location, and later logins ask for the location the bot holds
+
+#### Scenario: Old key
+- **WHEN** the config contains `object` with a UUID and no `sit`
+- **THEN** the bot behaves as with `sit` set to that UUID and its log names `object` as deprecated in favour of `sit`
+
+#### Scenario: Persist not mentioned
+- **WHEN** the config has no `persist` key
+- **THEN** the bot behaves as with `persist = "off"`
+
+#### Scenario: Persist as the simulator reports
+- **WHEN** the config contains `region`, `position`, `sit` with the UUID of an object and `persist = "cur"`
+- **THEN** the bot logs in at that position, sits on that object, and from then on holds the location and seat the simulator reported
+
+#### Scenario: Persist as the config says
+- **WHEN** the config contains `region`, `position`, `sit` and `persist = "cfg"`
+- **THEN** the bot keeps holding the configured position and the configured `sit` UUID after it has sat
+
+#### Scenario: Persist off
+- **WHEN** the config contains `persist = "off"` or `persist = false`
+- **THEN** the bot reaches the config placement once and then is in manual mode
+
+#### Scenario: Persist as an array
+- **WHEN** the config contains `persist = ["cfg", "cur"]`
+- **THEN** the bot holds the configured position and the seat the simulator reported
+
+#### Scenario: Persist as a table
+- **WHEN** the config ends with a `[persist]` table containing `position = "cur"` and `sit = "cfg"`
+- **THEN** the bot holds the location the simulator reported and the configured `sit`
+
+#### Scenario: Persist table with one key
+- **WHEN** the config ends with a `[persist]` table containing only `sit = "cfg"`
+- **THEN** the location value is `cur` and the sit state value is `cfg`
+
+#### Scenario: Config path from the command line
+- **WHEN** the bot is started with a file path as its first argument
+- **THEN** it reads that file and not `russelbot.toml`
+
+#### Scenario: Single-word user name
+- **WHEN** `user` is a single word such as `sitbot`
+- **THEN** the bot logs in with first name `sitbot` and last name `Resident`
+
+#### Scenario: No logging keys
+- **WHEN** the config contains none of `log_chat`, `log_im` and `fetch_offline_im`
+- **THEN** the bot starts, writes no log file and does not fetch offline instant messages
+
+#### Scenario: Chat log configured
+- **WHEN** the config contains `log_chat = "chat.tsv"`
+- **THEN** the bot creates `chat.tsv` in the directory it was started in if it does not exist, and appends chat rows to it
+
+#### Scenario: Control socket enabled
+- **WHEN** the config contains `socket = true`
+- **THEN** the bot listens on the control socket
+
+#### Scenario: Control socket not mentioned
+- **WHEN** the config has no `socket` key or has `socket = false`
+- **THEN** the bot does not listen on any control socket
+
+#### Scenario: Teleport request timeout configured
+- **WHEN** the config contains `requesttp_timeout = 30`
+- **THEN** a teleport offer from an avatar the bot asked 20 minutes ago is accepted
+
+#### Scenario: Scan distance configured
+- **WHEN** the config contains `scan_distance = 64`
+- **THEN** the bot starts learning the objects within 64 metres as soon as it has entered a region
+
+#### Scenario: Restoring attachments is on by default
+- **WHEN** the config does not contain `restore_attachments`
+- **THEN** the bot restores attachments after a login as `avatar-outfit` describes
+
+#### Scenario: Restoring attachments switched off
+- **WHEN** the config contains `restore_attachments = false`
+- **THEN** the bot starts normally and never asks the grid about the Current Outfit folder unless a command needs it
+
+### Requirement: Config validation before any network activity
+The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `position` and `sit` or with a value other than `"cur"` and `"cfg"`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, a `restore_attachments` that is not a boolean, and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
+
+#### Scenario: Both password forms given
+- **WHEN** the config contains both `password` and `password_hash`
+- **THEN** the bot prints an error naming both keys and exits with status 2 without contacting the login server
+
+#### Scenario: Malformed sit value
+- **WHEN** `sit` is neither a valid UUID nor `ground`
+- **THEN** the bot prints an error naming `sit` and exits with status 2
+
+#### Scenario: Malformed object UUID
+- **WHEN** `object` is not a valid UUID
+- **THEN** the bot prints an error naming `object` and exits with status 2
+
+#### Scenario: Both seat keys
+- **WHEN** the config contains both `sit` and `object`
+- **THEN** the bot prints an error naming both keys and exits with status 2
+
+#### Scenario: Region without position
+- **WHEN** the config contains `region` and no `position`
+- **THEN** the bot prints an error naming `region` and `position` and exits with status 2
+
+#### Scenario: Start together with a region
+- **WHEN** the config contains `start = "home"` together with `region` and `position`
+- **THEN** the bot prints an error naming `start` and `region` and exits with status 2
+
+#### Scenario: Unknown start value
+- **WHEN** the config contains `start = "last"`
+- **THEN** the bot prints an error naming `start` and the two accepted values, and exits with status 2
+
+#### Scenario: Persist value that only the command takes
+- **WHEN** the config contains `persist = "last"`, `persist = "Target/128/128/25"` or `persist = true`
+- **THEN** the bot prints an error naming `persist` and its accepted forms, and exits with status 2
+
+#### Scenario: Malformed persist array
+- **WHEN** the config contains `persist = ["cur"]`, `persist = ["cur", "cfg", "cur"]` or `persist = ["cur", "off"]`
+- **THEN** the bot prints an error naming `persist` and exits with status 2
+
+#### Scenario: Malformed persist table
+- **WHEN** the config has a `[persist]` table containing `location = "cur"` or `sit = "ground"`
+- **THEN** the bot prints an error naming `persist` and the offending key, and exits with status 2
+
+#### Scenario: Unknown key
+- **WHEN** the config contains a key the bot does not define, such as `regoin`
+- **THEN** the bot prints an error naming that key and exits with status 2
+
+#### Scenario: Log file cannot be opened
+- **WHEN** `log_im` names a file in a directory that does not exist
+- **THEN** the bot prints an error naming `log_im` and the reason, and exits with status 2 without contacting the login server
+
+#### Scenario: Empty log path
+- **WHEN** `log_chat` is an empty string
+- **THEN** the bot prints an error naming `log_chat` and exits with status 2
+
+#### Scenario: Socket key of the wrong type
+- **WHEN** the config contains `socket = "yes"`
+- **THEN** the bot prints an error naming `socket` and exits with status 2
+
+#### Scenario: Socket cannot be created
+- **WHEN** `socket = true` and `RUSSELBOT_SOCK` names a path in a directory that does not exist
+- **THEN** the bot prints an error naming `socket`, the address and the reason, and exits with status 2 without contacting the login server
+
+#### Scenario: No home directory
+- **WHEN** `socket = true` on Unix and neither `RUSSELBOT_SOCK` nor `HOME` is set
+- **THEN** the bot prints an error naming `socket` and `RUSSELBOT_SOCK` and exits with status 2
+
+#### Scenario: Bad teleport request timeout
+- **WHEN** the config contains `requesttp_timeout = 0` or `requesttp_timeout = "soon"`
+- **THEN** the bot prints an error naming `requesttp_timeout` and exits with status 2
+
+#### Scenario: Scan distance out of range
+- **WHEN** the config contains `scan_distance = 5000`
+- **THEN** the bot prints an error naming `scan_distance` and exits with status 2
+
+#### Scenario: Restore option of the wrong type
+- **WHEN** the config contains `restore_attachments = "no"`
+- **THEN** the bot prints an error naming `restore_attachments` and exits with status 2
