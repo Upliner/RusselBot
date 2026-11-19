@@ -8,7 +8,7 @@ use crate::login::SessionInfo;
 use crate::persist::{Location, Sitting, World};
 use crate::reconciler::same_region;
 use crate::udp::circuit::Circuit;
-use crate::udp::messages::{self, Agent, Incoming, Motion, Outgoing, Vector3};
+use crate::udp::messages::{self, Agent, Incoming, Outgoing, Transform, Vector3};
 use crate::udp::packet;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -85,16 +85,27 @@ pub enum SessionEvent {
     AvatarSearchUrl(Option<String>),
     /// An avatar offers to teleport the bot's avatar to it; `lure` is what
     /// `accept_teleport` takes.
-    TeleportOffer { from: Uuid, name: String, lure: Uuid },
+    TeleportOffer {
+        from: Uuid,
+        name: String,
+        lure: Uuid,
+    },
     /// An avatar asks to be teleported to the bot's avatar.
-    TeleportRequested { from: Uuid, name: String, text: String },
+    TeleportRequested {
+        from: Uuid,
+        name: String,
+        text: String,
+    },
     /// A touch that waited for its object went out.
     Touched(Uuid),
     /// A touch gave up waiting: the object did not turn up.
     TouchFailed(Uuid),
     /// The answer to `find_avatar`: the avatars the grid offers for the
     /// name, as id and `First Last`.
-    AvatarsFound { query: Uuid, avatars: Vec<(Uuid, String)> },
+    AvatarsFound {
+        query: Uuid,
+        avatars: Vec<(Uuid, String)>,
+    },
 }
 
 /// A chat or instant message as the simulator delivered it; the names that
@@ -113,11 +124,20 @@ pub struct Message {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Source {
-    Avatar { id: Uuid, name: String },
+    Avatar {
+        id: Uuid,
+        name: String,
+    },
     /// `id` is missing when the simulator does not say which object it was.
-    Object { id: Option<Uuid>, name: String, owner: Uuid },
+    Object {
+        id: Option<Uuid>,
+        name: String,
+        owner: Uuid,
+    },
     /// The grid itself.
-    System { name: String },
+    System {
+        name: String,
+    },
 }
 
 const CHAT_SOURCE_AGENT: u8 = 1;
@@ -196,7 +216,7 @@ struct Sim {
     /// stands, relative to its seat while it sits.
     own_offset: Option<Vector3>,
     /// Where the object the avatar sits on is and how it is turned.
-    seat_frame: Option<Motion>,
+    seat_frame: Option<Transform>,
     /// Both halves of the handshake are done and the region is known.
     entered: bool,
     next_agent_update: Instant,
@@ -271,7 +291,10 @@ impl<N: Net> Session<N> {
     ) -> Session<N> {
         let mut session = Session {
             net,
-            agent: Agent { agent_id: info.agent_id, session_id: info.session_id },
+            agent: Agent {
+                agent_id: info.agent_id,
+                session_id: info.session_id,
+            },
             agent_name: agent_name.to_string(),
             circuit_code: info.circuit_code,
             scan_distance,
@@ -312,7 +335,11 @@ impl<N: Net> Session<N> {
             }
         };
         consider(sim.circuit.next_deadline());
-        consider(if sim.entered { Some(sim.next_agent_update) } else { Some(sim.opened_at + HANDSHAKE_LIMIT) });
+        consider(if sim.entered {
+            Some(sim.next_agent_update)
+        } else {
+            Some(sim.opened_at + HANDSHAKE_LIMIT)
+        });
         consider(self.sit_deadline);
         consider(sim.wanted.iter().map(|(_, deadline)| *deadline).min());
         consider(self.teleport.as_ref().map(|t| t.deadline));
@@ -320,7 +347,13 @@ impl<N: Net> Session<N> {
         deadline
     }
 
-    fn open_circuit(&mut self, generation: u64, addr: SocketAddr, seed_capability: &str, now: Instant) {
+    fn open_circuit(
+        &mut self,
+        generation: u64,
+        addr: SocketAddr,
+        seed_capability: &str,
+        now: Instant,
+    ) {
         self.fail_touches();
         self.sim = Sim::new(generation, now);
         self.seat_confirmed = None;
@@ -332,8 +365,16 @@ impl<N: Net> Session<N> {
         self.sit_deadline = None;
         self.teleport = None;
         self.net.open(generation, addr, seed_capability);
-        self.send(messages::use_circuit_code(&self.agent, self.circuit_code), true, now);
-        self.send(messages::complete_agent_movement(&self.agent, self.circuit_code), true, now);
+        self.send(
+            messages::use_circuit_code(&self.agent, self.circuit_code),
+            true,
+            now,
+        );
+        self.send(
+            messages::complete_agent_movement(&self.agent, self.circuit_code),
+            true,
+            now,
+        );
     }
 
     fn send(&mut self, message: Outgoing, reliable: bool, now: Instant) {
@@ -369,7 +410,8 @@ impl<N: Net> Session<N> {
     /// carry none, which is how a viewer ends a key press.
     fn send_control(&mut self, control_flags: u32, now: Instant) {
         let camera = self.sim.position.unwrap_or_default();
-        let update = messages::agent_update(&self.agent, camera, self.draw_distance(), control_flags);
+        let update =
+            messages::agent_update(&self.agent, camera, self.draw_distance(), control_flags);
         self.send(update, true, now);
     }
 
@@ -417,7 +459,9 @@ impl<N: Net> Session<N> {
     /// Works the avatar's position out again after an update about it or
     /// about its seat.
     fn update_position(&mut self) {
-        let Some(offset) = self.sim.own_offset else { return };
+        let Some(offset) = self.sim.own_offset else {
+            return;
+        };
         match (self.own_parent, self.sim.seat_frame) {
             (Some(0), _) => self.sim.position = Some(offset),
             (Some(_), Some(seat)) => {
@@ -430,11 +474,11 @@ impl<N: Net> Session<N> {
 
     /// An update about the object with this region-local id says where it
     /// is: of interest when it is the avatar or its seat.
-    fn moved(&mut self, local_id: u32, motion: Motion) {
+    fn moved(&mut self, local_id: u32, transform: Transform) {
         if self.sim.own_local == Some(local_id) {
-            self.sim.own_offset = Some(motion.position);
+            self.sim.own_offset = Some(transform.position);
         } else if local_id != 0 && self.own_parent == Some(local_id) {
-            self.sim.seat_frame = Some(motion);
+            self.sim.seat_frame = Some(transform);
         } else {
             return;
         }
@@ -465,10 +509,18 @@ impl<N: Net> Session<N> {
     /// Teleports to `position` in `region`. Ends in `RegionEntered` (another
     /// region), `TeleportArrived` (same region), `TeleportFailed` or `Lost`.
     pub fn start_teleport(&mut self, region: &str, position: Vector3, now: Instant) {
-        let here = self.sim.region_name.as_deref().is_some_and(|name| same_region(name, region));
+        let here = self
+            .sim
+            .region_name
+            .as_deref()
+            .is_some_and(|name| same_region(name, region));
         let phase = match self.sim.region_handle {
             Some(handle) if here => {
-                self.send(messages::teleport_location_request(&self.agent, handle, position), true, now);
+                self.send(
+                    messages::teleport_location_request(&self.agent, handle, position),
+                    true,
+                    now,
+                );
                 TeleportPhase::Requested
             }
             _ => {
@@ -493,7 +545,10 @@ impl<N: Net> Session<N> {
     /// Whether the avatar is where it can talk: in a region, and not on its
     /// way out of it.
     pub fn present(&self) -> Result<(), String> {
-        let here = self.sim.entered && !self.lost && self.teleport.is_none() && self.logout_deadline.is_none();
+        let here = self.sim.entered
+            && !self.lost
+            && self.teleport.is_none()
+            && self.logout_deadline.is_none();
         if here {
             Ok(())
         } else {
@@ -502,9 +557,19 @@ impl<N: Net> Session<N> {
     }
 
     /// Says `text` in local chat. `chat_type` is 0 whisper, 1 say, 2 shout.
-    pub fn say(&mut self, channel: i32, chat_type: u8, text: &str, now: Instant) -> Result<(), String> {
+    pub fn say(
+        &mut self,
+        channel: i32,
+        chat_type: u8,
+        text: &str,
+        now: Instant,
+    ) -> Result<(), String> {
         self.present()?;
-        self.send(messages::chat_from_viewer(&self.agent, text, chat_type, channel), true, now);
+        self.send(
+            messages::chat_from_viewer(&self.agent, text, chat_type, channel),
+            true,
+            now,
+        );
         Ok(())
     }
 
@@ -516,14 +581,20 @@ impl<N: Net> Session<N> {
     fn send_im(&mut self, to: Uuid, dialog: u8, text: &str, now: Instant) -> Result<(), String> {
         self.present()?;
         let position = self.sim.position.unwrap_or_default();
-        let message = messages::instant_message(&self.agent, &self.agent_name, to, position, dialog, text);
+        let message =
+            messages::instant_message(&self.agent, &self.agent_name, to, position, dialog, text);
         self.send(message, true, now);
         Ok(())
     }
 
     /// Asks the avatar `to` to teleport this avatar to it. If it agrees, a
     /// `TeleportOffer` from it follows.
-    pub fn request_teleport(&mut self, to: Uuid, message: &str, now: Instant) -> Result<(), String> {
+    pub fn request_teleport(
+        &mut self,
+        to: Uuid,
+        message: &str,
+        now: Instant,
+    ) -> Result<(), String> {
         self.send_im(to, messages::IM_TELEPORT_REQUEST, message, now)
     }
 
@@ -537,7 +608,11 @@ impl<N: Net> Session<N> {
     /// Accepts a teleport offer. Ends like `start_teleport`.
     pub fn accept_teleport(&mut self, lure: Uuid, now: Instant) -> Result<(), String> {
         self.present()?;
-        self.send(messages::teleport_lure_request(&self.agent, lure), true, now);
+        self.send(
+            messages::teleport_lure_request(&self.agent, lure),
+            true,
+            now,
+        );
         self.teleport = Some(Teleport {
             region: String::new(),
             position: [0.0; 3],
@@ -564,7 +639,11 @@ impl<N: Net> Session<N> {
 
     fn request_objects(&mut self, local_ids: &[u32], now: Instant) {
         for batch in local_ids.chunks(REQUEST_BATCH) {
-            self.send(messages::request_multiple_objects(&self.agent, batch), true, now);
+            self.send(
+                messages::request_multiple_objects(&self.agent, batch),
+                true,
+                now,
+            );
         }
     }
 
@@ -632,7 +711,11 @@ impl<N: Net> Session<N> {
     /// the same `query`, if the grid answers.
     pub fn find_avatar(&mut self, query: Uuid, name: &str, now: Instant) -> Result<(), String> {
         self.present()?;
-        self.send(messages::avatar_picker_request(&self.agent, query, name), true, now);
+        self.send(
+            messages::avatar_picker_request(&self.agent, query, name),
+            true,
+            now,
+        );
         Ok(())
     }
 
@@ -658,9 +741,15 @@ impl<N: Net> Session<N> {
         if self.sim.entered && now >= self.sim.next_agent_update {
             self.sim.next_agent_update = now + AGENT_UPDATE_INTERVAL;
             let camera = self.sim.position.unwrap_or_default();
-            self.send(messages::agent_update(&self.agent, camera, self.draw_distance(), 0), false, now);
+            self.send(
+                messages::agent_update(&self.agent, camera, self.draw_distance(), 0),
+                false,
+                now,
+            );
         }
-        let (late, wanted) = std::mem::take(&mut self.sim.wanted).into_iter().partition(|(_, at)| now >= *at);
+        let (late, wanted) = std::mem::take(&mut self.sim.wanted)
+            .into_iter()
+            .partition(|(_, at)| now >= *at);
         self.sim.wanted = wanted;
         for (object, _) in late {
             self.events.push(SessionEvent::TouchFailed(object));
@@ -674,7 +763,9 @@ impl<N: Net> Session<N> {
         }
         if self.teleport.as_ref().is_some_and(|t| now >= t.deadline) {
             self.teleport = None;
-            self.events.push(SessionEvent::TeleportFailed("no answer within 60 s".to_string()));
+            self.events.push(SessionEvent::TeleportFailed(
+                "no answer within 60 s".to_string(),
+            ));
         }
         if self.logout_deadline.is_some_and(|deadline| now >= deadline) {
             self.logout_deadline = None;
@@ -695,7 +786,11 @@ impl<N: Net> Session<N> {
                 return;
             }
         };
-        crate::debug!("received {} ({} bytes)", messages::name(packet.id), datagram.len());
+        crate::debug!(
+            "received {} ({} bytes)",
+            messages::name(packet.id),
+            datagram.len()
+        );
         if !self.sim.circuit.receive(&packet, now) {
             return;
         }
@@ -723,7 +818,12 @@ impl<N: Net> Session<N> {
     fn hand_over(&mut self, finish: TeleportFinish, now: Instant) {
         crate::debug!("teleport finishing at {}", finish.sim_addr);
         self.net.close(self.sim.generation);
-        self.open_circuit(self.sim.generation + 1, finish.sim_addr, &finish.seed_capability, now);
+        self.open_circuit(
+            self.sim.generation + 1,
+            finish.sim_addr,
+            &finish.seed_capability,
+            now,
+        );
         self.sim.region_handle = Some(finish.region_handle);
     }
 
@@ -736,10 +836,17 @@ impl<N: Net> Session<N> {
             Incoming::RegionHandshake { sim_name } => {
                 self.sim.region_name = Some(sim_name);
                 self.send(messages::region_handshake_reply(&self.agent), true, now);
-                self.send(messages::agent_throttle(&self.agent, self.circuit_code, THROTTLES), true, now);
+                self.send(
+                    messages::agent_throttle(&self.agent, self.circuit_code, THROTTLES),
+                    true,
+                    now,
+                );
                 self.check_entered(now);
             }
-            Incoming::AgentMovementComplete { position, region_handle } => {
+            Incoming::AgentMovementComplete {
+                position,
+                region_handle,
+            } => {
                 self.sim.position = Some(position);
                 self.sim.region_handle = Some(region_handle);
                 self.check_entered(now);
@@ -767,11 +874,17 @@ impl<N: Net> Session<N> {
                 // one with the sit target, or the root). While a sit is in
                 // progress it answers our request, whatever it names.
                 if self.sit_deadline.is_some() {
-                    self.seat_confirmed = Some(Sat { prim: object, requested: self.sit_request });
+                    self.seat_confirmed = Some(Sat {
+                        prim: object,
+                        requested: self.sit_request,
+                    });
                     crate::debug!("sit accepted on {object} (autopilot: {autopilot})");
                     self.send(messages::agent_sit(&self.agent), true, now);
                 } else {
-                    self.seat_confirmed = Some(Sat { prim: object, requested: None });
+                    self.seat_confirmed = Some(Sat {
+                        prim: object,
+                        requested: None,
+                    });
                     crate::debug!("unrequested sit on {object}");
                 }
                 self.update_seat();
@@ -783,8 +896,8 @@ impl<N: Net> Session<N> {
                 }
                 for object in &objects {
                     if object.full_id != own_id {
-                        if let Some(motion) = object.motion {
-                            self.moved(object.local_id, motion);
+                        if let Some(transform) = object.transform {
+                            self.moved(object.local_id, transform);
                         }
                         continue;
                     }
@@ -812,8 +925,8 @@ impl<N: Net> Session<N> {
                     }
                     self.own_parent = Some(object.parent_id);
                     self.sim.own_local = Some(object.local_id);
-                    if let Some(motion) = object.motion {
-                        self.sim.own_offset = Some(motion.position);
+                    if let Some(transform) = object.transform {
+                        self.sim.own_offset = Some(transform.position);
                         self.update_position();
                     }
                     self.update_seat();
@@ -822,19 +935,21 @@ impl<N: Net> Session<N> {
             Incoming::ObjectsCompressed(objects) => {
                 for object in objects {
                     self.learn(object.full_id, object.local_id, now);
-                    if let Some(motion) = object.motion {
-                        self.moved(object.local_id, motion);
+                    if let Some(transform) = object.transform {
+                        self.moved(object.local_id, transform);
                     }
                 }
             }
             Incoming::ObjectsMoved(objects) => {
-                for (local_id, motion) in objects {
-                    self.moved(local_id, motion);
+                for (local_id, trasform) in objects {
+                    self.moved(local_id, trasform);
                 }
             }
             Incoming::ObjectsCached(local_ids) => {
-                let unknown: Vec<u32> =
-                    local_ids.into_iter().filter(|id| !self.sim.local_ids.contains_key(id)).collect();
+                let unknown: Vec<u32> = local_ids
+                    .into_iter()
+                    .filter(|id| !self.sim.local_ids.contains_key(id))
+                    .collect();
                 if self.sim.scan_started.is_some() {
                     self.request_objects(&unknown, now);
                 } else {
@@ -852,46 +967,101 @@ impl<N: Net> Session<N> {
             }
             Incoming::KickUser { reason } => self.lose(format!("kicked: {reason}")),
             Incoming::Alert { message } => self.events.push(SessionEvent::Alert(message)),
-            Incoming::Chat { from_name, source_id, owner_id, source_type, chat_type, audible, text } => {
+            Incoming::Chat {
+                from_name,
+                source_id,
+                owner_id,
+                source_type,
+                chat_type,
+                audible,
+                text,
+            } => {
                 let typing = matches!(chat_type, CHAT_TYPE_START_TYPING | CHAT_TYPE_STOP_TYPING);
                 if typing || text.is_empty() || audible == CHAT_NOT_AUDIBLE {
                     return;
                 }
                 let source = match source_type {
-                    CHAT_SOURCE_AGENT => Source::Avatar { id: source_id, name: from_name },
-                    CHAT_SOURCE_OBJECT => {
-                        Source::Object { id: Some(source_id), name: from_name, owner: owner_id }
-                    }
+                    CHAT_SOURCE_AGENT => Source::Avatar {
+                        id: source_id,
+                        name: from_name,
+                    },
+                    CHAT_SOURCE_OBJECT => Source::Object {
+                        id: Some(source_id),
+                        name: from_name,
+                        owner: owner_id,
+                    },
                     _ => Source::System { name: from_name },
                 };
                 let kind = chat_kind(chat_type);
-                self.events.push(SessionEvent::Chat(Message { kind, source, sent_at: None, text }));
+                self.events.push(SessionEvent::Chat(Message {
+                    kind,
+                    source,
+                    sent_at: None,
+                    text,
+                }));
             }
-            Incoming::InstantMessage { from_agent, from_name, dialog, id, offline, timestamp, text } => {
+            Incoming::InstantMessage {
+                from_agent,
+                from_name,
+                dialog,
+                id,
+                offline,
+                timestamp,
+                text,
+            } => {
                 let (kind, source) = match dialog {
-                    IM_NOTHING_SPECIAL if from_agent.is_nil() => ("im", Source::System { name: from_name }),
-                    IM_NOTHING_SPECIAL => ("im", Source::Avatar { id: from_agent, name: from_name }),
+                    IM_NOTHING_SPECIAL if from_agent.is_nil() => {
+                        ("im", Source::System { name: from_name })
+                    }
+                    IM_NOTHING_SPECIAL => (
+                        "im",
+                        Source::Avatar {
+                            id: from_agent,
+                            name: from_name,
+                        },
+                    ),
                     // The sender is the object's owner and the id is the object.
                     IM_FROM_TASK => {
                         let id = (!id.is_nil()).then_some(id);
-                        ("object", Source::Object { id, name: from_name, owner: from_agent })
+                        (
+                            "object",
+                            Source::Object {
+                                id,
+                                name: from_name,
+                                owner: from_agent,
+                            },
+                        )
                     }
                     messages::IM_TELEPORT_OFFER => {
-                        let offer = SessionEvent::TeleportOffer { from: from_agent, name: from_name, lure: id };
+                        let offer = SessionEvent::TeleportOffer {
+                            from: from_agent,
+                            name: from_name,
+                            lure: id,
+                        };
                         return self.events.push(offer);
                     }
                     messages::IM_TELEPORT_REQUEST => {
-                        let request = SessionEvent::TeleportRequested { from: from_agent, name: from_name, text };
+                        let request = SessionEvent::TeleportRequested {
+                            from: from_agent,
+                            name: from_name,
+                            text,
+                        };
                         return self.events.push(request);
                     }
                     other => return crate::debug!("ignoring instant message with dialog {other}"),
                 };
                 let sent_at = (offline && timestamp != 0).then_some(timestamp);
-                let message = Message { kind: kind.to_string(), source, sent_at, text };
+                let message = Message {
+                    kind: kind.to_string(),
+                    source,
+                    sent_at,
+                    text,
+                };
                 self.events.push(SessionEvent::InstantMessage(message));
             }
             Incoming::AvatarPickerReply { query, avatars } => {
-                self.events.push(SessionEvent::AvatarsFound { query, avatars });
+                self.events
+                    .push(SessionEvent::AvatarsFound { query, avatars });
             }
             Incoming::LogoutReply => {
                 if self.logout_deadline.take().is_some() {
@@ -923,7 +1093,9 @@ impl<N: Net> Session<N> {
     }
 
     fn handle_map_blocks(&mut self, blocks: &[messages::MapBlock], now: Instant) {
-        let Some(teleport) = &mut self.teleport else { return };
+        let Some(teleport) = &mut self.teleport else {
+            return;
+        };
         if !matches!(teleport.phase, TeleportPhase::Lookup) {
             return;
         }
@@ -934,11 +1106,17 @@ impl<N: Net> Session<N> {
             // Region handles are the region's south-west corner in metres.
             let handle = ((u64::from(block.x) * 256) << 32) | (u64::from(block.y) * 256);
             teleport.phase = TeleportPhase::Requested;
-            let request = messages::teleport_location_request(&self.agent, handle, teleport.position);
+            let request =
+                messages::teleport_location_request(&self.agent, handle, teleport.position);
             self.send(request, true, now);
-        } else if blocks.iter().any(|b| b.access == ACCESS_NONEXISTENT || (b.x == 0 && b.y == 0)) {
+        } else if blocks
+            .iter()
+            .any(|b| b.access == ACCESS_NONEXISTENT || (b.x == 0 && b.y == 0))
+        {
             let region = self.teleport.take().map(|t| t.region).unwrap_or_default();
-            self.events.push(SessionEvent::TeleportFailed(format!("region \"{region}\" not found")));
+            self.events.push(SessionEvent::TeleportFailed(format!(
+                "region \"{region}\" not found"
+            )));
         }
     }
 
@@ -949,7 +1127,10 @@ impl<N: Net> Session<N> {
         let seat = self.seat_confirmed.filter(|_| parented);
         match seat {
             // A sit in progress is answered even when it changes nothing.
-            Some(sat) if self.seat != seat || (self.sit_request.is_some() && self.sit_request == sat.requested) => {
+            Some(sat)
+                if self.seat != seat
+                    || (self.sit_request.is_some() && self.sit_request == sat.requested) =>
+            {
                 self.sit_request = None;
                 self.sit_deadline = None;
                 self.events.push(SessionEvent::Seated(sat));
@@ -984,7 +1165,9 @@ impl<N: Net> World for Session<N> {
     }
 
     fn region_of(&self, object: Uuid) -> Option<String> {
-        self.region().filter(|_| self.knows(object)).map(str::to_string)
+        self.region()
+            .filter(|_| self.knows(object))
+            .map(str::to_string)
     }
 }
 
@@ -1038,10 +1221,17 @@ mod tests {
 
     impl Net for FakeNet {
         fn open(&mut self, generation: u64, addr: SocketAddr, seed_capability: &str) {
-            self.0.borrow_mut().calls.push(Call::Open(generation, addr, seed_capability.to_string()));
+            self.0.borrow_mut().calls.push(Call::Open(
+                generation,
+                addr,
+                seed_capability.to_string(),
+            ));
         }
         fn send(&mut self, generation: u64, datagram: &[u8]) {
-            self.0.borrow_mut().sent.push((generation, packet::parse(datagram).unwrap()));
+            self.0
+                .borrow_mut()
+                .sent
+                .push((generation, packet::parse(datagram).unwrap()));
         }
         fn close(&mut self, generation: u64) {
             self.0.borrow_mut().calls.push(Call::Close(generation));
@@ -1070,12 +1260,18 @@ mod tests {
 
     /// A sit the bot asked for, answered naming the same object.
     fn asked(object: Uuid) -> Sat {
-        Sat { prim: object, requested: Some(object) }
+        Sat {
+            prim: object,
+            requested: Some(object),
+        }
     }
 
     /// A sit the simulator made unprompted.
     fn forced(object: Uuid) -> Sat {
-        Sat { prim: object, requested: None }
+        Sat {
+            prim: object,
+            requested: None,
+        }
     }
 
     impl Rig {
@@ -1097,8 +1293,21 @@ mod tests {
                 seed_capability: "http://127.0.0.1:9000/CAPS/seed/".to_string(),
             };
             let now = Instant::now();
-            let session = Session::new(net.clone(), &info, "Sit Bot", scan_distance, fetch_offline_im, 1, now);
-            Rig { session, net, now, sequence: 0 }
+            let session = Session::new(
+                net.clone(),
+                &info,
+                "Sit Bot",
+                scan_distance,
+                fetch_offline_im,
+                1,
+                now,
+            );
+            Rig {
+                session,
+                net,
+                now,
+                sequence: 0,
+            }
         }
 
         /// A session that has completed the handshake in region "Home",
@@ -1131,11 +1340,18 @@ mod tests {
             self.receive_from(generation, id, body, true);
         }
 
-        fn receive_from(&mut self, generation: u64, id: packet::MessageId, body: &[u8], reliable: bool) {
+        fn receive_from(
+            &mut self,
+            generation: u64,
+            id: packet::MessageId,
+            body: &[u8],
+            reliable: bool,
+        ) {
             self.sequence += 1;
             let flags = if reliable { FLAG_RELIABLE } else { 0 };
             let datagram = packet::build(flags, self.sequence, id, body, false);
-            self.session.handle_datagram(generation, &datagram, self.now);
+            self.session
+                .handle_datagram(generation, &datagram, self.now);
         }
 
         /// Acknowledges every sequence number the session could have used.
@@ -1177,7 +1393,10 @@ mod tests {
         }
 
         fn sit_response(&mut self, object: Uuid) {
-            self.receive(messages::AVATAR_SIT_RESPONSE, &wire::avatar_sit_response(object, false));
+            self.receive(
+                messages::AVATAR_SIT_RESPONSE,
+                &wire::avatar_sit_response(object, false),
+            );
         }
 
         fn seated() -> Rig {
@@ -1206,17 +1425,30 @@ mod tests {
         let mut rig = Rig::new();
         assert_eq!(
             rig.calls(),
-            [Call::Open(1, "127.0.0.1:9000".parse().unwrap(), "http://127.0.0.1:9000/CAPS/seed/".into())]
+            [Call::Open(
+                1,
+                "127.0.0.1:9000".parse().unwrap(),
+                "http://127.0.0.1:9000/CAPS/seed/".into()
+            )]
         );
         let sent = rig.sent();
         assert_eq!(
             sent.iter().map(|p| p.id).collect::<Vec<_>>(),
-            [messages::USE_CIRCUIT_CODE, messages::COMPLETE_AGENT_MOVEMENT]
+            [
+                messages::USE_CIRCUIT_CODE,
+                messages::COMPLETE_AGENT_MOVEMENT
+            ]
         );
         assert!(sent.iter().all(Packet::is_reliable));
 
-        rig.receive(messages::REGION_HANDSHAKE, &wire::region_handshake("Target"));
-        assert_eq!(rig.sent_ids(), [messages::REGION_HANDSHAKE_REPLY, messages::AGENT_THROTTLE]);
+        rig.receive(
+            messages::REGION_HANDSHAKE,
+            &wire::region_handshake("Target"),
+        );
+        assert_eq!(
+            rig.sent_ids(),
+            [messages::REGION_HANDSHAKE_REPLY, messages::AGENT_THROTTLE]
+        );
         assert_eq!(rig.events(), []);
 
         let body = wire::agent_movement_complete(&rig.agent(), [1.0, 2.0, 3.0], HOME_HANDLE);
@@ -1230,7 +1462,10 @@ mod tests {
         let body = wire::agent_movement_complete(&rig.agent(), [1.0, 2.0, 3.0], HOME_HANDLE);
         rig.receive(messages::AGENT_MOVEMENT_COMPLETE, &body);
         assert_eq!(rig.events(), []);
-        rig.receive(messages::REGION_HANDSHAKE, &wire::region_handshake("Target"));
+        rig.receive(
+            messages::REGION_HANDSHAKE,
+            &wire::region_handshake("Target"),
+        );
         assert_eq!(rig.events(), [SessionEvent::RegionEntered("Target".into())]);
     }
 
@@ -1250,7 +1485,10 @@ mod tests {
         rig.receive_from(1, messages::START_PING_CHECK, &[42, 0, 0, 0, 0], false);
         let sent = rig.sent();
         assert_eq!(sent.len(), 1);
-        assert_eq!((sent[0].id, sent[0].body.as_slice()), (messages::COMPLETE_PING_CHECK, &[42u8][..]));
+        assert_eq!(
+            (sent[0].id, sent[0].body.as_slice()),
+            (messages::COMPLETE_PING_CHECK, &[42u8][..])
+        );
         assert!(!sent[0].is_reliable());
     }
 
@@ -1261,7 +1499,10 @@ mod tests {
         rig.advance(secs(2));
         let updates = |rig: &Rig| {
             let net = rig.net.0.borrow();
-            net.sent.iter().filter(|(_, p)| p.id == messages::AGENT_UPDATE).count()
+            net.sent
+                .iter()
+                .filter(|(_, p)| p.id == messages::AGENT_UPDATE)
+                .count()
         };
         assert_eq!(updates(&rig), 0);
 
@@ -1283,7 +1524,11 @@ mod tests {
         assert_eq!(rig.events(), []);
         rig.advance(Duration::from_millis(200));
         let net = rig.net.0.borrow();
-        let acks: Vec<_> = net.sent.iter().filter(|(_, p)| p.id == messages::PACKET_ACK).collect();
+        let acks: Vec<_> = net
+            .sent
+            .iter()
+            .filter(|(_, p)| p.id == messages::PACKET_ACK)
+            .collect();
         assert_eq!(acks.len(), 1);
         let Ok(Incoming::PacketAck(acked)) = messages::decode(acks[0].1.id, &acks[0].1.body) else {
             panic!("not a PacketAck")
@@ -1321,9 +1566,22 @@ mod tests {
     #[test]
     fn kick_is_a_loss_with_the_reason() {
         let mut rig = Rig::entered();
-        rig.receive(messages::KICK_USER, &wire::kick_user("You have been kicked"));
+        rig.receive(
+            messages::KICK_USER,
+            &wire::kick_user("You have been kicked"),
+        );
         assert_eq!(rig.lost_reason(), "kicked: You have been kicked");
-        assert_eq!(rig.calls(), [Call::Open(1, "127.0.0.1:9000".parse().unwrap(), "http://127.0.0.1:9000/CAPS/seed/".into()), Call::Close(1)]);
+        assert_eq!(
+            rig.calls(),
+            [
+                Call::Open(
+                    1,
+                    "127.0.0.1:9000".parse().unwrap(),
+                    "http://127.0.0.1:9000/CAPS/seed/".into()
+                ),
+                Call::Close(1)
+            ]
+        );
     }
 
     #[test]
@@ -1371,13 +1629,20 @@ mod tests {
         }
         assert_eq!(resends, 4);
         let events = rig.events();
-        assert!(matches!(events.last(), Some(SessionEvent::Lost(r)) if r.contains("acknowledging")), "{events:?}");
+        assert!(
+            matches!(events.last(), Some(SessionEvent::Lost(r)) if r.contains("acknowledging")),
+            "{events:?}"
+        );
     }
 
     #[test]
     fn event_queue_gone_is_a_loss() {
         let mut rig = Rig::entered();
-        rig.session.handle_caps(1, CapsEvent::Gone("event queue reports no such session".into()), rig.now);
+        rig.session.handle_caps(
+            1,
+            CapsEvent::Gone("event queue reports no such session".into()),
+            rig.now,
+        );
         assert_eq!(rig.lost_reason(), "event queue reports no such session");
     }
 
@@ -1399,7 +1664,8 @@ mod tests {
         let mut rig = Rig::entered();
         rig.receive_from(7, messages::KICK_USER, &wire::kick_user("stale"), true);
         rig.receive_from(0, messages::DISABLE_SIMULATOR, &[], true);
-        rig.session.handle_caps(7, CapsEvent::Gone("stale".into()), rig.now);
+        rig.session
+            .handle_caps(7, CapsEvent::Gone("stale".into()), rig.now);
         assert_eq!(rig.events(), []);
         assert!(!rig.session.lost);
     }
@@ -1421,7 +1687,11 @@ mod tests {
     fn session_ending_during_logout_counts_as_logged_out() {
         let mut rig = Rig::entered();
         rig.session.start_logout(rig.now);
-        rig.session.handle_caps(1, CapsEvent::Gone("event queue reports no such session".into()), rig.now);
+        rig.session.handle_caps(
+            1,
+            CapsEvent::Gone("event queue reports no such session".into()),
+            rig.now,
+        );
         assert_eq!(rig.events(), [SessionEvent::LoggedOut]);
         // The late confirmation is not a second outcome.
         rig.receive(messages::LOGOUT_REPLY, &[0; 33]);
@@ -1453,7 +1723,11 @@ mod tests {
 
         rig.sit_response(target());
         assert_eq!(rig.sent_ids(), [messages::AGENT_SIT]);
-        assert_eq!(rig.events(), [], "not seated until the simulator shows the avatar parented");
+        assert_eq!(
+            rig.events(),
+            [],
+            "not seated until the simulator shows the avatar parented"
+        );
 
         rig.own_update(4242);
         assert_eq!(rig.events(), [SessionEvent::Seated(asked(target()))]);
@@ -1498,10 +1772,16 @@ mod tests {
         rig.session.start_sit(target(), rig.now);
         let text = "There is no suitable surface to sit on, try another spot.";
         rig.receive(messages::ALERT_MESSAGE, &wire::alert_message(text));
-        rig.receive(messages::AGENT_ALERT_MESSAGE, &wire::agent_alert_message("Region restarting"));
+        rig.receive(
+            messages::AGENT_ALERT_MESSAGE,
+            &wire::agent_alert_message("Region restarting"),
+        );
         assert_eq!(
             rig.events(),
-            [SessionEvent::Alert(text.into()), SessionEvent::Alert("Region restarting".into())]
+            [
+                SessionEvent::Alert(text.into()),
+                SessionEvent::Alert("Region restarting".into())
+            ]
         );
         // An alert is information only; the sit still runs to its deadline.
         rig.ack_all();
@@ -1519,7 +1799,10 @@ mod tests {
         assert_eq!(rig.sent_ids(), [messages::AGENT_SIT]);
         rig.own_update(555);
         // Both are reported: the object asked for and the prim sat on.
-        let sat = Sat { prim: Uuid::from_bytes([0xEE; 16]), requested: Some(target()) };
+        let sat = Sat {
+            prim: Uuid::from_bytes([0xEE; 16]),
+            requested: Some(target()),
+        };
         assert_eq!(rig.events(), [SessionEvent::Seated(sat)]);
         assert!(sat.is_on(target()) && sat.is_on(Uuid::from_bytes([0xEE; 16])));
         assert!(!sat.is_on(other_object()));
@@ -1555,8 +1838,14 @@ mod tests {
     fn other_avatars_do_not_change_the_seat() {
         let mut rig = Rig::seated();
         let other = Uuid::from_bytes([0x77; 16]);
-        rig.receive(messages::OBJECT_UPDATE, &wire::object_update(&[(other, 0), (other, 4242)]));
-        rig.receive(messages::OBJECT_UPDATE, &wire::object_update(&[(target(), 0)]));
+        rig.receive(
+            messages::OBJECT_UPDATE,
+            &wire::object_update(&[(other, 0), (other, 4242)]),
+        );
+        rig.receive(
+            messages::OBJECT_UPDATE,
+            &wire::object_update(&[(target(), 0)]),
+        );
         assert_eq!(rig.events(), []);
     }
 
@@ -1572,7 +1861,8 @@ mod tests {
     // ---------------------------------------------------------- teleport
 
     fn start_teleport(rig: &mut Rig) {
-        rig.session.start_teleport("Target", [128.0, 129.0, 25.0], rig.now);
+        rig.session
+            .start_teleport("Target", [128.0, 129.0, 25.0], rig.now);
     }
 
     #[test]
@@ -1584,7 +1874,8 @@ mod tests {
         assert!(sent[0].body.ends_with(b"\x07Target\0"));
 
         // Partial matches are not the region; the exact one is, in any case.
-        let body = wire::map_block_reply(&[(1002, 1000, "Target Annex", 13), (1001, 1000, "TARGET", 13)]);
+        let body =
+            wire::map_block_reply(&[(1002, 1000, "Target Annex", 13), (1001, 1000, "TARGET", 13)]);
         rig.receive(messages::MAP_BLOCK_REPLY, &body);
         let sent = rig.sent();
         assert_eq!(sent[0].id, messages::TELEPORT_LOCATION_REQUEST);
@@ -1598,8 +1889,16 @@ mod tests {
     fn teleport_fails_when_the_region_is_not_on_the_map() {
         let mut rig = Rig::entered();
         start_teleport(&mut rig);
-        rig.receive(messages::MAP_BLOCK_REPLY, &wire::map_block_reply(&[(0, 0, "Target", 255)]));
-        assert_eq!(rig.events(), [SessionEvent::TeleportFailed("region \"Target\" not found".into())]);
+        rig.receive(
+            messages::MAP_BLOCK_REPLY,
+            &wire::map_block_reply(&[(0, 0, "Target", 255)]),
+        );
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::TeleportFailed(
+                "region \"Target\" not found".into()
+            )]
+        );
         // Still connected where it was.
         assert!(!rig.session.lost);
         assert_eq!(rig.generation(), 1);
@@ -1609,13 +1908,28 @@ mod tests {
     fn teleport_reports_the_grids_failure_reason() {
         let mut rig = Rig::entered();
         start_teleport(&mut rig);
-        rig.receive(messages::MAP_BLOCK_REPLY, &wire::map_block_reply(&[(1001, 1000, "Target", 13)]));
+        rig.receive(
+            messages::MAP_BLOCK_REPLY,
+            &wire::map_block_reply(&[(1001, 1000, "Target", 13)]),
+        );
         rig.receive(messages::TELEPORT_START, &[0; 4]);
-        rig.receive(messages::TELEPORT_PROGRESS, &wire::teleport_progress("contacting"));
-        rig.receive(messages::TELEPORT_FAILED, &wire::teleport_failed("Destination refused"));
-        assert_eq!(rig.events(), [SessionEvent::TeleportFailed("Destination refused".into())]);
+        rig.receive(
+            messages::TELEPORT_PROGRESS,
+            &wire::teleport_progress("contacting"),
+        );
+        rig.receive(
+            messages::TELEPORT_FAILED,
+            &wire::teleport_failed("Destination refused"),
+        );
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::TeleportFailed("Destination refused".into())]
+        );
         // A second failure report for the same attempt is not a second outcome.
-        rig.receive(messages::TELEPORT_FAILED, &wire::teleport_failed("Destination refused"));
+        rig.receive(
+            messages::TELEPORT_FAILED,
+            &wire::teleport_failed("Destination refused"),
+        );
         assert_eq!(rig.events(), []);
     }
 
@@ -1631,17 +1945,24 @@ mod tests {
         assert_eq!(rig.events(), []);
         rig.receive_from(1, packet::high(200), &[], false);
         rig.advance(secs(1));
-        assert_eq!(rig.events(), [SessionEvent::TeleportFailed("no answer within 60 s".into())]);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::TeleportFailed("no answer within 60 s".into())]
+        );
     }
 
     #[test]
     fn teleport_inside_the_current_region_skips_the_lookup() {
         let mut rig = Rig::entered();
-        rig.session.start_teleport(" home", [5.0, 6.0, 7.0], rig.now);
+        rig.session
+            .start_teleport(" home", [5.0, 6.0, 7.0], rig.now);
         let sent = rig.sent();
         assert_eq!(sent[0].id, messages::TELEPORT_LOCATION_REQUEST);
         assert_eq!(sent[0].body[32..40], HOME_HANDLE.to_le_bytes());
-        rig.receive(messages::TELEPORT_LOCAL, &wire::teleport_local([5.0, 6.0, 7.0]));
+        rig.receive(
+            messages::TELEPORT_LOCAL,
+            &wire::teleport_local([5.0, 6.0, 7.0]),
+        );
         assert_eq!(rig.events(), [SessionEvent::TeleportArrived]);
         assert_eq!(rig.generation(), 1);
         assert_eq!(rig.session.sim.position, Some([5.0, 6.0, 7.0]));
@@ -1660,7 +1981,10 @@ mod tests {
         let mut rig = Rig::seated();
         rig.calls();
         start_teleport(&mut rig);
-        rig.receive(messages::MAP_BLOCK_REPLY, &wire::map_block_reply(&[(1001, 1000, "Target", 13)]));
+        rig.receive(
+            messages::MAP_BLOCK_REPLY,
+            &wire::map_block_reply(&[(1001, 1000, "Target", 13)]),
+        );
         rig.sent();
 
         rig.session.handle_caps(1, finish(), rig.now);
@@ -1668,15 +1992,29 @@ mod tests {
             rig.calls(),
             [
                 Call::Close(1),
-                Call::Open(2, "127.0.0.1:9001".parse().unwrap(), "http://127.0.0.1:9001/CAPS/seed2/".into()),
+                Call::Open(
+                    2,
+                    "127.0.0.1:9001".parse().unwrap(),
+                    "http://127.0.0.1:9001/CAPS/seed2/".into()
+                ),
             ]
         );
         let handshake = std::mem::take(&mut rig.net.0.borrow_mut().sent);
         assert_eq!(
-            handshake.iter().map(|(generation, p)| (*generation, p.id, p.sequence)).collect::<Vec<_>>(),
-            [(2, messages::USE_CIRCUIT_CODE, 1), (2, messages::COMPLETE_AGENT_MOVEMENT, 2)]
+            handshake
+                .iter()
+                .map(|(generation, p)| (*generation, p.id, p.sequence))
+                .collect::<Vec<_>>(),
+            [
+                (2, messages::USE_CIRCUIT_CODE, 1),
+                (2, messages::COMPLETE_AGENT_MOVEMENT, 2)
+            ]
         );
-        assert_eq!(rig.events(), [], "arrival is reported once the new handshake is done");
+        assert_eq!(
+            rig.events(),
+            [],
+            "arrival is reported once the new handshake is done"
+        );
 
         rig.enter("Target", ((1001 * 256) << 32) | (1000 * 256));
         assert_eq!(rig.events(), [SessionEvent::RegionEntered("Target".into())]);
@@ -1702,8 +2040,14 @@ mod tests {
 
         rig.receive_from(1, messages::DISABLE_SIMULATOR, &[], true);
         rig.receive_from(1, messages::KICK_USER, &wire::kick_user("old"), true);
-        rig.receive_from(1, messages::REGION_HANDSHAKE, &wire::region_handshake("Home"), true);
-        rig.session.handle_caps(1, CapsEvent::Gone("old queue closed".into()), rig.now);
+        rig.receive_from(
+            1,
+            messages::REGION_HANDSHAKE,
+            &wire::region_handshake("Home"),
+            true,
+        );
+        rig.session
+            .handle_caps(1, CapsEvent::Gone("old queue closed".into()), rig.now);
         assert_eq!(rig.events(), []);
         assert!(!rig.session.lost);
         assert_eq!(rig.session.sim.region_name.as_deref(), Some("Target"));
@@ -1714,7 +2058,10 @@ mod tests {
         let mut rig = Rig::seated();
         rig.session.handle_caps(1, finish(), rig.now);
         rig.enter("Elsewhere", HOME_HANDLE);
-        assert_eq!(rig.events(), [SessionEvent::RegionEntered("Elsewhere".into())]);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::RegionEntered("Elsewhere".into())]
+        );
     }
 
     #[test]
@@ -1729,16 +2076,28 @@ mod tests {
     // ------------------------------------------------------ chat and IMs
 
     fn avatar(name: &str) -> Source {
-        Source::Avatar { id: Uuid::from_bytes([0x77; 16]), name: name.into() }
+        Source::Avatar {
+            id: Uuid::from_bytes([0x77; 16]),
+            name: name.into(),
+        }
     }
 
     fn message(kind: &str, source: Source, text: &str) -> Message {
-        Message { kind: kind.into(), source, sent_at: None, text: text.into() }
+        Message {
+            kind: kind.into(),
+            source,
+            sent_at: None,
+            text: text.into(),
+        }
     }
 
     impl Rig {
         fn chat(&mut self, source_type: u8, chat_type: u8, audible: i8, text: &str) {
-            let ids = (Uuid::from_bytes([0x77; 16]), Uuid::from_bytes([0x88; 16]), source_type);
+            let ids = (
+                Uuid::from_bytes([0x77; 16]),
+                Uuid::from_bytes([0x88; 16]),
+                source_type,
+            );
             let body = wire::chat_from_simulator("Speaker", ids, chat_type, audible, text);
             self.receive(messages::CHAT_FROM_SIMULATOR, &body);
         }
@@ -1750,23 +2109,55 @@ mod tests {
 
         /// How many RetrieveInstantMessages were sent since the last call to `sent`.
         fn offline_requests(&mut self) -> usize {
-            self.sent_ids().iter().filter(|id| **id == messages::RETRIEVE_INSTANT_MESSAGES).count()
+            self.sent_ids()
+                .iter()
+                .filter(|id| **id == messages::RETRIEVE_INSTANT_MESSAGES)
+                .count()
         }
     }
 
     #[test]
     fn chat_is_reported_with_its_kind() {
         let mut rig = Rig::entered();
-        let kinds = [(0, "whisper"), (1, "say"), (2, "shout"), (6, "debug"), (7, "region"), (8, "owner"), (9, "direct")];
+        let kinds = [
+            (0, "whisper"),
+            (1, "say"),
+            (2, "shout"),
+            (6, "debug"),
+            (7, "region"),
+            (8, "owner"),
+            (9, "direct"),
+        ];
         for (chat_type, kind) in kinds {
             rig.chat(1, chat_type, 1, "hello");
-            assert_eq!(rig.events(), [SessionEvent::Chat(message(kind, avatar("Speaker"), "hello"))]);
+            assert_eq!(
+                rig.events(),
+                [SessionEvent::Chat(message(
+                    kind,
+                    avatar("Speaker"),
+                    "hello"
+                ))]
+            );
         }
         rig.chat(1, 42, 1, "hello");
-        assert_eq!(rig.events(), [SessionEvent::Chat(message("type-42", avatar("Speaker"), "hello"))]);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::Chat(message(
+                "type-42",
+                avatar("Speaker"),
+                "hello"
+            ))]
+        );
         // Barely audible chat is still chat.
         rig.chat(1, 1, 0, "far away");
-        assert_eq!(rig.events(), [SessionEvent::Chat(message("say", avatar("Speaker"), "far away"))]);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::Chat(message(
+                "say",
+                avatar("Speaker"),
+                "far away"
+            ))]
+        );
     }
 
     #[test]
@@ -1778,10 +2169,18 @@ mod tests {
             name: "Speaker".into(),
             owner: Uuid::from_bytes([0x88; 16]),
         };
-        assert_eq!(rig.events(), [SessionEvent::Chat(message("say", object, "tick"))]);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::Chat(message("say", object, "tick"))]
+        );
         rig.chat(0, 1, 1, "notice");
-        let system = Source::System { name: "Speaker".into() };
-        assert_eq!(rig.events(), [SessionEvent::Chat(message("say", system, "notice"))]);
+        let system = Source::System {
+            name: "Speaker".into(),
+        };
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::Chat(message("say", system, "notice"))]
+        );
     }
 
     #[test]
@@ -1799,30 +2198,73 @@ mod tests {
     fn instant_messages_from_avatars_and_objects_are_reported() {
         let mut rig = Rig::entered();
         let (sender, object) = (Uuid::from_bytes([0x77; 16]), Uuid::from_bytes([0x99; 16]));
-        rig.im(sender, 0, Uuid::from_bytes([0x66; 16]), None, "are you there?");
+        rig.im(
+            sender,
+            0,
+            Uuid::from_bytes([0x66; 16]),
+            None,
+            "are you there?",
+        );
         assert_eq!(
             rig.events(),
-            [SessionEvent::InstantMessage(message("im", avatar("Sender"), "are you there?"))]
+            [SessionEvent::InstantMessage(message(
+                "im",
+                avatar("Sender"),
+                "are you there?"
+            ))]
         );
 
         rig.im(sender, 19, object, None, "done");
-        let source = Source::Object { id: Some(object), name: "Sender".into(), owner: sender };
-        assert_eq!(rig.events(), [SessionEvent::InstantMessage(message("object", source, "done"))]);
+        let source = Source::Object {
+            id: Some(object),
+            name: "Sender".into(),
+            owner: sender,
+        };
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::InstantMessage(message(
+                "object", source, "done"
+            ))]
+        );
 
         // An older region does not say which object it was.
         rig.im(sender, 19, Uuid::nil(), None, "done");
-        let source = Source::Object { id: None, name: "Sender".into(), owner: sender };
-        assert_eq!(rig.events(), [SessionEvent::InstantMessage(message("object", source, "done"))]);
+        let source = Source::Object {
+            id: None,
+            name: "Sender".into(),
+            owner: sender,
+        };
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::InstantMessage(message(
+                "object", source, "done"
+            ))]
+        );
 
         rig.im(Uuid::nil(), 0, Uuid::nil(), None, "maintenance");
-        let source = Source::System { name: "Sender".into() };
-        assert_eq!(rig.events(), [SessionEvent::InstantMessage(message("im", source, "maintenance"))]);
+        let source = Source::System {
+            name: "Sender".into(),
+        };
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::InstantMessage(message(
+                "im",
+                source,
+                "maintenance"
+            ))]
+        );
     }
 
     #[test]
     fn stored_instant_messages_carry_the_time_they_were_sent() {
         let mut rig = Rig::entered();
-        rig.im(Uuid::from_bytes([0x77; 16]), 0, Uuid::nil(), Some(1_700_000_000), "earlier");
+        rig.im(
+            Uuid::from_bytes([0x77; 16]),
+            0,
+            Uuid::nil(),
+            Some(1_700_000_000),
+            "earlier",
+        );
         let mut expected = message("im", avatar("Sender"), "earlier");
         expected.sent_at = Some(1_700_000_000);
         assert_eq!(rig.events(), [SessionEvent::InstantMessage(expected)]);
@@ -1841,19 +2283,29 @@ mod tests {
     #[test]
     fn offline_messages_are_requested_once_per_session_when_enabled() {
         let mut rig = Rig::with_offline_im(true);
-        assert_eq!(rig.offline_requests(), 0, "not before the region is entered");
+        assert_eq!(
+            rig.offline_requests(),
+            0,
+            "not before the region is entered"
+        );
         rig.receive(messages::REGION_HANDSHAKE, &wire::region_handshake("Home"));
         let body = wire::agent_movement_complete(&rig.agent(), [1.0, 2.0, 3.0], HOME_HANDLE);
         rig.receive(messages::AGENT_MOVEMENT_COMPLETE, &body);
         let sent = rig.sent();
-        let request: Vec<_> = sent.iter().filter(|p| p.id == messages::RETRIEVE_INSTANT_MESSAGES).collect();
+        let request: Vec<_> = sent
+            .iter()
+            .filter(|p| p.id == messages::RETRIEVE_INSTANT_MESSAGES)
+            .collect();
         assert_eq!(request.len(), 1);
         assert!(request[0].is_reliable());
         rig.ack_all();
 
         // Not again in the next region.
         rig.session.handle_caps(1, finish(), rig.now);
-        rig.receive(messages::REGION_HANDSHAKE, &wire::region_handshake("Target"));
+        rig.receive(
+            messages::REGION_HANDSHAKE,
+            &wire::region_handshake("Target"),
+        );
         let body = wire::agent_movement_complete(&rig.agent(), [1.0, 2.0, 3.0], HOME_HANDLE);
         rig.receive(messages::AGENT_MOVEMENT_COMPLETE, &body);
         assert_eq!(rig.offline_requests(), 0);
@@ -1872,18 +2324,26 @@ mod tests {
     fn display_names_url_is_passed_on_for_the_current_circuit_only() {
         let mut rig = Rig::entered();
         let url = Some("http://127.0.0.1:9000/CAPS/names/".to_string());
-        rig.session.handle_caps(1, CapsEvent::DisplayNames(url.clone()), rig.now);
-        rig.session.handle_caps(1, CapsEvent::DisplayNames(None), rig.now);
+        rig.session
+            .handle_caps(1, CapsEvent::DisplayNames(url.clone()), rig.now);
+        rig.session
+            .handle_caps(1, CapsEvent::DisplayNames(None), rig.now);
         assert_eq!(
             rig.events(),
-            [SessionEvent::DisplayNamesUrl(url.clone()), SessionEvent::DisplayNamesUrl(None)]
+            [
+                SessionEvent::DisplayNamesUrl(url.clone()),
+                SessionEvent::DisplayNamesUrl(None)
+            ]
         );
-        rig.session.handle_caps(7, CapsEvent::DisplayNames(url.clone()), rig.now);
+        rig.session
+            .handle_caps(7, CapsEvent::DisplayNames(url.clone()), rig.now);
         assert_eq!(rig.events(), []);
         // The avatar search URL travels the same way.
-        rig.session.handle_caps(1, CapsEvent::AvatarSearch(url.clone()), rig.now);
+        rig.session
+            .handle_caps(1, CapsEvent::AvatarSearch(url.clone()), rig.now);
         assert_eq!(rig.events(), [SessionEvent::AvatarSearchUrl(url.clone())]);
-        rig.session.handle_caps(7, CapsEvent::AvatarSearch(url), rig.now);
+        rig.session
+            .handle_caps(7, CapsEvent::AvatarSearch(url), rig.now);
         assert_eq!(rig.events(), []);
     }
 
@@ -1899,10 +2359,17 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert!(sent.iter().all(Packet::is_reliable));
         let expected = messages::chat_from_viewer(&rig.agent(), "test message", 2, 1);
-        assert_eq!((sent[0].id, &sent[0].body), (messages::CHAT_FROM_VIEWER, &expected.body));
+        assert_eq!(
+            (sent[0].id, &sent[0].body),
+            (messages::CHAT_FROM_VIEWER, &expected.body)
+        );
         // The message carries the avatar's name and where it stands.
-        let expected = messages::instant_message(&rig.agent(), "Sit Bot", to, [10.0, 20.0, 30.0], 0, "hello");
-        assert_eq!((sent[1].id, &sent[1].body), (messages::IMPROVED_INSTANT_MESSAGE, &expected.body));
+        let expected =
+            messages::instant_message(&rig.agent(), "Sit Bot", to, [10.0, 20.0, 30.0], 0, "hello");
+        assert_eq!(
+            (sent[1].id, &sent[1].body),
+            (messages::IMPROVED_INSTANT_MESSAGE, &expected.body)
+        );
     }
 
     #[test]
@@ -1915,10 +2382,16 @@ mod tests {
         assert!(sent[0].body.ends_with(b"\x09jane doe\0"));
 
         let jane = Uuid::from_bytes([1; 16]);
-        rig.receive(messages::AVATAR_PICKER_REPLY, &wire::avatar_picker_reply(query, &[(jane, "Jane", "Doe")]));
+        rig.receive(
+            messages::AVATAR_PICKER_REPLY,
+            &wire::avatar_picker_reply(query, &[(jane, "Jane", "Doe")]),
+        );
         assert_eq!(
             rig.events(),
-            [SessionEvent::AvatarsFound { query, avatars: vec![(jane, "Jane Doe".to_string())] }]
+            [SessionEvent::AvatarsFound {
+                query,
+                avatars: vec![(jane, "Jane Doe".to_string())]
+            }]
         );
     }
 
@@ -1927,10 +2400,23 @@ mod tests {
         let to = Uuid::from_bytes([0x0F; 16]);
         let refused = |rig: &mut Rig| {
             let now = rig.now;
-            assert_eq!(rig.session.say(0, 1, "hello", now), Err(NOT_CONNECTED.to_string()));
-            assert_eq!(rig.session.instant_message(to, "hello", now), Err(NOT_CONNECTED.to_string()));
-            assert_eq!(rig.session.find_avatar(to, "jane doe", now), Err(NOT_CONNECTED.to_string()));
-            let chatty = [messages::CHAT_FROM_VIEWER, messages::IMPROVED_INSTANT_MESSAGE, messages::AVATAR_PICKER_REQUEST];
+            assert_eq!(
+                rig.session.say(0, 1, "hello", now),
+                Err(NOT_CONNECTED.to_string())
+            );
+            assert_eq!(
+                rig.session.instant_message(to, "hello", now),
+                Err(NOT_CONNECTED.to_string())
+            );
+            assert_eq!(
+                rig.session.find_avatar(to, "jane doe", now),
+                Err(NOT_CONNECTED.to_string())
+            );
+            let chatty = [
+                messages::CHAT_FROM_VIEWER,
+                messages::IMPROVED_INSTANT_MESSAGE,
+                messages::AVATAR_PICKER_REQUEST,
+            ];
             assert!(rig.sent_ids().iter().all(|id| !chatty.contains(id)));
         };
         // Before the handshake is done.
@@ -1970,7 +2456,10 @@ mod tests {
     fn update_fields(packet: &Packet) -> (f32, u32) {
         assert_eq!(packet.id, messages::AGENT_UPDATE);
         let far = f32::from_le_bytes(packet.body[105..109].try_into().unwrap());
-        (far, u32::from_le_bytes(packet.body[109..113].try_into().unwrap()))
+        (
+            far,
+            u32::from_le_bytes(packet.body[109..113].try_into().unwrap()),
+        )
     }
 
     #[test]
@@ -1985,7 +2474,10 @@ mod tests {
         rig.sit_response(Uuid::from_bytes([0x0D; 16]));
         assert_eq!(rig.sent_ids(), [messages::AGENT_SIT]);
         rig.own_update(777);
-        let sat = Sat { prim: Uuid::from_bytes([0x0D; 16]), requested: Some(other_object()) };
+        let sat = Sat {
+            prim: Uuid::from_bytes([0x0D; 16]),
+            requested: Some(other_object()),
+        };
         assert_eq!(rig.events(), [SessionEvent::Seated(sat)]);
         assert_eq!(rig.session.seat(), Seat::Object(sat));
     }
@@ -1995,7 +2487,11 @@ mod tests {
         let mut rig = Rig::seated();
         rig.session.start_sit(other_object(), rig.now);
         rig.own_update(4242);
-        assert_eq!(rig.events(), [], "still on the target as far as anyone knows");
+        assert_eq!(
+            rig.events(),
+            [],
+            "still on the target as far as anyone knows"
+        );
         rig.ack_all();
         rig.advance(secs(15));
         assert!(matches!(&rig.events()[..], [SessionEvent::SitFailed(_)]));
@@ -2035,7 +2531,10 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert!(sent.iter().all(Packet::is_reliable));
         assert_eq!(update_fields(&sent[0]), (32.0, messages::CONTROL_STAND_UP));
-        assert_eq!(update_fields(&sent[1]), (32.0, messages::CONTROL_SIT_ON_GROUND));
+        assert_eq!(
+            update_fields(&sent[1]),
+            (32.0, messages::CONTROL_SIT_ON_GROUND)
+        );
         // The periodic update that follows carries no flags.
         rig.ack_all();
         rig.advance(secs(1));
@@ -2067,7 +2566,10 @@ mod tests {
 
         // A teleport inside the region.
         rig.session.sit_ground(rig.now).unwrap();
-        rig.receive(messages::TELEPORT_LOCAL, &wire::teleport_local([4.0, 5.0, 6.0]));
+        rig.receive(
+            messages::TELEPORT_LOCAL,
+            &wire::teleport_local([4.0, 5.0, 6.0]),
+        );
         assert!(!rig.session.on_ground());
 
         // Another simulator.
@@ -2090,7 +2592,11 @@ mod tests {
         assert_eq!(rig.session.stand(rig.now), Ok(()));
         rig.ack_all();
         rig.advance(secs(20));
-        assert_eq!(rig.events(), [], "no SitFailed for a sit that was called off");
+        assert_eq!(
+            rig.events(),
+            [],
+            "no SitFailed for a sit that was called off"
+        );
     }
 
     #[test]
@@ -2100,19 +2606,30 @@ mod tests {
         let mut rig = Rig::entered();
         assert_eq!(rig.session.region(), Some("Home"));
         assert_eq!(rig.session.position(), Some([10.0, 20.0, 30.0]));
-        rig.receive(messages::TELEPORT_LOCAL, &wire::teleport_local([1.0, 2.0, 3.0]));
+        rig.receive(
+            messages::TELEPORT_LOCAL,
+            &wire::teleport_local([1.0, 2.0, 3.0]),
+        );
         assert_eq!(rig.session.position(), Some([1.0, 2.0, 3.0]));
     }
 
     #[test]
     fn teleport_inside_the_current_region_needs_no_lookup() {
         let mut rig = Rig::entered();
-        rig.session.start_teleport("home", [100.0, 120.0, 40.0], rig.now);
+        rig.session
+            .start_teleport("home", [100.0, 120.0, 40.0], rig.now);
         let sent = rig.sent();
         assert_eq!(sent.len(), 1);
-        let expected = messages::teleport_location_request(&rig.agent(), HOME_HANDLE, [100.0, 120.0, 40.0]);
-        assert_eq!((sent[0].id, &sent[0].body), (messages::TELEPORT_LOCATION_REQUEST, &expected.body));
-        rig.receive(messages::TELEPORT_LOCAL, &wire::teleport_local([100.0, 120.0, 40.0]));
+        let expected =
+            messages::teleport_location_request(&rig.agent(), HOME_HANDLE, [100.0, 120.0, 40.0]);
+        assert_eq!(
+            (sent[0].id, &sent[0].body),
+            (messages::TELEPORT_LOCATION_REQUEST, &expected.body)
+        );
+        rig.receive(
+            messages::TELEPORT_LOCAL,
+            &wire::teleport_local([100.0, 120.0, 40.0]),
+        );
         assert_eq!(rig.events(), [SessionEvent::TeleportArrived]);
     }
 
@@ -2123,12 +2640,24 @@ mod tests {
         let refused = Err(NOT_CONNECTED.to_string());
         assert_eq!(rig.session.stand(now), refused);
         assert_eq!(rig.session.sit_ground(now), refused);
-        assert_eq!(rig.session.request_teleport(other_object(), "", now), refused);
+        assert_eq!(
+            rig.session.request_teleport(other_object(), "", now),
+            refused
+        );
         assert_eq!(rig.session.offer_teleport(other_object(), "", now), refused);
         assert_eq!(rig.session.accept_teleport(other_object(), now), refused);
-        assert_eq!(rig.session.touch(other_object(), now), Err(NOT_CONNECTED.to_string()));
-        let handshake = [messages::USE_CIRCUIT_CODE, messages::COMPLETE_AGENT_MOVEMENT];
-        assert_eq!(rig.sent_all().iter().map(|p| p.id).collect::<Vec<_>>(), handshake);
+        assert_eq!(
+            rig.session.touch(other_object(), now),
+            Err(NOT_CONNECTED.to_string())
+        );
+        let handshake = [
+            messages::USE_CIRCUIT_CODE,
+            messages::COMPLETE_AGENT_MOVEMENT,
+        ];
+        assert_eq!(
+            rig.sent_all().iter().map(|p| p.id).collect::<Vec<_>>(),
+            handshake
+        );
     }
 
     // --------------------------------------------------- teleport offers
@@ -2142,8 +2671,16 @@ mod tests {
         assert_eq!(
             rig.events(),
             [
-                SessionEvent::TeleportOffer { from: jane, name: "Sender".into(), lure },
-                SessionEvent::TeleportRequested { from: jane, name: "Sender".into(), text: "may I come over?".into() },
+                SessionEvent::TeleportOffer {
+                    from: jane,
+                    name: "Sender".into(),
+                    lure
+                },
+                SessionEvent::TeleportRequested {
+                    from: jane,
+                    name: "Sender".into(),
+                    text: "may I come over?".into()
+                },
             ]
         );
         // Neither is a message for the log, and other offers still are not.
@@ -2155,14 +2692,29 @@ mod tests {
     fn asks_for_and_offers_teleports() {
         let mut rig = Rig::entered();
         let jane = Uuid::from_bytes([0x77; 16]);
-        assert_eq!(rig.session.request_teleport(jane, "may I?", rig.now), Ok(()));
+        assert_eq!(
+            rig.session.request_teleport(jane, "may I?", rig.now),
+            Ok(())
+        );
         assert_eq!(rig.session.offer_teleport(jane, "come", rig.now), Ok(()));
         let sent = rig.sent();
-        let request =
-            messages::instant_message(&rig.agent(), "Sit Bot", jane, [10.0, 20.0, 30.0], 26, "may I?");
-        assert_eq!((sent[0].id, &sent[0].body), (messages::IMPROVED_INSTANT_MESSAGE, &request.body));
+        let request = messages::instant_message(
+            &rig.agent(),
+            "Sit Bot",
+            jane,
+            [10.0, 20.0, 30.0],
+            26,
+            "may I?",
+        );
+        assert_eq!(
+            (sent[0].id, &sent[0].body),
+            (messages::IMPROVED_INSTANT_MESSAGE, &request.body)
+        );
         let offer = messages::start_lure(&rig.agent(), "come", jane);
-        assert_eq!((sent[1].id, &sent[1].body), (messages::START_LURE, &offer.body));
+        assert_eq!(
+            (sent[1].id, &sent[1].body),
+            (messages::START_LURE, &offer.body)
+        );
         assert!(sent.iter().all(Packet::is_reliable));
     }
 
@@ -2173,19 +2725,30 @@ mod tests {
         assert_eq!(rig.session.accept_teleport(lure, rig.now), Ok(()));
         let sent = rig.sent();
         let expected = messages::teleport_lure_request(&rig.agent(), lure);
-        assert_eq!((sent[0].id, &sent[0].body), (messages::TELEPORT_LURE_REQUEST, &expected.body));
+        assert_eq!(
+            (sent[0].id, &sent[0].body),
+            (messages::TELEPORT_LURE_REQUEST, &expected.body)
+        );
         // A teleport is under way: nothing else is said meanwhile.
-        assert_eq!(rig.session.say(0, 1, "hello", rig.now), Err(NOT_CONNECTED.to_string()));
+        assert_eq!(
+            rig.session.say(0, 1, "hello", rig.now),
+            Err(NOT_CONNECTED.to_string())
+        );
 
         rig.session.handle_caps(1, finish(), rig.now);
         rig.enter("Elsewhere", HOME_HANDLE + 256);
-        assert_eq!(rig.events(), [SessionEvent::RegionEntered("Elsewhere".into())]);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::RegionEntered("Elsewhere".into())]
+        );
     }
 
     #[test]
     fn offer_that_goes_unanswered_fails_like_any_teleport() {
         let mut rig = Rig::entered();
-        rig.session.accept_teleport(Uuid::from_bytes([0x44; 16]), rig.now).unwrap();
+        rig.session
+            .accept_teleport(Uuid::from_bytes([0x44; 16]), rig.now)
+            .unwrap();
         rig.ack_all();
         // Kept alive meanwhile, so that only the teleport's own limit ends it.
         for _ in 0..6 {
@@ -2193,7 +2756,10 @@ mod tests {
             rig.receive(messages::START_PING_CHECK, &[1, 0, 0, 0, 0]);
             rig.ack_all();
         }
-        assert_eq!(rig.events(), [SessionEvent::TeleportFailed("no answer within 60 s".into())]);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::TeleportFailed("no answer within 60 s".into())]
+        );
     }
 
     // ---------------------------------------------------------- position
@@ -2210,20 +2776,38 @@ mod tests {
         /// `parent` is 0 and on its seat otherwise.
         fn own_at(&mut self, parent: u32, position: Vector3) {
             let data = wire::object_data(position, [0.0; 3], true);
-            let block = wire::Block { full_id: agent_id(), local_id: OWN, parent_id: parent, data };
+            let block = wire::Block {
+                full_id: agent_id(),
+                local_id: OWN,
+                parent_id: parent,
+                data,
+            };
             self.receive(messages::OBJECT_UPDATE, &wire::object_blocks(&[block]));
         }
 
         /// A full update describing the chair.
         fn chair_at(&mut self, position: Vector3, rotation: Vector3) {
             let data = wire::object_data(position, rotation, false);
-            let block = wire::Block { full_id: target(), local_id: CHAIR, parent_id: 0, data };
+            let block = wire::Block {
+                full_id: target(),
+                local_id: CHAIR,
+                parent_id: 0,
+                data,
+            };
             self.receive(messages::OBJECT_UPDATE, &wire::object_blocks(&[block]));
         }
 
         fn terse(&mut self, local_id: u32, avatar: bool, position: Vector3) {
-            let object = wire::Terse { local_id, avatar, position, rotation: [0.0, 0.0, 0.0, 1.0] };
-            self.receive(messages::IMPROVED_TERSE_OBJECT_UPDATE, &wire::improved_terse_object_update(&[object]));
+            let object = wire::Terse {
+                local_id,
+                avatar,
+                position,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            };
+            self.receive(
+                messages::IMPROVED_TERSE_OBJECT_UPDATE,
+                &wire::improved_terse_object_update(&[object]),
+            );
         }
 
         fn position(&self) -> Vector3 {
@@ -2244,7 +2828,13 @@ mod tests {
             rig.sit_response(target());
             rig.sent();
             rig.own_at(CHAIR, offset);
-            assert_eq!(rig.events(), [SessionEvent::Standing, SessionEvent::Seated(asked(target()))]);
+            assert_eq!(
+                rig.events(),
+                [
+                    SessionEvent::Standing,
+                    SessionEvent::Seated(asked(target()))
+                ]
+            );
             rig
         }
     }
@@ -2275,7 +2865,11 @@ mod tests {
         assert!(!rig.session.seat_frame_known());
 
         rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
-        assert!(near(rig.position(), [131.0, 64.5, 23.0]), "{:?}", rig.position());
+        assert!(
+            near(rig.position(), [131.0, 64.5, 23.0]),
+            "{:?}",
+            rig.position()
+        );
         assert!(rig.session.seat_frame_known());
         assert_eq!(rig.events(), []);
     }
@@ -2286,15 +2880,28 @@ mod tests {
         // turn about the vertical: one metre along the region's y axis.
         let mut rig = Rig::on_chair([1.0, 0.0, 0.0]);
         rig.chair_at([131.0, 64.0, 23.0], [0.0, 0.0, QUARTER]);
-        assert!(near(rig.position(), [131.0, 65.0, 23.0]), "{:?}", rig.position());
+        assert!(
+            near(rig.position(), [131.0, 65.0, 23.0]),
+            "{:?}",
+            rig.position()
+        );
     }
 
     #[test]
     fn the_seat_may_be_described_in_the_compressed_form() {
         let mut rig = Rig::on_chair([1.0, 0.0, 0.0]);
-        let body = wire::object_update_compressed_at(&[(target(), CHAIR, [131.0, 64.0, 23.0], [0.0, 0.0, QUARTER])]);
+        let body = wire::object_update_compressed_at(&[(
+            target(),
+            CHAIR,
+            [131.0, 64.0, 23.0],
+            [0.0, 0.0, QUARTER],
+        )]);
         rig.receive(messages::OBJECT_UPDATE_COMPRESSED, &body);
-        assert!(near(rig.position(), [131.0, 65.0, 23.0]), "{:?}", rig.position());
+        assert!(
+            near(rig.position(), [131.0, 65.0, 23.0]),
+            "{:?}",
+            rig.position()
+        );
     }
 
     #[test]
@@ -2315,10 +2922,18 @@ mod tests {
         let mut rig = Rig::on_chair([0.0, 0.5, 0.6]);
         rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
         rig.terse(CHAIR, false, [141.0, 64.0, 22.4]);
-        assert!(near(rig.position(), [141.0, 64.5, 23.0]), "{:?}", rig.position());
+        assert!(
+            near(rig.position(), [141.0, 64.5, 23.0]),
+            "{:?}",
+            rig.position()
+        );
         // The avatar shifting on the seat counts too.
         rig.terse(OWN, true, [0.0, 0.0, 1.0]);
-        assert!(near(rig.position(), [141.0, 64.0, 23.4]), "{:?}", rig.position());
+        assert!(
+            near(rig.position(), [141.0, 64.0, 23.4]),
+            "{:?}",
+            rig.position()
+        );
         // Other objects moving do not.
         rig.terse(77, false, [1.0, 2.0, 3.0]);
         assert!(near(rig.position(), [141.0, 64.0, 23.4]));
@@ -2372,7 +2987,10 @@ mod tests {
     fn a_teleport_inside_the_region_outdates_the_seat() {
         let mut rig = Rig::on_chair([0.0, 0.5, 0.6]);
         rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
-        rig.receive(messages::TELEPORT_LOCAL, &wire::teleport_local([5.0, 6.0, 7.0]));
+        rig.receive(
+            messages::TELEPORT_LOCAL,
+            &wire::teleport_local([5.0, 6.0, 7.0]),
+        );
         // The chair moving before the avatar is reported standing must not
         // drag the position back.
         rig.terse(CHAIR, false, [141.0, 64.0, 22.4]);
@@ -2400,11 +3018,21 @@ mod tests {
         let mut rig = Rig::entered();
         rig.own_at(0, [100.0, 100.0, 25.0]);
         // The same avatar in a form that carries no motion the bot reads.
-        let block = wire::Block { full_id: agent_id(), local_id: OWN, parent_id: 0, data: vec![0x12; 32] };
+        let block = wire::Block {
+            full_id: agent_id(),
+            local_id: OWN,
+            parent_id: 0,
+            data: vec![0x12; 32],
+        };
         rig.receive(messages::OBJECT_UPDATE, &wire::object_blocks(&[block]));
         assert_eq!(rig.position(), [100.0, 100.0, 25.0]);
         let data = wire::object_data([f32::NAN, 1.0, 2.0], [0.0; 3], true);
-        let block = wire::Block { full_id: agent_id(), local_id: OWN, parent_id: 0, data };
+        let block = wire::Block {
+            full_id: agent_id(),
+            local_id: OWN,
+            parent_id: 0,
+            data,
+        };
         rig.receive(messages::OBJECT_UPDATE, &wire::object_blocks(&[block]));
         assert_eq!(rig.position(), [100.0, 100.0, 25.0]);
     }
@@ -2413,7 +3041,13 @@ mod tests {
     fn the_session_tells_persist_where_the_avatar_is_and_how_it_sits() {
         // Just arrived: standing, as far as anyone knows.
         let mut rig = Rig::entered();
-        assert_eq!(rig.session.here(), Location { region: "Home".to_string(), position: [10.0, 20.0, 30.0] });
+        assert_eq!(
+            rig.session.here(),
+            Location {
+                region: "Home".to_string(),
+                position: [10.0, 20.0, 30.0]
+            }
+        );
         assert_eq!(rig.session.sitting(), Sitting::Standing);
         rig.own_at(0, [100.0, 100.0, 25.0]);
         assert_eq!(rig.session.sitting(), Sitting::Standing);
@@ -2456,27 +3090,50 @@ mod tests {
     }
 
     fn requests(packets: &[Packet]) -> Vec<Vec<u8>> {
-        packets.iter().filter(|p| p.id == messages::REQUEST_MULTIPLE_OBJECTS).map(|p| p.body.clone()).collect()
+        packets
+            .iter()
+            .filter(|p| p.id == messages::REQUEST_MULTIPLE_OBJECTS)
+            .map(|p| p.body.clone())
+            .collect()
     }
 
     #[test]
     fn nothing_is_asked_about_objects_before_a_scan() {
         let mut rig = Rig::entered();
-        rig.receive(messages::OBJECT_UPDATE, &wire::object_update(&[(object(1), 0)]));
-        rig.receive(messages::OBJECT_UPDATE_COMPRESSED, &wire::object_update_compressed(&[(object(2), 500)]));
-        rig.receive(messages::OBJECT_UPDATE_CACHED, &wire::object_update_cached(&[600, 601]));
+        rig.receive(
+            messages::OBJECT_UPDATE,
+            &wire::object_update(&[(object(1), 0)]),
+        );
+        rig.receive(
+            messages::OBJECT_UPDATE_COMPRESSED,
+            &wire::object_update_compressed(&[(object(2), 500)]),
+        );
+        rig.receive(
+            messages::OBJECT_UPDATE_CACHED,
+            &wire::object_update_cached(&[600, 601]),
+        );
         rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[601]));
         rig.advance(secs(30));
         let sent = rig.sent_all();
-        assert!(sent.iter().all(|p| p.id == messages::AGENT_UPDATE), "{:?}", sent.iter().map(|p| p.id).collect::<Vec<_>>());
+        assert!(
+            sent.iter().all(|p| p.id == messages::AGENT_UPDATE),
+            "{:?}",
+            sent.iter().map(|p| p.id).collect::<Vec<_>>()
+        );
         assert!(sent.iter().all(|p| update_fields(p) == (32.0, 0)));
     }
 
     #[test]
     fn touching_a_described_object_presses_and_releases_it() {
         let mut rig = Rig::entered();
-        rig.receive(messages::OBJECT_UPDATE, &wire::object_update(&[(object(1), 0)]));
-        rig.receive(messages::OBJECT_UPDATE_COMPRESSED, &wire::object_update_compressed(&[(object(2), 500)]));
+        rig.receive(
+            messages::OBJECT_UPDATE,
+            &wire::object_update(&[(object(1), 0)]),
+        );
+        rig.receive(
+            messages::OBJECT_UPDATE_COMPRESSED,
+            &wire::object_update_compressed(&[(object(2), 500)]),
+        );
         assert_eq!(rig.session.touch(object(2), rig.now), Ok(Touch::Sent));
         assert_eq!(rig.session.touch(object(1), rig.now), Ok(Touch::Sent));
         let sent = rig.sent();
@@ -2484,7 +3141,10 @@ mod tests {
         let (grab, release) = (messages::OBJECT_GRAB, messages::OBJECT_DEGRAB);
         assert_eq!(ids, [grab, release, grab, release]);
         assert_eq!(sent[0].body, messages::object_grab(&rig.agent(), 500).body);
-        assert_eq!(sent[1].body, messages::object_degrab(&rig.agent(), 500).body);
+        assert_eq!(
+            sent[1].body,
+            messages::object_degrab(&rig.agent(), 500).body
+        );
         assert_eq!(sent[2].body, messages::object_grab(&rig.agent(), 100).body);
         assert!(sent.iter().all(Packet::is_reliable));
         assert_eq!(rig.events(), []);
@@ -2494,33 +3154,65 @@ mod tests {
     fn first_touch_of_an_unknown_object_scans_for_it() {
         let mut rig = Rig::entered();
         let many: Vec<u32> = (1000..1300).collect();
-        rig.receive(messages::OBJECT_UPDATE_CACHED, &wire::object_update_cached(&many[..200]));
-        rig.receive(messages::OBJECT_UPDATE_CACHED, &wire::object_update_cached(&many[200..]));
+        rig.receive(
+            messages::OBJECT_UPDATE_CACHED,
+            &wire::object_update_cached(&many[..200]),
+        );
+        rig.receive(
+            messages::OBJECT_UPDATE_CACHED,
+            &wire::object_update_cached(&many[200..]),
+        );
         rig.sent();
 
         assert_eq!(rig.session.touch(object(3), rig.now), Ok(Touch::Waiting));
         // Everything mentioned so far is asked about, 255 at a time.
         let asked = requests(&rig.sent());
-        assert_eq!(asked.iter().map(|body| body[32]).collect::<Vec<_>>(), [255, 45]);
+        assert_eq!(
+            asked.iter().map(|body| body[32]).collect::<Vec<_>>(),
+            [255, 45]
+        );
         let mut ids: Vec<u32> = asked
             .iter()
-            .flat_map(|body| body[33..].chunks(5).map(|c| u32::from_le_bytes(c[1..].try_into().unwrap())).collect::<Vec<_>>())
+            .flat_map(|body| {
+                body[33..]
+                    .chunks(5)
+                    .map(|c| u32::from_le_bytes(c[1..].try_into().unwrap()))
+                    .collect::<Vec<_>>()
+            })
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, many);
 
         // From now on a cached update is asked about as it comes.
-        rig.receive(messages::OBJECT_UPDATE_CACHED, &wire::object_update_cached(&[2000]));
-        assert_eq!(requests(&rig.sent()), [messages::request_multiple_objects(&rig.agent(), &[2000]).body]);
+        rig.receive(
+            messages::OBJECT_UPDATE_CACHED,
+            &wire::object_update_cached(&[2000]),
+        );
+        assert_eq!(
+            requests(&rig.sent()),
+            [messages::request_multiple_objects(&rig.agent(), &[2000]).body]
+        );
 
         // The answer describes the object, and the touch goes out.
-        rig.receive(messages::OBJECT_UPDATE_COMPRESSED, &wire::object_update_compressed(&[(object(3), 2000)]));
-        assert_eq!(rig.sent_ids(), [messages::OBJECT_GRAB, messages::OBJECT_DEGRAB]);
+        rig.receive(
+            messages::OBJECT_UPDATE_COMPRESSED,
+            &wire::object_update_compressed(&[(object(3), 2000)]),
+        );
+        assert_eq!(
+            rig.sent_ids(),
+            [messages::OBJECT_GRAB, messages::OBJECT_DEGRAB]
+        );
         assert_eq!(rig.events(), [SessionEvent::Touched(object(3))]);
         // Known now: later touches go straight out, and it is not asked about again.
-        rig.receive(messages::OBJECT_UPDATE_CACHED, &wire::object_update_cached(&[2000]));
+        rig.receive(
+            messages::OBJECT_UPDATE_CACHED,
+            &wire::object_update_cached(&[2000]),
+        );
         assert_eq!(rig.session.touch(object(3), rig.now), Ok(Touch::Sent));
-        assert_eq!(rig.sent_ids(), [messages::OBJECT_GRAB, messages::OBJECT_DEGRAB]);
+        assert_eq!(
+            rig.sent_ids(),
+            [messages::OBJECT_GRAB, messages::OBJECT_DEGRAB]
+        );
     }
 
     #[test]
@@ -2534,23 +3226,36 @@ mod tests {
         assert_eq!(rig.events(), [SessionEvent::TouchFailed(object(3))]);
         // The scan has had its time: an unknown object is refused at once.
         let refused = rig.session.touch(object(4), rig.now).unwrap_err();
-        assert!(refused.contains(&object(4).to_string()) && refused.contains("32 m"), "{refused}");
+        assert!(
+            refused.contains(&object(4).to_string()) && refused.contains("32 m"),
+            "{refused}"
+        );
         assert_eq!(rig.sent_ids(), []);
     }
 
     #[test]
     fn killed_objects_are_forgotten() {
         let mut rig = Rig::entered();
-        rig.receive(messages::OBJECT_UPDATE_COMPRESSED, &wire::object_update_compressed(&[(object(2), 500)]));
+        rig.receive(
+            messages::OBJECT_UPDATE_COMPRESSED,
+            &wire::object_update_compressed(&[(object(2), 500)]),
+        );
         rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[500]));
         assert_eq!(rig.session.touch(object(2), rig.now), Ok(Touch::Waiting));
-        assert_eq!(rig.sent_ids(), [], "nothing to press, and nothing left to ask about");
+        assert_eq!(
+            rig.sent_ids(),
+            [],
+            "nothing to press, and nothing left to ask about"
+        );
     }
 
     #[test]
     fn objects_are_forgotten_with_the_simulator() {
         let mut rig = Rig::entered();
-        rig.receive(messages::OBJECT_UPDATE_COMPRESSED, &wire::object_update_compressed(&[(object(2), 500)]));
+        rig.receive(
+            messages::OBJECT_UPDATE_COMPRESSED,
+            &wire::object_update_compressed(&[(object(2), 500)]),
+        );
         assert_eq!(rig.session.touch(object(9), rig.now), Ok(Touch::Waiting));
         rig.sent();
         rig.session.handle_caps(1, finish(), rig.now);
@@ -2558,27 +3263,46 @@ mod tests {
         rig.enter("Elsewhere", HOME_HANDLE + 256);
         rig.events();
         // A new region: nothing known, and no scan until it is needed again.
-        rig.receive(messages::OBJECT_UPDATE_CACHED, &wire::object_update_cached(&[700]));
+        rig.receive(
+            messages::OBJECT_UPDATE_CACHED,
+            &wire::object_update_cached(&[700]),
+        );
         assert_eq!(requests(&rig.sent()), Vec::<Vec<u8>>::new());
         assert_eq!(rig.session.touch(object(2), rig.now), Ok(Touch::Waiting));
-        assert_eq!(requests(&rig.sent()), [messages::request_multiple_objects(&rig.agent(), &[700]).body]);
+        assert_eq!(
+            requests(&rig.sent()),
+            [messages::request_multiple_objects(&rig.agent(), &[700]).body]
+        );
     }
 
     #[test]
     fn configured_scan_distance_scans_from_the_start() {
         let mut rig = Rig::with(Some(64.0), false);
-        rig.receive(messages::OBJECT_UPDATE_CACHED, &wire::object_update_cached(&[600]));
+        rig.receive(
+            messages::OBJECT_UPDATE_CACHED,
+            &wire::object_update_cached(&[600]),
+        );
         rig.enter("Home", HOME_HANDLE);
         rig.events();
         // What was mentioned before the region was entered is asked about on entry...
-        rig.receive(messages::OBJECT_UPDATE_CACHED, &wire::object_update_cached(&[601]));
-        assert_eq!(requests(&rig.sent()), [messages::request_multiple_objects(&rig.agent(), &[601]).body]);
+        rig.receive(
+            messages::OBJECT_UPDATE_CACHED,
+            &wire::object_update_cached(&[601]),
+        );
+        assert_eq!(
+            requests(&rig.sent()),
+            [messages::request_multiple_objects(&rig.agent(), &[601]).body]
+        );
         // ...and the simulator is told how far to look.
         rig.advance(secs(1));
         let updates = rig.sent_all();
         assert_eq!(update_fields(updates.last().unwrap()), (64.0, 0));
         // After its time, an unknown object is refused naming that distance.
         rig.advance(secs(10));
-        assert!(rig.session.touch(object(4), rig.now).unwrap_err().contains("64 m"));
+        assert!(rig
+            .session
+            .touch(object(4), rig.now)
+            .unwrap_err()
+            .contains("64 m"));
     }
 }

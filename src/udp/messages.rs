@@ -171,7 +171,9 @@ struct Writer(Vec<u8>);
 
 impl Writer {
     fn agent(agent: &Agent) -> Writer {
-        Writer::default().uuid(agent.agent_id).uuid(agent.session_id)
+        Writer::default()
+            .uuid(agent.agent_id)
+            .uuid(agent.session_id)
     }
     fn u8(mut self, v: u8) -> Self {
         self.0.push(v);
@@ -221,7 +223,11 @@ impl Writer {
         self.variable2(&terminated(text, MAX_TEXT))
     }
     fn finish(self, id: MessageId, zerocoded: bool) -> Outgoing {
-        Outgoing { id, zerocoded, body: self.0 }
+        Outgoing {
+            id,
+            zerocoded,
+            body: self.0,
+        }
     }
 }
 
@@ -236,12 +242,16 @@ pub fn use_circuit_code(agent: &Agent, circuit_code: u32) -> Outgoing {
 
 /// CompleteAgentMovement, Low 249.
 pub fn complete_agent_movement(agent: &Agent, circuit_code: u32) -> Outgoing {
-    Writer::agent(agent).u32(circuit_code).finish(COMPLETE_AGENT_MOVEMENT, false)
+    Writer::agent(agent)
+        .u32(circuit_code)
+        .finish(COMPLETE_AGENT_MOVEMENT, false)
 }
 
 /// RegionHandshakeReply, Low 149, Zerocoded.
 pub fn region_handshake_reply(agent: &Agent) -> Outgoing {
-    Writer::agent(agent).u32(0).finish(REGION_HANDSHAKE_REPLY, true)
+    Writer::agent(agent)
+        .u32(0)
+        .finish(REGION_HANDSHAKE_REPLY, true)
 }
 
 /// AgentThrottle, Low 81, Zerocoded. `throttles` are bits per second for
@@ -279,7 +289,9 @@ pub fn agent_update(agent: &Agent, camera: Vector3, far: f32, control_flags: u32
 
 /// CompletePingCheck, High 2.
 pub fn complete_ping_check(ping_id: u8) -> Outgoing {
-    Writer::default().u8(ping_id).finish(COMPLETE_PING_CHECK, false)
+    Writer::default()
+        .u8(ping_id)
+        .finish(COMPLETE_PING_CHECK, false)
 }
 
 /// PacketAck, Fixed 0xFFFFFFFB. At most 255 ids fit in one message.
@@ -336,7 +348,11 @@ pub fn agent_sit(agent: &Agent) -> Outgoing {
 /// ChatFromViewer, Low 80, Zerocoded: Message Variable 2, Type U8,
 /// Channel S32. `chat_type` is 0 whisper, 1 say, 2 shout.
 pub fn chat_from_viewer(agent: &Agent, text: &str, chat_type: u8, channel: i32) -> Outgoing {
-    Writer::agent(agent).text2(text).u8(chat_type).i32(channel).finish(CHAT_FROM_VIEWER, true)
+    Writer::agent(agent)
+        .text2(text)
+        .u8(chat_type)
+        .i32(channel)
+        .finish(CHAT_FROM_VIEWER, true)
 }
 
 /// Instant-message dialog: an ordinary message.
@@ -385,7 +401,10 @@ pub fn instant_message(
 /// AvatarPickerRequest, Low 26: QueryID LLUUID, Name Variable 1. Asks for
 /// the avatars whose names match `name`.
 pub fn avatar_picker_request(agent: &Agent, query: Uuid, name: &str) -> Outgoing {
-    Writer::agent(agent).uuid(query).text1(name).finish(AVATAR_PICKER_REQUEST, false)
+    Writer::agent(agent)
+        .uuid(query)
+        .text1(name)
+        .finish(AVATAR_PICKER_REQUEST, false)
 }
 
 /// StartLure, Low 70: LureType U8, Message Variable 1, then the avatars
@@ -401,7 +420,10 @@ pub fn start_lure(agent: &Agent, message: &str, target: Uuid) -> Outgoing {
 
 /// TeleportLureRequest, Low 71: accepts the teleport offer `lure`.
 pub fn teleport_lure_request(agent: &Agent, lure: Uuid) -> Outgoing {
-    Writer::agent(agent).uuid(lure).u32(TELEPORT_VIA_LURE).finish(TELEPORT_LURE_REQUEST, false)
+    Writer::agent(agent)
+        .uuid(lure)
+        .u32(TELEPORT_VIA_LURE)
+        .finish(TELEPORT_LURE_REQUEST, false)
 }
 
 /// ObjectGrab, Low 117, Zerocoded: LocalID U32, GrabOffset, then
@@ -517,24 +539,36 @@ pub type Quaternion = [f32; 4];
 /// Where an object is and how it is turned: in the region, or relative to
 /// its parent when it has one (a child prim, or a seated avatar).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Motion {
+pub struct Transform {
     pub position: Vector3,
     pub rotation: Quaternion,
 }
 
-impl Motion {
+impl Transform {
     /// `None` for anything that is not a usable position and rotation: a
     /// wrong offset tends to produce such values.
-    fn checked(position: Vector3, rotation: Quaternion) -> Option<Motion> {
+    fn checked(position: Vector3, rotation: Quaternion) -> Option<Transform> {
         let norm = rotation.iter().map(|part| part * part).sum::<f32>().sqrt();
-        let usable = position.iter().all(|part| part.is_finite()) && norm.is_finite() && norm > 0.5 && norm < 2.0;
-        usable.then(|| Motion { position, rotation: rotation.map(|part| part / norm) })
+        let usable = position.iter().all(|part| part.is_finite())
+            && norm.is_finite()
+            && norm > 0.5
+            && norm < 2.0;
+        usable.then(|| Transform {
+            position,
+            rotation: rotation.map(|part| part / norm),
+        })
     }
 }
 
 /// `v` turned by the unit quaternion `q`.
 pub fn rotate(q: Quaternion, v: Vector3) -> Vector3 {
-    let cross = |a: Vector3, b: Vector3| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let cross = |a: Vector3, b: Vector3| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
     let axis = [q[0], q[1], q[2]];
     let once = cross(axis, v);
     let twice = cross(axis, once);
@@ -551,7 +585,7 @@ pub struct ObjectParent {
     /// Region-local id of the parent; zero when the object has none.
     pub parent_id: u32,
     /// Missing when the update carries it in a form the bot does not read.
-    pub motion: Option<Motion>,
+    pub transform: Option<Transform>,
 }
 
 /// One object from an ObjectUpdateCompressed.
@@ -559,33 +593,53 @@ pub struct ObjectParent {
 pub struct CompressedObject {
     pub full_id: Uuid,
     pub local_id: u32,
-    pub motion: Option<Motion>,
+    pub transform: Option<Transform>,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Incoming {
-    StartPingCheck { ping_id: u8 },
+    StartPingCheck {
+        ping_id: u8,
+    },
     PacketAck(Vec<u32>),
-    RegionHandshake { sim_name: String },
-    AgentMovementComplete { position: Vector3, region_handle: u64 },
+    RegionHandshake {
+        sim_name: String,
+    },
+    AgentMovementComplete {
+        position: Vector3,
+        region_handle: u64,
+    },
     MapBlockReply(Vec<MapBlock>),
     TeleportStart,
-    TeleportProgress { message: String },
-    TeleportFailed { reason: String },
-    TeleportLocal { position: Vector3 },
-    AvatarSitResponse { object: Uuid, autopilot: bool },
+    TeleportProgress {
+        message: String,
+    },
+    TeleportFailed {
+        reason: String,
+    },
+    TeleportLocal {
+        position: Vector3,
+    },
+    AvatarSitResponse {
+        object: Uuid,
+        autopilot: bool,
+    },
     ObjectUpdate(Vec<ObjectParent>),
     /// Objects described in the compressed form.
     ObjectsCompressed(Vec<CompressedObject>),
     /// Objects that moved, as region-local id and where they are now.
-    ObjectsMoved(Vec<(u32, Motion)>),
+    ObjectsMoved(Vec<(u32, Transform)>),
     /// Region-local ids of objects the simulator assumes to be cached.
     ObjectsCached(Vec<u32>),
     /// Region-local ids of objects that are gone or out of view.
     ObjectsKilled(Vec<u32>),
-    KickUser { reason: String },
+    KickUser {
+        reason: String,
+    },
     /// Text the simulator wants shown to the user.
-    Alert { message: String },
+    Alert {
+        message: String,
+    },
     /// Local chat, including typing notifications (empty text).
     Chat {
         from_name: String,
@@ -614,7 +668,10 @@ pub enum Incoming {
     },
     /// The answer to an avatar search: the avatars found, as id and
     /// `First Last`.
-    AvatarPickerReply { query: Uuid, avatars: Vec<(Uuid, String)> },
+    AvatarPickerReply {
+        query: Uuid,
+        avatars: Vec<(Uuid, String)>,
+    },
     LogoutReply,
     DisableSimulator,
     /// A message the bot has no use for.
@@ -634,7 +691,9 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
         // RegionHandshake, Low 148: RegionFlags U32, SimAccess U8, SimName Variable 1, ...
         REGION_HANDSHAKE => {
             r.skip(5)?;
-            Incoming::RegionHandshake { sim_name: text(r.variable1()?) }
+            Incoming::RegionHandshake {
+                sim_name: text(r.variable1()?),
+            }
         }
         // AgentMovementComplete, Low 250: AgentID, SessionID, Position,
         // LookAt, RegionHandle U64, Timestamp U32, ...
@@ -642,7 +701,10 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
             r.skip(32)?;
             let position = r.vector3()?;
             r.skip(12)?;
-            Incoming::AgentMovementComplete { position, region_handle: r.u64()? }
+            Incoming::AgentMovementComplete {
+                position,
+                region_handle: r.u64()?,
+            }
         }
         // MapBlockReply, Low 409: AgentID, Flags U32, then Data Variable
         // { X U16, Y U16, Name Variable 1, Access U8, RegionFlags U32,
@@ -665,22 +727,29 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
         // TeleportProgress, Low 66: AgentID, TeleportFlags U32, Message Variable 1.
         TELEPORT_PROGRESS => {
             r.skip(20)?;
-            Incoming::TeleportProgress { message: text(r.variable1()?) }
+            Incoming::TeleportProgress {
+                message: text(r.variable1()?),
+            }
         }
         // TeleportFailed, Low 74: AgentID, Reason Variable 1, ...
         TELEPORT_FAILED => {
             r.skip(16)?;
-            Incoming::TeleportFailed { reason: text(r.variable1()?) }
+            Incoming::TeleportFailed {
+                reason: text(r.variable1()?),
+            }
         }
         // TeleportLocal, Low 64: AgentID, LocationID U32, Position, LookAt, TeleportFlags U32.
         TELEPORT_LOCAL => {
             r.skip(20)?;
-            Incoming::TeleportLocal { position: r.vector3()? }
+            Incoming::TeleportLocal {
+                position: r.vector3()?,
+            }
         }
         // AvatarSitResponse, High 21: ID LLUUID, AutoPilot BOOL, ...
-        AVATAR_SIT_RESPONSE => {
-            Incoming::AvatarSitResponse { object: r.uuid()?, autopilot: r.u8()? != 0 }
-        }
+        AVATAR_SIT_RESPONSE => Incoming::AvatarSitResponse {
+            object: r.uuid()?,
+            autopilot: r.u8()? != 0,
+        },
         OBJECT_UPDATE => Incoming::ObjectUpdate(decode_object_update(&mut r)?),
         // ObjectUpdateCompressed, High 13: RegionHandle U64, TimeDilation
         // U16, then ObjectData Variable { UpdateFlags U32, Data Variable 2 }.
@@ -699,9 +768,18 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
                 let (full_id, local_id) = (data.uuid()?, data.u32()?);
                 // Whatever is too short to hold them describes the object
                 // all the same.
-                let motion = data.skip(20).and_then(|()| Ok((data.vector3()?, data.vector3()?))).ok();
-                let motion = motion.and_then(|(position, rotation)| Motion::checked(position, unpack(rotation)));
-                objects.push(CompressedObject { full_id, local_id, motion });
+                let transform = data
+                    .skip(20)
+                    .and_then(|()| Ok((data.vector3()?, data.vector3()?)))
+                    .ok();
+                let transform = transform.and_then(|(position, rotation)| {
+                    Transform::checked(position, unpack(rotation))
+                });
+                objects.push(CompressedObject {
+                    full_id,
+                    local_id,
+                    transform,
+                });
             }
             Incoming::ObjectsCompressed(objects)
         }
@@ -732,8 +810,8 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
                 for part in &mut rotation {
                     *part = f32::from(data.u16()?) / f32::from(u16::MAX) * 2.0 - 1.0;
                 }
-                if let Some(motion) = Motion::checked(position, rotation) {
-                    objects.push((local_id, motion));
+                if let Some(transform) = Transform::checked(position, rotation) {
+                    objects.push((local_id, transform));
                 }
             }
             Incoming::ObjectsMoved(objects)
@@ -759,14 +837,20 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
         // SessionID, Reason Variable 2.
         KICK_USER => {
             r.skip(4 + 2 + 32)?;
-            Incoming::KickUser { reason: text(r.variable2()?) }
+            Incoming::KickUser {
+                reason: text(r.variable2()?),
+            }
         }
         // AlertMessage, Low 134: Message Variable 1, ...
-        ALERT_MESSAGE => Incoming::Alert { message: text(r.variable1()?) },
+        ALERT_MESSAGE => Incoming::Alert {
+            message: text(r.variable1()?),
+        },
         // AgentAlertMessage, Low 135: AgentID, Modal BOOL, Message Variable 1.
         AGENT_ALERT_MESSAGE => {
             r.skip(16 + 1)?;
-            Incoming::Alert { message: text(r.variable1()?) }
+            Incoming::Alert {
+                message: text(r.variable1()?),
+            }
         }
         // ChatFromSimulator, Low 139: FromName Variable 1, SourceID, OwnerID,
         // SourceType U8, ChatType U8, Audible U8, Position, Message Variable 2.
@@ -839,7 +923,7 @@ fn unpack(rotation: Vector3) -> Quaternion {
 /// plane. 124 and 140 bytes are the same with room for later additions.
 /// The quantized 48, 32 and 16-byte forms are not sent any more and not
 /// read here.
-fn full_motion(data: &[u8]) -> Option<Motion> {
+fn transform_from_motion(data: &[u8]) -> Option<Transform> {
     let offset = match data.len() {
         60 | 124 => 0,
         76 | 140 => 16,
@@ -848,7 +932,7 @@ fn full_motion(data: &[u8]) -> Option<Motion> {
     let mut r = Reader(&data[offset..]);
     let position = r.vector3().ok()?;
     r.skip(12 + 12).ok()?;
-    Motion::checked(position, unpack(r.vector3().ok()?))
+    Transform::checked(position, unpack(r.vector3().ok()?))
 }
 
 /// ObjectUpdate, High 12: RegionHandle U64, TimeDilation U16, then
@@ -863,7 +947,7 @@ fn decode_object_update(r: &mut Reader) -> Decoded<Vec<ObjectParent>> {
         r.skip(1)?; // State
         let full_id = r.uuid()?;
         r.skip(4 + 1 + 1 + 1 + 12)?; // CRC, PCode, Material, ClickAction, Scale
-        let motion = full_motion(r.variable1()?); // ObjectData
+        let transform = transform_from_motion(r.variable1()?); // ObjectData
         let parent_id = r.u32()?;
         r.skip(4)?; // UpdateFlags
         r.skip(23)?; // PathCurve .. ProfileHollow
@@ -876,9 +960,14 @@ fn decode_object_update(r: &mut Reader) -> Decoded<Vec<ObjectParent>> {
         r.variable1()?; // MediaURL
         r.variable1()?; // PSBlock
         r.variable1()?; // ExtraParams
-        // Sound, OwnerID, Gain, Flags, Radius, JointType, JointPivot, JointAxisOrAnchor
+                        // Sound, OwnerID, Gain, Flags, Radius, JointType, JointPivot, JointAxisOrAnchor
         r.skip(16 + 16 + 4 + 1 + 4 + 1 + 12 + 12)?;
-        objects.push(ObjectParent { full_id, local_id, parent_id, motion });
+        objects.push(ObjectParent {
+            full_id,
+            local_id,
+            parent_id,
+            transform,
+        });
     }
     Ok(objects)
 }
@@ -1038,7 +1127,7 @@ pub mod testing {
         body
     }
 
-    /// One object's motion in an ImprovedTerseObjectUpdate.
+    /// One object's transform in an ImprovedTerseObjectUpdate.
     pub struct Terse {
         pub local_id: u32,
         pub avatar: bool,
@@ -1161,7 +1250,16 @@ pub mod testing {
     pub fn object_blocks(objects: &[Block]) -> Vec<u8> {
         let mut body = vec![0; 8 + 2];
         body.push(objects.len() as u8);
-        for (index, Block { full_id, local_id, parent_id, data }) in objects.iter().enumerate() {
+        for (
+            index,
+            Block {
+                full_id,
+                local_id,
+                parent_id,
+                data,
+            },
+        ) in objects.iter().enumerate()
+        {
             let pad = index + 1;
             body.extend(local_id.to_le_bytes()); // ID
             body.push(0); // State
@@ -1197,7 +1295,10 @@ mod tests {
     use super::*;
 
     fn agent() -> Agent {
-        Agent { agent_id: Uuid::from_bytes([0xA1; 16]), session_id: Uuid::from_bytes([0x5E; 16]) }
+        Agent {
+            agent_id: Uuid::from_bytes([0xA1; 16]),
+            session_id: Uuid::from_bytes([0x5E; 16]),
+        }
     }
 
     fn agent_prefix() -> Vec<u8> {
@@ -1209,7 +1310,10 @@ mod tests {
         let msg = use_circuit_code(&agent(), 0x0403_0201);
         assert_eq!((msg.id, msg.zerocoded), (low(3), false));
         // Code, SessionID, ID: the session id comes before the agent id here.
-        assert_eq!(msg.body, [vec![1, 2, 3, 4], vec![0x5E; 16], vec![0xA1; 16]].concat());
+        assert_eq!(
+            msg.body,
+            [vec![1, 2, 3, 4], vec![0x5E; 16], vec![0xA1; 16]].concat()
+        );
     }
 
     #[test]
@@ -1272,14 +1376,26 @@ mod tests {
     fn encodes_map_name_request() {
         let msg = map_name_request(&agent(), "Target");
         assert_eq!(msg.id, low(408));
-        assert_eq!(msg.body, [agent_prefix(), vec![0; 9], vec![7], b"Target\0".to_vec()].concat());
+        assert_eq!(
+            msg.body,
+            [agent_prefix(), vec![0; 9], vec![7], b"Target\0".to_vec()].concat()
+        );
     }
 
     #[test]
     fn encodes_chat_from_viewer() {
         let msg = chat_from_viewer(&agent(), "hi", 2, 0x0102_0304);
         assert_eq!((msg.id, msg.zerocoded), (low(80), true));
-        assert_eq!(msg.body, [agent_prefix(), vec![3, 0], b"hi\0".to_vec(), vec![2, 4, 3, 2, 1]].concat());
+        assert_eq!(
+            msg.body,
+            [
+                agent_prefix(),
+                vec![3, 0],
+                b"hi\0".to_vec(),
+                vec![2, 4, 3, 2, 1]
+            ]
+            .concat()
+        );
     }
 
     #[test]
@@ -1289,10 +1405,13 @@ mod tests {
         assert_eq!((msg.id, msg.zerocoded), (low(254), true));
         let expected = [
             agent_prefix(),
-            vec![0],       // FromGroup
-            vec![0x0F; 16], // ToAgentID
+            vec![0],         // FromGroup
+            vec![0x0F; 16],  // ToAgentID
             vec![0; 4 + 16], // ParentEstateID, RegionID
-            [1.0f32, 2.0, 3.0].iter().flat_map(|f| f.to_le_bytes()).collect(),
+            [1.0f32, 2.0, 3.0]
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect(),
             vec![0, 0],            // Offline, Dialog
             vec![0xA1 ^ 0x0F; 16], // ID
             vec![0; 4],            // Timestamp
@@ -1306,18 +1425,37 @@ mod tests {
         .concat();
         assert_eq!(msg.body, expected);
         // What goes out is what the decoder reads as an incoming message.
-        let Ok(Incoming::InstantMessage { from_agent, from_name, dialog, text, .. }) = decode(msg.id, &msg.body)
+        let Ok(Incoming::InstantMessage {
+            from_agent,
+            from_name,
+            dialog,
+            text,
+            ..
+        }) = decode(msg.id, &msg.body)
         else {
             panic!("not an instant message")
         };
-        assert_eq!((from_agent, from_name.as_str(), dialog, text.as_str()), (agent().agent_id, "Sit Bot", 0, "hello"));
+        assert_eq!(
+            (from_agent, from_name.as_str(), dialog, text.as_str()),
+            (agent().agent_id, "Sit Bot", 0, "hello")
+        );
     }
 
     #[test]
     fn teleport_request_is_an_instant_message_without_a_conversation() {
         let to = Uuid::from_bytes([0x0F; 16]);
-        let msg = instant_message(&agent(), "Sit Bot", to, [0.0; 3], IM_TELEPORT_REQUEST, "may I?");
-        let Ok(Incoming::InstantMessage { dialog, id, text, .. }) = decode(msg.id, &msg.body) else {
+        let msg = instant_message(
+            &agent(),
+            "Sit Bot",
+            to,
+            [0.0; 3],
+            IM_TELEPORT_REQUEST,
+            "may I?",
+        );
+        let Ok(Incoming::InstantMessage {
+            dialog, id, text, ..
+        }) = decode(msg.id, &msg.body)
+        else {
             panic!("not an instant message")
         };
         assert_eq!((dialog, id, text.as_str()), (26, Uuid::nil(), "may I?"));
@@ -1328,44 +1466,82 @@ mod tests {
         let to = Uuid::from_bytes([0x0F; 16]);
         let msg = start_lure(&agent(), "come", to);
         assert_eq!((msg.id, msg.zerocoded), (low(70), false));
-        assert_eq!(msg.body, [agent_prefix(), vec![0, 5], b"come\0".to_vec(), vec![1], vec![0x0F; 16]].concat());
+        assert_eq!(
+            msg.body,
+            [
+                agent_prefix(),
+                vec![0, 5],
+                b"come\0".to_vec(),
+                vec![1],
+                vec![0x0F; 16]
+            ]
+            .concat()
+        );
 
         let msg = teleport_lure_request(&agent(), Uuid::from_bytes([0x44; 16]));
         assert_eq!((msg.id, msg.zerocoded), (low(71), false));
-        assert_eq!(msg.body, [agent_prefix(), vec![0x44; 16], vec![4, 0, 0, 0]].concat());
+        assert_eq!(
+            msg.body,
+            [agent_prefix(), vec![0x44; 16], vec![4, 0, 0, 0]].concat()
+        );
     }
 
     #[test]
     fn encodes_a_touch() {
         let msg = object_grab(&agent(), 0x0403_0201);
         assert_eq!((msg.id, msg.zerocoded), (low(117), true));
-        assert_eq!(msg.body, [agent_prefix(), vec![1, 2, 3, 4], vec![0; 12], vec![0]].concat());
+        assert_eq!(
+            msg.body,
+            [agent_prefix(), vec![1, 2, 3, 4], vec![0; 12], vec![0]].concat()
+        );
         let msg = object_degrab(&agent(), 0x0403_0201);
         assert_eq!((msg.id, msg.zerocoded), (low(119), false));
-        assert_eq!(msg.body, [agent_prefix(), vec![1, 2, 3, 4], vec![0]].concat());
+        assert_eq!(
+            msg.body,
+            [agent_prefix(), vec![1, 2, 3, 4], vec![0]].concat()
+        );
     }
 
     #[test]
     fn encodes_request_multiple_objects() {
         let msg = request_multiple_objects(&agent(), &[7, 0x0102]);
         assert_eq!((msg.id, msg.zerocoded), (medium(3), true));
-        assert_eq!(msg.body, [agent_prefix(), vec![2, 0, 7, 0, 0, 0, 0, 2, 1, 0, 0]].concat());
+        assert_eq!(
+            msg.body,
+            [agent_prefix(), vec![2, 0, 7, 0, 0, 0, 0, 2, 1, 0, 0]].concat()
+        );
     }
 
     #[test]
     fn decodes_the_other_object_messages() {
         let (a, b) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]));
         let body = object_update_compressed(&[(a, 500), (b, 501)]);
-        let plain = |full_id, local_id| CompressedObject { full_id, local_id, motion: None };
-        assert_eq!(decode(high(13), &body), Ok(Incoming::ObjectsCompressed(vec![plain(a, 500), plain(b, 501)])));
+        let plain = |full_id, local_id| CompressedObject {
+            full_id,
+            local_id,
+            transform: None,
+        };
+        assert_eq!(
+            decode(high(13), &body),
+            Ok(Incoming::ObjectsCompressed(vec![
+                plain(a, 500),
+                plain(b, 501)
+            ]))
+        );
         assert_eq!(decode(high(13), &body[..body.len() - 40]), Err(DecodeError));
 
         let body = object_update_cached(&[500, 501]);
-        assert_eq!(decode(high(14), &body), Ok(Incoming::ObjectsCached(vec![500, 501])));
+        assert_eq!(
+            decode(high(14), &body),
+            Ok(Incoming::ObjectsCached(vec![500, 501]))
+        );
         assert_eq!(decode(high(14), &body[..body.len() - 1]), Err(DecodeError));
 
         let body = kill_object(&[500, 501]);
-        assert_eq!(decode(high(16), &body), Ok(Incoming::ObjectsKilled(vec![500, 501])));
+        assert_eq!(
+            decode(high(16), &body),
+            Ok(Incoming::ObjectsKilled(vec![500, 501]))
+        );
         assert_eq!(decode(high(16), &body[..body.len() - 1]), Err(DecodeError));
     }
 
@@ -1374,7 +1550,16 @@ mod tests {
         let query = Uuid::from_bytes([0x33; 16]);
         let msg = avatar_picker_request(&agent(), query, "jane doe");
         assert_eq!((msg.id, msg.zerocoded), (low(26), false));
-        assert_eq!(msg.body, [agent_prefix(), vec![0x33; 16], vec![9], b"jane doe\0".to_vec()].concat());
+        assert_eq!(
+            msg.body,
+            [
+                agent_prefix(),
+                vec![0x33; 16],
+                vec![9],
+                b"jane doe\0".to_vec()
+            ]
+            .concat()
+        );
     }
 
     #[test]
@@ -1386,12 +1571,21 @@ mod tests {
             decode(low(28), &body),
             Ok(Incoming::AvatarPickerReply {
                 query,
-                avatars: vec![(jane, "Jane Doe".to_string()), (other, "Jane Doester".to_string())],
+                avatars: vec![
+                    (jane, "Jane Doe".to_string()),
+                    (other, "Jane Doester".to_string())
+                ],
             })
         );
         assert_eq!(decode(low(28), &body[..body.len() - 1]), Err(DecodeError));
         let none = avatar_picker_reply(query, &[]);
-        assert_eq!(decode(low(28), &none), Ok(Incoming::AvatarPickerReply { query, avatars: vec![] }));
+        assert_eq!(
+            decode(low(28), &none),
+            Ok(Incoming::AvatarPickerReply {
+                query,
+                avatars: vec![]
+            })
+        );
     }
 
     #[test]
@@ -1408,14 +1602,20 @@ mod tests {
         let target = Uuid::from_bytes([0x0B; 16]);
         let request = agent_request_sit(&agent(), target);
         assert_eq!((request.id, request.zerocoded), (high(6), true));
-        assert_eq!(request.body, [agent_prefix(), vec![0x0B; 16], vec![0; 12]].concat());
+        assert_eq!(
+            request.body,
+            [agent_prefix(), vec![0x0B; 16], vec![0; 12]].concat()
+        );
         let sit = agent_sit(&agent());
         assert_eq!((sit.id, sit.body), (high(7), agent_prefix()));
     }
 
     #[test]
     fn decodes_ping_and_acks() {
-        assert_eq!(decode(high(1), &[7, 1, 0, 0, 0]), Ok(Incoming::StartPingCheck { ping_id: 7 }));
+        assert_eq!(
+            decode(high(1), &[7, 1, 0, 0, 0]),
+            Ok(Incoming::StartPingCheck { ping_id: 7 })
+        );
         assert_eq!(
             decode(PACKET_ACK, &[2, 5, 0, 0, 0, 0, 1, 0, 0]),
             Ok(Incoming::PacketAck(vec![5, 256]))
@@ -1427,7 +1627,9 @@ mod tests {
     fn decodes_region_handshake() {
         assert_eq!(
             decode(low(148), &region_handshake("Target")),
-            Ok(Incoming::RegionHandshake { sim_name: "Target".into() })
+            Ok(Incoming::RegionHandshake {
+                sim_name: "Target".into()
+            })
         );
     }
 
@@ -1449,8 +1651,18 @@ mod tests {
         assert_eq!(
             decode(low(409), &body),
             Ok(Incoming::MapBlockReply(vec![
-                MapBlock { x: 1000, y: 1001, name: "Target".into(), access: 13 },
-                MapBlock { x: 0, y: 0, name: "Nowhere".into(), access: 255 },
+                MapBlock {
+                    x: 1000,
+                    y: 1001,
+                    name: "Target".into(),
+                    access: 13
+                },
+                MapBlock {
+                    x: 0,
+                    y: 0,
+                    name: "Nowhere".into(),
+                    access: 255
+                },
             ]))
         );
     }
@@ -1460,15 +1672,21 @@ mod tests {
         assert_eq!(decode(low(73), &[0; 4]), Ok(Incoming::TeleportStart));
         assert_eq!(
             decode(low(66), &teleport_progress("resolving")),
-            Ok(Incoming::TeleportProgress { message: "resolving".into() })
+            Ok(Incoming::TeleportProgress {
+                message: "resolving".into()
+            })
         );
         assert_eq!(
             decode(low(74), &teleport_failed("Destination offline")),
-            Ok(Incoming::TeleportFailed { reason: "Destination offline".into() })
+            Ok(Incoming::TeleportFailed {
+                reason: "Destination offline".into()
+            })
         );
         assert_eq!(
             decode(low(64), &teleport_local([4.0, 5.0, 6.0])),
-            Ok(Incoming::TeleportLocal { position: [4.0, 5.0, 6.0] })
+            Ok(Incoming::TeleportLocal {
+                position: [4.0, 5.0, 6.0]
+            })
         );
     }
 
@@ -1477,7 +1695,10 @@ mod tests {
         let object = Uuid::from_bytes([0x0B; 16]);
         assert_eq!(
             decode(high(21), &avatar_sit_response(object, true)),
-            Ok(Incoming::AvatarSitResponse { object, autopilot: true })
+            Ok(Incoming::AvatarSitResponse {
+                object,
+                autopilot: true
+            })
         );
     }
 
@@ -1485,7 +1706,9 @@ mod tests {
     fn decodes_kick_logout_and_disable() {
         assert_eq!(
             decode(low(163), &kick_user("Bye")),
-            Ok(Incoming::KickUser { reason: "Bye".into() })
+            Ok(Incoming::KickUser {
+                reason: "Bye".into()
+            })
         );
         assert_eq!(decode(low(253), &[0; 33]), Ok(Incoming::LogoutReply));
         assert_eq!(decode(low(152), &[]), Ok(Incoming::DisableSimulator));
@@ -1493,24 +1716,43 @@ mod tests {
 
     #[test]
     fn decodes_both_alert_messages() {
-        let alert = Incoming::Alert { message: "No suitable surface".into() };
-        assert_eq!(decode(low(134), &alert_message("No suitable surface")), Ok(alert));
-        let alert = Incoming::Alert { message: "Region restarting".into() };
-        assert_eq!(decode(low(135), &agent_alert_message("Region restarting")), Ok(alert));
+        let alert = Incoming::Alert {
+            message: "No suitable surface".into(),
+        };
+        assert_eq!(
+            decode(low(134), &alert_message("No suitable surface")),
+            Ok(alert)
+        );
+        let alert = Incoming::Alert {
+            message: "Region restarting".into(),
+        };
+        assert_eq!(
+            decode(low(135), &agent_alert_message("Region restarting")),
+            Ok(alert)
+        );
     }
 
     #[test]
     fn encodes_retrieve_instant_messages() {
         let msg = retrieve_instant_messages(&agent());
-        assert_eq!((msg.id, msg.zerocoded, msg.body), (low(255), false, agent_prefix()));
+        assert_eq!(
+            (msg.id, msg.zerocoded, msg.body),
+            (low(255), false, agent_prefix())
+        );
     }
 
     #[test]
     fn decodes_chat_from_simulator() {
-        let (avatar, object, owner) =
-            (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
+        let (avatar, object, owner) = (
+            Uuid::from_bytes([1; 16]),
+            Uuid::from_bytes([2; 16]),
+            Uuid::from_bytes([3; 16]),
+        );
         assert_eq!(
-            decode(low(139), &chat_from_simulator("Jane Doe", (avatar, avatar, 1), 1, 1, "hello")),
+            decode(
+                low(139),
+                &chat_from_simulator("Jane Doe", (avatar, avatar, 1), 1, 1, "hello")
+            ),
             Ok(Incoming::Chat {
                 from_name: "Jane Doe".into(),
                 source_id: avatar,
@@ -1539,48 +1781,89 @@ mod tests {
 
     #[test]
     fn decodes_improved_instant_message() {
-        let (sender, session, object) =
-            (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
-        let im = |dialog, id, offline, timestamp, from_name: &str, text: &str| Incoming::InstantMessage {
-            from_agent: sender,
-            from_name: from_name.into(),
-            dialog,
-            id,
-            offline,
-            timestamp,
-            text: text.into(),
+        let (sender, session, object) = (
+            Uuid::from_bytes([1; 16]),
+            Uuid::from_bytes([2; 16]),
+            Uuid::from_bytes([3; 16]),
+        );
+        let im = |dialog, id, offline, timestamp, from_name: &str, text: &str| {
+            Incoming::InstantMessage {
+                from_agent: sender,
+                from_name: from_name.into(),
+                dialog,
+                id,
+                offline,
+                timestamp,
+                text: text.into(),
+            }
         };
         assert_eq!(
-            decode(low(254), &improved_instant_message(sender, "Jane Doe", 0, session, None, "hi")),
+            decode(
+                low(254),
+                &improved_instant_message(sender, "Jane Doe", 0, session, None, "hi")
+            ),
             Ok(im(0, session, false, 0, "Jane Doe", "hi"))
         );
         assert_eq!(
-            decode(low(254), &improved_instant_message(sender, "Clock", 19, object, None, "done")),
+            decode(
+                low(254),
+                &improved_instant_message(sender, "Clock", 19, object, None, "done")
+            ),
             Ok(im(19, object, false, 0, "Clock", "done"))
         );
-        let body = improved_instant_message(sender, "Jane Doe", 0, session, Some(1_700_000_000), "later");
-        assert_eq!(decode(low(254), &body), Ok(im(0, session, true, 1_700_000_000, "Jane Doe", "later")));
+        let body =
+            improved_instant_message(sender, "Jane Doe", 0, session, Some(1_700_000_000), "later");
+        assert_eq!(
+            decode(low(254), &body),
+            Ok(im(0, session, true, 1_700_000_000, "Jane Doe", "later"))
+        );
         assert_eq!(decode(low(254), &body[..80]), Err(DecodeError));
     }
 
     #[test]
     fn decodes_object_update_with_several_blocks() {
-        let ids = [Uuid::from_bytes([1; 16]), agent().agent_id, Uuid::from_bytes([3; 16])];
+        let ids = [
+            Uuid::from_bytes([1; 16]),
+            agent().agent_id,
+            Uuid::from_bytes([3; 16]),
+        ];
         let body = object_update(&[(ids[0], 0), (ids[1], 4242), (ids[2], 77)]);
         assert_eq!(
             decode(high(12), &body),
             Ok(Incoming::ObjectUpdate(vec![
-                ObjectParent { full_id: ids[0], local_id: 100, parent_id: 0, motion: None },
-                ObjectParent { full_id: ids[1], local_id: 101, parent_id: 4242, motion: None },
-                ObjectParent { full_id: ids[2], local_id: 102, parent_id: 77, motion: None },
+                ObjectParent {
+                    full_id: ids[0],
+                    local_id: 100,
+                    parent_id: 0,
+                    transform: None
+                },
+                ObjectParent {
+                    full_id: ids[1],
+                    local_id: 101,
+                    parent_id: 4242,
+                    transform: None
+                },
+                ObjectParent {
+                    full_id: ids[2],
+                    local_id: 102,
+                    parent_id: 77,
+                    transform: None
+                },
             ]))
         );
     }
 
     /// A quarter turn about the vertical axis, as the x, y and z of its
     /// quaternion and in full.
-    const QUARTER_TURN: (Vector3, Quaternion) =
-        ([0.0, 0.0, std::f32::consts::FRAC_1_SQRT_2], [0.0, 0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2]);
+    const QUARTER_TURN: (Vector3, Quaternion) = (
+        [0.0, 0.0, std::f32::consts::FRAC_1_SQRT_2],
+        [
+            0.0,
+            0.0,
+            std::f32::consts::FRAC_1_SQRT_2,
+            std::f32::consts::FRAC_1_SQRT_2,
+        ],
+    );
 
     fn close(a: &[f32], b: &[f32]) -> bool {
         a.len() == b.len() && a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-3)
@@ -1588,26 +1871,53 @@ mod tests {
 
     #[test]
     fn object_update_carries_position_and_rotation() {
-        let (prim, avatar, old) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
+        let (prim, avatar, old) = (
+            Uuid::from_bytes([1; 16]),
+            Uuid::from_bytes([2; 16]),
+            Uuid::from_bytes([3; 16]),
+        );
         let body = object_blocks(&[
-            Block { full_id: prim, local_id: 7, parent_id: 0, data: object_data([131.0, 64.0, 23.0], QUARTER_TURN.0, false) },
-            Block { full_id: avatar, local_id: 8, parent_id: 7, data: object_data([0.5, 0.0, 0.75], [0.0; 3], true) },
+            Block {
+                full_id: prim,
+                local_id: 7,
+                parent_id: 0,
+                data: object_data([131.0, 64.0, 23.0], QUARTER_TURN.0, false),
+            },
+            Block {
+                full_id: avatar,
+                local_id: 8,
+                parent_id: 7,
+                data: object_data([0.5, 0.0, 0.75], [0.0; 3], true),
+            },
             // A quantized form: described, but without a motion.
-            Block { full_id: old, local_id: 9, parent_id: 0, data: vec![0x12; 32] },
+            Block {
+                full_id: old,
+                local_id: 9,
+                parent_id: 0,
+                data: vec![0x12; 32],
+            },
         ]);
-        let Ok(Incoming::ObjectUpdate(objects)) = decode(high(12), &body) else { panic!("not an object update") };
-        assert_eq!(objects.iter().map(|o| (o.full_id, o.local_id, o.parent_id)).collect::<Vec<_>>(), [
-            (prim, 7, 0),
-            (avatar, 8, 7),
-            (old, 9, 0)
-        ]);
-        let seat = objects[0].motion.unwrap();
+        let Ok(Incoming::ObjectUpdate(objects)) = decode(high(12), &body) else {
+            panic!("not an object update")
+        };
+        assert_eq!(
+            objects
+                .iter()
+                .map(|o| (o.full_id, o.local_id, o.parent_id))
+                .collect::<Vec<_>>(),
+            [(prim, 7, 0), (avatar, 8, 7), (old, 9, 0)]
+        );
+        let seat = objects[0].transform.unwrap();
         assert_eq!(seat.position, [131.0, 64.0, 23.0]);
-        assert!(close(&seat.rotation, &QUARTER_TURN.1), "{:?}", seat.rotation);
-        let rider = objects[1].motion.unwrap();
+        assert!(
+            close(&seat.rotation, &QUARTER_TURN.1),
+            "{:?}",
+            seat.rotation
+        );
+        let rider = objects[1].transform.unwrap();
         assert_eq!(rider.position, [0.5, 0.0, 0.75]);
         assert!(close(&rider.rotation, &[0.0, 0.0, 0.0, 1.0]));
-        assert_eq!(objects[2].motion, None);
+        assert_eq!(objects[2].transform, None);
     }
 
     #[test]
@@ -1617,27 +1927,53 @@ mod tests {
         let mut avatar = object_data([4.0, 5.0, 6.0], [0.0; 3], true);
         avatar.extend([0xEE; 64]);
         assert_eq!((prim.len(), avatar.len()), (124, 140));
-        assert_eq!(full_motion(&prim).unwrap().position, [1.0, 2.0, 3.0]);
-        assert_eq!(full_motion(&avatar).unwrap().position, [4.0, 5.0, 6.0]);
+        assert_eq!(
+            transform_from_motion(&prim).unwrap().position,
+            [1.0, 2.0, 3.0]
+        );
+        assert_eq!(
+            transform_from_motion(&avatar).unwrap().position,
+            [4.0, 5.0, 6.0]
+        );
     }
 
     #[test]
     fn positions_that_are_not_numbers_are_dropped() {
-        assert_eq!(full_motion(&object_data([f32::NAN, 2.0, 3.0], [0.0; 3], false)), None);
-        assert_eq!(full_motion(&object_data([1.0, f32::INFINITY, 3.0], [0.0; 3], false)), None);
-        assert_eq!(full_motion(&[0xFF; 60]), None);
-        assert_eq!(full_motion(&[0; 61]), None);
+        assert_eq!(
+            transform_from_motion(&object_data([f32::NAN, 2.0, 3.0], [0.0; 3], false)),
+            None
+        );
+        assert_eq!(
+            transform_from_motion(&object_data([1.0, f32::INFINITY, 3.0], [0.0; 3], false)),
+            None
+        );
+        assert_eq!(transform_from_motion(&[0xFF; 60]), None);
+        assert_eq!(transform_from_motion(&[0; 61]), None);
     }
 
     #[test]
     fn compressed_update_carries_position_and_rotation() {
         let (a, b) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]));
-        let body = object_update_compressed_at(&[(a, 500, [10.0, 20.0, 30.0], QUARTER_TURN.0), (b, 501, [1.0, 2.0, 3.0], [0.0; 3])]);
-        let Ok(Incoming::ObjectsCompressed(objects)) = decode(high(13), &body) else { panic!("not compressed") };
-        assert_eq!(objects.iter().map(|o| (o.full_id, o.local_id)).collect::<Vec<_>>(), [(a, 500), (b, 501)]);
-        assert_eq!(objects[0].motion.unwrap().position, [10.0, 20.0, 30.0]);
-        assert!(close(&objects[0].motion.unwrap().rotation, &QUARTER_TURN.1));
-        assert_eq!(objects[1].motion.unwrap().position, [1.0, 2.0, 3.0]);
+        let body = object_update_compressed_at(&[
+            (a, 500, [10.0, 20.0, 30.0], QUARTER_TURN.0),
+            (b, 501, [1.0, 2.0, 3.0], [0.0; 3]),
+        ]);
+        let Ok(Incoming::ObjectsCompressed(objects)) = decode(high(13), &body) else {
+            panic!("not compressed")
+        };
+        assert_eq!(
+            objects
+                .iter()
+                .map(|o| (o.full_id, o.local_id))
+                .collect::<Vec<_>>(),
+            [(a, 500), (b, 501)]
+        );
+        assert_eq!(objects[0].transform.unwrap().position, [10.0, 20.0, 30.0]);
+        assert!(close(
+            &objects[0].transform.unwrap().rotation,
+            &QUARTER_TURN.1
+        ));
+        assert_eq!(objects[1].transform.unwrap().position, [1.0, 2.0, 3.0]);
         // Cut inside the second block's data: an error, not a guess.
         assert_eq!(decode(high(13), &body[..body.len() - 20]), Err(DecodeError));
     }
@@ -1645,27 +1981,59 @@ mod tests {
     #[test]
     fn terse_update_carries_position_and_rotation() {
         let body = improved_terse_object_update(&[
-            Terse { local_id: 7, avatar: false, position: [141.0, 64.0, 23.0], rotation: QUARTER_TURN.1 },
-            Terse { local_id: 8, avatar: true, position: [0.5, 0.25, 0.75], rotation: [0.0, 0.0, 0.0, 1.0] },
+            Terse {
+                local_id: 7,
+                avatar: false,
+                position: [141.0, 64.0, 23.0],
+                rotation: QUARTER_TURN.1,
+            },
+            Terse {
+                local_id: 8,
+                avatar: true,
+                position: [0.5, 0.25, 0.75],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
         ]);
-        let Ok(Incoming::ObjectsMoved(objects)) = decode(high(15), &body) else { panic!("not a terse update") };
-        assert_eq!(objects.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [7, 8]);
+        let Ok(Incoming::ObjectsMoved(objects)) = decode(high(15), &body) else {
+            panic!("not a terse update")
+        };
+        assert_eq!(
+            objects.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [7, 8]
+        );
         assert_eq!(objects[0].1.position, [141.0, 64.0, 23.0]);
-        assert!(close(&objects[0].1.rotation, &QUARTER_TURN.1), "{:?}", objects[0].1.rotation);
+        assert!(
+            close(&objects[0].1.rotation, &QUARTER_TURN.1),
+            "{:?}",
+            objects[0].1.rotation
+        );
         // The avatar's block is longer by its collision plane.
         assert_eq!(objects[1].1.position, [0.5, 0.25, 0.75]);
         assert!(close(&objects[1].1.rotation, &[0.0, 0.0, 0.0, 1.0]));
         for cut in [1, 10, 30] {
-            assert_eq!(decode(high(15), &body[..body.len() - cut]), Err(DecodeError), "cut {cut}");
+            assert_eq!(
+                decode(high(15), &body[..body.len() - cut]),
+                Err(DecodeError),
+                "cut {cut}"
+            );
         }
     }
 
     #[test]
     fn rotate_turns_a_vector_by_a_quaternion() {
         // A quarter turn about the vertical axis takes x to y.
-        assert!(close(&rotate(QUARTER_TURN.1, [1.0, 0.0, 0.0]), &[0.0, 1.0, 0.0]));
-        assert!(close(&rotate(QUARTER_TURN.1, [0.0, 1.0, 2.0]), &[-1.0, 0.0, 2.0]));
-        assert!(close(&rotate([0.0, 0.0, 0.0, 1.0], [3.0, 4.0, 5.0]), &[3.0, 4.0, 5.0]));
+        assert!(close(
+            &rotate(QUARTER_TURN.1, [1.0, 0.0, 0.0]),
+            &[0.0, 1.0, 0.0]
+        ));
+        assert!(close(
+            &rotate(QUARTER_TURN.1, [0.0, 1.0, 2.0]),
+            &[-1.0, 0.0, 2.0]
+        ));
+        assert!(close(
+            &rotate([0.0, 0.0, 0.0, 1.0], [3.0, 4.0, 5.0]),
+            &[3.0, 4.0, 5.0]
+        ));
     }
 
     #[test]
