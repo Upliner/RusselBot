@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Rig helper: logs in as the estate owner, rezzes one box prim in region
-Target next to where the avatar lands, prints the prim's UUID and position,
-and logs out. Stands in for rezzing a prim with a viewer. If it reports
-"already logged in", run it again: the failed attempt clears the stale
-presence."""
+Target (or the region named as the first argument) next to where the avatar
+lands, prints the prim's UUID and position, and logs out. Stands in for
+rezzing a prim with a viewer. If it reports "already logged in", run it
+again: the failed attempt clears the stale presence.
+
+Usage: rezprim.py [REGION]"""
 import hashlib, re, socket, struct, sys, time, urllib.request, uuid
 
 FIRST, LAST, PASSWORD = "Rig", "Owner", "rigowner"
 LOGIN = "http://127.0.0.1:9000/"
+REGION = sys.argv[1] if len(sys.argv) > 1 else "Target"
 
 
 def member(n, v):
@@ -17,7 +20,7 @@ def member(n, v):
 body = ("<?xml version=\"1.0\"?><methodCall><methodName>login_to_simulator</methodName><params><param><value><struct>"
         + member("first", FIRST) + member("last", LAST)
         + member("passwd", "$1$" + hashlib.md5(PASSWORD.encode()).hexdigest())
-        + member("start", "uri:Target&amp;124&amp;128&amp;25") + member("channel", "rig-rezzer") + member("version", "0.1")
+        + member("start", "uri:%s&amp;124&amp;128&amp;25" % REGION) + member("channel", "rig-rezzer") + member("version", "0.1")
         + member("platform", "Lnx") + member("mac", "0" * 32) + member("id0", "0" * 32)
         + "<member><name>agree_to_tos</name><value><boolean>1</boolean></value></member>"
         + "<member><name>options</name><value><array><data></data></array></value></member>"

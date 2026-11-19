@@ -511,7 +511,38 @@ pub struct MapBlock {
     pub access: u8,
 }
 
-/// One object from an ObjectUpdate, reduced to what seat tracking needs.
+/// A rotation as a unit quaternion `[x, y, z, w]`.
+pub type Quaternion = [f32; 4];
+
+/// Where an object is and how it is turned: in the region, or relative to
+/// its parent when it has one (a child prim, or a seated avatar).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Motion {
+    pub position: Vector3,
+    pub rotation: Quaternion,
+}
+
+impl Motion {
+    /// `None` for anything that is not a usable position and rotation: a
+    /// wrong offset tends to produce such values.
+    fn checked(position: Vector3, rotation: Quaternion) -> Option<Motion> {
+        let norm = rotation.iter().map(|part| part * part).sum::<f32>().sqrt();
+        let usable = position.iter().all(|part| part.is_finite()) && norm.is_finite() && norm > 0.5 && norm < 2.0;
+        usable.then(|| Motion { position, rotation: rotation.map(|part| part / norm) })
+    }
+}
+
+/// `v` turned by the unit quaternion `q`.
+pub fn rotate(q: Quaternion, v: Vector3) -> Vector3 {
+    let cross = |a: Vector3, b: Vector3| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let axis = [q[0], q[1], q[2]];
+    let once = cross(axis, v);
+    let twice = cross(axis, once);
+    [0, 1, 2].map(|i| v[i] + 2.0 * (q[3] * once[i] + twice[i]))
+}
+
+/// One object from an ObjectUpdate, reduced to what seat and position
+/// tracking need.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ObjectParent {
     pub full_id: Uuid,
@@ -519,6 +550,16 @@ pub struct ObjectParent {
     pub local_id: u32,
     /// Region-local id of the parent; zero when the object has none.
     pub parent_id: u32,
+    /// Missing when the update carries it in a form the bot does not read.
+    pub motion: Option<Motion>,
+}
+
+/// One object from an ObjectUpdateCompressed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompressedObject {
+    pub full_id: Uuid,
+    pub local_id: u32,
+    pub motion: Option<Motion>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -534,8 +575,10 @@ pub enum Incoming {
     TeleportLocal { position: Vector3 },
     AvatarSitResponse { object: Uuid, autopilot: bool },
     ObjectUpdate(Vec<ObjectParent>),
-    /// Objects described in the compressed form, as id and region-local id.
-    ObjectsCompressed(Vec<(Uuid, u32)>),
+    /// Objects described in the compressed form.
+    ObjectsCompressed(Vec<CompressedObject>),
+    /// Objects that moved, as region-local id and where they are now.
+    ObjectsMoved(Vec<(u32, Motion)>),
     /// Region-local ids of objects the simulator assumes to be cached.
     ObjectsCached(Vec<u32>),
     /// Region-local ids of objects that are gone or out of view.
@@ -640,8 +683,12 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
         }
         OBJECT_UPDATE => Incoming::ObjectUpdate(decode_object_update(&mut r)?),
         // ObjectUpdateCompressed, High 13: RegionHandle U64, TimeDilation
-        // U16, then ObjectData Variable { UpdateFlags U32, Data Variable 2 };
-        // the data starts with the FullID and the local ID.
+        // U16, then ObjectData Variable { UpdateFlags U32, Data Variable 2 }.
+        // The data is FullID LLUUID, LocalID U32, PCode U8
+        // (llviewerobjectlist.cpp:538-540), then State U8, CRC U32,
+        // Material U8, ClickAction U8, Scale LLVector3, Position LLVector3,
+        // Rotation LLVector3 (llviewerobject.cpp:1719, 1778-1795), so the
+        // position is at offset 40 and the rotation at 52.
         OBJECT_UPDATE_COMPRESSED => {
             r.skip(8 + 2)?;
             let count = r.u8()?;
@@ -649,9 +696,47 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
             for _ in 0..count {
                 r.skip(4)?;
                 let mut data = Reader(r.variable2()?);
-                objects.push((data.uuid()?, data.u32()?));
+                let (full_id, local_id) = (data.uuid()?, data.u32()?);
+                // Whatever is too short to hold them describes the object
+                // all the same.
+                let motion = data.skip(20).and_then(|()| Ok((data.vector3()?, data.vector3()?))).ok();
+                let motion = motion.and_then(|(position, rotation)| Motion::checked(position, unpack(rotation)));
+                objects.push(CompressedObject { full_id, local_id, motion });
             }
             Incoming::ObjectsCompressed(objects)
+        }
+        // ImprovedTerseObjectUpdate, High 15: RegionHandle U64, TimeDilation
+        // U16, then ObjectData Variable { Data Variable 1, TextureEntry
+        // Variable 2 } (message_template.msg:3393). The data is LocalID U32
+        // (llviewerobjectlist.cpp:563), State U8, a U8 that is non-zero for
+        // an avatar and then followed by a 16-byte collision plane, Position
+        // LLVector3, velocity and acceleration as U16 x 3 each, the rotation
+        // as U16 x 4 mapped to -1..1 in the order x, y, z, w, and the
+        // angular velocity as U16 x 3 (llviewerobject.cpp:1719-1765; written
+        // by OpenSim's CreateImprovedTerseBlock, LLClientView.cs:6749).
+        IMPROVED_TERSE_OBJECT_UPDATE => {
+            r.skip(8 + 2)?;
+            let count = r.u8()?;
+            let mut objects = Vec::with_capacity(usize::from(count));
+            for _ in 0..count {
+                let mut data = Reader(r.variable1()?);
+                r.variable2()?; // TextureEntry
+                let local_id = data.u32()?;
+                data.skip(1)?; // State
+                if data.u8()? != 0 {
+                    data.skip(16)?; // collision plane
+                }
+                let position = data.vector3()?;
+                data.skip(6 + 6)?; // velocity, acceleration
+                let mut rotation = [0.0; 4];
+                for part in &mut rotation {
+                    *part = f32::from(data.u16()?) / f32::from(u16::MAX) * 2.0 - 1.0;
+                }
+                if let Some(motion) = Motion::checked(position, rotation) {
+                    objects.push((local_id, motion));
+                }
+            }
+            Incoming::ObjectsMoved(objects)
         }
         // ObjectUpdateCached, High 14: RegionHandle U64, TimeDilation U16,
         // then ObjectData Variable { ID U32, CRC U32, UpdateFlags U32 }.
@@ -740,6 +825,32 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
     })
 }
 
+/// A rotation sent as the x, y and z of a unit quaternion whose w is not
+/// negative (LLQuaternion::unpackFromVector3, llquaternion.cpp:943).
+fn unpack(rotation: Vector3) -> Quaternion {
+    let [x, y, z] = rotation;
+    [x, y, z, (1.0 - (x * x + y * y + z * z)).max(0.0).sqrt()]
+}
+
+/// The motion in the ObjectData field of a full update, in the two layouts
+/// simulators send (llviewerobject.cpp:1386-1420): 60 bytes of Position,
+/// Velocity, Acceleration, Rotation and AngularVelocity, each an
+/// LLVector3; or 76 bytes for an avatar, the same after a 16-byte collision
+/// plane. 124 and 140 bytes are the same with room for later additions.
+/// The quantized 48, 32 and 16-byte forms are not sent any more and not
+/// read here.
+fn full_motion(data: &[u8]) -> Option<Motion> {
+    let offset = match data.len() {
+        60 | 124 => 0,
+        76 | 140 => 16,
+        _ => return None,
+    };
+    let mut r = Reader(&data[offset..]);
+    let position = r.vector3().ok()?;
+    r.skip(12 + 12).ok()?;
+    Motion::checked(position, unpack(r.vector3().ok()?))
+}
+
 /// ObjectUpdate, High 12: RegionHandle U64, TimeDilation U16, then
 /// ObjectData Variable. Each block is read up to ParentID and the rest is
 /// skipped by its length prefixes to reach the next block.
@@ -752,7 +863,7 @@ fn decode_object_update(r: &mut Reader) -> Decoded<Vec<ObjectParent>> {
         r.skip(1)?; // State
         let full_id = r.uuid()?;
         r.skip(4 + 1 + 1 + 1 + 12)?; // CRC, PCode, Material, ClickAction, Scale
-        r.variable1()?; // ObjectData
+        let motion = full_motion(r.variable1()?); // ObjectData
         let parent_id = r.u32()?;
         r.skip(4)?; // UpdateFlags
         r.skip(23)?; // PathCurve .. ProfileHollow
@@ -767,7 +878,7 @@ fn decode_object_update(r: &mut Reader) -> Decoded<Vec<ObjectParent>> {
         r.variable1()?; // ExtraParams
         // Sound, OwnerID, Gain, Flags, Radius, JointType, JointPivot, JointAxisOrAnchor
         r.skip(16 + 16 + 4 + 1 + 4 + 1 + 12 + 12)?;
-        objects.push(ObjectParent { full_id, local_id, parent_id });
+        objects.push(ObjectParent { full_id, local_id, parent_id, motion });
     }
     Ok(objects)
 }
@@ -927,7 +1038,59 @@ pub mod testing {
         body
     }
 
-    /// Blocks are (FullID, local ID); the rest of each block's data is filler.
+    /// One object's motion in an ImprovedTerseObjectUpdate.
+    pub struct Terse {
+        pub local_id: u32,
+        pub avatar: bool,
+        pub position: Vector3,
+        pub rotation: Quaternion,
+    }
+
+    fn quantized(value: f32) -> [u8; 2] {
+        (((value + 1.0) / 2.0 * f32::from(u16::MAX)).round() as u16).to_le_bytes()
+    }
+
+    pub fn improved_terse_object_update(objects: &[Terse]) -> Vec<u8> {
+        let mut body = vec![0; 8 + 2];
+        body.push(objects.len() as u8);
+        for (index, object) in objects.iter().enumerate() {
+            let mut data = object.local_id.to_le_bytes().to_vec();
+            data.push(0); // State
+            data.push(u8::from(object.avatar));
+            if object.avatar {
+                data.extend([0x5A; 16]); // collision plane
+            }
+            data.extend(vector(object.position));
+            data.extend([0x6B; 6 + 6]); // velocity, acceleration
+            data.extend(object.rotation.iter().flat_map(|part| quantized(*part)));
+            data.extend([0x7C; 6]); // angular velocity
+            body.push(data.len() as u8);
+            body.extend(data);
+            body.extend((index as u16 * 5).to_le_bytes()); // TextureEntry
+            body.extend(vec![0x8D; index * 5]);
+        }
+        body
+    }
+
+    /// Blocks are (FullID, local ID, position, rotation as x, y, z).
+    pub fn object_update_compressed_at(objects: &[(Uuid, u32, Vector3, Vector3)]) -> Vec<u8> {
+        let mut body = vec![0; 8 + 2];
+        body.push(objects.len() as u8);
+        for (full_id, local_id, position, rotation) in objects {
+            body.extend([0xEF; 4]); // UpdateFlags
+            body.extend(80u16.to_le_bytes());
+            body.extend(full_id.as_bytes());
+            body.extend(local_id.to_le_bytes());
+            body.extend([0x99; 1 + 1 + 4 + 1 + 1 + 12]); // PCode .. Scale
+            body.extend(vector(*position));
+            body.extend(vector(*rotation));
+            body.extend([0x99; 16]); // what follows
+        }
+        body
+    }
+
+    /// Blocks are (FullID, local ID); the rest of each block's data is
+    /// filler, too short to hold a position.
     pub fn object_update_compressed(objects: &[(Uuid, u32)]) -> Vec<u8> {
         let mut body = vec![0; 8 + 2];
         body.push(objects.len() as u8);
@@ -957,20 +1120,55 @@ pub mod testing {
         body
     }
 
-    /// Blocks are (FullID, ParentID), with local ids counting up from 100;
-    /// variable fields get assorted lengths so
-    /// a wrong skip misaligns the next block.
+    /// One block of an ObjectUpdate.
+    pub struct Block {
+        pub full_id: Uuid,
+        pub local_id: u32,
+        pub parent_id: u32,
+        /// The ObjectData field.
+        pub data: Vec<u8>,
+    }
+
+    /// An ObjectData field in full precision: 60 bytes, or 76 for an
+    /// avatar. The rotation is the x, y and z of a unit quaternion.
+    pub fn object_data(position: Vector3, rotation: Vector3, avatar: bool) -> Vec<u8> {
+        let mut data = if avatar { vec![0x5A; 16] } else { Vec::new() };
+        data.extend(vector(position));
+        data.extend([0x6B; 12 + 12]); // velocity, acceleration
+        data.extend(vector(rotation));
+        data.extend([0x7C; 12]); // angular velocity
+        data
+    }
+
+    /// Blocks are (FullID, ParentID), with local ids counting up from 100
+    /// and an ObjectData field that carries no motion the bot reads.
     pub fn object_update(objects: &[(Uuid, u32)]) -> Vec<u8> {
+        let blocks: Vec<Block> = objects
+            .iter()
+            .enumerate()
+            .map(|(index, (full_id, parent_id))| Block {
+                full_id: *full_id,
+                local_id: index as u32 + 100,
+                parent_id: *parent_id,
+                data: vec![0xCD; 32],
+            })
+            .collect();
+        object_blocks(&blocks)
+    }
+
+    /// Variable fields get assorted lengths so a wrong skip misaligns the
+    /// next block.
+    pub fn object_blocks(objects: &[Block]) -> Vec<u8> {
         let mut body = vec![0; 8 + 2];
         body.push(objects.len() as u8);
-        for (index, (full_id, parent_id)) in objects.iter().enumerate() {
+        for (index, Block { full_id, local_id, parent_id, data }) in objects.iter().enumerate() {
             let pad = index + 1;
-            body.extend((index as u32 + 100).to_le_bytes()); // ID
+            body.extend(local_id.to_le_bytes()); // ID
             body.push(0); // State
             body.extend(full_id.as_bytes());
             body.extend([0xAB; 4 + 1 + 1 + 1 + 12]);
-            body.push(60); // ObjectData: 60 bytes of motion data
-            body.extend([0xCD; 60]);
+            body.push(data.len() as u8); // ObjectData
+            body.extend(data);
             body.extend(parent_id.to_le_bytes());
             body.extend([0xEF; 4]); // UpdateFlags
             body.extend([0x11; 23]); // PathCurve .. ProfileHollow
@@ -1158,7 +1356,8 @@ mod tests {
     fn decodes_the_other_object_messages() {
         let (a, b) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]));
         let body = object_update_compressed(&[(a, 500), (b, 501)]);
-        assert_eq!(decode(high(13), &body), Ok(Incoming::ObjectsCompressed(vec![(a, 500), (b, 501)])));
+        let plain = |full_id, local_id| CompressedObject { full_id, local_id, motion: None };
+        assert_eq!(decode(high(13), &body), Ok(Incoming::ObjectsCompressed(vec![plain(a, 500), plain(b, 501)])));
         assert_eq!(decode(high(13), &body[..body.len() - 40]), Err(DecodeError));
 
         let body = object_update_cached(&[500, 501]);
@@ -1371,11 +1570,102 @@ mod tests {
         assert_eq!(
             decode(high(12), &body),
             Ok(Incoming::ObjectUpdate(vec![
-                ObjectParent { full_id: ids[0], local_id: 100, parent_id: 0 },
-                ObjectParent { full_id: ids[1], local_id: 101, parent_id: 4242 },
-                ObjectParent { full_id: ids[2], local_id: 102, parent_id: 77 },
+                ObjectParent { full_id: ids[0], local_id: 100, parent_id: 0, motion: None },
+                ObjectParent { full_id: ids[1], local_id: 101, parent_id: 4242, motion: None },
+                ObjectParent { full_id: ids[2], local_id: 102, parent_id: 77, motion: None },
             ]))
         );
+    }
+
+    /// A quarter turn about the vertical axis, as the x, y and z of its
+    /// quaternion and in full.
+    const QUARTER_TURN: (Vector3, Quaternion) =
+        ([0.0, 0.0, std::f32::consts::FRAC_1_SQRT_2], [0.0, 0.0, std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2]);
+
+    fn close(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-3)
+    }
+
+    #[test]
+    fn object_update_carries_position_and_rotation() {
+        let (prim, avatar, old) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
+        let body = object_blocks(&[
+            Block { full_id: prim, local_id: 7, parent_id: 0, data: object_data([131.0, 64.0, 23.0], QUARTER_TURN.0, false) },
+            Block { full_id: avatar, local_id: 8, parent_id: 7, data: object_data([0.5, 0.0, 0.75], [0.0; 3], true) },
+            // A quantized form: described, but without a motion.
+            Block { full_id: old, local_id: 9, parent_id: 0, data: vec![0x12; 32] },
+        ]);
+        let Ok(Incoming::ObjectUpdate(objects)) = decode(high(12), &body) else { panic!("not an object update") };
+        assert_eq!(objects.iter().map(|o| (o.full_id, o.local_id, o.parent_id)).collect::<Vec<_>>(), [
+            (prim, 7, 0),
+            (avatar, 8, 7),
+            (old, 9, 0)
+        ]);
+        let seat = objects[0].motion.unwrap();
+        assert_eq!(seat.position, [131.0, 64.0, 23.0]);
+        assert!(close(&seat.rotation, &QUARTER_TURN.1), "{:?}", seat.rotation);
+        let rider = objects[1].motion.unwrap();
+        assert_eq!(rider.position, [0.5, 0.0, 0.75]);
+        assert!(close(&rider.rotation, &[0.0, 0.0, 0.0, 1.0]));
+        assert_eq!(objects[2].motion, None);
+    }
+
+    #[test]
+    fn object_data_of_the_longer_layouts_is_read_the_same() {
+        let mut prim = object_data([1.0, 2.0, 3.0], [0.0; 3], false);
+        prim.extend([0xEE; 64]);
+        let mut avatar = object_data([4.0, 5.0, 6.0], [0.0; 3], true);
+        avatar.extend([0xEE; 64]);
+        assert_eq!((prim.len(), avatar.len()), (124, 140));
+        assert_eq!(full_motion(&prim).unwrap().position, [1.0, 2.0, 3.0]);
+        assert_eq!(full_motion(&avatar).unwrap().position, [4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn positions_that_are_not_numbers_are_dropped() {
+        assert_eq!(full_motion(&object_data([f32::NAN, 2.0, 3.0], [0.0; 3], false)), None);
+        assert_eq!(full_motion(&object_data([1.0, f32::INFINITY, 3.0], [0.0; 3], false)), None);
+        assert_eq!(full_motion(&[0xFF; 60]), None);
+        assert_eq!(full_motion(&[0; 61]), None);
+    }
+
+    #[test]
+    fn compressed_update_carries_position_and_rotation() {
+        let (a, b) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]));
+        let body = object_update_compressed_at(&[(a, 500, [10.0, 20.0, 30.0], QUARTER_TURN.0), (b, 501, [1.0, 2.0, 3.0], [0.0; 3])]);
+        let Ok(Incoming::ObjectsCompressed(objects)) = decode(high(13), &body) else { panic!("not compressed") };
+        assert_eq!(objects.iter().map(|o| (o.full_id, o.local_id)).collect::<Vec<_>>(), [(a, 500), (b, 501)]);
+        assert_eq!(objects[0].motion.unwrap().position, [10.0, 20.0, 30.0]);
+        assert!(close(&objects[0].motion.unwrap().rotation, &QUARTER_TURN.1));
+        assert_eq!(objects[1].motion.unwrap().position, [1.0, 2.0, 3.0]);
+        // Cut inside the second block's data: an error, not a guess.
+        assert_eq!(decode(high(13), &body[..body.len() - 20]), Err(DecodeError));
+    }
+
+    #[test]
+    fn terse_update_carries_position_and_rotation() {
+        let body = improved_terse_object_update(&[
+            Terse { local_id: 7, avatar: false, position: [141.0, 64.0, 23.0], rotation: QUARTER_TURN.1 },
+            Terse { local_id: 8, avatar: true, position: [0.5, 0.25, 0.75], rotation: [0.0, 0.0, 0.0, 1.0] },
+        ]);
+        let Ok(Incoming::ObjectsMoved(objects)) = decode(high(15), &body) else { panic!("not a terse update") };
+        assert_eq!(objects.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [7, 8]);
+        assert_eq!(objects[0].1.position, [141.0, 64.0, 23.0]);
+        assert!(close(&objects[0].1.rotation, &QUARTER_TURN.1), "{:?}", objects[0].1.rotation);
+        // The avatar's block is longer by its collision plane.
+        assert_eq!(objects[1].1.position, [0.5, 0.25, 0.75]);
+        assert!(close(&objects[1].1.rotation, &[0.0, 0.0, 0.0, 1.0]));
+        for cut in [1, 10, 30] {
+            assert_eq!(decode(high(15), &body[..body.len() - cut]), Err(DecodeError), "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn rotate_turns_a_vector_by_a_quaternion() {
+        // A quarter turn about the vertical axis takes x to y.
+        assert!(close(&rotate(QUARTER_TURN.1, [1.0, 0.0, 0.0]), &[0.0, 1.0, 0.0]));
+        assert!(close(&rotate(QUARTER_TURN.1, [0.0, 1.0, 2.0]), &[-1.0, 0.0, 2.0]));
+        assert!(close(&rotate([0.0, 0.0, 0.0, 1.0], [3.0, 4.0, 5.0]), &[3.0, 4.0, 5.0]));
     }
 
     #[test]

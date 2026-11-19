@@ -13,22 +13,37 @@ user = "Sit Bot"
 password = "secret"
 # password_hash = "$1$5ebe2294ecd0e0f08eab7690d2a6ee69"
 
-# Optional: where the avatar should be: region name and coordinates inside
-# it, always both. The bot logs in there and teleports back whenever it finds
-# the avatar in another region. With a `sit` object, pick coordinates close
-# to it, or the sit may fail.
+# Optional: where the avatar starts out: region name and coordinates inside
+# it, always both. The bot logs in there and teleports there when the login
+# lands elsewhere. With a `sit` object, pick coordinates close to it, or the
+# sit may fail. What the bot holds afterwards is up to `persist`, below.
 region = "Target"
 position = [128.0, 128.0, 25.0]
 
-# Without `region` and `position` the bot stays wherever it is, and `start`
-# says where a login puts the avatar: "home" for its home location, "latest"
-# for the place it was last at. Default: "latest".
+# Without `region` and `position`, `start` says where the first login puts
+# the avatar: "home" for its home location, "latest" for the place it was
+# last at. Default: "latest".
 # start = "home"
 
 # Optional: what to sit on: the UUID of an object, or "ground". Without it
 # the bot does not sit the avatar anywhere by itself.
 sit = "00000000-0000-0000-0000-000000000000"
 # sit = "ground"
+
+# Optional: what the bot holds once it has got to the place above (logged in,
+# and seated when `sit` is set). It returns to what it holds after a kick, a
+# region restart or being moved to another region, and `rslbot ctl persist`
+# changes it while the bot runs.
+#   "cur"  the position and the seat the simulator reported at that moment.
+#          This is the default.
+#   "cfg"  `position` and `sit` exactly as written above; without `position`,
+#          the place the first login arrived at.
+#   "off"  (or false) nothing: the bot leaves the avatar alone from then on.
+# An array gives the position and the seat separately, as does the [persist]
+# table at the end of this file.
+# persist = "cfg"
+#   persist = "off"
+#   persist = ["cfg", "cur"]
 
 # Optional: record what the avatar hears and is told. Every message is also
 # written to standard error. The files are tab-separated, appended to, and
@@ -56,3 +71,9 @@ sit = "00000000-0000-0000-0000-000000000000"
 # once. This costs traffic all the time. Without it the bot learns the
 # objects within 32 metres when `touch` is first used.
 # scan_distance = 64
+
+# The same as `persist = ["cur", "cfg"]`, as a table. A key that is left out
+# is "cur". A table has to come after all the keys above.
+# [persist]
+# position = "cur"
+# sit = "cfg"

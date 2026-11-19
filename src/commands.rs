@@ -5,6 +5,7 @@
 
 use crate::config::DEFAULT_REQUESTTP_TIMEOUT;
 use crate::control::{Request, Response};
+use crate::persist::{Location, SitState};
 use crate::session::{Touch, NOT_CONNECTED};
 use crate::udp::messages::{Vector3, MAX_TEXT};
 use std::collections::HashMap;
@@ -250,6 +251,10 @@ pub struct Commands {
     touches: Vec<(Uuid, Sender<Response>)>,
     /// A command moved the avatar since `take_manual` was last asked.
     went_manual: bool,
+    /// Where the last `tp` command that was carried out went.
+    last_tp: Option<Location>,
+    /// What the last `sit` command that was carried out named.
+    last_sit: Option<SitState>,
 }
 
 impl Default for Commands {
@@ -286,13 +291,15 @@ impl Commands {
             pending_teleport: None,
             touches: Vec::new(),
             went_manual: false,
+            last_tp: None,
+            last_sit: None,
         }
     }
 
     /// Carries out `request` on `grid` and answers on `reply`: now, or once
     /// the grid has resolved a name or the simulator has said how it ended.
-    /// Returns the instant message sent. `home`, `status` and `quit` are the
-    /// bot's own business and never get here.
+    /// Returns the instant message sent. `persist`, `home`, `status` and
+    /// `quit` are the bot's own business and never get here.
     pub fn handle<G: Grid>(
         &mut self,
         request: Request,
@@ -312,6 +319,7 @@ impl Commands {
             Request::AcceptTp(_) => "accepttp",
             Request::SendTp { .. } => "sendtp",
             Request::Touch(_) => "touch",
+            Request::Persist { .. } => "persist",
             Request::Home => "home",
             Request::Status => "status",
             Request::Quit => "quit",
@@ -332,7 +340,9 @@ impl Commands {
             Request::SendTp { to, message } => check_length(&message, MAX_OFFER_TEXT)
                 .and_then(|()| self.with_avatar(&to, After::SendTp(message), &reply, grid, now)),
             Request::Touch(object) => self.touch(&object, &reply, grid, now),
-            Request::Home | Request::Status | Request::Quit => Err("not a command for the grid".to_string()),
+            Request::Persist { .. } | Request::Home | Request::Status | Request::Quit => {
+                Err("not a command for the grid".to_string())
+            }
         };
         finish(command, done, &reply)
     }
@@ -347,6 +357,18 @@ impl Commands {
     /// that the bot should stop putting it back.
     pub fn take_manual(&mut self) -> bool {
         std::mem::take(&mut self.went_manual)
+    }
+
+    /// Where the last `tp` command went that was handed to the simulator,
+    /// whatever became of it: what `last_cmd` stands for as a location.
+    pub fn last_tp(&self) -> Option<&Location> {
+        self.last_tp.as_ref()
+    }
+
+    /// What the last `sit` command named that was handed to the simulator,
+    /// an object or the ground: what `last_cmd` stands for as a sit state.
+    pub fn last_sit(&self) -> Option<SitState> {
+        self.last_sit
     }
 
     fn say<G: Grid>(&mut self, message: &str, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
@@ -382,10 +404,16 @@ impl Commands {
         grid.ok_or(NOT_CONNECTED)?.stand(now)?;
         self.went_manual = true;
         crate::info!("control: standing up");
+        self.stood_up();
+        Ok(Done::Answer(None))
+    }
+
+    /// The avatar was told to stand up, by a command here or by the bot: a
+    /// `sit` command still waiting for its seat will not get it.
+    pub fn stood_up(&mut self) {
         if let Some(sit) = self.pending_sit.take() {
             refuse("sit", &sit, "the avatar was told to stand up".to_string());
         }
-        Ok(Done::Answer(None))
     }
 
     fn sit<G: Grid>(
@@ -401,6 +429,7 @@ impl Commands {
             SitTarget::Ground => {
                 grid.sit_ground(now)?;
                 self.went_manual = true;
+                self.last_sit = Some(SitState::Ground);
                 crate::info!("control: sitting on the ground");
                 return Ok(Done::Answer(None));
             }
@@ -408,6 +437,7 @@ impl Commands {
         };
         grid.sit(object, now)?;
         self.went_manual = true;
+        self.last_sit = Some(SitState::Object(object));
         crate::info!("control: sitting on {object}");
         if let Some(earlier) = self.pending_sit.replace(reply.clone()) {
             refuse("sit", &earlier, "superseded by a newer sit command".to_string());
@@ -435,6 +465,7 @@ impl Commands {
         grid.teleport(&region, [to.x, to.y, z], now)?;
         self.went_manual = true;
         crate::info!("control: teleporting to \"{region}\" at {}, {}, {z}", to.x, to.y);
+        self.last_tp = Some(Location { region, position: [to.x, to.y, z] });
         self.park_teleport(reply);
         Ok(Done::Parked)
     }
@@ -1329,6 +1360,63 @@ mod tests {
         assert!(!rig.commands.take_manual());
         rig.command(Request::Tp(Rig::words(&["100", "120", "40"])));
         assert_eq!(rig.calls(), [Call::Teleport("Home".into(), [100.0, 120.0, 40.0])]);
+    }
+
+    #[test]
+    fn the_last_tp_and_sit_are_remembered_for_persist() {
+        let mut rig = Rig::new();
+        assert_eq!((rig.commands.last_tp(), rig.commands.last_sit()), (None, None));
+
+        // The region and the height are the ones the command resolved to.
+        rig.command(Request::Tp(Rig::words(&["100", "120"])));
+        let here = Location { region: "Home".to_string(), position: [100.0, 120.0, 30.0] };
+        assert_eq!(rig.commands.last_tp(), Some(&here));
+        // The outcome does not matter.
+        rig.command(Request::Tp(Rig::words(&["128", "128", "25", "Blue", "Lagoon"])));
+        assert!(rig.commands.teleport_failed("region \"Blue Lagoon\" not found"));
+        let lagoon = Location { region: "Blue Lagoon".to_string(), position: [128.0, 128.0, 25.0] };
+        assert_eq!(rig.commands.last_tp(), Some(&lagoon));
+
+        rig.command(Request::Sit(other_object().to_string()));
+        assert_eq!(rig.commands.last_sit(), Some(SitState::Object(other_object())));
+        assert!(rig.commands.sit_failed("no room to sit here"));
+        assert_eq!(rig.commands.last_sit(), Some(SitState::Object(other_object())));
+        rig.command(Request::Sit("ground".into()));
+        assert_eq!(rig.commands.last_sit(), Some(SitState::Ground));
+
+        // Neither is a `tp` or a `sit`.
+        rig.command(Request::Stand);
+        rig.offer(jane(), "Jane Doe", Uuid::from_bytes([0x44; 16]));
+        rig.command(Request::AcceptTp(jane().to_string()));
+        rig.command(Request::AskTp { to: jane().to_string(), message: String::new() });
+        assert_eq!(rig.commands.last_tp(), Some(&lagoon));
+        assert_eq!(rig.commands.last_sit(), Some(SitState::Ground));
+
+        // They outlive the session.
+        rig.commands.session_lost();
+        assert_eq!(rig.commands.last_tp(), Some(&lagoon));
+        assert_eq!(rig.commands.last_sit(), Some(SitState::Ground));
+    }
+
+    #[test]
+    fn refused_tp_and_sit_commands_are_not_remembered() {
+        let mut rig = Rig::new();
+        rig.command(Request::Sit("chair".into()));
+        rig.command(Request::Tp(Rig::words(&["north", "1"])));
+        rig.grid.offline = true;
+        rig.command(Request::Sit(other_object().to_string()));
+        rig.command(Request::Sit("ground".into()));
+        rig.command(Request::Tp(Rig::words(&["1", "2", "3"])));
+        assert_eq!((rig.commands.last_tp(), rig.commands.last_sit()), (None, None));
+    }
+
+    #[test]
+    fn persist_is_not_a_command_for_the_grid() {
+        let mut rig = Rig::new();
+        let answer = rig.command(Request::Persist { location: None, sit: None });
+        assert!(error(&answer).contains("not a command for the grid"));
+        assert_eq!(rig.calls(), []);
+        assert!(!rig.commands.take_manual());
     }
 
     #[test]

@@ -5,9 +5,10 @@
 
 use crate::caps::{CapsEvent, EqEvent, TeleportFinish};
 use crate::login::SessionInfo;
+use crate::persist::{Location, Sitting, World};
 use crate::reconciler::same_region;
 use crate::udp::circuit::Circuit;
-use crate::udp::messages::{self, Agent, Incoming, Outgoing, Vector3};
+use crate::udp::messages::{self, Agent, Incoming, Motion, Outgoing, Vector3};
 use crate::udp::packet;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -58,9 +59,9 @@ pub enum SessionEvent {
     RegionEntered(String),
     /// The session is over; nothing more will be sent.
     Lost(String),
-    /// The avatar is seated on this object: the simulator confirmed a sit
-    /// on it and shows the avatar attached.
-    Seated(Uuid),
+    /// The avatar is seated on an object: the simulator confirmed a sit on
+    /// it and shows the avatar attached.
+    Seated(Sat),
     /// The avatar is known not to be seated on an object the simulator
     /// confirmed a sit on.
     Standing,
@@ -127,6 +128,24 @@ const CHAT_NOT_AUDIBLE: i8 = -1;
 const IM_NOTHING_SPECIAL: u8 = messages::IM_PLAIN;
 const IM_FROM_TASK: u8 = 19;
 
+/// A confirmed sit on an object.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sat {
+    /// The prim the simulator named when it seated the avatar. In a linkset
+    /// that may be another prim than the one asked for.
+    pub prim: Uuid,
+    /// The object the bot asked to sit on, when the sit was its own.
+    pub requested: Option<Uuid>,
+}
+
+impl Sat {
+    /// Whether this is a sit on `object`: the simulator named it, or it
+    /// answered the bot's request for it.
+    pub fn is_on(&self, object: Uuid) -> bool {
+        self.prim == object || self.requested == Some(object)
+    }
+}
+
 /// What the avatar sits on, as far as the simulator has said.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Seat {
@@ -134,8 +153,8 @@ pub enum Seat {
     Unknown,
     /// Not attached to anything; a ground sit looks like this too.
     None,
-    /// Seated on this object.
-    Object(Uuid),
+    /// Seated on an object.
+    Object(Sat),
     /// Attached to something the simulator did not name.
     Other,
 }
@@ -169,7 +188,15 @@ struct Sim {
     opened_at: Instant,
     region_name: Option<String>,
     region_handle: Option<u64>,
+    /// Where the avatar is in the region, as last reported or worked out.
     position: Option<Vector3>,
+    /// The avatar's own region-local id, once its description has come.
+    own_local: Option<u32>,
+    /// The position in the avatar's last update: in the region while it
+    /// stands, relative to its seat while it sits.
+    own_offset: Option<Vector3>,
+    /// Where the object the avatar sits on is and how it is turned.
+    seat_frame: Option<Motion>,
     /// Both halves of the handshake are done and the region is known.
     entered: bool,
     next_agent_update: Instant,
@@ -208,14 +235,17 @@ pub struct Session<N: Net> {
     /// config says; a scan then starts on entering each region.
     scan_distance: Option<f32>,
     sim: Sim,
-    /// The object the simulator confirmed a sit on since the avatar last
-    /// stood up: the one we asked for, or one it named unprompted.
-    seat_confirmed: Option<Uuid>,
+    /// The sit the simulator confirmed since the avatar last stood up: an
+    /// answer to our request, or one it made unprompted.
+    seat_confirmed: Option<Sat>,
     /// Local id of what the avatar sits on, from its own object updates.
     own_parent: Option<u32>,
     /// The seat as last reported in an event.
-    seat: Option<Uuid>,
+    seat: Option<Sat>,
     seat_reported: bool,
+    /// The last sit or stand request sent since the avatar arrived was a
+    /// ground sit. The simulator does not report one, so this is a belief.
+    ground: bool,
     /// The object of the sit in progress.
     sit_request: Option<Uuid>,
     sit_deadline: Option<Instant>,
@@ -250,6 +280,7 @@ impl<N: Net> Session<N> {
             own_parent: None,
             seat: None,
             seat_reported: false,
+            ground: false,
             sit_request: None,
             sit_deadline: None,
             teleport: None,
@@ -296,6 +327,7 @@ impl<N: Net> Session<N> {
         self.own_parent = None;
         self.seat = None;
         self.seat_reported = false;
+        self.ground = false;
         self.sit_request = None;
         self.sit_deadline = None;
         self.teleport = None;
@@ -347,6 +379,7 @@ impl<N: Net> Session<N> {
         self.present()?;
         self.sit_request = None;
         self.sit_deadline = None;
+        self.ground = false;
         self.send_control(messages::CONTROL_STAND_UP, now);
         Ok(())
     }
@@ -354,6 +387,7 @@ impl<N: Net> Session<N> {
     /// Sits the avatar down on the ground where it stands.
     pub fn sit_ground(&mut self, now: Instant) -> Result<(), String> {
         self.present()?;
+        self.ground = true;
         self.send_control(messages::CONTROL_SIT_ON_GROUND, now);
         Ok(())
     }
@@ -363,10 +397,48 @@ impl<N: Net> Session<N> {
         self.sim.region_name.as_deref().filter(|_| self.sim.entered)
     }
 
-    /// Where the simulator last said the avatar is: on arrival in the
-    /// region, or after a teleport inside it.
+    /// Where the avatar is in the region: what the simulator said on
+    /// arrival or after a teleport inside the region, and what its updates
+    /// about the avatar have said since. While the avatar sits on an
+    /// object this is worked out from where the object is; until that is
+    /// known it stays the last position before.
     pub fn position(&self) -> Option<Vector3> {
         self.sim.position
+    }
+
+    /// Whether the position of a seated avatar has been worked out from
+    /// its seat. False while it does not sit on an object.
+    pub fn seat_frame_known(&self) -> bool {
+        self.own_parent.is_some_and(|parent| parent != 0)
+            && self.sim.seat_frame.is_some()
+            && self.sim.own_offset.is_some()
+    }
+
+    /// Works the avatar's position out again after an update about it or
+    /// about its seat.
+    fn update_position(&mut self) {
+        let Some(offset) = self.sim.own_offset else { return };
+        match (self.own_parent, self.sim.seat_frame) {
+            (Some(0), _) => self.sim.position = Some(offset),
+            (Some(_), Some(seat)) => {
+                let turned = messages::rotate(seat.rotation, offset);
+                self.sim.position = Some([0, 1, 2].map(|i| seat.position[i] + turned[i]));
+            }
+            _ => {}
+        }
+    }
+
+    /// An update about the object with this region-local id says where it
+    /// is: of interest when it is the avatar or its seat.
+    fn moved(&mut self, local_id: u32, motion: Motion) {
+        if self.sim.own_local == Some(local_id) {
+            self.sim.own_offset = Some(motion.position);
+        } else if local_id != 0 && self.own_parent == Some(local_id) {
+            self.sim.seat_frame = Some(motion);
+        } else {
+            return;
+        }
+        self.update_position();
     }
 
     /// What the avatar sits on.
@@ -374,9 +446,16 @@ impl<N: Net> Session<N> {
         match (self.own_parent, self.seat_confirmed) {
             (None, _) => Seat::Unknown,
             (Some(0), _) => Seat::None,
-            (Some(_), Some(object)) => Seat::Object(object),
+            (Some(_), Some(sat)) => Seat::Object(sat),
             (Some(_), None) => Seat::Other,
         }
+    }
+
+    /// Whether the bot last sat the avatar on the ground: a ground sit was
+    /// sent, and since then the avatar has not arrived anywhere, been told
+    /// to stand, or been seated on an object.
+    pub fn on_ground(&self) -> bool {
+        self.ground
     }
 
     fn draw_distance(&self) -> f32 {
@@ -536,6 +615,11 @@ impl<N: Net> Session<N> {
         Ok(Touch::Waiting)
     }
 
+    /// Whether the simulator has described `object` in this region.
+    pub fn knows(&self, object: Uuid) -> bool {
+        self.sim.objects.contains_key(&object)
+    }
+
     /// Why a touch cannot find its object.
     pub fn unknown_object(&self, object: Uuid) -> String {
         format!(
@@ -670,6 +754,9 @@ impl<N: Net> Session<N> {
             }
             Incoming::TeleportLocal { position } => {
                 self.sim.position = Some(position);
+                // Whatever the avatar's last update said is out of date now.
+                self.sim.own_offset = None;
+                self.ground = false;
                 if self.teleport.take().is_some() {
                     self.events.push(SessionEvent::TeleportArrived);
                 }
@@ -680,11 +767,11 @@ impl<N: Net> Session<N> {
                 // one with the sit target, or the root). While a sit is in
                 // progress it answers our request, whatever it names.
                 if self.sit_deadline.is_some() {
-                    self.seat_confirmed = self.sit_request;
+                    self.seat_confirmed = Some(Sat { prim: object, requested: self.sit_request });
                     crate::debug!("sit accepted on {object} (autopilot: {autopilot})");
                     self.send(messages::agent_sit(&self.agent), true, now);
                 } else {
-                    self.seat_confirmed = Some(object);
+                    self.seat_confirmed = Some(Sat { prim: object, requested: None });
                     crate::debug!("unrequested sit on {object}");
                 }
                 self.update_seat();
@@ -694,21 +781,55 @@ impl<N: Net> Session<N> {
                 for object in &objects {
                     self.learn(object.full_id, object.local_id, now);
                 }
-                for object in objects.iter().filter(|o| o.full_id == own_id) {
+                for object in &objects {
+                    if object.full_id != own_id {
+                        if let Some(motion) = object.motion {
+                            self.moved(object.local_id, motion);
+                        }
+                        continue;
+                    }
                     let stood_up = object.parent_id == 0 && self.own_parent.is_some_and(|p| p != 0);
                     if stood_up {
                         self.seat_confirmed = None;
                     }
+                    if object.parent_id != 0 {
+                        self.ground = false;
+                    }
                     if self.own_parent != Some(object.parent_id) {
                         crate::debug!("own avatar's parent is now {}", object.parent_id);
+                        // The avatar's position is relative to something
+                        // else from here on: to the root prim of what it
+                        // sits on, which is what simulators name as its
+                        // parent (OpenSim: LLClientView.cs:7153). That prim
+                        // has to be asked about: nothing says the simulator
+                        // described it, and what it said earlier was not
+                        // kept.
+                        self.sim.seat_frame = None;
+                        self.sim.own_offset = None;
+                        if object.parent_id != 0 {
+                            self.request_objects(&[object.parent_id], now);
+                        }
                     }
                     self.own_parent = Some(object.parent_id);
+                    self.sim.own_local = Some(object.local_id);
+                    if let Some(motion) = object.motion {
+                        self.sim.own_offset = Some(motion.position);
+                        self.update_position();
+                    }
                     self.update_seat();
                 }
             }
             Incoming::ObjectsCompressed(objects) => {
-                for (object, local_id) in objects {
-                    self.learn(object, local_id, now);
+                for object in objects {
+                    self.learn(object.full_id, object.local_id, now);
+                    if let Some(motion) = object.motion {
+                        self.moved(object.local_id, motion);
+                    }
+                }
+            }
+            Incoming::ObjectsMoved(objects) => {
+                for (local_id, motion) in objects {
+                    self.moved(local_id, motion);
                 }
             }
             Incoming::ObjectsCached(local_ids) => {
@@ -828,10 +949,10 @@ impl<N: Net> Session<N> {
         let seat = self.seat_confirmed.filter(|_| parented);
         match seat {
             // A sit in progress is answered even when it changes nothing.
-            Some(object) if self.seat != seat || self.sit_request == seat => {
+            Some(sat) if self.seat != seat || (self.sit_request.is_some() && self.sit_request == sat.requested) => {
                 self.sit_request = None;
                 self.sit_deadline = None;
-                self.events.push(SessionEvent::Seated(object));
+                self.events.push(SessionEvent::Seated(sat));
             }
             None if self.seat.is_some() || (!self.seat_reported && self.own_parent.is_some()) => {
                 self.events.push(SessionEvent::Standing);
@@ -840,6 +961,30 @@ impl<N: Net> Session<N> {
         }
         self.seat = seat;
         self.seat_reported = true;
+    }
+}
+
+/// The avatar's surroundings as `persist` sees them. Only to be asked
+/// while the avatar is `present`.
+impl<N: Net> World for Session<N> {
+    fn here(&self) -> Location {
+        Location {
+            region: self.region().unwrap_or_default().to_string(),
+            position: self.position().unwrap_or_default(),
+        }
+    }
+
+    fn sitting(&self) -> Sitting {
+        match self.seat() {
+            Seat::Object(sat) => Sitting::Object(sat.prim),
+            Seat::Other => Sitting::Unnamed,
+            Seat::None | Seat::Unknown if self.on_ground() => Sitting::Ground,
+            Seat::None | Seat::Unknown => Sitting::Standing,
+        }
+    }
+
+    fn region_of(&self, object: Uuid) -> Option<String> {
+        self.region().filter(|_| self.knows(object)).map(str::to_string)
     }
 }
 
@@ -852,6 +997,9 @@ impl Sim {
             region_name: None,
             region_handle: None,
             position: None,
+            own_local: None,
+            own_offset: None,
+            seat_frame: None,
             entered: false,
             next_agent_update: now,
             objects: HashMap::new(),
@@ -918,6 +1066,16 @@ mod tests {
 
     fn target() -> Uuid {
         Uuid::from_bytes([0x0B; 16])
+    }
+
+    /// A sit the bot asked for, answered naming the same object.
+    fn asked(object: Uuid) -> Sat {
+        Sat { prim: object, requested: Some(object) }
+    }
+
+    /// A sit the simulator made unprompted.
+    fn forced(object: Uuid) -> Sat {
+        Sat { prim: object, requested: None }
     }
 
     impl Rig {
@@ -1027,7 +1185,7 @@ mod tests {
             rig.session.start_sit(target(), rig.now);
             rig.sit_response(target());
             rig.own_update(4242);
-            assert_eq!(rig.events(), [SessionEvent::Seated(target())]);
+            assert_eq!(rig.events(), [SessionEvent::Seated(asked(target()))]);
             rig.ack_all();
             rig.sent();
             rig
@@ -1298,7 +1456,9 @@ mod tests {
         assert_eq!(rig.events(), [], "not seated until the simulator shows the avatar parented");
 
         rig.own_update(4242);
-        assert_eq!(rig.events(), [SessionEvent::Seated(target())]);
+        assert_eq!(rig.events(), [SessionEvent::Seated(asked(target()))]);
+        // Becoming seated asks where the seat is, once.
+        assert_eq!(rig.sent_ids(), [messages::REQUEST_MULTIPLE_OBJECTS]);
 
         // The deadline is disarmed and nothing more is sent about sitting.
         rig.ack_all();
@@ -1358,7 +1518,11 @@ mod tests {
         rig.sit_response(Uuid::from_bytes([0xEE; 16]));
         assert_eq!(rig.sent_ids(), [messages::AGENT_SIT]);
         rig.own_update(555);
-        assert_eq!(rig.events(), [SessionEvent::Seated(target())]);
+        // Both are reported: the object asked for and the prim sat on.
+        let sat = Sat { prim: Uuid::from_bytes([0xEE; 16]), requested: Some(target()) };
+        assert_eq!(rig.events(), [SessionEvent::Seated(sat)]);
+        assert!(sat.is_on(target()) && sat.is_on(Uuid::from_bytes([0xEE; 16])));
+        assert!(!sat.is_on(other_object()));
     }
 
     #[test]
@@ -1369,8 +1533,10 @@ mod tests {
         rig.own_update(555);
         // Seated, but on that object: whether it is the right one is for
         // whoever holds the seat to say.
-        assert_eq!(rig.events(), [SessionEvent::Seated(Uuid::from_bytes([0xEE; 16]))]);
-        assert_eq!(rig.session.seat(), Seat::Object(Uuid::from_bytes([0xEE; 16])));
+        let sat = forced(Uuid::from_bytes([0xEE; 16]));
+        assert_eq!(rig.events(), [SessionEvent::Seated(sat)]);
+        assert_eq!(rig.session.seat(), Seat::Object(sat));
+        assert!(!sat.is_on(target()));
     }
 
     #[test]
@@ -1400,7 +1566,7 @@ mod tests {
         rig.sit_response(target());
         assert_eq!(rig.sent_ids(), [], "no AgentSit without a sit in progress");
         rig.own_update(4242);
-        assert_eq!(rig.events(), [SessionEvent::Seated(target())]);
+        assert_eq!(rig.events(), [SessionEvent::Seated(forced(target()))]);
     }
 
     // ---------------------------------------------------------- teleport
@@ -1810,7 +1976,7 @@ mod tests {
     #[test]
     fn sits_on_any_object_and_says_which() {
         let mut rig = Rig::seated();
-        assert_eq!(rig.session.seat(), Seat::Object(target()));
+        assert_eq!(rig.session.seat(), Seat::Object(asked(target())));
         rig.session.start_sit(other_object(), rig.now);
         let sent = rig.sent();
         assert_eq!(sent[0].id, messages::AGENT_REQUEST_SIT);
@@ -1819,8 +1985,9 @@ mod tests {
         rig.sit_response(Uuid::from_bytes([0x0D; 16]));
         assert_eq!(rig.sent_ids(), [messages::AGENT_SIT]);
         rig.own_update(777);
-        assert_eq!(rig.events(), [SessionEvent::Seated(other_object())]);
-        assert_eq!(rig.session.seat(), Seat::Object(other_object()));
+        let sat = Sat { prim: Uuid::from_bytes([0x0D; 16]), requested: Some(other_object()) };
+        assert_eq!(rig.events(), [SessionEvent::Seated(sat)]);
+        assert_eq!(rig.session.seat(), Seat::Object(sat));
     }
 
     #[test]
@@ -1832,7 +1999,7 @@ mod tests {
         rig.ack_all();
         rig.advance(secs(15));
         assert!(matches!(&rig.events()[..], [SessionEvent::SitFailed(_)]));
-        assert_eq!(rig.session.seat(), Seat::Object(target()));
+        assert_eq!(rig.session.seat(), Seat::Object(asked(target())));
     }
 
     #[test]
@@ -1840,7 +2007,7 @@ mod tests {
         let mut rig = Rig::seated();
         rig.session.start_sit(target(), rig.now);
         rig.sit_response(target());
-        assert_eq!(rig.events(), [SessionEvent::Seated(target())]);
+        assert_eq!(rig.events(), [SessionEvent::Seated(asked(target()))]);
         rig.ack_all();
         rig.advance(secs(20));
         assert_eq!(rig.events(), [], "the sit ended when it was confirmed");
@@ -1875,6 +2042,45 @@ mod tests {
         let sent = rig.sent_all();
         assert_eq!(sent.len(), 1);
         assert_eq!(update_fields(&sent[0]), (32.0, 0));
+    }
+
+    #[test]
+    fn the_ground_sit_is_believed_until_something_ends_it() {
+        let mut rig = Rig::entered();
+        assert!(!rig.session.on_ground());
+        assert_eq!(rig.session.sit_ground(rig.now), Ok(()));
+        assert!(rig.session.on_ground());
+        // The avatar's own updates while it is not on an object change nothing.
+        rig.own_update(0);
+        assert!(rig.session.on_ground());
+
+        // Told to stand.
+        assert_eq!(rig.session.stand(rig.now), Ok(()));
+        assert!(!rig.session.on_ground());
+
+        // Seated on an object.
+        rig.session.sit_ground(rig.now).unwrap();
+        rig.own_update(31);
+        assert!(!rig.session.on_ground());
+        rig.own_update(0);
+        assert!(!rig.session.on_ground());
+
+        // A teleport inside the region.
+        rig.session.sit_ground(rig.now).unwrap();
+        rig.receive(messages::TELEPORT_LOCAL, &wire::teleport_local([4.0, 5.0, 6.0]));
+        assert!(!rig.session.on_ground());
+
+        // Another simulator.
+        rig.session.sit_ground(rig.now).unwrap();
+        rig.session.handle_caps(rig.generation(), finish(), rig.now);
+        assert!(!rig.session.on_ground());
+    }
+
+    #[test]
+    fn a_ground_sit_outside_a_region_is_not_believed() {
+        let mut rig = Rig::new();
+        assert!(rig.session.sit_ground(rig.now).is_err());
+        assert!(!rig.session.on_ground());
     }
 
     #[test]
@@ -1988,6 +2194,259 @@ mod tests {
             rig.ack_all();
         }
         assert_eq!(rig.events(), [SessionEvent::TeleportFailed("no answer within 60 s".into())]);
+    }
+
+    // ---------------------------------------------------------- position
+
+    /// Region-local ids of the avatar and of the seat in these tests.
+    const OWN: u32 = 900;
+    const CHAIR: u32 = 4242;
+    /// A quarter turn about the vertical axis, as x, y and z of its
+    /// quaternion and in full.
+    const QUARTER: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+    impl Rig {
+        /// The avatar's own full update: where it is, in the region when
+        /// `parent` is 0 and on its seat otherwise.
+        fn own_at(&mut self, parent: u32, position: Vector3) {
+            let data = wire::object_data(position, [0.0; 3], true);
+            let block = wire::Block { full_id: agent_id(), local_id: OWN, parent_id: parent, data };
+            self.receive(messages::OBJECT_UPDATE, &wire::object_blocks(&[block]));
+        }
+
+        /// A full update describing the chair.
+        fn chair_at(&mut self, position: Vector3, rotation: Vector3) {
+            let data = wire::object_data(position, rotation, false);
+            let block = wire::Block { full_id: target(), local_id: CHAIR, parent_id: 0, data };
+            self.receive(messages::OBJECT_UPDATE, &wire::object_blocks(&[block]));
+        }
+
+        fn terse(&mut self, local_id: u32, avatar: bool, position: Vector3) {
+            let object = wire::Terse { local_id, avatar, position, rotation: [0.0, 0.0, 0.0, 1.0] };
+            self.receive(messages::IMPROVED_TERSE_OBJECT_UPDATE, &wire::improved_terse_object_update(&[object]));
+        }
+
+        fn position(&self) -> Vector3 {
+            self.session.position().unwrap()
+        }
+
+        /// How many requests about objects went out since the last call.
+        fn object_requests(&mut self) -> Vec<Vec<u8>> {
+            requests(&self.sent())
+        }
+
+        /// Standing at 100, 100, 25, then seated on the chair with the
+        /// given offset on it. The chair has not been described yet.
+        fn on_chair(offset: Vector3) -> Rig {
+            let mut rig = Rig::entered();
+            rig.own_at(0, [100.0, 100.0, 25.0]);
+            rig.session.start_sit(target(), rig.now);
+            rig.sit_response(target());
+            rig.sent();
+            rig.own_at(CHAIR, offset);
+            assert_eq!(rig.events(), [SessionEvent::Standing, SessionEvent::Seated(asked(target()))]);
+            rig
+        }
+    }
+
+    fn near(a: Vector3, b: Vector3) -> bool {
+        a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-3)
+    }
+
+    #[test]
+    fn the_avatars_own_updates_say_where_it_stands() {
+        let mut rig = Rig::entered();
+        assert_eq!(rig.position(), [10.0, 20.0, 30.0]);
+        rig.own_at(0, [100.0, 100.0, 25.0]);
+        assert_eq!(rig.position(), [100.0, 100.0, 25.0]);
+        assert!(!rig.session.seat_frame_known());
+        // Nothing is asked about objects for that.
+        assert_eq!(rig.object_requests(), Vec::<Vec<u8>>::new());
+    }
+
+    #[test]
+    fn seated_position_is_worked_out_from_the_seat() {
+        let mut rig = Rig::on_chair([0.0, 0.5, 0.6]);
+        // One request about the seat, and until it is answered the avatar
+        // is where it was last known to be.
+        let expected = messages::request_multiple_objects(&rig.agent(), &[CHAIR]);
+        assert_eq!(rig.object_requests(), [expected.body]);
+        assert_eq!(rig.position(), [100.0, 100.0, 25.0]);
+        assert!(!rig.session.seat_frame_known());
+
+        rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
+        assert!(near(rig.position(), [131.0, 64.5, 23.0]), "{:?}", rig.position());
+        assert!(rig.session.seat_frame_known());
+        assert_eq!(rig.events(), []);
+    }
+
+    #[test]
+    fn a_turned_seat_turns_the_offset() {
+        // One metre along the seat's own x axis, the seat turned a quarter
+        // turn about the vertical: one metre along the region's y axis.
+        let mut rig = Rig::on_chair([1.0, 0.0, 0.0]);
+        rig.chair_at([131.0, 64.0, 23.0], [0.0, 0.0, QUARTER]);
+        assert!(near(rig.position(), [131.0, 65.0, 23.0]), "{:?}", rig.position());
+    }
+
+    #[test]
+    fn the_seat_may_be_described_in_the_compressed_form() {
+        let mut rig = Rig::on_chair([1.0, 0.0, 0.0]);
+        let body = wire::object_update_compressed_at(&[(target(), CHAIR, [131.0, 64.0, 23.0], [0.0, 0.0, QUARTER])]);
+        rig.receive(messages::OBJECT_UPDATE_COMPRESSED, &body);
+        assert!(near(rig.position(), [131.0, 65.0, 23.0]), "{:?}", rig.position());
+    }
+
+    #[test]
+    fn standing_up_leaves_the_avatar_next_to_the_seat() {
+        let mut rig = Rig::on_chair([0.0, 0.5, 0.6]);
+        rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
+        rig.own_at(0, [132.0, 65.0, 23.5]);
+        assert_eq!(rig.events(), [SessionEvent::Standing]);
+        assert_eq!(rig.position(), [132.0, 65.0, 23.5]);
+        assert!(!rig.session.seat_frame_known());
+        // The chair moving on is nothing to the avatar now.
+        rig.terse(CHAIR, false, [10.0, 10.0, 10.0]);
+        assert_eq!(rig.position(), [132.0, 65.0, 23.5]);
+    }
+
+    #[test]
+    fn a_seat_that_moves_takes_the_avatar_along() {
+        let mut rig = Rig::on_chair([0.0, 0.5, 0.6]);
+        rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
+        rig.terse(CHAIR, false, [141.0, 64.0, 22.4]);
+        assert!(near(rig.position(), [141.0, 64.5, 23.0]), "{:?}", rig.position());
+        // The avatar shifting on the seat counts too.
+        rig.terse(OWN, true, [0.0, 0.0, 1.0]);
+        assert!(near(rig.position(), [141.0, 64.0, 23.4]), "{:?}", rig.position());
+        // Other objects moving do not.
+        rig.terse(77, false, [1.0, 2.0, 3.0]);
+        assert!(near(rig.position(), [141.0, 64.0, 23.4]));
+    }
+
+    #[test]
+    fn a_pushed_avatar_is_where_the_simulator_says() {
+        let mut rig = Rig::entered();
+        rig.own_at(0, [100.0, 100.0, 25.0]);
+        rig.terse(OWN, true, [120.0, 100.0, 25.5]);
+        assert_eq!(rig.position(), [120.0, 100.0, 25.5]);
+        // Another avatar's movement is not the bot's.
+        rig.terse(OWN + 1, true, [1.0, 2.0, 3.0]);
+        assert_eq!(rig.position(), [120.0, 100.0, 25.5]);
+    }
+
+    #[test]
+    fn a_seat_that_is_never_described_leaves_the_last_position() {
+        let mut rig = Rig::on_chair([0.0, 0.5, 0.6]);
+        rig.object_requests();
+        for _ in 0..30 {
+            rig.ack_all();
+            rig.advance(secs(1));
+        }
+        assert_eq!(rig.events(), [], "still connected and seated");
+        assert_eq!(rig.session.seat(), Seat::Object(asked(target())));
+        assert_eq!(rig.position(), [100.0, 100.0, 25.0]);
+        assert!(!rig.session.seat_frame_known());
+        // And it is not asked about again.
+        assert_eq!(rig.object_requests(), Vec::<Vec<u8>>::new());
+    }
+
+    #[test]
+    fn the_seat_is_asked_about_once_per_sit() {
+        let mut rig = Rig::on_chair([0.0, 0.5, 0.6]);
+        assert_eq!(rig.object_requests().len(), 1);
+        // More updates of the seated avatar ask nothing.
+        rig.own_at(CHAIR, [0.0, 0.5, 0.7]);
+        rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
+        rig.own_at(CHAIR, [0.0, 0.5, 0.6]);
+        assert_eq!(rig.object_requests().len(), 0);
+        // Standing up asks nothing; the next sit asks again.
+        rig.own_at(0, [132.0, 65.0, 23.5]);
+        assert_eq!(rig.object_requests().len(), 0);
+        rig.own_at(CHAIR + 1, [0.0, 0.0, 0.5]);
+        let expected = messages::request_multiple_objects(&rig.agent(), &[CHAIR + 1]);
+        assert_eq!(rig.object_requests(), [expected.body]);
+    }
+
+    #[test]
+    fn a_teleport_inside_the_region_outdates_the_seat() {
+        let mut rig = Rig::on_chair([0.0, 0.5, 0.6]);
+        rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
+        rig.receive(messages::TELEPORT_LOCAL, &wire::teleport_local([5.0, 6.0, 7.0]));
+        // The chair moving before the avatar is reported standing must not
+        // drag the position back.
+        rig.terse(CHAIR, false, [141.0, 64.0, 22.4]);
+        assert_eq!(rig.position(), [5.0, 6.0, 7.0]);
+        rig.own_at(0, [5.0, 6.0, 7.2]);
+        assert_eq!(rig.position(), [5.0, 6.0, 7.2]);
+    }
+
+    #[test]
+    fn position_tracking_starts_over_in_a_new_region() {
+        let mut rig = Rig::on_chair([0.0, 0.5, 0.6]);
+        rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
+        rig.session.handle_caps(rig.generation(), finish(), rig.now);
+        rig.enter("Elsewhere", HOME_HANDLE + 256);
+        assert_eq!(rig.position(), [10.0, 20.0, 30.0]);
+        assert!(!rig.session.seat_frame_known());
+        // Local ids of the old region mean nothing here.
+        rig.terse(CHAIR, false, [1.0, 2.0, 3.0]);
+        rig.terse(OWN, true, [1.0, 2.0, 3.0]);
+        assert_eq!(rig.position(), [10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn an_update_without_a_readable_position_changes_nothing() {
+        let mut rig = Rig::entered();
+        rig.own_at(0, [100.0, 100.0, 25.0]);
+        // The same avatar in a form that carries no motion the bot reads.
+        let block = wire::Block { full_id: agent_id(), local_id: OWN, parent_id: 0, data: vec![0x12; 32] };
+        rig.receive(messages::OBJECT_UPDATE, &wire::object_blocks(&[block]));
+        assert_eq!(rig.position(), [100.0, 100.0, 25.0]);
+        let data = wire::object_data([f32::NAN, 1.0, 2.0], [0.0; 3], true);
+        let block = wire::Block { full_id: agent_id(), local_id: OWN, parent_id: 0, data };
+        rig.receive(messages::OBJECT_UPDATE, &wire::object_blocks(&[block]));
+        assert_eq!(rig.position(), [100.0, 100.0, 25.0]);
+    }
+
+    #[test]
+    fn the_session_tells_persist_where_the_avatar_is_and_how_it_sits() {
+        // Just arrived: standing, as far as anyone knows.
+        let mut rig = Rig::entered();
+        assert_eq!(rig.session.here(), Location { region: "Home".to_string(), position: [10.0, 20.0, 30.0] });
+        assert_eq!(rig.session.sitting(), Sitting::Standing);
+        rig.own_at(0, [100.0, 100.0, 25.0]);
+        assert_eq!(rig.session.sitting(), Sitting::Standing);
+        rig.session.sit_ground(rig.now).unwrap();
+        assert_eq!(rig.session.sitting(), Sitting::Ground);
+
+        // Seated: the prim the simulator named, not the object asked for.
+        let prim = Uuid::from_bytes([0xEE; 16]);
+        rig.session.start_sit(target(), rig.now);
+        rig.sit_response(prim);
+        rig.own_at(CHAIR, [0.0, 0.5, 0.6]);
+        rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
+        assert_eq!(rig.session.sitting(), Sitting::Object(prim));
+        assert!(near(rig.session.here().position, [131.0, 64.5, 23.0]));
+
+        // Attached to something nobody confirmed a sit on.
+        let mut rig = Rig::entered();
+        rig.own_update(31);
+        assert_eq!(rig.session.sitting(), Sitting::Unnamed);
+    }
+
+    #[test]
+    fn objects_described_here_are_known_to_be_in_this_region() {
+        let mut rig = Rig::entered();
+        assert_eq!(rig.session.region_of(target()), None);
+        rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
+        assert!(rig.session.knows(target()));
+        assert_eq!(rig.session.region_of(target()), Some("Home".to_string()));
+        assert_eq!(rig.session.region_of(other_object()), None);
+        // In the next region they are not.
+        rig.session.handle_caps(rig.generation(), finish(), rig.now);
+        rig.enter("Elsewhere", HOME_HANDLE + 256);
+        assert_eq!(rig.session.region_of(target()), None);
     }
 
     // ----------------------------------------------------------- objects

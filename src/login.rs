@@ -1,6 +1,7 @@
 //! Grid login over XML-RPC: request, reply parsing and outcome classification.
 
-use crate::config::{Config, Place};
+use crate::config::Config;
+use crate::persist::Location;
 use crate::xml::{self, Value};
 use md5::{Digest, Md5};
 use std::net::{IpAddr, SocketAddr};
@@ -12,7 +13,7 @@ const MAX_REDIRECTS: usize = 5;
 /// Where the login asks the grid to place the avatar.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Start {
-    /// The configured region and position.
+    /// The location the bot holds.
     Target,
     /// The avatar's home location.
     Home,
@@ -58,23 +59,23 @@ fn md5_hex(text: &str) -> String {
     Md5::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-pub fn start_location(cfg: &Config, start: Start) -> String {
-    match start {
-        Start::Last => "last".to_string(),
-        Start::Home => "home".to_string(),
-        Start::Target => match &cfg.place {
-            Place::Region { name, position } => {
-                let [x, y, z] = position.map(|v| v.round() as i32);
-                format!("uri:{name}&{x}&{y}&{z}")
-            }
-            // Nothing to aim for: the reconciler asks for this only with a
-            // configured region.
-            Place::Home | Place::Latest => "last".to_string(),
-        },
+/// What the login request asks for as its start. `held` is the location
+/// the bot holds, if it holds one.
+pub fn start_location(start: Start, held: Option<&Location>) -> String {
+    match (start, held) {
+        (Start::Last, _) => "last".to_string(),
+        (Start::Home, _) => "home".to_string(),
+        (Start::Target, Some(Location { region, position })) => {
+            let [x, y, z] = position.map(|v| v.round() as i32);
+            format!("uri:{region}&{x}&{y}&{z}")
+        }
+        // Nothing to aim for: the reconciler asks for this only while a
+        // location is held.
+        (Start::Target, None) => "last".to_string(),
     }
 }
 
-pub fn request_xml(cfg: &Config, start: Start) -> String {
+pub fn request_xml(cfg: &Config, start: Start, held: Option<&Location>) -> String {
     let str = |s: &str| Value::Str(s.to_string());
     // Stable per-account hardware identifiers, so the bot presents the same
     // identity to the grid on every login.
@@ -85,7 +86,7 @@ pub fn request_xml(cfg: &Config, start: Start) -> String {
             ("first", str(&cfg.first_name)),
             ("last", str(&cfg.last_name)),
             ("passwd", str(&cfg.password_hash)),
-            ("start", Value::Str(start_location(cfg, start))),
+            ("start", Value::Str(start_location(start, held))),
             ("channel", str(CHANNEL)),
             ("version", str(env!("CARGO_PKG_VERSION"))),
             ("platform", str("Lnx")),
@@ -167,8 +168,8 @@ fn interpret(http: Result<(u16, String), String>) -> Result<Outcome, String> {
 }
 
 /// Logs in, following the login server's redirects.
-pub fn login(agent: &ureq::Agent, cfg: &Config, start: Start) -> Outcome {
-    let request = request_xml(cfg, start);
+pub fn login(agent: &ureq::Agent, cfg: &Config, start: Start, held: Option<&Location>) -> Outcome {
+    let request = request_xml(cfg, start, held);
     let mut url = cfg.login_url.clone();
     for _ in 0..=MAX_REDIRECTS {
         let http = agent
@@ -243,9 +244,14 @@ mod tests {
         interpret(Ok((200, body))).unwrap()
     }
 
+    /// The location the bot holds in these tests.
+    fn held() -> Location {
+        Location { region: "Target Region".to_string(), position: [128.4, 60.6, 25.0] }
+    }
+
     #[test]
     fn request_carries_credentials_and_start_location() {
-        let xml = request_xml(&config(), Start::Target);
+        let xml = request_xml(&config(), Start::Target, Some(&held()));
         let value = |name: &str| {
             let tail = xml.split(&format!("<name>{name}</name><value>")).nth(1).unwrap();
             tail.split("</value>").next().unwrap().to_string()
@@ -262,16 +268,27 @@ mod tests {
 
     #[test]
     fn request_for_last_location() {
-        assert!(request_xml(&config(), Start::Last).contains("<string>last</string>"));
-        assert!(request_xml(&config(), Start::Home).contains("<string>home</string>"));
-        // Without a region there is nothing else to ask for.
-        let bare = Config::parse("user = \"Sit Bot\"\npassword = \"secret\"\n").unwrap();
-        assert!(request_xml(&bare, Start::Target).contains("<string>last</string>"));
+        // Whatever is held, `last` and `home` are asked for as such.
+        assert!(request_xml(&config(), Start::Last, Some(&held())).contains("<string>last</string>"));
+        assert!(request_xml(&config(), Start::Home, Some(&held())).contains("<string>home</string>"));
+        assert!(request_xml(&config(), Start::Home, None).contains("<string>home</string>"));
+        // Without a held location there is nothing else to ask for.
+        assert!(request_xml(&config(), Start::Target, None).contains("<string>last</string>"));
+    }
+
+    #[test]
+    fn request_for_a_persisted_location() {
+        // The held location counts, not the config's region and position.
+        let persisted = Location { region: "Blue Lagoon".to_string(), position: [128.0, 127.6, 25.4] };
+        assert_eq!(start_location(Start::Target, Some(&persisted)), "uri:Blue Lagoon&128&128&25");
+        let xml = request_xml(&config(), Start::Target, Some(&persisted));
+        assert!(xml.contains("<string>uri:Blue Lagoon&amp;128&amp;128&amp;25</string>"), "{xml}");
+        assert!(!xml.contains("Target Region"));
     }
 
     #[test]
     fn identity_is_stable_per_account() {
-        assert_eq!(request_xml(&config(), Start::Last), request_xml(&config(), Start::Last));
+        assert_eq!(request_xml(&config(), Start::Last, None), request_xml(&config(), Start::Last, None));
     }
 
     #[test]

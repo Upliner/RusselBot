@@ -40,7 +40,7 @@ New `src/persist.rs`, no I/O, in the style of `reconciler.rs`:
 - `Location { region: String, position: Vector3 }`, `SitState { Object(Uuid), Ground, Stand, Unchanged }`, `Placement { location: Option<Location>, sit: SitState }`. `location` is `None` only for "config has no position and no login has reported one yet".
 - `LocationArg { Cur, Cfg, Last, LastCmd, At(Location) }` and `SitArg { Cur, Cfg, Last, LastCmd, Is(SitState) }` with `parse_location` / `parse_sit_state`. A location is split from the right on `/`: exactly four parts, the last three numbers. Formatting (`Display`) is the inverse, rounded to 0.01 with trailing zeros dropped, and is used for the command's answer, the `status` line and the log.
 - `Book`: the config placement, the first location, the last persisted placement, the held placement, and a bounded list (64, most recent first) of `(object, region)` pairs the avatar was seated on.
-- `Book::resolve(location, sit, &dyn World, last_tp, last_sit) -> Result<Placement, String>` does the special-word table and the region check and changes nothing; `Book::commit(placement)` makes it held and `last`. `World` is a small trait over the live session (`here() -> Option<Location>`, `seat()`, `on_ground()`, `knows(Uuid)`), absent while not connected, with a fake in tests. This mirrors how `commands.rs` uses `Grid`.
+- `Book::resolve(location, sit, &dyn World, last_tp, last_sit) -> Result<Placement, String>` does the special-word table and the region check and changes nothing; `Book::commit(placement)` makes it held and `last`. `World` is a small trait over the live session (`here()`, `sitting()`, `region_of(Uuid)`), implemented by `Session` and passed only while the avatar is in a region and not on its way out, with a fake in tests. This mirrors how `commands.rs` uses `Grid`.
 
 Alternative considered: put the state into `Reconciler`. Rejected: the reconciler needs only "which region" and "which kind of seat", and mixing in argument parsing and `last`/`last_cmd` memory would end its being a small pure state machine.
 
@@ -70,7 +70,7 @@ Alternative considered: start in manual mode and treat startup placement as a sc
 
 ### 4. The session reports the prim the simulator named
 
-`Session` keeps both `seat_requested` (what `seat_confirmed` is today) and `seat_prim` (the `AvatarSitResponse` object). `SessionEvent::Seated { prim, requested }` and `Seat::Object { prim, requested }` carry both. "On target" in `Bot` is `prim == target || requested == Some(target)`, which keeps today's linkset rule for a `cfg` child prim and lets a `cur` persist hold the named prim. `status`, the `sit` command's answer and the `(object, region)` list use `prim` (and record `requested` too for the region check).
+`Session` keeps both `seat_requested` (what `seat_confirmed` is today) and `seat_prim` (the `AvatarSitResponse` object). `SessionEvent::Seated` and `Seat::Object` carry both, as a `Sat { prim, requested }`. "On target" in `Bot` is `prim == target || requested == Some(target)`, which keeps today's linkset rule for a `cfg` child prim and lets a `cur` persist hold the named prim. `status`, the `sit` command's answer and the `(object, region)` list use `prim` (and record `requested` too for the region check).
 
 `Session` also gets `on_ground: bool`, set by `sit_ground`, cleared by `stand`, on opening a circuit, on `TeleportLocal`, and when the avatar becomes parented. It serves only `cur` and the one-off stand.
 

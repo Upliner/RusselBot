@@ -49,7 +49,8 @@ echo 'show regions' > /tmp/sim.in
    ```
 
 2. Rez the seat prim in `Target`. Either run the helper, which logs in as
-   `Rig Owner`, rezzes a box at 130, 128 and prints its UUID and position:
+   `Rig Owner`, rezzes a box at 130, 128 and prints its UUID and position
+   (`test-rig/rezprim.py Home` rezzes one in the other region):
 
    ```sh
    test-rig/rezprim.py
@@ -205,6 +206,53 @@ and no `region`, the ground sit after standing up from an object, and the
 sit backoff's one-minute cap without a region. Not tried on Second Life:
 any of the above, in particular whether a ground sit sent right at region
 entry takes effect there.
+
+## Holding a place: `persist`
+
+Since `add-persist-command` the bot holds a placement that `persist` in the
+config and `rslbot ctl persist` choose. The items above were run with what
+is now `persist = "cfg"`; items 58, 61 and 62 describe the behaviour before
+this change and are superseded by items 70 to 72.
+
+The configs here have `position = [120.0, 120.0, 25.0]`, ten metres from
+the seat prim (at 130, 128, 25.55 in `Target`), so that a held position
+shows whether it is the configured one or the seated one. `rezprim.py Home`
+rezzed a second prim, at 130, 128, 25.2 in `Home`; `<home prim>` below.
+Where a position is compared, the other side is `listen.py`'s
+`bot at ...` line (the avatar's offset on its seat, or its place in the
+region when it stands) and the prim's location from the console's
+`show object id`.
+
+| # | Inject | Expected | Result (2026-11-19, OpenSim 9d00a55552) |
+|---|---|---|---|
+| 65 | `region`, `position`, `sit`, no `persist`; then `ctl status` | After `seated`: `config: persist cur cur` and `placement: holding` with the seated position and the seat; the same on the `persist` line; `seat: target` | Pass: `Target/129.33/127.6/26.45 <uuid>`, persisted in the second of the sit. The simulator answered the request about the seat with an `ObjectUpdateCompressed` |
+| 66 | `ctl stand`, `ctl sit <uuid>`, `ctl status`, with `listen.py` running | The bot's position is the prim's plus the offset the helper sees | Pass: the helper saw `-0.7 -0.2 0.9` on the prim; 130, 128, 25.55 plus that is the bot's `129.33, 127.85, 26.45`. Standing, the helper's one full update said z 27.1 and the bot, following the avatar down, 26.01 |
+| 67 | `kick user Sit Bot bye` after item 65 | Login asking for the persisted location, then seated again | Pass: `start: uri:Target&129&128&26`, seated in the same second |
+| 68 | `persist = "cfg"`; items 3, 5 and 9 again; then the same config with a `sit` UUID that does not exist (in place of item 8, which deletes the prim) | Holds `Target/120/120/25 <uuid>` before and after sitting; re-sit after 5 s; login at `uri:Target&120&120&25`; return from `Home` to 120, 120, 25; three failed sits, then a teleport to 120, 120, 25, and no `config: persist` line | Pass, all of it |
+| 69 | `persist = "off"`; `stand user`, `kick user`, then `ctl home` | Sits once, `the avatar is in place and persist is off`, `mode: manual`; no re-sit; login with `start: last` and no sit; `home` sits on the configured object | Pass |
+| 70 | `persist = ["cfg", "cur"]`; a `[persist]` table with `position = "cur"`, `sit = "cfg"` | `config: persist cfg cur` holding `Target/120/120/25 ...`; `config: persist cur cfg` holding the seated position | Pass, both; with the array, `teleport user ... Home/...` was answered by a teleport to 120, 120, 25 and a sit |
+| 71 | Account only, avatar last in `Target` (was item 58) | `start: last`; holds the place it arrived at with `stand`; teleports back after `teleport user ... Home/...`; after a kick logs in asking for that place; never sits | Pass: `persist: Target/129.33/127.6/26.45 stand`. The location is the one the login reported; the avatar then settled 0.5 m lower |
+| 72 | `sit = <uuid>` without `region`: avatar last in `Target` (was item 61), then last in `Home` (was item 62) | In `Target`: sits, holds the seated position, returns and sits again after `teleport user`. In `Home`: holds `Home/...`, three failed sits, then a teleport to that place, and sitting goes on | Pass, both: failures at 15 s with delays of 5, 10 and 20 s, then `teleporting to "Home" at 128, 128, 25.96` |
+| 73 | During item 72 in `Home`: `ctl tp 128 128 25 Target`, `ctl sit <uuid>` | `mode: manual`, and no `config: persist` line afterwards although the avatar now sits on the configured object | Pass |
+| 74 | `ctl tp 100 100 25 Home`, `ctl sit <home prim>`, `ctl persist`; then `teleport user Sit Bot Target/128/128/25` | The command prints the place in `Home` and the prim, exit status 0, no new sit request; the bot teleports back to `Home` and sits again | Pass: `Home/129.33/127.53/26.34 <home prim>` |
+| 75 | From `Home`, seated: `ctl persist "Target/128/128/25" ground`, with `listen.py` running | Status 0 at once; `standing up`, a teleport to `Target`, `sitting on the ground`; `bot ground sit: yes` | Pass |
+| 76 | In `Target` at 128, 128: `ctl persist Target/10/10/25 stand` | The avatar stands up from the ground and is not moved | Pass: `bot ground sit: no`, position still 128, 128 |
+| 77 | Seated: `ctl persist cur stand`; seated again: `ctl persist cur unchanged`, then `stand user`; seated: `ctl persist cur ground` | Stands up; stays seated, and after the simulator unseats it no sit request follows; stands up and then sits on the ground | Pass: no `AgentRequestSit` after the unseat; the helper saw the avatar leave the prim and then `bot ground sit: yes` |
+| 78 | `kick user`, then before the next login `ctl persist`, `ctl persist cfg cfg` | The first: `the avatar is not connected to a region`, status 1, nothing changed. The second: status 0, and the login that follows asks for the configured position and sits | Pass |
+| 79 | After item 74: `ctl tp 128 128 25 Target`, `ctl home` | `home` prints the persisted place in `Home` and the bot goes there and sits, not to the configured `Target` | Pass |
+| 80 | `ctl sit <uuid>`, `ctl tp 110 120 30`, `ctl persist "Home/100/100/25" stand`, then `ctl persist last_cmd last_cmd` | Prints `Target/110/120/30 <uuid>`; the bot teleports there and sits | Pass |
+| 81 | Seated in `Target`: `ctl persist "Home/128/128/25" cur`; `ctl persist cur <home prim>`; with the last `tp` in `Home` and the last `sit` in `Target`: `ctl persist last_cmd last_cmd` | Status 1 naming both regions each time; `persist` line and `mode` unchanged | Pass, all three |
+| 82 | `ctl persist Target/128/128 stand`, `ctl persist cur chair`, `ctl persist Blue Lagoon/128/128/25 stand` (unquoted), `ctl home now` | Status 1 naming the argument and its accepted forms; for the third, that a region name of several words has to be quoted | Pass |
+| 83 | `--verbose` without `scan_distance`, over all the runs above | One `RequestMultipleObjects` each time the avatar becomes seated, none otherwise | Pass: 15 of 15, 3 of 3, 2 of 2, 2 of 2, 1 of 1, and none in the runs where the avatar never sat |
+
+Not covered on this rig: a seat in a linkset (the prims here are single, so
+the prim the simulator names is the one asked for; the difference is in
+unit tests only), a seat that is turned or that moves, and an avatar pushed
+by a script (unit tests only). OpenSim answered the request about the seat
+at once; the 10-second wait and the fallback to the position before the
+sit are covered by unit tests only. Not tried on Second Life: any of this,
+in particular whether the simulator there answers the request about the
+seat and in which form, and the positions in its terse updates.
 
 Not covered: Windows, where the socket is TCP. On Second Life, looking a
 name up through `AvatarPickerRequest` found nobody (2026-11-18, an avatar

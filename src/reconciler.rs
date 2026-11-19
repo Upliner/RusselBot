@@ -43,10 +43,12 @@ pub enum SeatGoal {
     Ground,
 }
 
-/// What the config asks the bot to hold.
+/// What the bot holds, as far as the decisions here need it: the held
+/// placement without its coordinates and its object's id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Goal {
-    /// The region to stay in; without one every region will do.
+    /// The region to stay in. Missing only until the first login has said
+    /// where the avatar is; every region will do until then.
     pub region: Option<String>,
     /// Where a login asks to be placed.
     pub start: Start,
@@ -85,9 +87,10 @@ pub struct Memory {
     sit_failures: u32,
     reposition: bool,
     /// The ground sit the goal asks for has been sent since the avatar last
-    /// arrived, stood up from an object, or came back to holding mode.
+    /// arrived, stood up from an object, or a placement was persisted.
     ground_done: bool,
-    /// The avatar has been seen seated on an object since that ground sit.
+    /// The avatar is seated on an object, the target or another, as far as
+    /// the simulator has said.
     on_object: bool,
     fatal: Option<String>,
     /// The operator placed the avatar by hand: stay connected, and leave
@@ -108,7 +111,8 @@ fn gate(not_before: Option<Instant>, action: Action, now: Instant) -> Decision {
 
 /// Chooses the next step from the current state, the placement mode and
 /// the goal alone, by the first rule that applies: log in, nothing (manual
-/// mode), teleport, sit on the object, sit on the ground, or nothing.
+/// mode), teleport, sit on the object, sit on the ground (once the avatar
+/// is off any object), or nothing.
 pub fn decide(observed: &Observed, memory: &Memory, goal: &Goal, now: Instant) -> Decision {
     if let Some(message) = &memory.fatal {
         return Decision::Exit { code: 1, message: message.clone() };
@@ -133,7 +137,11 @@ pub fn decide(observed: &Observed, memory: &Memory, goal: &Goal, now: Instant) -
             gate(memory.next_teleport, Action::Teleport, now)
         }
         (Some(SeatGoal::Object), _) => gate(memory.next_sit, Action::Sit, now),
-        (Some(SeatGoal::Ground), _) if !memory.ground_done => Decision::Start(Action::SitGround),
+        // A ground sit means nothing to an avatar on an object: it waits
+        // for the avatar to be reported standing.
+        (Some(SeatGoal::Ground), _) if !memory.ground_done && !memory.on_object => {
+            Decision::Start(Action::SitGround)
+        }
         _ => Decision::Wait(None),
     }
 }
@@ -186,31 +194,79 @@ impl Reconciler {
         self.memory.manual
     }
 
-    /// Switches between holding the configured place (the default) and
-    /// leaving the avatar where the operator put it. Going manual gives up
-    /// a teleport or sit of the bot's own without counting it as failed;
+    /// Switches between holding the placement (the default) and leaving
+    /// the avatar where the operator put it. Going manual gives up a
+    /// teleport or sit of the bot's own without counting it as failed;
     /// coming back starts the return at once.
     pub fn set_manual(&mut self, manual: bool) {
         self.memory.manual = manual;
         if manual {
-            if matches!(self.memory.in_flight, Some(Action::Teleport | Action::Sit)) {
-                self.memory.in_flight = None;
-            }
+            self.abandon();
         } else {
-            // What happened to the avatar under the operator's hand says
-            // nothing about how well the bot's own attempts go.
-            self.memory.teleport.reset();
-            self.memory.sit.reset();
-            self.memory.next_teleport = None;
-            self.memory.next_sit = None;
-            self.memory.sit_failures = 0;
-            self.memory.reposition = false;
-            self.memory.ground_done = false;
+            self.rearm();
         }
+    }
+
+    /// Gives up a teleport or sit of the bot's own, without counting it as
+    /// failed: what it was for no longer holds.
+    fn abandon(&mut self) {
+        if matches!(self.memory.in_flight, Some(Action::Teleport | Action::Sit)) {
+            self.memory.in_flight = None;
+        }
+    }
+
+    /// Lets the bot act on its goal at once: what happened to the avatar
+    /// under the operator's hand, or for an earlier goal, says nothing
+    /// about how well the next attempts go. A ground sit is due again.
+    pub fn rearm(&mut self) {
+        self.memory.teleport.reset();
+        self.memory.sit.reset();
+        self.memory.next_teleport = None;
+        self.memory.next_sit = None;
+        self.memory.sit_failures = 0;
+        self.memory.reposition = false;
+        self.memory.ground_done = false;
     }
 
     pub fn goal(&self) -> &Goal {
         &self.goal
+    }
+
+    /// Replaces what the bot holds. `seated_on_target` says whether the
+    /// avatar sits on the new goal's object right now, so that a seat that
+    /// has just become the target is not asked for again. An action of the
+    /// bot's own that was for the old goal is given up.
+    pub fn set_goal(&mut self, goal: Goal, seated_on_target: bool, now: Instant) {
+        self.goal = goal;
+        self.abandon();
+        if self.observed.region.is_none() {
+            return;
+        }
+        match (seated_on_target, self.observed.seat) {
+            (true, Seat::SeatedOnTarget) => {}
+            (true, _) => {
+                self.observed.seat = Seat::SeatedOnTarget;
+                self.memory.on_object = true;
+                self.memory.seated_since = Some(now);
+            }
+            (false, Seat::SeatedOnTarget) => {
+                // Still on that object, which is no longer the target.
+                self.observed.seat = Seat::NotSeated;
+                self.memory.seated_since = None;
+            }
+            (false, _) => {}
+        }
+    }
+
+    /// Whether the avatar is seated on the goal's object.
+    pub fn seated_on_target(&self) -> bool {
+        self.observed.seat == Seat::SeatedOnTarget
+    }
+
+    /// Whether the ground sit the goal asks for has been sent since it
+    /// last became due.
+    pub fn ground_sat(&self) -> bool {
+        self.memory.ground_done
     }
 
     /// Whether the avatar is in the region it is to stay in; without a
@@ -827,18 +883,160 @@ mod tests {
         rec
     }
 
+    /// What `Bot` does when the first login reports a location and none is
+    /// held: the region arrived in becomes the one to hold.
+    fn hold_arrival(rec: &mut Reconciler, region: &str, now: Instant) {
+        let seat = rec.goal().seat;
+        rec.set_goal(goal(Some(region), Start::Target, seat), false, now);
+    }
+
     #[test]
-    fn without_region_and_seat_the_bot_only_stays_connected() {
+    fn nothing_configured_but_the_account_holds_where_it_arrived() {
         let now = Instant::now();
         let mut rec = arrived(goal(None, Start::Last, None), "Anywhere", now);
+        // Until the bot has taken the arrival region as its goal, every
+        // region will do.
         assert!(rec.in_target_region());
         assert_eq!(rec.decide(now), Decision::Wait(None));
+        hold_arrival(&mut rec, "Anywhere", now);
+        assert!(rec.in_target_region());
+        assert_eq!(rec.decide(now), Decision::Wait(None));
+        // It never sits by itself.
         assert_eq!(rec.standing(now + secs(1)), None);
-        rec.region_entered("Elsewhere", now + secs(5));
         assert_eq!(rec.decide(now + secs(4000)), Decision::Wait(None));
+        // It logs in there again whenever the session is lost.
         let lost = now + secs(5000);
         assert_eq!(rec.session_lost(lost), secs(10));
-        assert_eq!(step(&mut rec, lost + secs(10)), start(Action::Login(Start::Last)));
+        assert_eq!(step(&mut rec, lost + secs(10)), start(Action::Login(Start::Target)));
+    }
+
+    #[test]
+    fn moved_while_no_region_is_configured_teleports_back() {
+        let now = Instant::now();
+        let mut rec = arrived(goal(None, Start::Last, None), "Anywhere", now);
+        hold_arrival(&mut rec, "Anywhere", now);
+        rec.region_entered("Elsewhere", now + secs(5));
+        assert!(!rec.in_target_region());
+        assert_eq!(step(&mut rec, now + secs(5)), start(Action::Teleport));
+        rec.region_entered("Anywhere", now + secs(8));
+        assert_eq!(rec.decide(now + secs(8)), Decision::Wait(None));
+    }
+
+    #[test]
+    fn moved_inside_the_target_region_is_left_alone() {
+        let now = Instant::now();
+        // Standing: nothing at all.
+        let mut rec = arrived(goal(Some(TARGET), Start::Target, None), TARGET, now);
+        rec.teleport_arrived();
+        assert_eq!(rec.standing(now + secs(1)), None);
+        assert_eq!(rec.decide(now + secs(1)), Decision::Wait(None));
+        // On the ground: it is sat down again where it now is, not moved.
+        let mut rec = arrived(ground(Some(TARGET)), TARGET, now);
+        assert_eq!(step(&mut rec, now), start(Action::SitGround));
+        rec.teleport_arrived();
+        assert_eq!(step(&mut rec, now + secs(1)), start(Action::SitGround));
+        assert_eq!(rec.decide(now + secs(1)), Decision::Wait(None));
+    }
+
+    #[test]
+    fn stand_and_unchanged_ask_for_no_sit() {
+        // Both sit states reach the reconciler as "no seat".
+        let now = Instant::now();
+        let mut rec = arrived(goal(Some(TARGET), Start::Target, None), TARGET, now);
+        assert_eq!(rec.decide(now), Decision::Wait(None));
+        rec.seated_elsewhere(now + secs(1));
+        assert_eq!(rec.decide(now + secs(1)), Decision::Wait(None));
+        assert_eq!(rec.standing(now + secs(2)), None);
+        assert_eq!(rec.decide(now + secs(4000)), Decision::Wait(None));
+    }
+
+    // ------------------------------------------------ a goal that changes
+
+    #[test]
+    fn held_placement_changed_while_holding_acts_at_once() {
+        let now = Instant::now();
+        let mut rec = logged_in("Home", now);
+        assert_eq!(step(&mut rec, now), start(Action::Teleport));
+        assert_eq!(rec.teleport_failed(now), secs(10));
+        assert_eq!(rec.decide(now + secs(1)), Decision::Wait(Some(now + secs(10))));
+        // A persist names a place in another region.
+        rec.set_goal(goal(Some("Blue Lagoon"), Start::Target, Some(SeatGoal::Object)), false, now + secs(1));
+        rec.rearm();
+        assert_eq!(step(&mut rec, now + secs(1)), start(Action::Teleport));
+        // And the delays start over.
+        assert_eq!(rec.teleport_failed(now + secs(2)), secs(10));
+    }
+
+    #[test]
+    fn a_new_goal_gives_up_the_action_for_the_old_one() {
+        let now = Instant::now();
+        let mut rec = logged_in(TARGET, now);
+        assert_eq!(step(&mut rec, now), start(Action::Sit));
+        // The sit for the old object is still under way.
+        rec.set_goal(goal(Some(TARGET), Start::Target, None), false, now);
+        rec.rearm();
+        assert_eq!(rec.decide(now), Decision::Wait(None));
+        // Its late outcome is as good as standing, and nothing waits on it.
+        rec.seated_elsewhere(now + secs(1));
+        assert_eq!(rec.decide(now + secs(1)), Decision::Wait(None));
+
+        // A login is not given up.
+        let mut rec = Reconciler::new(holding());
+        assert_eq!(step(&mut rec, now), start(Action::Login(Start::Target)));
+        rec.set_goal(goal(Some("Blue Lagoon"), Start::Target, None), false, now);
+        assert_eq!(rec.decide(now), Decision::Wait(None));
+        rec.login_accepted();
+        rec.region_entered(TARGET, now);
+        assert_eq!(step(&mut rec, now), start(Action::Teleport));
+    }
+
+    #[test]
+    fn the_current_seat_becoming_the_target_is_not_asked_for_again() {
+        let now = Instant::now();
+        let mut rec = logged_in(TARGET, now);
+        rec.set_manual(true);
+        // Seated by a command on an object that is not the target.
+        rec.seated_elsewhere(now + secs(1));
+        assert!(!rec.seated_on_target());
+        // A persist makes that object the target.
+        rec.set_goal(holding(), true, now + secs(2));
+        rec.rearm();
+        rec.set_manual(false);
+        assert!(rec.seated_on_target());
+        assert_eq!(rec.decide(now + secs(2)), Decision::Wait(None));
+        // Being unseated from it is answered like any other unseating.
+        assert_eq!(rec.standing(now + secs(3)), Some(secs(5)));
+        assert_eq!(step(&mut rec, now + secs(8)), start(Action::Sit));
+    }
+
+    #[test]
+    fn a_seat_that_is_no_longer_the_target_is_left() {
+        let now = Instant::now();
+        let mut rec = seated(now);
+        // A persist with `stand` or `unchanged`: no seat is held any more.
+        rec.set_goal(goal(Some(TARGET), Start::Target, None), false, now + secs(1));
+        rec.rearm();
+        assert!(!rec.seated_on_target());
+        assert_eq!(rec.decide(now + secs(1)), Decision::Wait(None));
+        // Standing up later calls for nothing, and for no delay.
+        assert_eq!(rec.standing(now + secs(2)), None);
+        assert_eq!(rec.decide(now + secs(4000)), Decision::Wait(None));
+    }
+
+    #[test]
+    fn a_goal_set_while_disconnected_waits_for_the_login() {
+        let now = Instant::now();
+        let mut rec = seated(now);
+        let lost = now + secs(60);
+        rec.session_lost(lost);
+        rec.set_goal(goal(Some("Blue Lagoon"), Start::Target, Some(SeatGoal::Ground)), false, lost);
+        rec.rearm();
+        assert_eq!(step(&mut rec, lost + secs(10)), start(Action::Login(Start::Target)));
+        rec.login_accepted();
+        rec.region_entered(TARGET, lost + secs(11));
+        assert_eq!(step(&mut rec, lost + secs(11)), start(Action::Teleport));
+        rec.region_entered("blue lagoon", lost + secs(14));
+        assert_eq!(step(&mut rec, lost + secs(14)), start(Action::SitGround));
     }
 
     #[test]
@@ -878,19 +1076,38 @@ mod tests {
     }
 
     #[test]
-    fn seat_without_a_region_sits_anywhere_and_never_repositions() {
+    fn seat_without_a_region_sits_where_the_login_put_it() {
         let now = Instant::now();
         let mut rec = arrived(goal(None, Start::Last, Some(SeatGoal::Object)), "Anywhere", now);
+        hold_arrival(&mut rec, "Anywhere", now);
+        // No teleport: the avatar is where it is to be.
+        assert_eq!(step(&mut rec, now), start(Action::Sit));
+        rec.seated(now + secs(1));
+        assert_eq!(rec.decide(now + secs(4000)), Decision::Wait(None));
+    }
+
+    #[test]
+    fn object_not_in_reach_and_no_region_configured_repositions_to_the_arrival_spot() {
+        let now = Instant::now();
+        let mut rec = arrived(goal(None, Start::Last, Some(SeatGoal::Object)), "Anywhere", now);
+        hold_arrival(&mut rec, "Anywhere", now);
         let mut at = now;
-        for _ in 0..6 {
+        for _ in 0..3 {
             assert_eq!(step(&mut rec, at), start(Action::Sit));
             at += rec.sit_failed(at);
         }
-        // At the longest delay by now, and still sitting, not teleporting.
-        assert_eq!(rec.sit_failed(at), secs(60));
-        assert_eq!(step(&mut rec, at + secs(60)), start(Action::Sit));
-        rec.seated(at + secs(61));
-        assert_eq!(rec.decide(at + secs(4000)), Decision::Wait(None));
+        // The location the login reported is held like a configured one.
+        assert_eq!(step(&mut rec, at), start(Action::Teleport));
+        rec.teleport_arrived();
+        // And the sit goes on, slowing down to once a minute.
+        let mut delays = Vec::new();
+        for _ in 0..3 {
+            assert_eq!(step(&mut rec, at), start(Action::Sit));
+            let delay = rec.sit_failed(at);
+            delays.push(delay.as_secs());
+            at += delay;
+        }
+        assert_eq!(delays, [40, 60, 60]);
     }
 
     // ----------------------------------------------------- ground sit
@@ -950,5 +1167,30 @@ mod tests {
         rec.set_manual(false);
         assert_eq!(step(&mut rec, now + secs(30)), start(Action::SitGround));
         assert_eq!(rec.decide(now + secs(30)), Decision::Wait(None));
+        assert!(rec.ground_sat());
+    }
+
+    #[test]
+    fn ground_sit_waits_for_the_avatar_to_leave_its_object() {
+        let now = Instant::now();
+        // Seated on the target, then a persist asks for the ground.
+        let mut rec = seated(now);
+        rec.set_goal(ground(Some(TARGET)), false, now + secs(1));
+        rec.rearm();
+        assert!(!rec.ground_sat());
+        assert_eq!(rec.decide(now + secs(1)), Decision::Wait(None));
+        // The stand request of the persist takes effect.
+        assert_eq!(rec.standing(now + secs(2)), None);
+        assert_eq!(step(&mut rec, now + secs(2)), start(Action::SitGround));
+        assert_eq!(rec.decide(now + secs(2)), Decision::Wait(None));
+
+        // The same for an object that never was the target.
+        let mut rec = arrived(goal(Some(TARGET), Start::Target, None), TARGET, now);
+        rec.seated_elsewhere(now + secs(1));
+        rec.set_goal(ground(Some(TARGET)), false, now + secs(2));
+        rec.rearm();
+        assert_eq!(rec.decide(now + secs(2)), Decision::Wait(None));
+        rec.standing(now + secs(3));
+        assert_eq!(step(&mut rec, now + secs(3)), start(Action::SitGround));
     }
 }

@@ -30,6 +30,23 @@ pub enum Sit {
     Ground,
 }
 
+/// Where a persisted value comes from once the config placement is reached.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Source {
+    /// What the simulator reports at that moment.
+    Cur,
+    /// What the config says.
+    Cfg,
+}
+
+/// What the bot holds once it has reached the config placement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Persist {
+    /// Nothing: it goes to manual mode.
+    Off,
+    On { position: Source, sit: Source },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub login_url: String,
@@ -42,6 +59,7 @@ pub struct Config {
     pub sit: Option<Sit>,
     /// The seat came from the old key `object`.
     pub deprecated_object: bool,
+    pub persist: Persist,
     /// TSV file for local chat, if any.
     pub log_chat: Option<PathBuf>,
     /// TSV file for instant messages, if any.
@@ -79,6 +97,7 @@ struct Raw {
     sit: Option<String>,
     object: Option<String>,
     // Kept untyped so that a wrong type is reported with the key's name.
+    persist: Option<toml::Value>,
     log_chat: Option<toml::Value>,
     log_im: Option<toml::Value>,
     fetch_offline_im: Option<toml::Value>,
@@ -133,6 +152,48 @@ fn log_path(value: Option<toml::Value>, key: &str) -> Result<Option<PathBuf>, Co
         None => Ok(None),
         Some(toml::Value::String(path)) if !path.is_empty() => Ok(Some(PathBuf::from(path))),
         Some(_) => err(format!("`{key}` must be a non-empty file path")),
+    }
+}
+
+const PERSIST_FORMS: &str = "`persist` must be \"cur\", \"cfg\", \"off\" (or false), an array \
+     [position, sit] of \"cur\" and \"cfg\", or a table with the keys `position` and `sit`";
+
+fn source(value: &toml::Value) -> Option<Source> {
+    match value.as_str() {
+        Some("cur") => Some(Source::Cur),
+        Some("cfg") => Some(Source::Cfg),
+        _ => None,
+    }
+}
+
+fn persist(value: Option<toml::Value>) -> Result<Persist, ConfigError> {
+    let both = |source| Persist::On { position: source, sit: source };
+    match value {
+        None => Ok(both(Source::Cur)),
+        Some(toml::Value::Boolean(false)) => Ok(Persist::Off),
+        Some(toml::Value::String(word)) if word == "off" => Ok(Persist::Off),
+        Some(word @ toml::Value::String(_)) => source(&word).map(both).ok_or(ConfigError(PERSIST_FORMS.to_string())),
+        Some(toml::Value::Array(items)) => match &items[..] {
+            [position, sit] => match (source(position), source(sit)) {
+                (Some(position), Some(sit)) => Ok(Persist::On { position, sit }),
+                _ => err(PERSIST_FORMS),
+            },
+            _ => err(PERSIST_FORMS),
+        },
+        Some(toml::Value::Table(table)) => {
+            let (mut position, mut sit) = (Source::Cur, Source::Cur);
+            for (key, value) in &table {
+                let slot = match key.as_str() {
+                    "position" => &mut position,
+                    "sit" => &mut sit,
+                    _ => return err(format!("`persist` has no key `{key}`; its keys are `position` and `sit`")),
+                };
+                *slot = source(value)
+                    .ok_or_else(|| ConfigError(format!("`persist.{key}` must be \"cur\" or \"cfg\"")))?;
+            }
+            Ok(Persist::On { position, sit })
+        }
+        Some(_) => err(PERSIST_FORMS),
     }
 }
 
@@ -225,6 +286,7 @@ impl Config {
             )),
         };
 
+        let persist = persist(raw.persist)?;
         let log_chat = log_path(raw.log_chat, "log_chat")?;
         let log_im = log_path(raw.log_im, "log_im")?;
         let fetch_offline_im = flag(raw.fetch_offline_im, "fetch_offline_im")?;
@@ -249,6 +311,7 @@ impl Config {
             place,
             sit,
             deprecated_object,
+            persist,
             log_chat,
             log_im,
             fetch_offline_im,
@@ -351,6 +414,69 @@ mod tests {
     fn rejects_both_seat_keys() {
         let msg = rejected(&(base() + &format!("object = \"{OBJECT}\"\n")));
         assert!(msg.contains("`sit`") && msg.contains("`object`"), "{msg}");
+    }
+
+    fn held(position: Source, sit: Source) -> Persist {
+        Persist::On { position, sit }
+    }
+
+    #[test]
+    fn persist_defaults_to_the_current_values() {
+        assert_eq!(Config::parse(&base()).unwrap().persist, held(Source::Cur, Source::Cur));
+    }
+
+    #[test]
+    fn persist_takes_one_word_for_both_values() {
+        let parsed = |value: &str| Config::parse(&(base() + &format!("persist = {value}\n"))).unwrap().persist;
+        assert_eq!(parsed("\"cur\""), held(Source::Cur, Source::Cur));
+        assert_eq!(parsed("\"cfg\""), held(Source::Cfg, Source::Cfg));
+        assert_eq!(parsed("\"off\""), Persist::Off);
+        assert_eq!(parsed("false"), Persist::Off);
+    }
+
+    #[test]
+    fn persist_takes_an_array_of_position_and_sit() {
+        let cfg = Config::parse(&(base() + "persist = [\"cfg\", \"cur\"]\n")).unwrap();
+        assert_eq!(cfg.persist, held(Source::Cfg, Source::Cur));
+    }
+
+    #[test]
+    fn persist_takes_a_table() {
+        let cfg = Config::parse(&(base() + "[persist]\nposition = \"cur\"\nsit = \"cfg\"\n")).unwrap();
+        assert_eq!(cfg.persist, held(Source::Cur, Source::Cfg));
+        // A key that is left out is "cur".
+        let cfg = Config::parse(&(base() + "[persist]\nsit = \"cfg\"\n")).unwrap();
+        assert_eq!(cfg.persist, held(Source::Cur, Source::Cfg));
+        let cfg = Config::parse(&(base() + "[persist]\nposition = \"cfg\"\n")).unwrap();
+        assert_eq!(cfg.persist, held(Source::Cfg, Source::Cur));
+        let cfg = Config::parse(&(base() + "[persist]\n")).unwrap();
+        assert_eq!(cfg.persist, held(Source::Cur, Source::Cur));
+    }
+
+    #[test]
+    fn rejects_persist_values_only_the_command_takes() {
+        for bad in ["\"last\"", "\"last_cmd\"", "\"Target/128/128/25\"", "true", "5", "\"Cur\"", "\"\""] {
+            let msg = rejected(&(base() + &format!("persist = {bad}\n")));
+            assert!(msg.contains("`persist`") && msg.contains("\"cfg\"") && msg.contains("\"off\""), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_persist_arrays() {
+        for bad in ["[]", "[\"cur\"]", "[\"cur\", \"cfg\", \"cur\"]", "[\"cur\", \"off\"]", "[\"cur\", false]"] {
+            let msg = rejected(&(base() + &format!("persist = {bad}\n")));
+            assert!(msg.contains("`persist`"), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_persist_tables() {
+        let msg = rejected(&(base() + "[persist]\nlocation = \"cur\"\n"));
+        assert!(msg.contains("`persist`") && msg.contains("`location`"), "{msg}");
+        let msg = rejected(&(base() + "[persist]\nsit = \"ground\"\n"));
+        assert!(msg.contains("`persist.sit`"), "{msg}");
+        let msg = rejected(&(base() + "[persist]\nposition = \"off\"\n"));
+        assert!(msg.contains("`persist.position`"), "{msg}");
     }
 
     #[test]
@@ -495,6 +621,7 @@ mod tests {
         assert_eq!(cfg.place, Place::Region { name: "Target".to_string(), position: [128.0, 128.0, 25.0] });
         assert_eq!(cfg.sit, Some(Sit::Object(Uuid::nil())));
         assert!(!cfg.deprecated_object);
+        assert_eq!(cfg.persist, Persist::On { position: Source::Cur, sit: Source::Cur });
     }
 
     #[test]
@@ -506,7 +633,11 @@ mod tests {
             assert!(text.contains(&commented), "{key} is not in the example");
             enabled = enabled.replace(&commented, &format!("{key} = "));
         }
+        let persist = "# persist = \"cfg\"";
+        assert!(text.contains(persist), "persist is not in the example");
+        enabled = enabled.replace(persist, "persist = \"cfg\"");
         let cfg = Config::parse(&enabled).unwrap();
+        assert_eq!(cfg.persist, Persist::On { position: Source::Cfg, sit: Source::Cfg });
         assert_eq!(cfg.log_chat, Some(PathBuf::from("chat.tsv")));
         assert_eq!(cfg.log_im, Some(PathBuf::from("im.tsv")));
         assert!(cfg.fetch_offline_im);

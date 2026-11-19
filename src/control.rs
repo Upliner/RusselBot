@@ -44,6 +44,7 @@ Usage: rslbot ctl say MESSAGE...
        rslbot ctl accepttp AVATAR
        rslbot ctl sendtp AVATAR [MESSAGE...]
        rslbot ctl touch UUID
+       rslbot ctl persist [LOCATION] [SIT]
        rslbot ctl home
        rslbot ctl status
        rslbot ctl quit
@@ -54,12 +55,21 @@ so `/1 hello` goes to channel 1. `im` sends an instant message. AVATAR is
 one argument: \"First Last\", first.last, a single word or a UUID.
 
 `stand`, `sit`, `tp`, `requesttp` and `accepttp` move the avatar, and the
-bot then leaves it where it is until `home` sends it back to the configured
-region and seat. `tp` without REGION stays in the current region, and
-without Z keeps the current height. `requesttp` asks AVATAR to teleport the
-bot to them; `accepttp` accepts an offer AVATAR has sent; `sendtp` offers
-AVATAR a teleport to the bot. `touch` clicks an object. `status` shows
-where the avatar is; `quit` logs out and stops the bot.
+bot then leaves it where it is until `persist` or `home`. `tp` without
+REGION stays in the current region, and without Z keeps the current height.
+`requesttp` asks AVATAR to teleport the bot to them; `accepttp` accepts an
+offer AVATAR has sent; `sendtp` offers AVATAR a teleport to the bot. `touch`
+clicks an object. `status` shows where the avatar is; `quit` logs out and
+stops the bot.
+
+`persist` tells the bot what to hold from now on: it returns to LOCATION
+when the avatar ends up in another region, and keeps it seated as SIT says.
+LOCATION is REGION/X/Y/Z as one argument, such as \"Blue Lagoon/128/128/25\".
+SIT is an object's UUID, `ground`, `stand` (stand up) or `unchanged` (leave
+sitting and standing alone). Either can also be `cur` (where the avatar is
+and what it sits on now; the default), `cfg` (what the config says), `last`
+(what was last persisted) or `last_cmd` (where the last `tp` went, what the
+last `sit` named). `home` is `persist last last`.
 
 The socket address is taken from the environment variable RUSSELBOT_SOCK
 when it is set.";
@@ -83,6 +93,9 @@ pub enum Request {
     SendTp { to: String, message: String },
     /// A UUID, still to be read.
     Touch(String),
+    /// A location and a sit state, still to be read; what is left out
+    /// stands for `cur`.
+    Persist { location: Option<String>, sit: Option<String> },
     Home,
     Status,
     Quit,
@@ -172,6 +185,16 @@ impl Request {
             "touch" => {
                 arguments(1)?;
                 Ok(Request::Touch(fields.remove(0)))
+            }
+            "persist" => {
+                if given > 2 {
+                    return Err(format!(
+                        "`persist` takes at most 2 arguments, a location and a sit state, not {given}; \
+                         a region name of several words has to be quoted"
+                    ));
+                }
+                let mut fields = fields.into_iter();
+                Ok(Request::Persist { location: fields.next(), sit: fields.next() })
             }
             "home" => arguments(0).map(|()| Request::Home),
             "status" => arguments(0).map(|()| Request::Status),
@@ -493,6 +516,12 @@ mod tests {
         assert_eq!(Request::decode(b"accepttp\tjane.doe"), Ok(Request::AcceptTp(text("jane.doe"))));
         assert_eq!(Request::decode(b"touch\tabc"), Ok(Request::Touch(text("abc"))));
         assert_eq!(Request::decode(b"home"), Ok(Request::Home));
+        assert_eq!(Request::decode(b"persist"), Ok(Request::Persist { location: None, sit: None }));
+        assert_eq!(Request::decode(b"persist\tcur"), Ok(Request::Persist { location: Some(text("cur")), sit: None }));
+        assert_eq!(
+            Request::decode(b"persist\tBlue Lagoon/128/128/25\tstand"),
+            Ok(Request::Persist { location: Some(text("Blue Lagoon/128/128/25")), sit: Some(text("stand")) })
+        );
         assert_eq!(Request::decode(b"status"), Ok(Request::Status));
         assert_eq!(Request::decode(b"quit"), Ok(Request::Quit));
         assert_eq!(Request::decode(b"shout\tover\there"), Ok(Request::Shout(text("over here"))));
@@ -511,6 +540,10 @@ mod tests {
         assert!(Request::decode(b"accepttp\ta\tb").unwrap_err().contains("`accepttp`"));
         assert!(Request::decode(b"touch").unwrap_err().contains("`touch`"));
         assert!(Request::decode(b"shout").unwrap_err().contains("`shout`"));
+        assert!(Request::decode(b"home\tnow").unwrap_err().contains("`home` takes no arguments"));
+        // An unquoted region name of two words makes three arguments.
+        let reason = Request::decode(b"persist\tBlue\tLagoon/128/128/25\tstand").unwrap_err();
+        assert!(reason.contains("`persist`") && reason.contains("not 3") && reason.contains("quoted"), "{reason}");
     }
 
     #[test]
@@ -554,6 +587,12 @@ mod tests {
         assert_eq!(request_line(&strings(&["say"])), "say\n");
         assert_eq!(request_line(&strings(&["im", "Jane Doe"])), "im\tJane Doe\n");
         assert_eq!(request_line(&strings(&["dance", "with", "me"])), "dance\twith\tme\n");
+        // A quoted location stays one argument.
+        assert_eq!(
+            request_line(&strings(&["persist", "Blue Lagoon/128/128/25", "stand"])),
+            "persist\tBlue Lagoon/128/128/25\tstand\n"
+        );
+        assert_eq!(request_line(&strings(&["persist"])), "persist\n");
     }
 
     #[test]
