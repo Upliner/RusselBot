@@ -122,10 +122,14 @@ The command SHALL be answered with an error and do nothing further when no entry
 - **THEN** the command exits with status 1 saying there is no such item, and nothing is sent to the simulator
 
 ### Requirement: Inventory is read on demand
-The bot SHALL ask the grid about the inventory only to carry out a command that needs it, and SHALL NOT keep what it learned for a later command: every command sees the inventory as the grid has it then. The `inventory` command and every lookup of an item or folder SHALL be answered with an error, and SHALL ask the grid nothing, when the avatar is not connected to a region or is in the middle of a teleport or a logout, and when the simulator the avatar is on offers no inventory service. A command whose lookup is under way when the session is lost or the avatar changes simulator SHALL be answered with an error. Reading the inventory SHALL NOT delay the bot's simulator traffic and SHALL NOT change the bot's placement mode.
+The bot SHALL ask the grid about the inventory only to carry out a command that needs it and, while `restore_attachments` is on, to restore attachments after a login (see `avatar-outfit`, "Restoring attachments after a login"). It SHALL NOT keep what it learned for a later command: every command sees the inventory as the grid has it then. The `inventory` command and every lookup of an item or folder SHALL be answered with an error, and SHALL ask the grid nothing, when the avatar is not connected to a region or is in the middle of a teleport or a logout, and when the simulator the avatar is on offers no inventory service. A command whose lookup is under way when the session is lost or the avatar changes simulator SHALL be answered with an error. Reading the inventory SHALL NOT delay the bot's simulator traffic and SHALL NOT change the bot's placement mode.
 
 #### Scenario: No command, no inventory traffic
-- **WHEN** the bot runs for an hour and is given none of the commands that name an inventory item or folder
+- **WHEN** the bot runs for an hour with `restore_attachments = false` and is given none of the commands that name an inventory item or folder
+- **THEN** it has asked the grid for no inventory folder and no inventory item
+
+#### Scenario: No command and no outfit service
+- **WHEN** the bot runs for an hour with `restore_attachments` on, on a grid whose simulator offers no outfit service, and is given none of those commands
 - **THEN** it has asked the grid for no inventory folder and no inventory item
 
 #### Scenario: Change made in a viewer
