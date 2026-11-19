@@ -79,8 +79,28 @@ clothing commands can only be refused. On Second Life, checked by hand on
   not known. A viewer attaches at every login whatever the Current Outfit
   folder lists and the simulator did not bring, which would hide this. The
   bot now does the same (`restore_attachments`, see
-  [Attachments](#attachments)); that is verified by unit tests only and
-  has not been tried on Second Life yet.
+  [Attachments](#attachments)).
+- Two logins with that, the same evening, `--verbose`. At the first the
+  object lost before was still missing; 20 seconds after the region was
+  entered the bot read the Current Outfit folder, asked for it, and the
+  simulator showed it on `Right Hand` a second later. An `attach` of it
+  was then refused as attached already. Meanwhile another object had been
+  attached to the same point by command, and it was detached before the
+  logout. At the second login the simulator brought the restored object by
+  itself, so this time the same sequence lost nothing; whether that was the
+  order of the attaches or chance, two logins do not tell.
+- One thing in those two logins is not understood. The folder also lists an
+  object that the simulator showed at no login that day. The bot asked for
+  it both times, the simulator showed it on `Chin` within the second, where
+  another object already was, and at the next login it was missing again.
+  The avatar looked right afterwards, with nothing doubled. Whether it
+  then wears two things there or one under two inventory items the log
+  does not tell, and `inventory -a` was not run to see. So the bot sends
+  one request at every login that changes nothing to the eye; a viewer
+  would ask for the same object at every login.
+- Also seen there: at the first of the two logins the simulator took 12
+  seconds to show the avatar's attachments, not four as before, which
+  leaves 8 of the 20 seconds the bot waits.
 - In those four also: the simulator took 21 and 15 seconds to carry out an
   `attach`. The bot waits 15, so the first was answered as refused; the
   object came six seconds later and was reported, and got no link in the
@@ -92,8 +112,10 @@ viewer shows, `attach` with a body part named, `unwear` by kind of
 clothing, `wear` of a body part, a grid that refuses the new outfit,
 `anim`, `sound`, the points the bot reported compared with a viewer, a
 viewer login afterwards to see whether it finds the avatar as the bot left
-it, and whether an object missing after a login is on the avatar for other
-people.
+it, whether an object missing after a login is on the avatar for other
+people, a login with `restore_attachments = false`, a login at which the
+folder lists nothing that is missing, and an `attach` the simulator takes
+longer than 15 seconds over, now that the bot waits 30.
 
 ## Build
 
