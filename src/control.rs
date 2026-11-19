@@ -53,6 +53,10 @@ Usage: rslbot ctl say MESSAGE...
        rslbot ctl persist [LOCATION] [SIT]
        rslbot ctl home
        rslbot ctl status
+       rslbot ctl rlv mode on | off
+       rslbot ctl rlv persist follow | drop
+       rslbot ctl rlv status
+       rslbot ctl rlv cmd COMMAND...
        rslbot ctl quit
 
 Sends a command to a running bot that has `socket = true` in its config.
@@ -94,6 +98,16 @@ takes off an item, everything on a body part, or all clothing of a KIND
 (`shirt`, `pants`, ...). `anim play` and `anim stop` start and stop an
 animation from the inventory, and `sound` plays a sound from it once. None
 of these moves the avatar.
+
+`rlv mode` switches RLV on and off: while it is on, the bot reads the `@`
+commands that objects the avatar owns say to their owner, answers their
+version queries and carries out forced sits, stands, teleports and detaches.
+`rlv persist` says what such a forced movement does to the place the bot
+holds: `drop` makes it stop holding, `follow` makes the result the place it
+holds. `rlv status` prints both. `rlv cmd` carries out RLV commands as if an
+object had sent them, such as `rlv cmd @versionnum=5` or
+`rlv cmd @tpto:Blue Lagoon/128/128/25=force`, and prints what became of
+each; it is refused while RLV is off. None of the switches is saved.
 
 The socket address is taken from the environment variable RUSSELBOT_SOCK
 when it is set.";
@@ -153,7 +167,20 @@ pub enum Request {
     },
     Home,
     Status,
+    Rlv(RlvRequest),
     Quit,
+}
+
+/// The `rlv` commands.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RlvRequest {
+    /// `rlv mode on` (true) or `rlv mode off`.
+    Mode(bool),
+    /// `rlv persist follow` (true) or `rlv persist drop`.
+    Persist(bool),
+    Status,
+    /// RLV commands as an object would send them, still to be read.
+    Cmd(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -291,6 +318,23 @@ impl Request {
                     location: fields.next(),
                     sit: fields.next(),
                 })
+            }
+            "rlv" => {
+                let words: Vec<&str> = fields.iter().map(String::as_str).collect();
+                let rlv = match words[..] {
+                    ["mode", "on"] => RlvRequest::Mode(true),
+                    ["mode", "off"] => RlvRequest::Mode(false),
+                    ["mode", ..] => return Err("`rlv mode` takes `on` or `off`".to_string()),
+                    ["persist", "follow"] => RlvRequest::Persist(true),
+                    ["persist", "drop"] => RlvRequest::Persist(false),
+                    ["persist", ..] => return Err("`rlv persist` takes `follow` or `drop`".to_string()),
+                    ["status"] => RlvRequest::Status,
+                    ["status", ..] => return Err("`rlv status` takes no arguments".to_string()),
+                    ["cmd"] => return Err("`rlv cmd` takes an RLV command, such as `@versionnum=5`".to_string()),
+                    ["cmd", ..] => RlvRequest::Cmd(words[1..].join(" ")),
+                    _ => return Err("`rlv` takes `mode on|off`, `persist follow|drop`, `status` or `cmd COMMAND`".to_string()),
+                };
+                Ok(Request::Rlv(rlv))
             }
             "home" => arguments(0).map(|()| Request::Home),
             "status" => arguments(0).map(|()| Request::Status),
@@ -756,6 +800,46 @@ mod tests {
             let reason = Request::decode(bad).unwrap_err();
             assert!(reason.contains("`play ITEM`") && reason.contains("`stop ITEM`"), "{reason}");
         }
+    }
+
+    #[test]
+    fn rlv_requests_are_read_from_their_lines() {
+        let read = |line: &str| Request::decode(line.as_bytes());
+        assert_eq!(read("rlv\tmode\ton"), Ok(Request::Rlv(RlvRequest::Mode(true))));
+        assert_eq!(read("rlv\tmode\toff\n"), Ok(Request::Rlv(RlvRequest::Mode(false))));
+        assert_eq!(read("rlv\tpersist\tfollow"), Ok(Request::Rlv(RlvRequest::Persist(true))));
+        assert_eq!(read("rlv\tpersist\tdrop"), Ok(Request::Rlv(RlvRequest::Persist(false))));
+        assert_eq!(read("rlv\tstatus"), Ok(Request::Rlv(RlvRequest::Status)));
+        assert_eq!(
+            read("rlv\tcmd\t@versionnum=5"),
+            Ok(Request::Rlv(RlvRequest::Cmd("@versionnum=5".to_string())))
+        );
+        // The words of a command are joined: a region name may have spaces.
+        let line = request_line(&strings(&["rlv", "cmd", "@tpto:Blue", "Lagoon/128/100/25=force"]));
+        assert_eq!(
+            read(&line),
+            Ok(Request::Rlv(RlvRequest::Cmd("@tpto:Blue Lagoon/128/100/25=force".to_string())))
+        );
+    }
+
+    #[test]
+    fn rlv_requests_with_the_wrong_arguments_are_refused() {
+        let refused = |line: &str| Request::decode(line.as_bytes()).unwrap_err();
+        for line in ["rlv", "rlv\trestrictions", "rlv\ton"] {
+            let reason = refused(line);
+            assert!(
+                reason.contains("`mode on|off`") && reason.contains("`cmd COMMAND`"),
+                "{line}: {reason}"
+            );
+        }
+        for line in ["rlv\tmode", "rlv\tmode\tmaybe", "rlv\tmode\ton\toff", "rlv\tmode\tOn"] {
+            assert_eq!(refused(line), "`rlv mode` takes `on` or `off`", "{line}");
+        }
+        for line in ["rlv\tpersist", "rlv\tpersist\tkeep", "rlv\tpersist\tfollow\tdrop"] {
+            assert_eq!(refused(line), "`rlv persist` takes `follow` or `drop`", "{line}");
+        }
+        assert_eq!(refused("rlv\tstatus\tnow"), "`rlv status` takes no arguments");
+        assert!(refused("rlv\tcmd").contains("`rlv cmd` takes an RLV command"));
     }
 
     #[test]

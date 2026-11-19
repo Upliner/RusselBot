@@ -173,6 +173,27 @@ pub fn exact_match<'a>(name: &str, avatars: &'a [(Uuid, String)]) -> Option<&'a 
     avatars.iter().find(|(_, full)| full.to_lowercase() == name)
 }
 
+/// Who asks for a command: the operator through the control socket, or an
+/// object the avatar owns through an RLV command.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Origin {
+    Operator,
+    Rlv,
+}
+
+/// How the operator log marks the operator's commands.
+const CONTROL: &str = "control";
+
+impl Origin {
+    /// How the operator log marks a command of this origin.
+    fn tag(self) -> &'static str {
+        match self {
+            Origin::Operator => CONTROL,
+            Origin::Rlv => "rlv",
+        }
+    }
+}
+
 /// The part of a session the commands use. Everything that sends refuses
 /// while the avatar is not in a region.
 pub trait Grid {
@@ -185,6 +206,9 @@ pub trait Grid {
     fn sit(&mut self, object: Uuid, now: Instant) -> Result<(), String>;
     /// Ends in `RegionEntered`, `TeleportArrived` or `TeleportFailed`.
     fn teleport(&mut self, region: &str, position: Vector3, now: Instant) -> Result<(), String>;
+    /// Teleports to `position` in the region with this handle, without
+    /// looking anything up. Ends as `teleport` does.
+    fn teleport_to(&mut self, handle: u64, position: Vector3, now: Instant) -> Result<(), String>;
     /// The region the avatar is in.
     fn region(&self) -> Option<String>;
     /// Where the simulator last said the avatar is.
@@ -206,6 +230,9 @@ pub trait Grid {
     fn ready(&self) -> bool;
     /// The inventory items attached to the avatar now, and their points.
     fn attached(&self) -> Vec<(Uuid, u8)>;
+    /// The inventory item of the attachment on the avatar whose root prim
+    /// is `object`.
+    fn attached_item(&self, object: Uuid) -> Option<Uuid>;
     /// Ends in the session's `Attached` or `AttachFailed`. `point` 0
     /// leaves the choice to the simulator.
     fn attach(&mut self, item: &Item, point: u8, now: Instant) -> Result<(), String>;
@@ -280,6 +307,7 @@ impl Then {
 /// A command waiting for an inventory job.
 struct Pending {
     command: &'static str,
+    origin: Origin,
     reply: Sender<Response>,
     /// When the command gives up on the inventory: `LIMIT` after it
     /// arrived, whatever jobs it takes.
@@ -298,6 +326,7 @@ struct Attaching {
 
 /// A `detach` waiting to see its objects gone from the avatar.
 struct Detaching {
+    origin: Origin,
     reply: Sender<Response>,
     waiting: Vec<Item>,
     gone: Vec<Item>,
@@ -394,11 +423,13 @@ pub struct Commands {
     /// The latest teleport offer of each avatar that was not accepted.
     offers: HashMap<Uuid, Uuid>,
     /// The `sit` command waiting for the simulator's verdict.
-    pending_sit: Option<Sender<Response>>,
+    pending_sit: Option<(Sender<Response>, Origin)>,
     /// The `tp` or `accepttp` command waiting for the teleport to end.
-    pending_teleport: Option<Sender<Response>>,
+    pending_teleport: Option<(Sender<Response>, Origin)>,
     /// `touch` commands waiting for their object to turn up.
     touches: Vec<(Uuid, Sender<Response>)>,
+    /// Whose command is being carried out.
+    origin: Origin,
     /// A command moved the avatar since `take_manual` was last asked.
     went_manual: bool,
     /// Where the last `tp` command that was carried out went.
@@ -433,8 +464,8 @@ impl Default for Commands {
     }
 }
 
-fn refuse(what: &str, reply: &Sender<Response>, reason: String) {
-    crate::info!("control: {what} refused: {reason}");
+fn refuse(tag: &str, what: &str, reply: &Sender<Response>, reason: String) {
+    crate::info!("{tag}: {what} refused: {reason}");
     // The client may have gone away; the command is settled either way.
     let _ = reply.send(Response::Error(reason));
 }
@@ -460,6 +491,7 @@ impl Commands {
             pending_sit: None,
             pending_teleport: None,
             touches: Vec::new(),
+            origin: Origin::Operator,
             went_manual: false,
             last_tp: None,
             last_sit: None,
@@ -495,6 +527,20 @@ impl Commands {
     /// Returns the instant message sent. `persist`, `home`, `status` and
     /// `quit` are the bot's own business and never get here.
     pub fn handle<G: Grid>(&mut self, request: Request, reply: Sender<Response>, grid: Option<&mut G>, now: Instant) -> Option<SentIm> {
+        self.handle_from(Origin::Operator, request, reply, grid, now)
+    }
+
+    /// `handle` for a command of `origin`. One carried out for RLV is
+    /// marked so in the log and is not what `last_cmd` stands for.
+    pub fn handle_from<G: Grid>(
+        &mut self,
+        origin: Origin,
+        request: Request,
+        reply: Sender<Response>,
+        grid: Option<&mut G>,
+        now: Instant,
+    ) -> Option<SentIm> {
+        self.origin = origin;
         let command = match &request {
             Request::Say(_) => "say",
             Request::Shout(_) => "shout",
@@ -510,6 +556,7 @@ impl Commands {
             Request::Persist { .. } => "persist",
             Request::Home => "home",
             Request::Status => "status",
+            Request::Rlv(_) => "rlv",
             Request::Quit => "quit",
             Request::Inventory(_) => "inventory",
             Request::Attach { .. } => "attach",
@@ -535,7 +582,9 @@ impl Commands {
                 check_length(&message, MAX_OFFER_TEXT).and_then(|()| self.with_avatar(&to, After::SendTp(message), &reply, grid, now))
             }
             Request::Touch(object) => self.touch(&object, &reply, grid, now),
-            Request::Persist { .. } | Request::Home | Request::Status | Request::Quit => Err("not a command for the grid".to_string()),
+            Request::Persist { .. } | Request::Home | Request::Status | Request::Rlv(_) | Request::Quit => {
+                Err("not a command for the grid".to_string())
+            }
             Request::Inventory(args) => self.inventory(&args, &reply, grid, now),
             Request::Attach { item, part } => self.find_for_attach(&item, part.as_deref(), &reply, grid, now),
             Request::Wear(item) => {
@@ -555,7 +604,9 @@ impl Commands {
                 self.find(&item, then, command, &reply, grid, now)
             }
         };
-        finish(command, done, &reply)
+        let sent = finish(origin.tag(), command, done, &reply);
+        self.origin = Origin::Operator;
+        sent
     }
 
     /// The operator sent the bot home: an answer to an earlier `requesttp`
@@ -608,7 +659,7 @@ impl Commands {
     fn stand<G: Grid>(&mut self, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
         grid.ok_or(NOT_CONNECTED)?.stand(now)?;
         self.went_manual = true;
-        crate::info!("control: standing up");
+        crate::info!("{}: standing up", self.origin.tag());
         self.stood_up();
         Ok(Done::Answer(None))
     }
@@ -616,8 +667,8 @@ impl Commands {
     /// The avatar was told to stand up, by a command here or by the bot: a
     /// `sit` command still waiting for its seat will not get it.
     pub fn stood_up(&mut self) {
-        if let Some(sit) = self.pending_sit.take() {
-            refuse("sit", &sit, "the avatar was told to stand up".to_string());
+        if let Some((sit, origin)) = self.pending_sit.take() {
+            refuse(origin.tag(), "sit", &sit, "the avatar was told to stand up".to_string());
         }
     }
 
@@ -628,18 +679,18 @@ impl Commands {
             SitTarget::Ground => {
                 grid.sit_ground(now)?;
                 self.went_manual = true;
-                self.last_sit = Some(SitState::Ground);
-                crate::info!("control: sitting on the ground");
+                self.remember_sit(SitState::Ground);
+                crate::info!("{}: sitting on the ground", self.origin.tag());
                 return Ok(Done::Answer(None));
             }
             SitTarget::Object(object) => object,
         };
         grid.sit(object, now)?;
         self.went_manual = true;
-        self.last_sit = Some(SitState::Object(object));
-        crate::info!("control: sitting on {object}");
-        if let Some(earlier) = self.pending_sit.replace(reply.clone()) {
-            refuse("sit", &earlier, "superseded by a newer sit command".to_string());
+        self.remember_sit(SitState::Object(object));
+        crate::info!("{}: sitting on {object}", self.origin.tag());
+        if let Some((earlier, origin)) = self.pending_sit.replace((reply.clone(), self.origin)) {
+            refuse(origin.tag(), "sit", &earlier, "superseded by a newer sit command".to_string());
         }
         Ok(Done::Parked)
     }
@@ -657,19 +708,45 @@ impl Commands {
         };
         grid.teleport(&region, [to.x, to.y, z], now)?;
         self.went_manual = true;
-        crate::info!("control: teleporting to \"{region}\" at {}, {}, {z}", to.x, to.y);
-        self.last_tp = Some(Location {
-            region,
-            position: [to.x, to.y, z],
-        });
+        crate::info!("{}: teleporting to \"{region}\" at {}, {}, {z}", self.origin.tag(), to.x, to.y);
+        if self.origin == Origin::Operator {
+            self.last_tp = Some(Location {
+                region,
+                position: [to.x, to.y, z],
+            });
+        }
         self.park_teleport(reply);
         Ok(Done::Parked)
     }
 
     fn park_teleport(&mut self, reply: &Sender<Response>) {
-        if let Some(earlier) = self.pending_teleport.replace(reply.clone()) {
-            refuse("tp", &earlier, "superseded by a newer teleport".to_string());
+        if let Some((earlier, origin)) = self.pending_teleport.replace((reply.clone(), self.origin)) {
+            refuse(origin.tag(), "tp", &earlier, "superseded by a newer teleport".to_string());
         }
+    }
+
+    /// What a `sit` command named, for `last_cmd`: the operator's only.
+    fn remember_sit(&mut self, sit: SitState) {
+        if self.origin == Origin::Operator {
+            self.last_sit = Some(sit);
+        }
+    }
+
+    /// A teleport for RLV to a point given in the grid's own coordinates:
+    /// `position` in the region with this handle. `ctl tp` has no such
+    /// form; it ends as a `tp` does, with nobody waiting for the answer.
+    pub fn tp_global<G: Grid>(&mut self, handle: u64, position: Vector3, grid: Option<&mut G>, now: Instant) -> Result<(), String> {
+        grid.ok_or(NOT_CONNECTED)?.teleport_to(handle, position, now)?;
+        self.went_manual = true;
+        let [x, y, z] = position;
+        let (east, north) = (handle >> 32, handle & 0xffff_ffff);
+        crate::info!("rlv: teleporting to {x}, {y}, {z} in the region at {east}, {north}");
+        // Nobody reads the answer; the slot says whose teleport is under way.
+        let (reply, _) = std::sync::mpsc::channel();
+        self.origin = Origin::Rlv;
+        self.park_teleport(&reply);
+        self.origin = Origin::Operator;
+        Ok(())
     }
 
     fn touch<G: Grid>(&mut self, object: &str, reply: &Sender<Response>, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
@@ -703,6 +780,7 @@ impl Commands {
         grid.inventory(self.job_ids, deadline, what)?;
         let pending = Pending {
             command,
+            origin: self.origin,
             reply: reply.clone(),
             deadline,
             then,
@@ -811,7 +889,11 @@ impl Commands {
                 if !grid.outfit_service() {
                     return Err(inventory::NO_OUTFIT_SERVICE.to_string());
                 }
-                crate::info!("control: taking off every {} the avatar wears", inventory::kind_name(kind));
+                crate::info!(
+                    "{}: taking off every {} the avatar wears",
+                    self.origin.tag(),
+                    inventory::kind_name(kind)
+                );
                 let what = What::TakeOff(Clothes::Kind(kind));
                 self.start(grid, what, Then::Outfit { put_on: false }, "detach", reply, deadline)
             }
@@ -838,15 +920,19 @@ impl Commands {
         };
         let Pending {
             command,
+            origin,
             reply,
             deadline,
             then,
         } = pending;
+        // What follows is still that command, whoever asked for it.
+        self.origin = origin;
         let done = match result {
             Err(failed) => Err(then.failure(failed)),
             Ok(outcome) => self.go_on(then, outcome, command, &reply, deadline, grid, now),
         };
-        finish(command, done, &reply);
+        self.origin = Origin::Operator;
+        finish(origin.tag(), command, done, &reply);
     }
 
     /// What a command does with the inventory's answer.
@@ -886,8 +972,9 @@ impl Commands {
                         return Err(format!("{} is not attached", item.show()));
                     }
                     grid.detach(item.id, now)?;
-                    crate::info!("control: detaching {}", item.show());
+                    crate::info!("{}: detaching {}", self.origin.tag(), item.show());
                     self.detaching.push(Detaching {
+                        origin: self.origin,
                         reply: reply.clone(),
                         waiting: vec![item],
                         gone: Vec::new(),
@@ -900,7 +987,7 @@ impl Commands {
                     if !grid.outfit_service() {
                         return Err(inventory::NO_OUTFIT_SERVICE.to_string());
                     }
-                    crate::info!("control: taking off {}", item.show());
+                    crate::info!("{}: taking off {}", self.origin.tag(), item.show());
                     let what = What::TakeOff(Clothes::Item(item));
                     self.start(grid, what, Then::Outfit { put_on: false }, command, reply, deadline)
                 }
@@ -924,8 +1011,14 @@ impl Commands {
                     let described = found.iter().find(|item| item.id == id).cloned();
                     waiting.push(described.unwrap_or(Item { id, ..Item::default() }));
                 }
-                crate::info!("control: detaching {} from {}", names(&waiting), inventory::point_name(point));
+                crate::info!(
+                    "{}: detaching {} from {}",
+                    self.origin.tag(),
+                    names(&waiting),
+                    inventory::point_name(point)
+                );
                 self.detaching.push(Detaching {
+                    origin: self.origin,
                     reply: reply.clone(),
                     waiting,
                     gone: Vec::new(),
@@ -998,6 +1091,7 @@ impl Commands {
         self.attaching = others;
         for earlier in same {
             refuse(
+                CONTROL,
                 earlier.command,
                 &earlier.reply,
                 "superseded by a newer attach of the same item".to_string(),
@@ -1088,7 +1182,7 @@ impl Commands {
             if let Some(alert) = attach.alert {
                 reason.push_str(&format!("; it said: {alert}"));
             }
-            refuse(attach.command, &attach.reply, reason);
+            refuse(CONTROL, attach.command, &attach.reply, reason);
         }
     }
 
@@ -1107,7 +1201,7 @@ impl Commands {
         for detach in &mut self.detaching {
             if let Some(index) = detach.waiting.iter().position(|waiting| waiting.id == item) {
                 let gone = detach.waiting.remove(index);
-                crate::info!("control: {} is detached", gone.show());
+                crate::info!("{}: {} is detached", detach.origin.tag(), gone.show());
                 ours = Some(gone.show());
                 detach.gone.push(gone);
             }
@@ -1149,7 +1243,7 @@ impl Commands {
             if !detach.gone.is_empty() {
                 reason.push_str(&format!("; detached {}", names(&detach.gone)));
             }
-            refuse("detach", &detach.reply, reason);
+            refuse(detach.origin.tag(), "detach", &detach.reply, reason);
         }
     }
 
@@ -1243,7 +1337,7 @@ impl Commands {
 
     fn fail_jobs(&mut self, reason: &str) {
         for (_, pending) in std::mem::take(&mut self.jobs) {
-            refuse(pending.command, &pending.reply, reason.to_string());
+            refuse(pending.origin.tag(), pending.command, &pending.reply, reason.to_string());
         }
         self.notes.clear();
     }
@@ -1360,7 +1454,7 @@ impl Commands {
                     self.act(grid, *id, proper.clone(), then, &reply, now)
                 }
             };
-            sent.extend(finish(what, done, &reply));
+            sent.extend(finish(CONTROL, what, done, &reply));
         }
         sent
     }
@@ -1371,7 +1465,12 @@ impl Commands {
         self.waiting = waiting;
         for command in failed {
             let Waiting { given, then, reply, .. } = command;
-            refuse(then.command(), &reply, format!("the lookup of \"{given}\" failed: {reason}"));
+            refuse(
+                CONTROL,
+                then.command(),
+                &reply,
+                format!("the lookup of \"{given}\" failed: {reason}"),
+            );
         }
     }
 
@@ -1383,7 +1482,7 @@ impl Commands {
             let Waiting { given, then, reply, .. } = command;
             let limit = LOOKUP_LIMIT.as_secs();
             let reason = format!("the grid did not answer the lookup of \"{given}\" within {limit} s");
-            refuse(then.command(), &reply, reason);
+            refuse(CONTROL, then.command(), &reply, reason);
         }
         // The worker answers by the deadline; this is for one that does not.
         let late: Vec<u64> = self
@@ -1394,7 +1493,7 @@ impl Commands {
             .collect();
         for id in late {
             if let Some(job) = self.jobs.remove(&id) {
-                refuse(job.command, &job.reply, job.then.failure(Failed::TimedOut));
+                refuse(job.origin.tag(), job.command, &job.reply, job.then.failure(Failed::TimedOut));
             }
         }
     }
@@ -1403,23 +1502,23 @@ impl Commands {
     /// and every teleport offer made to it.
     pub fn session_lost(&mut self) {
         for command in std::mem::take(&mut self.waiting) {
-            refuse(command.then.command(), &command.reply, NOT_CONNECTED.to_string());
+            refuse(CONTROL, command.then.command(), &command.reply, NOT_CONNECTED.to_string());
         }
-        if let Some(reply) = self.pending_sit.take() {
-            refuse("sit", &reply, "the session was lost".to_string());
+        if let Some((reply, origin)) = self.pending_sit.take() {
+            refuse(origin.tag(), "sit", &reply, "the session was lost".to_string());
         }
-        if let Some(reply) = self.pending_teleport.take() {
-            refuse("tp", &reply, "the session was lost".to_string());
+        if let Some((reply, origin)) = self.pending_teleport.take() {
+            refuse(origin.tag(), "tp", &reply, "the session was lost".to_string());
         }
         for (_, reply) in std::mem::take(&mut self.touches) {
-            refuse("touch", &reply, "the session was lost".to_string());
+            refuse(CONTROL, "touch", &reply, "the session was lost".to_string());
         }
         self.fail_jobs("the session was lost");
         for attach in std::mem::take(&mut self.attaching) {
-            refuse(attach.command, &attach.reply, "the session was lost".to_string());
+            refuse(CONTROL, attach.command, &attach.reply, "the session was lost".to_string());
         }
         for detach in std::mem::take(&mut self.detaching) {
-            refuse("detach", &detach.reply, "the session was lost".to_string());
+            refuse(detach.origin.tag(), "detach", &detach.reply, "the session was lost".to_string());
         }
         // The next login compares anew, and owes this one's attaches nothing.
         self.restore = Restore::Idle;
@@ -1443,7 +1542,7 @@ impl Commands {
 
     /// The avatar is seated on `object`.
     pub fn seated(&mut self, object: Uuid) {
-        if let Some(reply) = self.pending_sit.take() {
+        if let Some((reply, _)) = self.pending_sit.take() {
             let _ = reply.send(Response::Ok(Some(format!("seated on {object}"))));
         }
     }
@@ -1451,8 +1550,8 @@ impl Commands {
     /// A sit came to nothing. Returns whether a command was waiting for it.
     pub fn sit_failed(&mut self, reason: &str) -> bool {
         match self.pending_sit.take() {
-            Some(reply) => {
-                refuse("sit", &reply, reason.to_string());
+            Some((reply, origin)) => {
+                refuse(origin.tag(), "sit", &reply, reason.to_string());
                 true
             }
             None => false,
@@ -1461,7 +1560,7 @@ impl Commands {
 
     /// A teleport ended with the avatar in `region`.
     pub fn arrived(&mut self, region: &str) {
-        if let Some(reply) = self.pending_teleport.take() {
+        if let Some((reply, _)) = self.pending_teleport.take() {
             let _ = reply.send(Response::Ok(Some(format!("arrived in {region}"))));
         }
     }
@@ -1470,8 +1569,8 @@ impl Commands {
     /// for it.
     pub fn teleport_failed(&mut self, reason: &str) -> bool {
         match self.pending_teleport.take() {
-            Some(reply) => {
-                refuse("tp", &reply, reason.to_string());
+            Some((reply, origin)) => {
+                refuse(origin.tag(), "tp", &reply, reason.to_string());
                 true
             }
             None => false,
@@ -1497,7 +1596,7 @@ impl Commands {
             .partition(|(wanted, _)| *wanted == object);
         self.touches = touches;
         for (_, reply) in failed {
-            refuse("touch", &reply, reason.to_string());
+            refuse(CONTROL, "touch", &reply, reason.to_string());
         }
     }
 
@@ -1590,7 +1689,7 @@ fn check_length(text: &str, limit: usize) -> Result<(), String> {
 
 /// Answers a command that has come to an end, and hands back the instant
 /// message it sent, if it did.
-fn finish(command: &str, done: Result<Done, String>, reply: &Sender<Response>) -> Option<SentIm> {
+fn finish(tag: &str, command: &str, done: Result<Done, String>, reply: &Sender<Response>) -> Option<SentIm> {
     match done {
         Ok(Done::Answer(text)) => {
             let _ = reply.send(Response::Ok(text));
@@ -1602,14 +1701,14 @@ fn finish(command: &str, done: Result<Done, String>, reply: &Sender<Response>) -
         }
         Ok(Done::Parked) => None,
         Err(reason) => {
-            refuse(command, reply, reason);
+            refuse(tag, command, reply, reason);
             None
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::mpsc::{self, Receiver};
 
@@ -1696,7 +1795,7 @@ mod tests {
     // ------------------------------------------------------------ commands
 
     #[derive(Debug, PartialEq)]
-    enum Call {
+    pub(crate) enum Call {
         Say(i32, u8, String),
         Im(Uuid, String),
         Find(Uuid, String),
@@ -1704,6 +1803,7 @@ mod tests {
         SitGround,
         Sit(Uuid),
         Teleport(String, Vector3),
+        TeleportTo(u64, Vector3),
         RequestTp(Uuid, String),
         OfferTp(Uuid, String),
         AcceptTp(Uuid),
@@ -1715,22 +1815,25 @@ mod tests {
         Sound(Uuid),
     }
 
-    struct FakeGrid {
-        calls: Vec<Call>,
-        offline: bool,
-        position: Option<Vector3>,
+    pub(crate) struct FakeGrid {
+        pub(crate) calls: Vec<Call>,
+        pub(crate) offline: bool,
+        pub(crate) position: Option<Vector3>,
         /// What `touch` answers.
-        touch: Result<Touch, String>,
+        pub(crate) touch: Result<Touch, String>,
         /// The inventory jobs handed over: id, deadline and what.
-        jobs: Vec<(u64, Instant, What)>,
+        pub(crate) jobs: Vec<(u64, Instant, What)>,
         /// The simulator has no inventory service.
-        no_inventory: bool,
+        pub(crate) no_inventory: bool,
         /// The grid makes the avatar's appearance.
-        outfit: bool,
+        pub(crate) outfit: bool,
         /// What is attached to the avatar.
-        attached: Vec<(Uuid, u8)>,
+        pub(crate) attached: Vec<(Uuid, u8)>,
         /// The simulator has not said yet which services it has.
-        settling: bool,
+        pub(crate) settling: bool,
+        /// The attachments on the avatar by their root prim, with the item
+        /// each was made from.
+        pub(crate) worn: Vec<(Uuid, Uuid)>,
     }
 
     impl Default for FakeGrid {
@@ -1746,6 +1849,7 @@ mod tests {
                 outfit: false,
                 attached: Vec::new(),
                 settling: false,
+                worn: Vec::new(),
             }
         }
     }
@@ -1796,6 +1900,11 @@ mod tests {
             self.calls.push(Call::Teleport(region.to_string(), position));
             Ok(())
         }
+        fn teleport_to(&mut self, handle: u64, position: Vector3, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::TeleportTo(handle, position));
+            Ok(())
+        }
         fn region(&self) -> Option<String> {
             (!self.offline).then(|| "Home".to_string())
         }
@@ -1838,6 +1947,9 @@ mod tests {
         }
         fn attached(&self) -> Vec<(Uuid, u8)> {
             self.attached.clone()
+        }
+        fn attached_item(&self, object: Uuid) -> Option<Uuid> {
+            self.worn.iter().find(|(prim, _)| *prim == object).map(|(_, item)| *item)
         }
         fn attach(&mut self, item: &Item, point: u8, _: Instant) -> Result<(), String> {
             self.check()?;

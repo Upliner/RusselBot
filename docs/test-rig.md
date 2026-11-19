@@ -339,6 +339,61 @@ only), a listing that takes longer than 50 seconds, and a link in a path
 were listed as `link`). What was tried on Second Life is under Status in
 `README.md`.
 
+## RLV
+
+`test-rig/relay.py` gives the bot account what nothing else on the rig
+has: scripted objects of its own that say RLV commands to their owner. It
+logs in as `Sit Bot`, so the bot has to be stopped while it runs, uploads
+one script, rezzes the box `Relay box` with it two metres from the bot's
+landing point and puts a second one, `Relay`, into the folder `RLV gear`
+at the top of My Inventory (an `RLV gear` from an earlier run goes to the
+Trash and is deleted first). The script says to its owner what its owner
+says on channel 77, and repeats on channel 0, as `heard on 5: ...`, what
+its owner says on channel 5:
+
+```sh
+test-rig/relay.py                 # prints the box's UUID and: stocked RLV gear/ (<uuid>) with Relay
+rslbot ctl say /77 @versionnew=5  # the box tells the bot `@versionnew=5`; the bot answers on channel 5
+```
+
+A `Relay box` from an earlier run stays in the region and would say every
+command a second time: delete it first on the OpenSim console with
+`change region Target`, `delete object name "Relay box"` and `y`.
+
+The items below were run with the config of item 1 plus `socket = true`,
+`rlv = true`, `log_chat` and `--verbose`, the release build, a
+`RUSSELBOT_SOCK` of the run's own, and a second prim `<bench>` rezzed with
+`rezprim.py` beside the seat. `say /77 X` stands for
+`rslbot ctl say /77 X`, which makes the box say `X` to the bot.
+
+| # | Inject | Expected | Result (2026-11-19, OpenSim 9d00a55552) |
+|---|---|---|---|
+| 108 | `rlv status`; `say /77 @versionnew=5`; `say /77 @version=5,versionnum=5` | `rlv: on`, `persist: drop`; one `rlv: Relay box <uuid>: ...: said "..." on channel 5` line per query; the box repeats each reply | Pass: `RestrainedLove viewer v0.1.0 (RusselBot 0.1.0)`, `RestrainedLife viewer v0.1.0 (RusselBot 0.1.0)` and `10000`, each heard back from the box as `heard on 5: ...`. `chat.tsv` has the `@` lines as kind `owner` and the box's echoes as `say` |
+| 109 | Holding the seat (`persist = "cfg"`): `say /77 @unsit=force`, `status`, `home` | `rlv: ...: as \`stand\``, `rlv: standing up`, `placement: manual`; `seat: none`, `mode: manual`, the seat still on the `persist` line; `home` sits again | Pass |
+| 110 | `say /77 @sit:<bench>=force`; `say /77 @sitground=force` | Seated on the bench, `mode: manual`; the ground sit is sent | Pass. The ground sit changes nothing while the avatar sits on an object, as with `ctl sit ground` |
+| 111 | `say /77 @detach=n,getstatus=5,nonsense` | Two `not supported` lines and one `malformed: it has no \`=\``; nothing said on channel 5, nothing changed | Pass |
+| 112 | `say /77 @sit:<a UUID that is no object>=force` | `rlv: sit refused: the simulator did not confirm the sit within 15 s` and `sit failed: ...` 15 s later | Pass |
+| 113 | `say "/77 @tpto:Home/128/100/25;1.57=force"`; in `Home`, `rlv cmd @tpto:256384/256128/25=force` | The avatar arrives in `Home` at 128, 100; then in `Target` at 128, 128 (`Target` is at 1001, 1000, so its corner is 256256, 256000); `mode: manual` | Pass, both; the second logs `rlv: teleporting to 128, 128, 25 in the region at 256256, 256000` |
+| 114 | `rlv cmd @tpto:Nowhere/1/2/3=force,versionnum=5`; `rlv cmd @tpto:north/128=force`; `rlv cmd @detachme=force` | `ok` for the teleport and `the avatar is not connected to a region` for the query behind it, status 1; `rlv: tp refused: region "Nowhere" not found` seven seconds later; the other two refused with their reasons, status 1 | Pass |
+| 115 | `rlv cmd @versionnum=5`; `rlv cmd @versionnum=5,detach=n` | `versionnum=5: 10000`, status 0; both lines on standard error, the second `detach=n: not supported`, status 1 | Pass |
+| 116 | `attach "RLV gear/Relay" left hand`, `say "/77 @detach:left hand=force"`; `attach ... HUD Center`, `say "/77 @remattach:center=force"`; `attach ... chest`, `say "/77 @detachme=force,remoutfit:shirt=force,detach:chin=force"` | `Relay` is detached each time; from the worn relay `@detachme` is carried out as `detach <its item>`, from the box it is refused as `the sender is not attached`; `remoutfit` is refused for want of the outfit service; `nothing is attached to Chin` | Pass. Worn and rezzed relay both hear channel 77, so every command is dealt with twice; the second detach of the same item finds it gone already |
+| 117 | `rlv mode off`; `say /77 @versionnew=5,unsit=force`; `rlv cmd @unsit=force`; `rlv mode on` | Nothing answered or done, no `rlv:` line but the two for the switch; `rlv cmd` refused naming `rlv mode on`; the `@` line is in `chat.tsv` | Pass |
+| 118 | `rlv persist follow`; standing in manual mode, `say /77 @sit:<bench>=force`; `status` at once and ten seconds later | `rlv: ...: persist cur <bench>` and `placement: holding Target/<where it stood> <bench>`; the bot sits; `rlv: following: persist cur cur` and `placement: holding Target/<the seat> <bench>`; `mode: holding` | Pass: 128/128/26.03 first, 129.33/128/26.34 within the second |
+| 119 | Then `stand`, `home`; `kick user Sit Bot bye` | Manual mode; `home` sits on the bench; after the kick the bot logs in and sits on the bench | Pass |
+| 120 | `say /77 @unsit=force`; `say /77 @sitground=force` | `rlv: following: persist cur stand` and `... ground`; `mode: holding` after each, the `persist` line ending in `stand`, then `ground` | Pass |
+| 121 | `say "/77 @tpto:Home/100/120/30=force"`; `rlv cmd @sit:<bench>=force`; `kick user Sit Bot bye` | `placement: holding Home/100/120/30 stand` on arrival; the sit refused naming `Target` and `Home`, nothing changed; the next login is in `Home` | Pass |
+| 122 | `rlv cmd @tpto:Nowhere/1/2/3=force`; then `rlv cmd @tpto:256384/256128/25=force` | Manual mode while the teleport is under way; `rlv: not following: the teleport failed; back to holding as before` and the `Home` placement unchanged; then `holding Target/128/128/... stand` | Pass |
+| 123 | `say /77 @sit:<a UUID that is no object>=force`; forty seconds; `home`; `persist cur stand` | The UUID is held at once and the sit is tried again after 5 and 10 seconds; `home` holds the same and tries again; `persist cur stand` ends it | Pass |
+| 124 | The bot started with a `[persist]` table of `atstart = true` and `rlv = "follow"`; with only `rlv = "follow"`; with `atstart = false` and `sit = "cfg"` | `config: persist cur cur` after the first sit, `persist: follow`; manual mode after the first sit, `persist: follow`; rejected naming `persist.atstart` and `persist.sit` | Pass, all three |
+
+Not covered here: RLV commands that arrive during a login or a teleport
+(the relay only says what the bot says, and the bot cannot talk then; the
+keeping and its limit are unit-tested), an attachment that asks for the
+version by itself when it is rezzed, `@remoutfit` carried out (OpenSim
+offers no outfit service), a region larger than 256 metres for the global
+`@tpto`, and `@detachme` from a child prim. Nothing of RLV has been tried on
+Second Life.
+
 Not covered: Windows, where the socket is TCP. On Second Life, looking a
 name up through `AvatarPickerRequest` found nobody (2026-11-18, an avatar
 that had just messaged the bot); the capability is what viewers use there,

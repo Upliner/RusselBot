@@ -12,6 +12,8 @@ Through its [control socket](#control-socket) it can also be told to talk,
 stand, sit elsewhere, teleport, exchange teleport offers and touch objects,
 and to use what the avatar owns: list its inventory, attach and detach
 objects, play animations and sounds, and (on Second Life) change clothing.
+With [RLV](#rlv) switched on, scripted objects the avatar owns can ask for
+some of the same: sit, stand, teleport, take things off.
 
 ## Status
 
@@ -29,6 +31,15 @@ on Windows. On Second Life, checked by hand on 2026-11-18:
 login, sitting, logging of chat and IMs from avatars and from objects, and
 fetching offline IMs (delivered with the time they were sent). Multi-factor login is not supported: an account that has it enabled
 makes the bot exit with an error.
+
+[RLV](#rlv) is verified by unit tests and on the local OpenSim
+(`docs/test-rig.md`, items 108 to 124, 2026-11-19), with a script of the
+bot's own that says to it what it is told: the version queries, the force
+commands, `drop` and `follow`, and the `[persist]` table. Nothing of it
+has been tried on Second Life: not what `@version` should answer there (the
+text is the one RLV viewers are known for, not one the specification
+quotes), not a real collar, relay or piece of furniture, not `@remoutfit`,
+and not commands that arrive while the avatar logs in.
 
 The inventory commands (`inventory`, `attach`, `wear`, `detach`, `anim`,
 `sound`) are verified by unit tests and on the local OpenSim, where the
@@ -212,6 +223,7 @@ One TOML file; see `russelbot.example.toml`.
 | `requesttp_timeout` | no | Minutes after `requesttp` during which the asked avatar's teleport offer is accepted. Default: `10` |
 | `scan_distance` | no | Metres (1 to 1024) within which objects are learned from the start, for `touch`; see [Touching objects](#touching-objects). Default: learn within 32 m when `touch` is first used |
 | `restore_attachments` | no | `false` to keep the bot from attaching again, after each login, what the Current Outfit folder lists and the simulator did not bring; see [Attachments](#attachments). Default: `true` |
+| `rlv` | no | `true` to start with RLV on: the bot then reads the `@` commands of scripted objects the avatar owns, see [RLV](#rlv). Default: `false` |
 
 `persist` takes these forms:
 
@@ -221,7 +233,13 @@ One TOML file; see `russelbot.example.toml`.
 | `"cfg"` | Keep holding `position` and `sit` as configured |
 | `"cur"` | Hold the position and the seat the simulator reported |
 | `["cfg", "cur"]` | An array of two, each `"cur"` or `"cfg"`: the first for the position, the second for the seat |
-| `[persist]` with `position` and `sit` | The same as a table, each `"cur"` or `"cfg"`; a key left out of the table is `"cur"`. As a TOML table it has to come after all other keys |
+| `[persist]` | A table with any of the keys below. As a TOML table it has to come after all other keys |
+
+| Key of `[persist]` | Meaning |
+|---|---|
+| `atstart` | `true` or `false`: whether the bot holds anything once the avatar is at the place above. Default: `true` when the table has `position` or `sit`, `false` otherwise. `atstart = true` alone is `persist = "cur"`; `atstart = false` together with `position` or `sit` is an error |
+| `position`, `sit` | Each `"cur"` or `"cfg"`, as in the array; one that is left out is `"cur"` |
+| `rlv` | `"drop"` or `"follow"`: what a sit, stand or teleport forced through [RLV](#rlv) does to the place the bot holds. Default: `"drop"`. It says nothing about `atstart`, so a table with only `rlv = "follow"` holds nothing at the start |
 
 ### Upgrading
 
@@ -239,6 +257,9 @@ Configs written for earlier versions still load, but three things changed:
   does not sit it again either.
 * `rslbot ctl home` returns to the last persisted placement, which need not
   be the configured one; `rslbot ctl persist cfg cfg` returns to the config.
+* A `[persist]` table holds something at the start only when it has
+  `position`, `sit` or `atstart = true`. An empty `[persist]` table used to
+  mean `"cur"` for both; write `atstart = true` into it to keep that.
 
 To keep the plain password out of the file:
 
@@ -317,6 +338,8 @@ target/release/rslbot ctl home
 target/release/rslbot ctl inventory "Bot gear"      # what the avatar owns there
 target/release/rslbot ctl attach "Bot gear/Radio" left hand
 target/release/rslbot ctl anim play "Bot gear/Dance"
+target/release/rslbot ctl rlv mode on               # let owned objects steer the avatar
+target/release/rslbot ctl rlv cmd @versionnum=5     # an RLV command, by hand
 ```
 
 | Command | Does |
@@ -340,6 +363,10 @@ target/release/rslbot ctl anim play "Bot gear/Dance"
 | `sound ITEM` | Play a sound from the inventory once, where the avatar is |
 | `persist [LOCATION] [SIT]` | Hold a place from now on: return to `LOCATION` whenever the avatar is in another region, and sit as `SIT` says. Without arguments: where the avatar is and how it sits now. See [Holding a place](#holding-a-place) |
 | `home` | The same as `persist last last`: hold the place last persisted again, or the configured one when nothing was persisted |
+| `rlv mode on`, `rlv mode off` | Switch [RLV](#rlv) on or off |
+| `rlv persist follow`, `rlv persist drop` | What a sit, stand or teleport forced through RLV does to the place the bot holds |
+| `rlv status` | Print whether RLV is on, and the `rlv persist` setting |
+| `rlv cmd COMMAND...` | Carry out RLV commands as if an object had sent them, and print what became of each |
 | `status` | Print where the avatar is |
 | `quit` | Log out and stop the bot, like Ctrl-C |
 
@@ -380,6 +407,11 @@ held last. Manual mode ends with the bot process too; a restarted bot
 starts from its config. `sendtp`, `touch`, the talking commands and the
 inventory commands (`inventory`, `attach`, `wear`, `detach`, `anim`,
 `sound`) leave the mode alone.
+
+A sit, stand or teleport that a scripted object forces through [RLV](#rlv)
+counts as the command it is carried out as: it switches holding off too.
+With `rlv persist follow` the bot holds the result instead; see
+[Forced movement and the place the bot holds](#forced-movement-and-the-place-the-bot-holds).
 
 ### Holding a place
 
@@ -435,7 +467,11 @@ What holding means:
   `Target`. It knows that of objects the avatar sat on in this run and of
   objects it has learned in the current region.
 * `last_cmd` goes by the commands as given, whether or not the teleport or
-  sit succeeded. `stand`, `requesttp` and `accepttp` do not count.
+  sit succeeded. `stand`, `requesttp` and `accepttp` do not count, and
+  neither does anything carried out for [RLV](#rlv).
+* With `rlv persist follow`, a sit, stand or teleport forced through RLV
+  is a persist of its own: it replaces what the bot holds, and `home`
+  returns to it.
 * Nothing is saved. A restarted bot starts from its config and the
   `persist` setting there.
 
@@ -735,6 +771,170 @@ have no names here.
 An animation plays until it is stopped, ends by itself, or the session
 ends. The bot does not remember it: after a kick or an outage it logs in
 again without starting the animation again.
+
+### RLV
+
+RLV, the RestrainedLove API, is how scripted objects steer an avatar:
+the object says a line starting with `@` to its owner (`llOwnerSay`), and
+a viewer that implements the API carries it out. Collars, furniture,
+relays and many games work this way, and most of them first ask for the
+version and do nothing for an avatar that does not answer.
+
+RLV is off unless the config has `rlv = true` or `rslbot ctl rlv mode on`
+was given. While it is off the bot does not read such lines at all, and
+nothing below applies. **While it is on, every object the avatar owns,
+worn or rezzed in the region, can make the avatar sit, stand and teleport
+and can take attachments and clothing off it, without the operator.**
+That is what RLV is for; switch it on only for an avatar whose objects you
+trust.
+
+```sh
+target/release/rslbot ctl rlv mode on
+target/release/rslbot ctl rlv status       # rlv: on / persist: drop
+target/release/rslbot ctl rlv mode off
+```
+
+The switch is not saved: a restarted bot starts from its config.
+
+What the bot implements is a first step, and it says so: it reports
+version 0.1.0 of the API, far below any viewer's, so that a script that
+looks at the number sees an incomplete implementation. **No restriction is
+implemented.** A command such as `@detach=n` or `@sittp=n` is noted in the
+log as not supported and holds nobody to anything: the avatar is not
+restricted, and every `rslbot ctl` command works as before. A script that
+only asks for the version and then assumes its restrictions hold is wrong
+about this avatar.
+
+A message is read as RLV commands when an object says it to its owner and
+it starts with `@`. Several commands follow the one `@`, separated by
+commas, each as `behaviour[:option]=param`. They are dealt with in order
+and each on its own. The behaviour and the param may be in any letter
+case; a space anywhere makes another command of it, as in a viewer. The
+line stays in the chat log like any other chat of kind `owner`.
+
+These queries are answered, by saying the reply on the channel named
+(any channel but 0, negative ones included):
+
+| Command | Reply |
+|---|---|
+| `@version=CHANNEL` | `RestrainedLife viewer v0.1.0 (RusselBot 0.1.0)`, with the bot's own version in the parentheses |
+| `@versionnew=CHANNEL` | `RestrainedLove viewer v0.1.0 (RusselBot 0.1.0)` |
+| `@versionnum=CHANNEL` | `10000` |
+
+These commands are carried out, each the way the `rslbot ctl` command
+beside it is, with the same checks and refusals:
+
+| RLV command | Carried out as |
+|---|---|
+| `@sit:UUID=force` | `sit UUID` |
+| `@sitground=force` | `sit ground` |
+| `@unsit=force` | `stand` |
+| `@tpto:REGION/X/Y/Z=force` | `tp X Y Z REGION` |
+| `@tpto:X/Y/Z=force` | A teleport to that point of the grid, X and Y in metres from the grid's origin. `rslbot ctl tp` has no such form |
+| `@detach:POINT=force`, `@remattach:POINT=force` | `detach POINT` |
+| `@remoutfit:KIND=force` | `unwear KIND` |
+| `@detachme=force` | `detach` of the item the object that says it was attached from |
+
+`POINT` is an attachment point by the names of [Attachments](#attachments)
+or by the names RLV has for some of them: `center 2`, `top right`, `top`,
+`top left`, `center`, `bottom left`, `bottom`, `bottom right` for the
+points of the heads-up display, and `root` for `Avatar Center`. A number
+is not taken as a point. What follows a `;` in `@tpto` (a direction to
+look in) is ignored. Nobody waits for the outcome of these commands: it is
+in the log, as it is for the commands they stand for. None of them counts
+as the last `tp` or `sit` command for `persist last_cmd`.
+
+Everything else is noted in the log as not supported and has no effect:
+all restrictions, `@clear`, `@notify`, the other queries (`@getstatus`,
+`@getsitid`, `@getoutfit`, `@getattach`, `@getinv`, `@versionnumbl`, ...),
+everything that names inventory folders (`@attach:...`, `@detachall:...`,
+`@detach:FOLDER`), and `@detach=force` and `@remoutfit=force` without an
+option, which would take everything off. An instant message that says
+`@version` is not answered either. Three limits of what is carried out:
+
+* `@tpto:X/Y/Z` takes regions to be 256 metres square, which they are on
+  Second Life. On a grid with larger regions use the form with the
+  region's name.
+* `@detachme` works when the script is in the attachment's root prim. From
+  a child prim the bot cannot tell which attachment is meant, and refuses.
+* Commands that arrive while the avatar cannot act, during the login or a
+  teleport, are kept (up to 64 messages) and carried out in order once it
+  is in a region. They are dropped when the session is lost and when RLV
+  is switched off.
+
+#### Forced movement and the place the bot holds
+
+A bot that holds a place puts the avatar back there within seconds, which
+would undo a forced stand or teleport at once. What happens instead is a
+setting, `drop` or `follow`:
+
+```sh
+target/release/rslbot ctl rlv persist follow
+target/release/rslbot ctl rlv persist drop
+```
+
+or in the config, as `rlv = "follow"` in the `[persist]` table. Like the
+RLV switch, a setting given by command is not saved.
+
+With `drop`, the default, `@sit`, `@sitground`, `@unsit` and `@tpto`
+switch holding off, as the `rslbot ctl` commands they stand for do. The
+bot is in manual mode from then on and keeps what it held for `home`.
+
+With `follow`, the result of the forced movement becomes what the bot
+holds, whether or not it held anything before:
+
+| Forced movement | The bot carries out | When |
+|---|---|---|
+| `@sit:UUID=force` | `persist cur UUID` | at once, in place of the `sit` |
+| | `persist cur cur` | when the avatar sits on that object and its seated position is known, or 10 seconds after it sat down |
+| `@sitground=force` | `persist cur ground` | when the ground sit has gone out |
+| `@unsit=force` | `persist cur stand` | when the stand has gone out |
+| `@tpto:...=force` | `persist cur stand` | when the avatar has arrived |
+
+So a forced seat is held from the moment it is forced, with the place the
+avatar was at: the bot sits there the way it sits on any held seat, tries
+again with growing delays when the sit fails, and what it held before is
+gone, also when the object does not exist or cannot be sat on. A
+`persist` of something else (`persist cur stand`, `persist cfg cfg`) or
+any `rslbot ctl` command that moves the avatar ends that; `home` does not,
+since the forced seat is what it returns to. Once
+the avatar sits, the seat's own position becomes the place the bot returns
+to. A forced sit is refused, and changes nothing, when the avatar is not
+in a region or the object is known to be in another region.
+
+A forced teleport that fails leaves everything as it was: the bot goes
+back to holding, or to manual mode, whichever it was in before. When the
+operator gives a command that moves the avatar, or `persist` or `home`,
+before a forced movement has been persisted, the operator's command
+decides and nothing more is persisted for the forced one. `@detach`,
+`@remattach`, `@remoutfit`, `@detachme` and the queries never change what
+the bot holds.
+
+With `follow`, an object the avatar owns decides where the bot returns to
+after a kick or a region restart, for as long as the bot runs or until the
+operator persists another place.
+
+#### RLV commands by hand
+
+`rlv cmd` carries out RLV commands as if an object had sent them, with the
+avatar itself as the sender, to try what an object would get. The leading
+`@` may be left out, and the words of the command are joined with single
+spaces:
+
+```sh
+target/release/rslbot ctl rlv cmd @versionnum=5
+target/release/rslbot ctl rlv cmd @tpto:Blue Lagoon/128/128/25=force
+target/release/rslbot ctl rlv cmd @versionnew=5,detach=n
+```
+
+It prints one line per command: the command, and the reply that was said
+for a query, `ok` for a command that was carried out or begun, or the
+reason it was not. The first example prints `versionnum=5: 10000` and
+says `10000` on channel 5 as well. The exit status is 0 when every command
+was carried out and 1 otherwise, as for the last example, whose second line
+is `detach=n: not supported`. `rlv cmd` does not wait for a sit, a
+teleport or a detach to end; that is in the log. It is refused while RLV
+is off, and `@detachme` has no meaning in it.
 
 ### Exit status and limits
 

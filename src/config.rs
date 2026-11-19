@@ -50,6 +50,15 @@ pub enum Persist {
     },
 }
 
+/// What a forced RLV movement does to the placement the bot holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RlvPersist {
+    /// The bot goes to manual mode and keeps what it held for `home`.
+    Drop,
+    /// The result of the movement becomes what the bot holds.
+    Follow,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     pub login_url: String,
@@ -79,6 +88,11 @@ pub struct Config {
     /// After each login, attach again what the Current Outfit folder lists
     /// and the simulator did not bring.
     pub restore_attachments: bool,
+    /// Start with RLV on: read the `@` commands of the objects the avatar
+    /// owns.
+    pub rlv: bool,
+    /// The RLV persist setting the bot starts with.
+    pub rlv_persist: RlvPersist,
 }
 
 #[derive(Debug, PartialEq)]
@@ -111,6 +125,7 @@ struct Raw {
     requesttp_timeout: Option<toml::Value>,
     scan_distance: Option<toml::Value>,
     restore_attachments: Option<toml::Value>,
+    rlv: Option<toml::Value>,
 }
 
 /// Hashes a plain password into the form grids accept: `$1$` + MD5 hex.
@@ -167,7 +182,7 @@ fn log_path(value: Option<toml::Value>, key: &str) -> Result<Option<PathBuf>, Co
 }
 
 const PERSIST_FORMS: &str = "`persist` must be \"cur\", \"cfg\", \"off\" (or false), an array \
-     [position, sit] of \"cur\" and \"cfg\", or a table with the keys `position` and `sit`";
+     [position, sit] of \"cur\" and \"cfg\", or a table with the keys `atstart`, `position`, `sit` and `rlv`";
 
 fn source(value: &toml::Value) -> Option<Source> {
     match value.as_str() {
@@ -177,37 +192,79 @@ fn source(value: &toml::Value) -> Option<Source> {
     }
 }
 
-fn persist(value: Option<toml::Value>) -> Result<Persist, ConfigError> {
+/// The config's `persist`: what the bot holds once the config placement is
+/// reached, and the RLV persist setting, which only the table form can set.
+fn persist(value: Option<toml::Value>) -> Result<(Persist, RlvPersist), ConfigError> {
     let both = |source| Persist::On {
         position: source,
         sit: source,
     };
-    match value {
-        None => Ok(Persist::Off),
-        Some(toml::Value::Boolean(false)) => Ok(Persist::Off),
-        Some(toml::Value::String(word)) if word == "off" => Ok(Persist::Off),
-        Some(word @ toml::Value::String(_)) => source(&word).map(both).ok_or(ConfigError(PERSIST_FORMS.to_string())),
+    let setting = match value {
+        None => Persist::Off,
+        Some(toml::Value::Boolean(false)) => Persist::Off,
+        Some(toml::Value::String(word)) if word == "off" => Persist::Off,
+        Some(word @ toml::Value::String(_)) => source(&word).map(both).ok_or(ConfigError(PERSIST_FORMS.to_string()))?,
         Some(toml::Value::Array(items)) => match &items[..] {
             [position, sit] => match (source(position), source(sit)) {
-                (Some(position), Some(sit)) => Ok(Persist::On { position, sit }),
-                _ => err(PERSIST_FORMS),
+                (Some(position), Some(sit)) => Persist::On { position, sit },
+                _ => return err(PERSIST_FORMS),
             },
-            _ => err(PERSIST_FORMS),
+            _ => return err(PERSIST_FORMS),
         },
-        Some(toml::Value::Table(table)) => {
-            let (mut position, mut sit) = (Source::Cur, Source::Cur);
-            for (key, value) in &table {
-                let slot = match key.as_str() {
-                    "position" => &mut position,
-                    "sit" => &mut sit,
-                    _ => return err(format!("`persist` has no key `{key}`; its keys are `position` and `sit`")),
-                };
-                *slot = source(value).ok_or_else(|| ConfigError(format!("`persist.{key}` must be \"cur\" or \"cfg\"")))?;
+        Some(toml::Value::Table(table)) => return persist_table(&table),
+        Some(_) => return err(PERSIST_FORMS),
+    };
+    Ok((setting, RlvPersist::Drop))
+}
+
+/// The table form of `persist`. `atstart` says whether anything is held
+/// once the config placement is reached; `position` and `sit` imply it.
+fn persist_table(table: &toml::Table) -> Result<(Persist, RlvPersist), ConfigError> {
+    let (mut position, mut sit, mut atstart, mut rlv) = (None, None, None, RlvPersist::Drop);
+    for (key, value) in table {
+        match key.as_str() {
+            "position" | "sit" => {
+                let source = source(value).ok_or_else(|| ConfigError(format!("`persist.{key}` must be \"cur\" or \"cfg\"")))?;
+                *(if key == "position" { &mut position } else { &mut sit }) = Some(source);
             }
-            Ok(Persist::On { position, sit })
+            "atstart" => match value {
+                toml::Value::Boolean(on) => atstart = Some(*on),
+                _ => return err("`persist.atstart` must be true or false"),
+            },
+            "rlv" => {
+                rlv = match value.as_str() {
+                    Some("drop") => RlvPersist::Drop,
+                    Some("follow") => RlvPersist::Follow,
+                    _ => return err("`persist.rlv` must be \"drop\" or \"follow\""),
+                }
+            }
+            _ => {
+                return err(format!(
+                    "`persist` has no key `{key}`; its keys are `atstart`, `position`, `sit` and `rlv`"
+                ))
+            }
         }
-        Some(_) => err(PERSIST_FORMS),
     }
+    let valued = [("position", position), ("sit", sit)]
+        .into_iter()
+        .find(|(_, value)| value.is_some());
+    let on = match (atstart, valued) {
+        (Some(false), Some((key, _))) => {
+            return err(format!(
+                "`persist.atstart` is false, but `persist.{key}` says what to hold; leave one of them out"
+            ))
+        }
+        (Some(on), _) => on,
+        (None, valued) => valued.is_some(),
+    };
+    let setting = match on {
+        true => Persist::On {
+            position: position.unwrap_or(Source::Cur),
+            sit: sit.unwrap_or(Source::Cur),
+        },
+        false => Persist::Off,
+    };
+    Ok((setting, rlv))
 }
 
 impl Config {
@@ -293,7 +350,7 @@ impl Config {
             )),
         };
 
-        let persist = persist(raw.persist)?;
+        let (persist, rlv_persist) = persist(raw.persist)?;
         let log_chat = log_path(raw.log_chat, "log_chat")?;
         let log_im = log_path(raw.log_im, "log_im")?;
         let fetch_offline_im = flag(raw.fetch_offline_im, "fetch_offline_im")?;
@@ -310,6 +367,7 @@ impl Config {
             Some(_) => return err("`scan_distance` must be a number of metres from 1 to 1024"),
         };
         let restore_attachments = flag_or(raw.restore_attachments, "restore_attachments", true)?;
+        let rlv = flag(raw.rlv, "rlv")?;
 
         Ok(Config {
             login_url,
@@ -327,6 +385,8 @@ impl Config {
             requesttp_timeout,
             scan_distance,
             restore_attachments,
+            rlv,
+            rlv_persist,
         })
     }
 }
@@ -480,8 +540,68 @@ mod tests {
         assert_eq!(cfg.persist, held(Source::Cur, Source::Cfg));
         let cfg = Config::parse(&(base() + "[persist]\nposition = \"cfg\"\n")).unwrap();
         assert_eq!(cfg.persist, held(Source::Cfg, Source::Cur));
-        let cfg = Config::parse(&(base() + "[persist]\n")).unwrap();
-        assert_eq!(cfg.persist, held(Source::Cur, Source::Cur));
+    }
+
+    fn table(keys: &str) -> Config {
+        Config::parse(&(base() + "[persist]\n" + keys)).unwrap()
+    }
+
+    #[test]
+    fn a_persist_table_holds_something_only_when_it_says_so() {
+        // Nothing to hold at the start: as `persist = "off"`.
+        assert_eq!(table("").persist, Persist::Off);
+        assert_eq!(table("atstart = false\n").persist, Persist::Off);
+        assert_eq!(table("rlv = \"follow\"\n").persist, Persist::Off);
+        // `atstart` alone is "cur" for both.
+        assert_eq!(table("atstart = true\n").persist, held(Source::Cur, Source::Cur));
+        // `position` and `sit` imply it, and may say so as well.
+        assert_eq!(table("atstart = true\nsit = \"cfg\"\n").persist, held(Source::Cur, Source::Cfg));
+        assert_eq!(table("sit = \"cfg\"\nrlv = \"follow\"\n").persist, held(Source::Cur, Source::Cfg));
+    }
+
+    #[test]
+    fn the_rlv_persist_setting_comes_from_the_table_only() {
+        assert_eq!(Config::parse(&base()).unwrap().rlv_persist, RlvPersist::Drop);
+        for form in ["\"cfg\"", "\"off\"", "false", "[\"cur\", \"cfg\"]"] {
+            let cfg = Config::parse(&(base() + &format!("persist = {form}\n"))).unwrap();
+            assert_eq!(cfg.rlv_persist, RlvPersist::Drop, "{form}");
+        }
+        assert_eq!(table("sit = \"cfg\"\n").rlv_persist, RlvPersist::Drop);
+        assert_eq!(table("rlv = \"drop\"\n").rlv_persist, RlvPersist::Drop);
+        assert_eq!(table("rlv = \"follow\"\n").rlv_persist, RlvPersist::Follow);
+        assert_eq!(table("sit = \"cfg\"\nrlv = \"follow\"\n").rlv_persist, RlvPersist::Follow);
+        // It does not switch RLV on.
+        assert!(!table("rlv = \"follow\"\n").rlv);
+    }
+
+    #[test]
+    fn rejects_persist_tables_that_contradict_themselves() {
+        let msg = rejected(&(base() + "[persist]\natstart = false\nsit = \"cfg\"\n"));
+        assert!(msg.contains("`persist.atstart`") && msg.contains("`persist.sit`"), "{msg}");
+        let msg = rejected(&(base() + "[persist]\natstart = false\nposition = \"cur\"\n"));
+        assert!(msg.contains("`persist.atstart`") && msg.contains("`persist.position`"), "{msg}");
+        for bad in ["\"yes\"", "1", "\"cur\""] {
+            let msg = rejected(&(base() + &format!("[persist]\natstart = {bad}\n")));
+            assert!(msg.contains("`persist.atstart`"), "{bad}: {msg}");
+        }
+        for bad in ["\"keep\"", "true", "\"Follow\"", "\"\""] {
+            let msg = rejected(&(base() + &format!("[persist]\nrlv = {bad}\n")));
+            assert!(
+                msg.contains("`persist.rlv`") && msg.contains("\"drop\"") && msg.contains("\"follow\""),
+                "{bad}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn rlv_is_off_unless_enabled() {
+        assert!(!Config::parse(&base()).unwrap().rlv);
+        assert!(!Config::parse(&(base() + "rlv = false\n")).unwrap().rlv);
+        assert!(Config::parse(&(base() + "rlv = true\n")).unwrap().rlv);
+        for bad in ["\"on\"", "1", "\"follow\""] {
+            let msg = rejected(&(base() + &format!("rlv = {bad}\n")));
+            assert!(msg.contains("`rlv`") && !msg.contains("persist"), "{bad}: {msg}");
+        }
     }
 
     #[test]
@@ -690,6 +810,35 @@ mod tests {
         assert_eq!(cfg.sit, Some(Sit::Object(Uuid::nil())));
         assert!(!cfg.deprecated_object);
         assert_eq!(cfg.persist, Persist::Off);
+        assert!(!cfg.rlv);
+        assert_eq!(cfg.rlv_persist, RlvPersist::Drop);
+    }
+
+    #[test]
+    fn example_file_is_valid_with_its_persist_table_enabled() {
+        let text = include_str!("../russelbot.example.toml");
+        let mut enabled = text.to_string();
+        for line in [
+            "# [persist]",
+            "# atstart = true",
+            "# position = \"cur\"",
+            "# sit = \"cfg\"",
+            "# rlv = \"follow\"",
+            "# rlv = true",
+        ] {
+            assert_eq!(text.matches(&format!("\n{line}\n")).count(), 1, "{line} is not once in the example");
+            enabled = enabled.replace(&format!("\n{line}\n"), &format!("\n{}\n", &line[2..]));
+        }
+        let cfg = Config::parse(&enabled).unwrap();
+        assert_eq!(
+            cfg.persist,
+            Persist::On {
+                position: Source::Cur,
+                sit: Source::Cfg
+            }
+        );
+        assert!(cfg.rlv);
+        assert_eq!(cfg.rlv_persist, RlvPersist::Follow);
     }
 
     #[test]

@@ -565,6 +565,19 @@ impl<N: Net> Session<N> {
         });
     }
 
+    /// Teleports to `position` in the region with this handle, which is
+    /// its south-west corner in metres. Nothing is looked up. Ends as
+    /// `start_teleport` does.
+    pub fn start_teleport_to(&mut self, handle: u64, position: Vector3, now: Instant) {
+        self.send(messages::teleport_location_request(&self.agent, handle, position), true, now);
+        self.teleport = Some(Teleport {
+            region: String::new(),
+            position,
+            phase: TeleportPhase::Requested,
+            deadline: now + TELEPORT_LIMIT,
+        });
+    }
+
     /// Tells the simulator the avatar is leaving. Ends in `LoggedOut`.
     pub fn start_logout(&mut self, now: Instant) {
         self.logout_deadline = Some(now + LOGOUT_LIMIT);
@@ -725,6 +738,19 @@ impl<N: Net> Session<N> {
         let own = self.sim.own_local;
         let worn = self.sim.attachments.iter().filter(|(_, worn)| own == Some(worn.parent));
         worn.map(|(item, worn)| (*item, worn.point)).collect()
+    }
+
+    /// The inventory item of the attachment on the avatar whose root prim
+    /// is `object`, as far as the simulator has described it.
+    pub fn attached_item(&self, object: Uuid) -> Option<Uuid> {
+        let local_id = *self.sim.objects.get(&object)?;
+        let own = self.sim.own_local?;
+        let worn = self
+            .sim
+            .attachments
+            .iter()
+            .find(|(_, worn)| worn.local_id == local_id && worn.parent == own);
+        worn.map(|(item, _)| *item)
     }
 
     /// The simulator described an object that carries an inventory item's
@@ -1957,6 +1983,48 @@ mod tests {
     }
 
     #[test]
+    fn teleport_by_handle_asks_for_the_region_at_once() {
+        let mut rig = Rig::entered();
+        let handle = ((1001u64 * 256) << 32) | (1000 * 256);
+        rig.session.start_teleport_to(handle, [128.0, 100.0, 25.0], rig.now);
+        // No lookup: the handle is the region.
+        let sent = rig.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].id, messages::TELEPORT_LOCATION_REQUEST);
+        assert_eq!(sent[0].body[32..40], handle.to_le_bytes());
+        assert_eq!(sent[0].body[40..44], 128.0f32.to_le_bytes());
+        assert_eq!(sent[0].body[44..48], 100.0f32.to_le_bytes());
+        assert_eq!(sent[0].body[48..52], 25.0f32.to_le_bytes());
+        // The avatar is on its way, and a map answer has nothing to say.
+        assert!(rig.session.present().is_err());
+        rig.receive(messages::MAP_BLOCK_REPLY, &wire::map_block_reply(&[(0, 0, "Target", 255)]));
+        assert_eq!(rig.events(), []);
+        // It ends as any teleport does: refused by the grid ...
+        rig.receive(messages::TELEPORT_FAILED, &wire::teleport_failed("Destination refused"));
+        assert_eq!(rig.events(), [SessionEvent::TeleportFailed("Destination refused".into())]);
+        assert!(rig.session.present().is_ok());
+        // ... or arrived, here in the region the avatar is in already.
+        rig.session.start_teleport_to(HOME_HANDLE, [5.0, 6.0, 7.0], rig.now);
+        rig.receive(messages::TELEPORT_LOCAL, &wire::teleport_local([5.0, 6.0, 7.0]));
+        assert_eq!(rig.events(), [SessionEvent::TeleportArrived]);
+    }
+
+    #[test]
+    fn teleport_by_handle_times_out_after_sixty_seconds() {
+        let mut rig = Rig::entered();
+        rig.session.start_teleport_to(HOME_HANDLE + 256, [5.0, 6.0, 7.0], rig.now);
+        rig.ack_all();
+        for _ in 0..59 {
+            rig.receive_from(1, packet::high(200), &[], false);
+            rig.advance(secs(1));
+        }
+        assert_eq!(rig.events(), []);
+        rig.receive_from(1, packet::high(200), &[], false);
+        rig.advance(secs(1));
+        assert_eq!(rig.events(), [SessionEvent::TeleportFailed("no answer within 60 s".into())]);
+    }
+
+    #[test]
     fn teleport_inside_the_current_region_skips_the_lookup() {
         let mut rig = Rig::entered();
         rig.session.start_teleport(" home", [5.0, 6.0, 7.0], rig.now);
@@ -3166,6 +3234,25 @@ mod tests {
         // Their going is nothing to report either.
         rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[RADIO_LOCAL, 702]));
         assert_eq!(rig.events(), []);
+    }
+
+    #[test]
+    fn an_attachment_on_the_avatar_names_its_inventory_item() {
+        let mut rig = Rig::standing();
+        // The avatar's own, another avatar's, and an object that is not worn.
+        rig.attachment(radio_object(), RADIO_LOCAL, OWN_LOCAL, 5, radio_item());
+        let (hat, hat_item) = (Uuid::from_bytes([0x38; 16]), Uuid::from_bytes([0x37; 16]));
+        rig.attachment(hat, 701, 4321, 2, hat_item);
+        rig.receive(messages::OBJECT_UPDATE, &wire::object_update(&[(object(3), 702)]));
+        assert_eq!(rig.session.attached_item(radio_object()), Some(radio_item()));
+        assert_eq!(rig.session.attached_item(hat), None);
+        assert_eq!(rig.session.attached_item(object(3)), None);
+        assert_eq!(rig.session.attached_item(Uuid::from_bytes([0x99; 16])), None);
+        // By its object, not by its item.
+        assert_eq!(rig.session.attached_item(radio_item()), None);
+        // Gone from the avatar, it names nothing.
+        rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[RADIO_LOCAL]));
+        assert_eq!(rig.session.attached_item(radio_object()), None);
     }
 
     #[test]

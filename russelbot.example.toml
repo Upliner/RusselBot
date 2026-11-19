@@ -79,8 +79,27 @@ sit = "00000000-0000-0000-0000-000000000000"
 # Life); elsewhere this does nothing. On by default; `false` switches it off.
 # restore_attachments = false
 
-# The same as `persist = ["cur", "cfg"]`, as a table. A key that is left out
-# of the table is "cur". A table has to come after all the keys above.
+# Optional: RLV (the RestrainedLove API). With `true` the bot reads the `@`
+# commands that scripted objects the avatar owns say to their owner, answers
+# their version queries, and carries out forced sits, stands, teleports and
+# detaches. Any such object, worn or rezzed nearby, can then move the avatar
+# and take things off it. Off by default; `rslbot ctl rlv mode on` switches
+# it on while the bot runs.
+# rlv = true
+
+# `persist` as a table. A table has to come after all the keys above.
+#   atstart   Whether the bot holds anything once it has got to the place
+#             above. True when `position` or `sit` is given and false
+#             otherwise; `atstart = true` alone is `persist = "cur"`.
+#   position  "cur" or "cfg", as in the array form. One that is left out is
+#   sit       "cur".
+#   rlv       What a forced RLV sit, stand or teleport does to the place the
+#             bot holds: "drop" (the default) makes it stop holding,
+#             "follow" makes the result the place it holds. It says nothing
+#             about `atstart`. `rslbot ctl rlv persist` changes it while the
+#             bot runs.
 # [persist]
+# atstart = true
 # position = "cur"
 # sit = "cfg"
+# rlv = "follow"

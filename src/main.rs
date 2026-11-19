@@ -15,6 +15,7 @@ mod names;
 mod net;
 mod persist;
 mod reconciler;
+mod rlv;
 mod session;
 mod udp {
     pub mod circuit;
@@ -24,14 +25,15 @@ mod udp {
 mod xml;
 
 use commands::{Commands, Grid, SentIm};
-use config::{Config, Persist, Place, Sit, Source};
-use control::{Request, Response};
+use config::{Config, Persist, Place, RlvPersist, Sit, Source};
+use control::{Request, Response, RlvRequest};
 use login::Outcome;
 use msglog::{Channel, Logs, Recorder};
 use names::{Lookup, Search};
 use net::{Event, RealNet};
 use persist::{Book, Location, LocationArg, Placement, SitArg, SitState, World};
 use reconciler::{Action, Decision, Goal, Reconciler, SeatGoal};
+use rlv::{After, Follow, Issuer, Rlv, Step};
 use session::{Seat, Session, SessionEvent, Touch};
 use std::io::{BufRead, IsTerminal};
 use std::path::Path;
@@ -184,6 +186,17 @@ struct Bot {
     startup_wait: Option<Instant>,
     /// What inventory commands need of the grid.
     inventory: Inventory,
+    /// RLV: whether it is on, and what a forced movement does to `book`.
+    rlv: Rlv,
+    /// A followed forced teleport that has not ended.
+    follow: Follow,
+    /// `startup` is armed for a followed forced sit, not by the config:
+    /// the seat is held already, and its position is persisted once the
+    /// avatar sits there.
+    follow_seat: bool,
+    /// Stands in for a session's view of the world, which tests have none of.
+    #[cfg(test)]
+    world: Option<Box<dyn World>>,
 }
 
 /// The way to the avatar's inventory: the worker, and what the login and
@@ -248,6 +261,11 @@ impl Grid for Live<'_> {
         self.session.start_teleport(region, position, now);
         Ok(())
     }
+    fn teleport_to(&mut self, handle: u64, position: Vector3, now: Instant) -> Result<(), String> {
+        self.session.present()?;
+        self.session.start_teleport_to(handle, position, now);
+        Ok(())
+    }
     fn region(&self) -> Option<String> {
         self.session.region().map(str::to_string)
     }
@@ -296,6 +314,9 @@ impl Grid for Live<'_> {
     }
     fn attached(&self) -> Vec<(Uuid, u8)> {
         self.session.attached()
+    }
+    fn attached_item(&self, object: Uuid) -> Option<Uuid> {
+        self.session.attached_item(object)
     }
     fn attach(&mut self, item: &inventory::Item, point: u8, now: Instant) -> Result<(), String> {
         let item = udp::messages::AttachItem {
@@ -350,6 +371,11 @@ impl Bot {
         let mut commands = Commands::new(config.requesttp_timeout);
         commands.set_restore(config.restore_attachments);
         Bot {
+            rlv: Rlv::new(config.rlv, config.rlv_persist),
+            follow: Follow::default(),
+            follow_seat: false,
+            #[cfg(test)]
+            world: None,
             reconciler: Reconciler::new(goal(book.held(), config_start(&config))),
             book,
             startup: Some(config.persist),
@@ -434,6 +460,7 @@ impl Bot {
         self.inventory.urls = None;
         self.inventory.generation = None;
         self.commands.session_lost();
+        self.rlv.forget_waiting();
     }
 
     /// Reads the Current Outfit folder when it is time to compare it with
@@ -469,10 +496,22 @@ impl Bot {
     /// Stops putting the avatar back once a command has moved it. The
     /// operator has taken over: the config's `persist` no longer applies.
     fn follow_commands(&mut self) {
-        if self.commands.take_manual() {
+        if self.go_manual() {
+            // And a forced movement that was to be followed is not.
+            self.follow.give_up();
+        }
+    }
+
+    /// Goes to manual mode if a command has moved the avatar. Returns
+    /// whether one has.
+    fn go_manual(&mut self) -> bool {
+        let moved = self.commands.take_manual();
+        if moved {
             self.startup = None;
+            self.follow_seat = false;
             self.set_manual(true);
         }
+        moved
     }
 
     /// Switches between holding the placement and leaving the avatar where
@@ -502,12 +541,17 @@ impl Bot {
         // `cur` needs the avatar in a region and not on its way out of it.
         let world = self.session.as_ref().filter(|session| session.present().is_ok());
         let world = world.map(|session| session as &dyn World);
+        #[cfg(test)]
+        let world = world.or(self.world.as_deref());
         let placement = self
             .book
             .resolve(location, sit, world, self.commands.last_tp(), self.commands.last_sit())?;
         self.book.commit(placement.clone());
         self.startup = None;
         self.startup_wait = None;
+        // What was to follow a forced movement is overtaken by this.
+        self.follow_seat = false;
+        self.follow.give_up();
         // An answer to an earlier `requesttp` must not take the avatar away.
         self.commands.forget_requests();
         self.sync_goal(now);
@@ -558,7 +602,9 @@ impl Bot {
             ground_sat: self.reconciler.ground_sat(),
             seat_frame_known: session.seat_frame_known(),
         };
-        let settled = match startup_due(self.book.config().sit, setting, arrival, self.startup_wait, now) {
+        // Until it has been applied, the config's sit state is the held
+        // one; for a followed forced sit the held one is what counts.
+        let settled = match startup_due(self.book.held().sit, setting, arrival, self.startup_wait, now) {
             Startup::NotYet => {
                 self.startup_wait = None;
                 return None;
@@ -571,6 +617,7 @@ impl Bot {
         };
         self.startup = None;
         self.startup_wait = None;
+        let for_rlv = std::mem::take(&mut self.follow_seat);
         let Persist::On { position, sit } = setting else {
             info!("the avatar is in place and `persist` is off");
             self.set_manual(true);
@@ -584,7 +631,8 @@ impl Bot {
             );
         }
         let word = |source| if source == Source::Cur { "cur" } else { "cfg" };
-        let what = format!("config: persist {} {}", word(position), word(sit));
+        let whose = if for_rlv { "rlv: following" } else { "config" };
+        let what = format!("{whose}: persist {} {}", word(position), word(sit));
         info!("{what}");
         let location = if position == Source::Cur {
             LocationArg::Cur
@@ -623,6 +671,19 @@ impl Bot {
                 self.persist_command(&format!("persist {location} {sit}"), location, sit, &reply, now);
             }
             Request::Home => self.persist_command("home", "last", "last", &reply, now),
+            Request::Rlv(RlvRequest::Mode(on)) => {
+                let line = self.rlv.set_on(on);
+                let _ = reply.send(Response::Ok(Some(line)));
+            }
+            Request::Rlv(RlvRequest::Persist(follow)) => {
+                let setting = if follow { RlvPersist::Follow } else { RlvPersist::Drop };
+                let line = self.rlv.set_persist(setting);
+                let _ = reply.send(Response::Ok(Some(line)));
+            }
+            Request::Rlv(RlvRequest::Status) => {
+                let _ = reply.send(Response::Ok(Some(self.rlv.status())));
+            }
+            Request::Rlv(RlvRequest::Cmd(text)) => self.rlv_command(&text, &reply, now),
             Request::Quit => {
                 info!("control: quit");
                 let _ = reply.send(Response::Ok(None));
@@ -637,6 +698,145 @@ impl Bot {
             }
         }
         Flow::Continue
+    }
+
+    // -------------------------------------------------------------- RLV
+
+    /// `rlv cmd`: RLV commands of the operator's, dealt with at once as
+    /// if an object had sent them, with the avatar itself as the sender.
+    fn rlv_command(&mut self, text: &str, reply: &Sender<Response>, now: Instant) {
+        let refuse = |reason: String| {
+            info!("control: rlv cmd refused: {reason}");
+            let _ = reply.send(Response::Error(reason));
+        };
+        if !self.rlv.is_on() {
+            return refuse("RLV is off; `rslbot ctl rlv mode on` switches it on".to_string());
+        }
+        let issuer = Issuer::operator(self.inventory.agent);
+        let outcomes = self.rlv_message(&issuer, text, now);
+        if outcomes.is_empty() {
+            return refuse(format!("there is no RLV command in \"{text}\""));
+        }
+        let carried_out = outcomes.iter().all(|(_, outcome)| outcome.is_ok());
+        let lines: Vec<String> = outcomes
+            .into_iter()
+            .map(|(command, outcome)| match outcome {
+                Ok(Some(said)) => format!("{command}: {said}"),
+                Ok(None) => format!("{command}: ok"),
+                Err(reason) => format!("{command}: {reason}"),
+            })
+            .collect();
+        let answer = lines.join("\n");
+        // The client may have gone away; the commands are dealt with.
+        let _ = reply.send(match carried_out {
+            true => Response::Ok(Some(answer)),
+            false => Response::Error(answer),
+        });
+    }
+
+    /// An object said RLV commands to its owner: now if the avatar can
+    /// act, and otherwise once it can, after what waits already.
+    fn rlv_heard(&mut self, issuer: Issuer, text: String, now: Instant) {
+        if self.can_act() && !self.rlv.has_waiting() {
+            self.rlv_message(&issuer, &text, now);
+        } else {
+            self.rlv.keep(issuer, text);
+        }
+    }
+
+    /// Whether the avatar is in a region and not on its way out of it.
+    fn can_act(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| session.present().is_ok())
+    }
+
+    /// Deals with the RLV messages that waited for the avatar, for as
+    /// long as it can act: one of them may send it off again.
+    fn rlv_waiting(&mut self, now: Instant) {
+        while self.can_act() {
+            let Some((issuer, text)) = self.rlv.next_waiting() else {
+                return;
+            };
+            self.rlv_message(&issuer, &text, now);
+        }
+    }
+
+    /// Deals with the RLV commands of one message, in order. Returns each
+    /// with what became of it: what was said for a query, nothing more
+    /// for a command that was carried out or begun, or why it was not.
+    fn rlv_message(&mut self, issuer: &Issuer, text: &str, now: Instant) -> Vec<(String, Result<Option<String>, String>)> {
+        let mut outcomes = Vec::new();
+        for piece in rlv::parse(text) {
+            let command = match piece {
+                Ok(command) => command,
+                Err(malformed) => {
+                    info!("rlv: {issuer}: {}: malformed: {}", malformed.text, malformed.reason);
+                    outcomes.push((malformed.text, Err(format!("malformed: {}", malformed.reason))));
+                    continue;
+                }
+            };
+            let follows = self.rlv.follows();
+            let was_manual = self.reconciler.is_manual();
+            let step = {
+                let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
+                rlv::deal(&command, issuer, follows, &mut self.commands, live.as_mut(), now)
+            };
+            let outcome = match step {
+                Step::Said(said) => Ok(Some(said)),
+                Step::Done => Ok(None),
+                Step::Moved(movement) => {
+                    let after = self.follow.moved(movement, follows, was_manual);
+                    self.go_manual();
+                    self.after_forced(after, "", now);
+                    Ok(None)
+                }
+                Step::HoldSeat(object) => self.hold_seat(issuer, &command.text, object, now).map(|()| None),
+                Step::Failed(reason) => Err(reason),
+            };
+            outcomes.push((command.text, outcome));
+        }
+        outcomes
+    }
+
+    /// A forced sit that is followed: the object becomes the held seat at
+    /// once, with the place the avatar is at, and the bot seats the avatar
+    /// as on any held seat. When it sits there, its seated position is
+    /// persisted the way the config's setting is applied.
+    fn hold_seat(&mut self, issuer: &Issuer, command: &str, object: Uuid, now: Instant) -> Result<(), String> {
+        info!("rlv: {issuer}: {command}: persist cur {object}");
+        match self.persist(&LocationArg::Cur, SitArg::Is(SitState::Object(object)), now) {
+            Ok(_) => {
+                self.startup = Some(Persist::On {
+                    position: Source::Cur,
+                    sit: Source::Cur,
+                });
+                self.follow_seat = true;
+                Ok(())
+            }
+            Err(reason) => {
+                info!("rlv: {issuer}: {command}: refused: {reason}");
+                Err(reason)
+            }
+        }
+    }
+
+    /// What follows a step of a forced movement: a persist of its result,
+    /// or the placement mode from before it. `why` says what went wrong.
+    fn after_forced(&mut self, after: After, why: &str, now: Instant) {
+        match after {
+            After::Nothing => {}
+            After::Persist(sit) => {
+                let what = format!("rlv: following: persist cur {sit}");
+                info!("{what}");
+                if let Err(reason) = self.persist(&LocationArg::Cur, SitArg::Is(sit), now) {
+                    info!("{what} refused: {reason}");
+                }
+            }
+            After::Restore { manual } => {
+                let mode = if manual { "manual mode" } else { "holding" };
+                info!("rlv: not following: {why}; back to {mode} as before");
+                self.set_manual(manual);
+            }
+        }
     }
 
     /// Puts an instant message the bot sent into the message log.
@@ -715,8 +915,12 @@ impl Bot {
                 }
                 self.commands.arrived(&name);
                 self.commands.entered_region(now);
+                let after = self.follow.arrived();
+                self.after_forced(after, "", now);
             }
             SessionEvent::Lost(reason) => {
+                let after = self.follow.failed();
+                self.after_forced(after, "the session was lost", now);
                 let delay = self.reconciler.session_lost(now);
                 self.drop_session();
                 if self.stopping {
@@ -770,6 +974,8 @@ impl Bot {
                 info!("teleport arrived");
                 let region = self.session.as_ref().and_then(Session::region).unwrap_or_default().to_string();
                 self.commands.arrived(&region);
+                let after = self.follow.arrived();
+                self.after_forced(after, "", now);
             }
             SessionEvent::TeleportFailed(reason) => {
                 if self.commands.teleport_failed(&reason) || manual {
@@ -778,6 +984,8 @@ impl Bot {
                     let delay = self.reconciler.teleport_failed(now);
                     info!("teleport failed: {reason}; next attempt in {}", seconds(delay));
                 }
+                let after = self.follow.failed();
+                self.after_forced(after, "the teleport failed", now);
             }
             SessionEvent::TeleportOffer { from, name, lure } => {
                 let mut live = live(&mut self.session, &self.search_url, &self.avatar_searches, &self.inventory);
@@ -820,7 +1028,16 @@ impl Bot {
             }
             SessionEvent::AttachFailed(item) => self.commands.attach_failed(item),
             SessionEvent::DetachFailed(item) => self.commands.detach_failed(item),
-            SessionEvent::Chat(message) => self.record(Channel::Chat, message, now),
+            SessionEvent::Chat(message) => {
+                // What an object says to its owner may be RLV commands; it
+                // is recorded like any other chat all the same.
+                let rlv = rlv::sender(&message).filter(|_| self.rlv.is_on());
+                let text = message.text.clone();
+                self.record(Channel::Chat, message, now);
+                if let Some(issuer) = rlv {
+                    self.rlv_heard(issuer, text, now);
+                }
+            }
             SessionEvent::InstantMessage(message) => self.record(Channel::Im, message, now),
             SessionEvent::DisplayNamesUrl(url) => {
                 if url.is_none() {
@@ -856,6 +1073,7 @@ impl Bot {
                 return Flow::Exit(code);
             }
         }
+        self.rlv_waiting(now);
         Flow::Continue
     }
 
@@ -913,6 +1131,7 @@ impl Bot {
             Some(session) => {
                 info!("stop requested; logging out");
                 session.start_logout(Instant::now());
+                self.rlv.forget_waiting();
                 Flow::Continue
             }
             None => {
@@ -1637,5 +1856,453 @@ mod tests {
             Response::Ok(Some("unknown stand".to_string()))
         );
         assert_eq!(next_login(&bot), Decision::Start(Action::Login(login::Start::Last)));
+    }
+
+    // ------------------------------------------------------------------ RLV
+
+    fn ok(bot: &mut Bot, line: &str) -> String {
+        match command(bot, line) {
+            Response::Ok(Some(text)) => text,
+            other => panic!("{line}: expected an answer with a text, got {other:?}"),
+        }
+    }
+
+    fn refused(bot: &mut Bot, line: &str) -> String {
+        match command(bot, line) {
+            Response::Error(reason) => reason,
+            other => panic!("{line}: expected an error, got {other:?}"),
+        }
+    }
+
+    /// What an object named `Collar` says to its owner.
+    fn owner_say(text: &str) -> SessionEvent {
+        SessionEvent::Chat(session::Message {
+            kind: "owner".to_string(),
+            source: session::Source::Object {
+                id: Some(Uuid::from_bytes([7; 16])),
+                name: "Collar".to_string(),
+                owner: Uuid::from_bytes([1; 16]),
+            },
+            sent_at: None,
+            text: text.to_string(),
+        })
+    }
+
+    fn hear(bot: &mut Bot, event: SessionEvent) {
+        assert!(matches!(bot.apply(event, Instant::now()), Flow::Continue));
+    }
+
+    #[test]
+    fn rlv_starts_as_the_config_says() {
+        let mut plain = bot(full(""));
+        assert_eq!(ok(&mut plain, "rlv\tstatus"), "rlv: off\npersist: drop");
+        let mut on = bot(full("rlv = true\n"));
+        assert_eq!(ok(&mut on, "rlv\tstatus"), "rlv: on\npersist: drop");
+        let mut following = bot(full("[persist]\nrlv = \"follow\"\n"));
+        assert_eq!(ok(&mut following, "rlv\tstatus"), "rlv: off\npersist: follow");
+        // That table holds nothing at the start, whatever RLV does later.
+        assert_eq!(following.startup, Some(Persist::Off));
+    }
+
+    #[test]
+    fn rlv_mode_and_persist_are_switched_by_command_in_any_state() {
+        // Between logins, in holding mode.
+        let mut bot = bot(full(""));
+        let held = bot.book.held().clone();
+        assert_eq!(ok(&mut bot, "rlv\tmode\ton"), "rlv: on");
+        assert_eq!(ok(&mut bot, "rlv\tmode\ton"), "rlv: on");
+        assert_eq!(ok(&mut bot, "rlv\tstatus"), "rlv: on\npersist: drop");
+        // The persist setting does not care whether RLV is on.
+        assert_eq!(ok(&mut bot, "rlv\tmode\toff"), "rlv: off");
+        assert_eq!(ok(&mut bot, "rlv\tpersist\tfollow"), "rlv persist: follow");
+        assert_eq!(ok(&mut bot, "rlv\tpersist\tfollow"), "rlv persist: follow");
+        assert_eq!(ok(&mut bot, "rlv\tstatus"), "rlv: off\npersist: follow");
+        assert_eq!(ok(&mut bot, "rlv\tmode\ton"), "rlv: on");
+        assert_eq!(ok(&mut bot, "rlv\tstatus"), "rlv: on\npersist: follow");
+        assert_eq!(ok(&mut bot, "rlv\tpersist\tdrop"), "rlv persist: drop");
+        // None of it touches the placement.
+        assert!(!bot.reconciler.is_manual());
+        assert_eq!(bot.book.held(), &held);
+        assert_eq!(bot.startup, Some(Persist::Off));
+    }
+
+    #[test]
+    fn rlv_cmd_is_refused_while_rlv_is_off() {
+        let mut bot = bot(full(""));
+        let reason = refused(&mut bot, "rlv\tcmd\t@unsit=force");
+        assert!(reason.contains("RLV is off") && reason.contains("rlv mode on"), "{reason}");
+        assert!(!bot.reconciler.is_manual());
+    }
+
+    #[test]
+    fn rlv_cmd_answers_a_line_for_each_command() {
+        let mut bot = bot(full("rlv = true\n"));
+        // Between logins nothing can be said or done; each says so.
+        assert_eq!(
+            refused(&mut bot, "rlv\tcmd\t@versionnum=5"),
+            format!("versionnum=5: {}", session::NOT_CONNECTED)
+        );
+        assert_eq!(
+            refused(&mut bot, "rlv\tcmd\tunsit=force"),
+            format!("unsit=force: {}", session::NOT_CONNECTED)
+        );
+        assert_eq!(
+            refused(&mut bot, "rlv\tcmd\t@versionnum=5,detach=n,nonsense,"),
+            format!(
+                "versionnum=5: {}\ndetach=n: not supported\nnonsense: malformed: it has no `=`",
+                session::NOT_CONNECTED
+            )
+        );
+        let reason = refused(&mut bot, "rlv\tcmd\t@");
+        assert!(reason.contains("no RLV command"), "{reason}");
+        // Nothing was carried out, so nothing changed.
+        assert!(!bot.reconciler.is_manual());
+        assert!(!bot.rlv.has_waiting());
+    }
+
+    #[test]
+    fn a_followed_sit_that_cannot_be_persisted_changes_nothing() {
+        let mut bot = bot(full("rlv = true\n[persist]\nrlv = \"follow\"\n"));
+        let held = bot.book.held().clone();
+        // `cur` needs the avatar in a region.
+        let reason = refused(&mut bot, &format!("rlv\tcmd\t@sit:{}=force", Uuid::from_bytes([9; 16])));
+        assert!(reason.contains("not connected"), "{reason}");
+        assert_eq!(bot.book.held(), &held);
+        assert!(!bot.reconciler.is_manual());
+        // The config's setting is still to be applied, and not for RLV.
+        assert_eq!(bot.startup, Some(Persist::Off));
+        assert!(!bot.follow_seat);
+    }
+
+    /// Where the avatar is said to be while a test has no session.
+    struct Somewhere(Location, persist::Sitting);
+
+    impl World for Somewhere {
+        fn here(&self) -> Location {
+            self.0.clone()
+        }
+        fn sitting(&self) -> persist::Sitting {
+            self.1
+        }
+        fn region_of(&self, _: Uuid) -> Option<String> {
+            None
+        }
+    }
+
+    fn bench() -> Uuid {
+        Uuid::from_bytes([9; 16])
+    }
+
+    /// A bot with RLV on and following, holding the config placement, whose
+    /// avatar stands at 40, 50, 22 in `Home` as far as `persist` can tell.
+    fn follower() -> Bot {
+        let mut bot = bot(full("rlv = true\npersist = \"cfg\"\n"));
+        ok(&mut bot, "rlv\tpersist\tfollow");
+        bot.world = Some(Box::new(Somewhere(at("Home", 40.0, 50.0, 22.0), persist::Sitting::Standing)));
+        bot
+    }
+
+    #[test]
+    fn a_followed_sit_holds_the_seat_at_once() {
+        let mut bot = follower();
+        let sit = format!("sit:{}=force", bench());
+        assert_eq!(ok(&mut bot, &format!("rlv\tcmd\t@{sit}")), format!("{sit}: ok"));
+        // The seat is held with the place the avatar is at, and the bot
+        // is the one to sit: it holds, it was not sent off by hand.
+        assert_eq!(bot.book.held().to_string(), format!("Home/40/50/22 {}", bench()));
+        assert!(!bot.reconciler.is_manual());
+        assert_eq!(bot.reconciler.goal().seat, Some(SeatGoal::Object));
+        // The seated position is persisted when the avatar sits there, the
+        // way the config's setting would be.
+        assert_eq!(
+            bot.startup,
+            Some(Persist::On {
+                position: Source::Cur,
+                sit: Source::Cur
+            })
+        );
+        assert!(bot.follow_seat);
+        // It is no `sit` command of the operator's.
+        assert_eq!(bot.commands.last_sit(), None);
+        // `home` returns to it: it was a persist.
+        assert_eq!(ok(&mut bot, "home"), format!("Home/40/50/22 {}", bench()));
+    }
+
+    #[test]
+    fn a_followed_sit_also_holds_for_a_bot_that_held_nothing() {
+        let mut bot = follower();
+        bot.set_manual(true);
+        ok(&mut bot, &format!("rlv\tcmd\t@sit:{}=force", bench()));
+        assert!(!bot.reconciler.is_manual());
+        assert_eq!(bot.book.held().sit, SitState::Object(bench()));
+    }
+
+    #[test]
+    fn the_second_persist_of_a_followed_sit_is_given_up_for_the_operator() {
+        for line in ["persist\tcfg\tcfg", "home"] {
+            let mut bot = follower();
+            ok(&mut bot, &format!("rlv\tcmd\t@sit:{}=force", bench()));
+            ok(&mut bot, line);
+            assert_eq!((bot.startup, bot.follow_seat), (None, false), "{line}");
+        }
+        // Switching the setting afterwards does not undo what was accepted.
+        let mut bot = follower();
+        ok(&mut bot, &format!("rlv\tcmd\t@sit:{}=force", bench()));
+        ok(&mut bot, "rlv\tpersist\tdrop");
+        assert!(bot.startup.is_some() && bot.follow_seat);
+        // A later forced sit takes its place.
+        let other = Uuid::from_bytes([8; 16]);
+        ok(&mut bot, "rlv\tpersist\tfollow");
+        ok(&mut bot, &format!("rlv\tcmd\t@sit:{other}=force"));
+        assert_eq!(bot.book.held().sit, SitState::Object(other));
+        assert!(bot.startup.is_some() && bot.follow_seat);
+    }
+
+    #[test]
+    fn a_followed_sit_on_an_object_elsewhere_is_refused() {
+        let mut bot = follower();
+        // The avatar sat on the bench in `Target` earlier, and is in `Home`.
+        bot.book.seated(bench(), "Target");
+        let held = bot.book.held().clone();
+        let reason = refused(&mut bot, &format!("rlv\tcmd\t@sit:{}=force", bench()));
+        assert!(reason.contains("Home") && reason.contains("Target"), "{reason}");
+        assert_eq!(bot.book.held(), &held);
+        assert!(!bot.reconciler.is_manual() && !bot.follow_seat);
+    }
+
+    #[test]
+    fn a_followed_sit_outlasts_a_lost_session() {
+        let mut bot = follower();
+        ok(&mut bot, &format!("rlv\tcmd\t@sit:{}=force", bench()));
+        hear(&mut bot, SessionEvent::Lost("kicked".to_string()));
+        // The seat is held, so the next login goes there and sits; the
+        // seated position is still to be persisted then.
+        assert_eq!(bot.book.held().sit, SitState::Object(bench()));
+        assert!(!bot.reconciler.is_manual());
+        assert!(bot.startup.is_some() && bot.follow_seat);
+    }
+
+    /// Carries a movement out on a simulator that takes everything, as
+    /// the operator's command or as one for RLV.
+    fn moved(bot: &mut Bot, origin: commands::Origin, request: Request) {
+        let (reply, _answer) = mpsc::channel();
+        let mut grid = commands::tests::FakeGrid::default();
+        bot.commands.handle_from(origin, request, reply, Some(&mut grid), Instant::now());
+    }
+
+    #[test]
+    fn the_operator_ends_a_followed_sit_that_has_not_seated_the_avatar() {
+        let mut bot = follower();
+        ok(&mut bot, &format!("rlv\tcmd\t@sit:{}=force", bench()));
+        moved(&mut bot, commands::Origin::Operator, Request::Stand);
+        bot.follow_commands();
+        // Manual mode, by the operator's command; nothing more follows the
+        // forced sit, and the bench stays what `home` returns to.
+        assert!(bot.reconciler.is_manual());
+        assert_eq!((bot.startup, bot.follow_seat), (None, false));
+        assert_eq!(bot.book.held().to_string(), format!("Home/40/50/22 {}", bench()));
+    }
+
+    #[test]
+    fn a_forced_stand_ends_a_followed_sit_that_has_not_seated_the_avatar() {
+        let mut bot = follower();
+        ok(&mut bot, &format!("rlv\tcmd\t@sit:{}=force", bench()));
+        // What `rlv_message` does once the commands have taken the stand.
+        let was_manual = bot.reconciler.is_manual();
+        moved(&mut bot, commands::Origin::Rlv, Request::Stand);
+        let after = bot.follow.moved(rlv::Movement::Stand, true, was_manual);
+        assert!(bot.go_manual());
+        bot.after_forced(after, "", Instant::now());
+        // Standing is what is held now, and no seat is waited for.
+        assert_eq!(bot.book.held().to_string(), "Home/40/50/22 stand");
+        assert!(!bot.reconciler.is_manual());
+        assert_eq!((bot.startup, bot.follow_seat), (None, false));
+    }
+
+    #[test]
+    fn a_dropped_movement_goes_manual_and_keeps_what_was_held() {
+        let mut bot = follower();
+        ok(&mut bot, "rlv\tpersist\tdrop");
+        let held = bot.book.held().clone();
+        let was_manual = bot.reconciler.is_manual();
+        moved(&mut bot, commands::Origin::Rlv, Request::Stand);
+        let after = bot.follow.moved(rlv::Movement::Stand, false, was_manual);
+        assert!(bot.go_manual());
+        bot.after_forced(after, "", Instant::now());
+        assert!(bot.reconciler.is_manual());
+        assert_eq!(bot.book.held(), &held);
+        // `home` returns to it.
+        assert_eq!(ok(&mut bot, "home"), held.to_string());
+        assert!(!bot.reconciler.is_manual());
+    }
+
+    #[test]
+    fn a_dropped_sit_is_a_sit_command_and_holds_nothing() {
+        let mut bot = follower();
+        ok(&mut bot, "rlv\tpersist\tdrop");
+        let held = bot.book.held().clone();
+        // Between logins the `sit` it is carried out as cannot be sent.
+        let reason = refused(&mut bot, &format!("rlv\tcmd\t@sit:{}=force", bench()));
+        assert!(reason.ends_with(session::NOT_CONNECTED), "{reason}");
+        assert_eq!(bot.book.held(), &held);
+        assert!(!bot.reconciler.is_manual() && !bot.follow_seat);
+    }
+
+    #[test]
+    fn the_seated_position_of_a_followed_sit_is_waited_for() {
+        // What `apply_startup` asks once the followed seat is held.
+        let cur = Persist::On {
+            position: Source::Cur,
+            sit: Source::Cur,
+        };
+        let held = SitState::Object(bench());
+        let now = Instant::now();
+        assert_eq!(startup_due(held, cur, arrived(), None, now), Startup::NotYet);
+        let seated = Arrival {
+            seated_on_target: true,
+            ..arrived()
+        };
+        assert_eq!(startup_due(held, cur, seated, None, now), Startup::Wait(now + SEAT_POSITION_WAIT));
+        let later = now + SEAT_POSITION_WAIT;
+        assert_eq!(startup_due(held, cur, seated, Some(now), later), Startup::Now { settled: false });
+        let described = Arrival {
+            seat_frame_known: true,
+            ..seated
+        };
+        assert_eq!(startup_due(held, cur, described, Some(now), now), Startup::Now { settled: true });
+    }
+
+    #[test]
+    fn a_followed_teleport_is_persisted_when_the_avatar_has_arrived() {
+        let mut bot = follower();
+        // As the bot is after it has accepted a forced teleport while holding.
+        bot.follow.moved(rlv::Movement::Teleport, true, false);
+        bot.set_manual(true);
+        hear(&mut bot, SessionEvent::RegionEntered("Home".to_string()));
+        assert_eq!(bot.book.held().to_string(), "Home/40/50/22 stand");
+        assert!(!bot.reconciler.is_manual());
+        // Once: the next arrival is not that teleport's.
+        bot.world = Some(Box::new(Somewhere(at("Target", 1.0, 2.0, 3.0), persist::Sitting::Standing)));
+        hear(&mut bot, SessionEvent::TeleportArrived);
+        assert_eq!(bot.book.held().to_string(), "Home/40/50/22 stand");
+    }
+
+    #[test]
+    fn a_followed_teleport_that_fails_leaves_everything_as_it_was() {
+        for was_manual in [false, true] {
+            for event in [
+                SessionEvent::TeleportFailed("region \"Nowhere\" not found".to_string()),
+                SessionEvent::Lost("kicked".to_string()),
+            ] {
+                let mut bot = follower();
+                bot.set_manual(was_manual);
+                let held = bot.book.held().clone();
+                bot.follow.moved(rlv::Movement::Teleport, true, was_manual);
+                bot.set_manual(true);
+                hear(&mut bot, event.clone());
+                assert_eq!(bot.reconciler.is_manual(), was_manual, "{event:?}");
+                assert_eq!(bot.book.held(), &held, "{event:?}");
+                // And an arrival later on is not followed.
+                hear(&mut bot, SessionEvent::RegionEntered("Home".to_string()));
+                assert_eq!(bot.book.held(), &held, "{event:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_followed_teleport_is_given_up_when_something_else_is_persisted() {
+        let mut bot = follower();
+        bot.follow.moved(rlv::Movement::Teleport, true, false);
+        bot.set_manual(true);
+        ok(&mut bot, "persist\tcfg\tcfg");
+        let held = bot.book.held().clone();
+        hear(&mut bot, SessionEvent::RegionEntered("Home".to_string()));
+        assert_eq!(bot.book.held(), &held);
+        assert!(!bot.reconciler.is_manual());
+    }
+
+    #[test]
+    fn a_followed_stand_or_ground_sit_is_persisted_at_once() {
+        for (movement, sit) in [(rlv::Movement::Stand, "stand"), (rlv::Movement::Ground, "ground")] {
+            let mut bot = follower();
+            // As after the command was handed to the simulator connection.
+            let after = bot.follow.moved(movement, true, false);
+            bot.set_manual(true);
+            bot.after_forced(after, "", Instant::now());
+            assert_eq!(bot.book.held().to_string(), format!("Home/40/50/22 {sit}"));
+            assert!(!bot.reconciler.is_manual());
+        }
+        // A persist that cannot be carried out leaves the bot in manual mode.
+        let mut bot = follower();
+        bot.world = None;
+        let held = bot.book.held().clone();
+        let after = bot.follow.moved(rlv::Movement::Stand, true, false);
+        bot.set_manual(true);
+        bot.after_forced(after, "", Instant::now());
+        assert!(bot.reconciler.is_manual());
+        assert_eq!(bot.book.held(), &held);
+    }
+
+    #[test]
+    fn owner_chat_is_read_as_rlv_only_while_rlv_is_on() {
+        let now = Instant::now();
+        // Off: the line is chat and nothing else.
+        let mut off = bot(full(""));
+        hear(&mut off, owner_say("@versionnum=5"));
+        assert!(!off.rlv.has_waiting());
+        assert_eq!(off.recorder.flush_all(now).len(), 1);
+        // On: it is recorded all the same, and, with the avatar not in a
+        // region yet, kept until it is.
+        let mut on = bot(full("rlv = true\n"));
+        hear(&mut on, owner_say("@versionnum=5"));
+        hear(&mut on, owner_say("@unsit=force"));
+        assert!(on.rlv.has_waiting());
+        assert_eq!(on.recorder.flush_all(now).len(), 2);
+        // What waits goes with the session, and with RLV.
+        on.drop_session();
+        assert!(!on.rlv.has_waiting());
+        hear(&mut on, owner_say("@versionnum=5"));
+        assert_eq!(ok(&mut on, "rlv\tmode\toff"), "rlv: off");
+        assert!(!on.rlv.has_waiting());
+        // `rlv cmd` is answered, not kept.
+        assert_eq!(ok(&mut on, "rlv\tmode\ton"), "rlv: on");
+        refused(&mut on, "rlv\tcmd\t@versionnum=5");
+        assert!(!on.rlv.has_waiting());
+    }
+
+    #[test]
+    fn other_chat_is_never_read_as_rlv() {
+        let mut bot = bot(full("rlv = true\n"));
+        let say = |kind: &str, source: session::Source, text: &str| {
+            SessionEvent::Chat(session::Message {
+                kind: kind.to_string(),
+                source,
+                sent_at: None,
+                text: text.to_string(),
+            })
+        };
+        let object = || session::Source::Object {
+            id: Some(Uuid::from_bytes([7; 16])),
+            name: "Collar".to_string(),
+            owner: Uuid::from_bytes([1; 16]),
+        };
+        let avatar = || session::Source::Avatar {
+            id: Uuid::from_bytes([2; 16]),
+            name: "Jane Doe".to_string(),
+        };
+        hear(&mut bot, say("say", object(), "@unsit=force"));
+        hear(&mut bot, say("owner", object(), "Battery low"));
+        hear(&mut bot, say("say", avatar(), "@unsit=force"));
+        hear(&mut bot, say("owner", avatar(), "@unsit=force"));
+        let message = session::Message {
+            kind: "im".to_string(),
+            source: avatar(),
+            sent_at: None,
+            text: "@version".to_string(),
+        };
+        hear(&mut bot, SessionEvent::InstantMessage(message));
+        assert!(!bot.rlv.has_waiting());
+        // All of it is recorded as what it is.
+        assert_eq!(bot.recorder.flush_all(Instant::now()).len(), 5);
     }
 }
