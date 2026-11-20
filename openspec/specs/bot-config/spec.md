@@ -31,6 +31,7 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `rlv` | no | Boolean; when true the bot starts with RLV on and reads the RLV commands of the objects the avatar owns (see `rlv-commands`). Defaults to false |
 | `perms` | no | Table saying which requests the bot accepts by itself (see `permission-requests`); its form is given below. Without it the bot accepts none by itself |
 | `xmpp` | no | Table that switches on the XMPP gateway (see `xmpp-gateway`); its form is given below. Without it the bot makes no XMPP connection |
+| `autoreply` | no | Table that switches on autoreplies to instant messages (see `im-autoreply`); its form is given below. Without it the bot starts with autoreply off and no autoreply text |
 
 `persist` SHALL be accepted in these forms:
 
@@ -54,6 +55,15 @@ In the table form, `atstart` is a boolean that says whether the bot holds anythi
 | `server` | no | `host:port` of the XMPP server's component port. The host SHALL be `localhost` or a loopback address. Defaults to `127.0.0.1:5347` |
 | `secret` | yes | The shared secret the XMPP server has for that component |
 | `owners` | yes | A non-empty array of bare XMPP addresses, `user@domain`, of the accounts that may use the gateway. Letter case does not matter, and an address given twice SHALL count once |
+
+`autoreply` SHALL be a table with these keys:
+
+| Key | Required | Meaning |
+|---|---|---|
+| `message` | yes | The autoreply text: a string that is not blank, at most 1023 bytes long. It may span several lines |
+| `pause` | no | How long the bot stays quiet towards an avatar after it has answered it, as a duration. Defaults to `"1h"` |
+
+A duration SHALL be a string of one or more groups, each a whole number followed by one of the units `s` (seconds), `m` (minutes), `h` (hours) and `d` (days), written without spaces, such as `"90s"`, `"30m"`, `"2h"` or `"1h30m"`, or the string `"0"`. A unit SHALL appear at most once, and the units SHALL be in the order `d`, `h`, `m`, `s`. The duration is the sum of the groups and SHALL be at most 365 days. A config with an `autoreply` table SHALL start the bot with autoreply on.
 
 A relative `log_chat` or `log_im` path SHALL be taken relative to the directory the bot was started in. A config that uses `object` SHALL behave exactly as the same config with that value under `sit`, and the bot SHALL write a line to standard error at startup that names `object` as deprecated and `sit` as its replacement.
 
@@ -221,8 +231,20 @@ A relative `log_chat` or `log_im` path SHALL be taken relative to the directory 
 - **WHEN** the config has no `[xmpp]` table
 - **THEN** the bot makes no XMPP connection
 
+#### Scenario: Autoreply configured
+- **WHEN** the config ends with an `[autoreply]` table containing `message = "Hello, I'm bot. I won't respond to you in next 2 hours"` and `pause = "2h"`
+- **THEN** the bot starts with autoreply on, that text, and a pause of two hours
+
+#### Scenario: Autoreply without a pause
+- **WHEN** the `[autoreply]` table contains only `message`
+- **THEN** the bot starts with autoreply on and a pause of one hour
+
+#### Scenario: No autoreply table
+- **WHEN** the config has no `autoreply` key
+- **THEN** the bot starts with autoreply off and answers no instant message by itself
+
 ### Requirement: Config validation before any network activity
-The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `atstart`, `position`, `sit`, `rlv` and `override`, with a `position` or `sit` other than `"cur"` and `"cfg"`, with an `atstart` that is not a boolean, with an `rlv` other than `"drop"` and `"follow"`, with an `override` that is neither `"sit"`, `"tp"` nor an array of these two strings, or with `atstart = false` together with `position` or `sit`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, a `restore_attachments` that is not a boolean, an `rlv` that is not a boolean, a `perms` that is not in its form (a value that is not a table, a key other than `autoaccept` and `except`, an `autoaccept` or `except` that is not a table, a key in either that is not a kind of request, a value under `autoaccept` that is neither `"all"`, a boolean nor an array of strings, a value under `except` that is not an array of strings, an entry that is neither a UUID nor a name of one or two words, the entry `"all"` inside an array, or one entry both in a kind's `autoaccept` array and in its `except` array), an `xmpp` that is not in its form (a value that is not a table, a key other than `component`, `server`, `secret` and `owners`, a missing `component`, `secret` or `owners`, a `component` that is not a domain name or that holds `@` or `/`, a `server` that is not `host:port` with a port from 1 to 65535 or whose host is neither `localhost` nor a loopback address, a `secret` that is not a non-empty string, an `owners` that is not a non-empty array of strings, or an owner that is not a bare address `user@domain`), and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
+The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `atstart`, `position`, `sit`, `rlv` and `override`, with a `position` or `sit` other than `"cur"` and `"cfg"`, with an `atstart` that is not a boolean, with an `rlv` other than `"drop"` and `"follow"`, with an `override` that is neither `"sit"`, `"tp"` nor an array of these two strings, or with `atstart = false` together with `position` or `sit`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, a `restore_attachments` that is not a boolean, an `rlv` that is not a boolean, a `perms` that is not in its form (a value that is not a table, a key other than `autoaccept` and `except`, an `autoaccept` or `except` that is not a table, a key in either that is not a kind of request, a value under `autoaccept` that is neither `"all"`, a boolean nor an array of strings, a value under `except` that is not an array of strings, an entry that is neither a UUID nor a name of one or two words, the entry `"all"` inside an array, or one entry both in a kind's `autoaccept` array and in its `except` array), an `xmpp` that is not in its form (a value that is not a table, a key other than `component`, `server`, `secret` and `owners`, a missing `component`, `secret` or `owners`, a `component` that is not a domain name or that holds `@` or `/`, a `server` that is not `host:port` with a port from 1 to 65535 or whose host is neither `localhost` nor a loopback address, a `secret` that is not a non-empty string, an `owners` that is not a non-empty array of strings, or an owner that is not a bare address `user@domain`), an `autoreply` that is not in its form (a value that is not a table, a key other than `message` and `pause`, a missing `message`, a `message` that is not a string, is blank or is longer than 1023 bytes, or a `pause` that is not a string in the duration form or is longer than 365 days), and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
 
 #### Scenario: Both password forms given
 - **WHEN** the config contains both `password` and `password_hash`
@@ -363,6 +385,18 @@ The bot SHALL validate the whole config before contacting any server. It SHALL r
 #### Scenario: XMPP server not running at startup
 - **WHEN** the config has a valid `[xmpp]` table and nothing listens on its `server` address
 - **THEN** the bot starts, logs in to the grid, and keeps trying to connect its component as `xmpp-gateway` describes
+
+#### Scenario: Autoreply without a message
+- **WHEN** the config has an `[autoreply]` table containing only `pause = "2h"`
+- **THEN** the bot prints an error naming `autoreply.message` and exits with status 2
+
+#### Scenario: Malformed pause
+- **WHEN** the `[autoreply]` table contains `pause = "2 hours"`, `pause = "30"`, `pause = "30m2h"`, `pause = "400d"` or `pause = 30`
+- **THEN** the bot prints an error naming `autoreply.pause` and the duration form, and exits with status 2
+
+#### Scenario: Blank autoreply text
+- **WHEN** the `[autoreply]` table contains `message = "  "`
+- **THEN** the bot prints an error naming `autoreply.message` and exits with status 2
 
 ### Requirement: Password hash subcommand
 The bot SHALL provide a `hash` subcommand that reads a password from standard input and prints the corresponding hash on standard output as `$1$` followed by the 32 lowercase hexadecimal digits of the MD5 digest of the password. The password SHALL NOT be accepted as a command-line argument. When standard input is a terminal the password SHALL NOT be echoed. A trailing line ending SHALL NOT be part of the hashed password. An empty password SHALL be rejected with a non-zero exit status.
