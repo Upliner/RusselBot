@@ -106,7 +106,7 @@ When `log_chat` is configured the bot SHALL append one row per recorded chat mes
 - **THEN** the `log_im` file gains one row for the instant message and no file receives the chat message
 
 ### Requirement: Logging never disturbs the bot
-Reading and recording messages SHALL NOT change what the bot does to stay logged in, in the target region and seated. A failure to look up a name or to write to a log file SHALL be reported on standard error and SHALL NOT end the session or the bot; later messages SHALL still be attempted. The bot SHALL NOT send chat or instant messages in response to what it reads; it sends them only on an operator's command. Messages still waiting for names when the bot stops SHALL be recorded before it exits.
+Reading and recording messages SHALL NOT change what the bot does to stay logged in, in the target region and seated. A failure to look up a name or to write to a log file SHALL be reported on standard error and SHALL NOT end the session or the bot; later messages SHALL still be attempted. The bot SHALL NOT send chat or instant messages in response to what it reads; it sends them only on an operator's command, given through the control socket or, as an owner's message, through the XMPP gateway (see `xmpp-gateway`). Messages still waiting for names when the bot stops SHALL be recorded before it exits.
 
 #### Scenario: Log file becomes unwritable
 - **WHEN** writing a row fails, for example because the disk is full
@@ -119,6 +119,10 @@ Reading and recording messages SHALL NOT change what the bot does to stay logged
 #### Scenario: Message that looks like a command
 - **WHEN** another avatar sends the bot's avatar the instant message `say hello`
 - **THEN** the message is recorded and the avatar says nothing
+
+#### Scenario: Message that looks like a command, with the gateway on
+- **WHEN** the XMPP gateway is configured and another avatar sends the bot's avatar the instant message `say hello`
+- **THEN** the message is recorded and passed to the owners as a message from that avatar's contact, and the avatar says nothing
 
 ### Requirement: Record outgoing instant messages
 The bot SHALL record every instant message it sends on command as an instant message of kind `im_out`, at the moment the message is handed to the simulator connection. The record's avatar name and display name SHALL be the recipient's, obtained and left empty under the same rules as the names of a received message; its object name and object UUID SHALL be empty; its text SHALL be the text sent. An `im_out` record SHALL be written to standard error and to the `log_im` file like any other recorded instant message, in order with the received ones. An instant message the bot refused to send SHALL NOT be recorded. Chat the bot sends on command SHALL NOT be recorded separately: it is recorded only when the simulator delivers it back as chat the avatar heard.

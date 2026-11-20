@@ -30,6 +30,7 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `restore_attachments` | no | Boolean; when true the bot attaches again, after each login, the objects the avatar's Current Outfit folder lists and the simulator did not bring (see `avatar-outfit`, "Restoring attachments after a login"). Defaults to true |
 | `rlv` | no | Boolean; when true the bot starts with RLV on and reads the RLV commands of the objects the avatar owns (see `rlv-commands`). Defaults to false |
 | `perms` | no | Table saying which requests the bot accepts by itself (see `permission-requests`); its form is given below. Without it the bot accepts none by itself |
+| `xmpp` | no | Table that switches on the XMPP gateway (see `xmpp-gateway`); its form is given below. Without it the bot makes no XMPP connection |
 
 `persist` SHALL be accepted in these forms:
 
@@ -44,6 +45,15 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 In the table form, `atstart` is a boolean that says whether the bot holds anything once the config placement is reached; `position` and `sit`, each `"cur"` or `"cfg"`, are the values for the location and for the sit state; `rlv`, `"drop"` or `"follow"`, is the RLV persist setting the bot starts with (see `rlv-commands`, "RLV persist setting"); and `override`, the string `"sit"` or `"tp"` or an array of these strings, is the persist override setting the bot starts with (see `rlv-commands`, "Persist override setting"). `atstart` SHALL default to true when the table has `position` or `sit`, and to false otherwise. While `atstart` is true, a `position` or `sit` that is left out of the table is `"cur"`, so `atstart = true` alone is the same as `persist = "cur"`. While `atstart` is false the bot holds nothing once the config placement is reached, as with `persist = "off"`. The `rlv` and `override` keys SHALL NOT affect `atstart`. The RLV persist setting SHALL be `"drop"` when the table has no `rlv` key, with every other form of `persist`, and without `persist`. The persist override setting SHALL be empty when the table has no `override` key or gives an empty array, with every other form of `persist`, and without `persist`; a string given twice in the array SHALL count once.
 
 `perms` SHALL be a table with any of the keys `autoaccept` and `except`, each of them a table whose keys are kinds of request: `tp`, `inventory`, `anim`, `attach`, `controls` and `camera`. A value under `autoaccept` is the auto-accept rule the bot starts with for that kind: the string `"all"` or the boolean `true` for the rule `all`, an array of entries for a list, and the boolean `false` for an empty list, which is also the rule of a kind without a key. A value under `except` SHALL be an array of entries, the exceptions the bot starts with for that kind. An entry SHALL be a string holding a UUID or an avatar's name, written `First Last`, `first.last` or as a single word (see `permission-requests`, "Auto-accept rules"). An entry that is given twice in one array SHALL count once.
+
+`xmpp` SHALL be a table with these keys:
+
+| Key | Required | Meaning |
+|---|---|---|
+| `component` | yes | The domain the bot's component owns on the XMPP server, such as `russel.sl.example.org`. Letter case does not matter; the bot uses it in lower case |
+| `server` | no | `host:port` of the XMPP server's component port. The host SHALL be `localhost` or a loopback address. Defaults to `127.0.0.1:5347` |
+| `secret` | yes | The shared secret the XMPP server has for that component |
+| `owners` | yes | A non-empty array of bare XMPP addresses, `user@domain`, of the accounts that may use the gateway. Letter case does not matter, and an address given twice SHALL count once |
 
 A relative `log_chat` or `log_im` path SHALL be taken relative to the directory the bot was started in. A config that uses `object` SHALL behave exactly as the same config with that value under `sit`, and the bot SHALL write a line to standard error at startup that names `object` as deprecated and `sit` as its replacement.
 
@@ -199,8 +209,20 @@ A relative `log_chat` or `log_im` path SHALL be taken relative to the directory 
 - **WHEN** the config contains `persist = "cfg"`, a `[persist]` table without `override` or with `override = []`, or no `persist` at all
 - **THEN** the persist override setting is empty
 
+#### Scenario: XMPP gateway configured
+- **WHEN** the config ends with an `[xmpp]` table containing `component = "Russel.SL.example.org"`, `secret = "s3cret"` and `owners = ["me@example.org"]`
+- **THEN** the bot starts its component as `russel.sl.example.org`, connects to `127.0.0.1:5347`, and lets only `me@example.org` use it
+
+#### Scenario: XMPP server port given
+- **WHEN** the `[xmpp]` table also contains `server = "localhost:5348"`
+- **THEN** the bot connects its component to port 5348 on the local host
+
+#### Scenario: XMPP not mentioned
+- **WHEN** the config has no `[xmpp]` table
+- **THEN** the bot makes no XMPP connection
+
 ### Requirement: Config validation before any network activity
-The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `atstart`, `position`, `sit`, `rlv` and `override`, with a `position` or `sit` other than `"cur"` and `"cfg"`, with an `atstart` that is not a boolean, with an `rlv` other than `"drop"` and `"follow"`, with an `override` that is neither `"sit"`, `"tp"` nor an array of these two strings, or with `atstart = false` together with `position` or `sit`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, a `restore_attachments` that is not a boolean, an `rlv` that is not a boolean, a `perms` that is not in its form (a value that is not a table, a key other than `autoaccept` and `except`, an `autoaccept` or `except` that is not a table, a key in either that is not a kind of request, a value under `autoaccept` that is neither `"all"`, a boolean nor an array of strings, a value under `except` that is not an array of strings, an entry that is neither a UUID nor a name of one or two words, the entry `"all"` inside an array, or one entry both in a kind's `autoaccept` array and in its `except` array), and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
+The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `atstart`, `position`, `sit`, `rlv` and `override`, with a `position` or `sit` other than `"cur"` and `"cfg"`, with an `atstart` that is not a boolean, with an `rlv` other than `"drop"` and `"follow"`, with an `override` that is neither `"sit"`, `"tp"` nor an array of these two strings, or with `atstart = false` together with `position` or `sit`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, a `restore_attachments` that is not a boolean, an `rlv` that is not a boolean, a `perms` that is not in its form (a value that is not a table, a key other than `autoaccept` and `except`, an `autoaccept` or `except` that is not a table, a key in either that is not a kind of request, a value under `autoaccept` that is neither `"all"`, a boolean nor an array of strings, a value under `except` that is not an array of strings, an entry that is neither a UUID nor a name of one or two words, the entry `"all"` inside an array, or one entry both in a kind's `autoaccept` array and in its `except` array), an `xmpp` that is not in its form (a value that is not a table, a key other than `component`, `server`, `secret` and `owners`, a missing `component`, `secret` or `owners`, a `component` that is not a domain name or that holds `@` or `/`, a `server` that is not `host:port` with a port from 1 to 65535 or whose host is neither `localhost` nor a loopback address, a `secret` that is not a non-empty string, an `owners` that is not a non-empty array of strings, or an owner that is not a bare address `user@domain`), and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
 
 #### Scenario: Both password forms given
 - **WHEN** the config contains both `password` and `password_hash`
@@ -318,6 +340,30 @@ The bot SHALL validate the whole config before contacting any server. It SHALL r
 - **WHEN** the config has a `[persist]` table containing `override = "stand"`, `override = true`, `override = ["tp", "home"]` or `override = [1]`
 - **THEN** the bot prints an error naming `persist`, `override` and the two accepted strings, and exits with status 2
 
+#### Scenario: XMPP table without owners
+- **WHEN** the config has an `[xmpp]` table with `component` and `secret` and no `owners`, or with `owners = []`
+- **THEN** the bot prints an error naming `xmpp.owners` and exits with status 2
+
+#### Scenario: Owner with a resource
+- **WHEN** the `[xmpp]` table contains `owners = ["me@example.org/phone"]` or `owners = ["example.org"]`
+- **THEN** the bot prints an error naming `xmpp.owners` and the entry, and saying that a bare address `user@domain` is wanted, and exits with status 2
+
+#### Scenario: Component that is an account
+- **WHEN** the `[xmpp]` table contains `component = "bot@example.org"`
+- **THEN** the bot prints an error naming `xmpp.component` and exits with status 2
+
+#### Scenario: Server on another host
+- **WHEN** the `[xmpp]` table contains `server = "xmpp.example.org:5347"` or `server = "192.0.2.10:5347"`
+- **THEN** the bot prints an error naming `xmpp.server` that says the component connection is not encrypted and must stay on this host, and exits with status 2
+
+#### Scenario: Unknown key in the XMPP table
+- **WHEN** the `[xmpp]` table contains `password = "x"`
+- **THEN** the bot prints an error naming `xmpp.password` and the keys there are, and exits with status 2
+
+#### Scenario: XMPP server not running at startup
+- **WHEN** the config has a valid `[xmpp]` table and nothing listens on its `server` address
+- **THEN** the bot starts, logs in to the grid, and keeps trying to connect its component as `xmpp-gateway` describes
+
 ### Requirement: Password hash subcommand
 The bot SHALL provide a `hash` subcommand that reads a password from standard input and prints the corresponding hash on standard output as `$1$` followed by the 32 lowercase hexadecimal digits of the MD5 digest of the password. The password SHALL NOT be accepted as a command-line argument. When standard input is a terminal the password SHALL NOT be echoed. A trailing line ending SHALL NOT be part of the hashed password. An empty password SHALL be rejected with a non-zero exit status.
 
@@ -334,8 +380,12 @@ The bot SHALL provide a `hash` subcommand that reads a password from standard in
 - **THEN** it prints an error and exits with a non-zero status without printing a hash
 
 ### Requirement: Secrets stay out of output
-The bot SHALL NOT write the plain password or the password hash to its log or to any error message.
+The bot SHALL NOT write the plain password, the password hash or the XMPP component secret to its log or to any error message.
 
 #### Scenario: Login failure logging
 - **WHEN** a login attempt is rejected
 - **THEN** the logged message contains the user name and the grid's reason but neither the password nor its hash
+
+#### Scenario: Component handshake refused
+- **WHEN** the XMPP server refuses the component's handshake because the secret is wrong
+- **THEN** the logged message names the component domain and the server's reason but not the secret
