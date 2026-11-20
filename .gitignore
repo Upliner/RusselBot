@@ -2,10 +2,11 @@
 /target
 /references
 /test-rig/opensim/
+/test-rig/prosody/
 /russelbot.toml
 /real-sl.toml
 /sl.toml
 /sla.toml
+/old
 *.tsv
 *.log
-/test-rig/prosody/

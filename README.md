@@ -1,5 +1,5 @@
 RusselBot is a lightweight bot software for Second Life and OpenSimulator written in Rust,
-replacement for heavy .NET/Mono bots. Requires just a few MBs of memory which makes it possible
+replacement for heavy .NET/Mono bots. Requires just about a dozen MBs of memory which makes it possible
 to run even on cheapest VPS machines without requiring to run heavy Mono runtime.
 
 Left alone, the bot follows one simple scenario:
