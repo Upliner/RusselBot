@@ -224,6 +224,9 @@ const ENFORCED: &[&str] = &[
     "sendimto",
     "startim",
     "startimto",
+    "recvim",
+    "recvim_sec",
+    "recvimfrom",
     "unsit",
     "sit",
     "sittp",
@@ -287,9 +290,6 @@ const KEPT: &[&str] = &[
     "recvemote",
     "recvemote_sec",
     "recvemotefrom",
-    "recvim",
-    "recvim_sec",
-    "recvimfrom",
     "sendgesture",
     "tplm",
     "standtp",
@@ -984,6 +984,14 @@ impl<'a> Limits<'a> {
         }
         Limits::ok(self.against("startim", to))?;
         Limits::ok(self.names("startimto", to))
+    }
+
+    /// An instant message from the avatar `from`: whether the avatar may
+    /// read it.
+    pub fn recvim(&self, from: Uuid) -> Result<(), Refusal> {
+        let from = Target::Id(from);
+        Limits::ok(self.against("recvim", from))?;
+        Limits::ok(self.names("recvimfrom", from))
     }
 
     pub fn inventory(&self) -> Result<(), Refusal> {
@@ -2554,11 +2562,20 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), count, "a behaviour is listed twice");
-        assert_eq!((ENFORCED.len(), KEPT.len()), (46, 71));
-        for behaviour in ["sendchat", "unsit", "detach", "tplure_sec", "permissive", "touchfar"] {
+        assert_eq!((ENFORCED.len(), KEPT.len()), (49, 68));
+        for behaviour in [
+            "sendchat",
+            "unsit",
+            "detach",
+            "tplure_sec",
+            "permissive",
+            "touchfar",
+            "recvim",
+            "recvimfrom",
+        ] {
             assert_eq!(effect(behaviour), Some(Effect::Enforced), "{behaviour}");
         }
-        for behaviour in ["showloc", "recvim", "standtp", "fly", "allowidle", "tplm"] {
+        for behaviour in ["showloc", "recvchat", "standtp", "fly", "allowidle", "tplm"] {
             assert_eq!(effect(behaviour), Some(Effect::Kept), "{behaviour}");
         }
         for behaviour in ["notify", "frobnicate", "clear", "getstatus", "Detach", ""] {
@@ -2776,6 +2793,30 @@ mod tests {
             limits(&store).against("sendim", jane).unwrap().holder,
             format!("Collar <{}>", id(COLLAR))
         );
+    }
+
+    #[test]
+    fn instant_messages_from_some_avatars_are_not_read() {
+        let (jane, john) = (id(1), id(2));
+        let excepted = format!("recvim:{jane}");
+        assert!(limits(&collared(&[])).recvim(jane).is_ok());
+        let store = collared(&["recvim"]);
+        assert_eq!(limits(&store).recvim(jane).unwrap_err().rule, "recvim");
+        // An exception from anyone counts against the plain restriction...
+        let store = holding(&[(holder(COLLAR), "recvim"), (holder(CUFF), &excepted)]);
+        assert!(limits(&store).recvim(jane).is_ok());
+        assert!(limits(&store).recvim(john).is_err());
+        // ...and only the holder's own against the secure one.
+        let mut store = holding(&[(holder(COLLAR), "recvim_sec"), (holder(CUFF), &excepted)]);
+        assert_eq!(limits(&store).recvim(jane).unwrap_err().rule, "recvim_sec");
+        hold(&mut store, holder(COLLAR), &excepted);
+        assert!(limits(&store).recvim(jane).is_ok());
+        // One sender barred.
+        let store = collared(&[&format!("recvimfrom:{jane}")]);
+        assert_eq!(limits(&store).recvim(jane).unwrap_err().rule, format!("recvimfrom:{jane}"));
+        assert!(limits(&store).recvim(john).is_ok());
+        // Nothing while no store is in force.
+        assert!(Limits::none().recvim(jane).is_ok());
     }
 
     #[test]

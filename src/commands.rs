@@ -588,7 +588,7 @@ fn refuse(tag: &str, what: &str, reply: &Sender<Response>, reason: String) {
     let _ = reply.send(Response::Error(reason));
 }
 
-fn whom(id: Uuid, name: &str) -> String {
+pub(crate) fn whom(id: Uuid, name: &str) -> String {
     if name.is_empty() {
         id.to_string()
     } else {
@@ -699,7 +699,7 @@ impl Commands {
                 check_length(&message, MAX_OFFER_TEXT).and_then(|()| self.with_avatar(&to, After::SendTp(message), &reply, grid, now))
             }
             Request::Touch(object) => self.touch(&object, &reply, grid, now),
-            Request::Persist { .. } | Request::Home | Request::Status | Request::Rlv(_) | Request::Quit => {
+            Request::Persist { .. } | Request::Home | Request::Status | Request::Rlv(_) | Request::Autoreply(_) | Request::Quit => {
                 Err("not a command for the grid".to_string())
             }
             Request::Inventory(args) => self.inventory(&args, &reply, grid, now),
@@ -2579,6 +2579,8 @@ pub(crate) mod tests {
     pub(crate) enum Call {
         Say(i32, u8, String),
         Im(Uuid, String),
+        /// An automatic answer: an autoreply or RLV's.
+        AutoIm(Uuid, String),
         Find(Uuid, String),
         Stand,
         SitGround,
@@ -2659,6 +2661,13 @@ pub(crate) mod tests {
     }
 
     impl FakeGrid {
+        /// What `Session::autoresponse` does, which is no part of `Grid`.
+        pub(crate) fn autoresponse(&mut self, to: Uuid, text: &str) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::AutoIm(to, text.to_string()));
+            Ok(())
+        }
+
         fn check(&self) -> Result<(), String> {
             if self.offline {
                 Err(NOT_CONNECTED.to_string())

@@ -123,6 +123,16 @@ pub struct Config {
     pub perms: Rules,
     /// The XMPP gateway, when the config has an `[xmpp]` table.
     pub xmpp: Option<XmppConfig>,
+    /// Autoreplies to instant messages, when the config has an
+    /// `[autoreply]` table.
+    pub autoreply: Option<AutoreplyConfig>,
+}
+
+/// The `[autoreply]` table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoreplyConfig {
+    pub message: String,
+    pub pause: Duration,
 }
 
 /// The default address of the XMPP server's component port.
@@ -194,6 +204,7 @@ struct Raw {
     rlv: Option<toml::Value>,
     perms: Option<toml::Value>,
     xmpp: Option<toml::Value>,
+    autoreply: Option<toml::Value>,
 }
 
 /// Hashes a plain password into the form grids accept: `$1$` + MD5 hex.
@@ -404,6 +415,43 @@ fn is_loopback(host: &str) -> bool {
         return v6.parse::<std::net::Ipv6Addr>().is_ok_and(|ip| ip.is_loopback());
     }
     host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The `[autoreply]` table.
+fn autoreply(value: Option<toml::Value>) -> Result<Option<AutoreplyConfig>, ConfigError> {
+    const KEYS: &str = "`message` and `pause`";
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let toml::Value::Table(table) = value else {
+        return err(format!("`autoreply` must be a table with the keys {KEYS}"));
+    };
+    let (mut message, mut pause) = (None, None);
+    for (key, value) in table {
+        match key.as_str() {
+            "message" => message = Some(value),
+            "pause" => pause = Some(value),
+            _ => return err(format!("`autoreply.{key}` is not a key of `autoreply`; its keys are {KEYS}")),
+        }
+    }
+    let message = match required(message, "autoreply.message")? {
+        toml::Value::String(text) => text,
+        _ => return err("`autoreply.message` must be a string, the text sent back"),
+    };
+    crate::autoreply::check_message(&message).map_err(|why| ConfigError(format!("`autoreply.message`: {why}")))?;
+    let pause = match pause {
+        None => crate::autoreply::DEFAULT_PAUSE,
+        Some(toml::Value::String(text)) => {
+            crate::autoreply::parse_duration(&text).map_err(|why| ConfigError(format!("`autoreply.pause`: {why}")))?
+        }
+        Some(_) => {
+            return err(format!(
+                "`autoreply.pause` must be a string holding a duration: {}",
+                crate::autoreply::DURATION_FORM
+            ))
+        }
+    };
+    Ok(Some(AutoreplyConfig { message, pause }))
 }
 
 /// The `[xmpp]` table.
@@ -656,6 +704,7 @@ impl Config {
         let rlv = flag(raw.rlv, "rlv")?;
         let perms = perms(raw.perms)?;
         let xmpp = xmpp(raw.xmpp)?;
+        let autoreply = autoreply(raw.autoreply)?;
 
         Ok(Config {
             login_url,
@@ -678,6 +727,7 @@ impl Config {
             persist_override,
             perms,
             xmpp,
+            autoreply,
         })
     }
 }
@@ -1306,6 +1356,77 @@ mod tests {
         assert_eq!(*rules.rule(Kind::Anim), Rule::All);
         assert_eq!(*rules.rule(Kind::Attach), Rule::All);
         assert_eq!(rules.exceptions(Kind::Anim), [entry("01234567-9abc-defe-dcba-987654321000")]);
+    }
+
+    #[test]
+    fn example_file_is_valid_with_its_autoreply_table_enabled() {
+        let text = include_str!("../russelbot.example.toml");
+        let mut enabled = text.to_string();
+        for line in [
+            "# [autoreply]",
+            "# message = \"Hello, I'm bot. I won't respond to you in next 2 hours\"",
+            "# pause = \"2h\"",
+        ] {
+            assert_eq!(text.matches(&format!("\n{line}\n")).count(), 1, "{line} is not once in the example");
+            enabled = enabled.replace(&format!("\n{line}\n"), &format!("\n{}\n", &line[2..]));
+        }
+        let autoreply = Config::parse(&enabled).unwrap().autoreply.unwrap();
+        assert_eq!(autoreply.message, "Hello, I'm bot. I won't respond to you in next 2 hours");
+        assert_eq!(autoreply.pause, Duration::from_secs(2 * 3600));
+        assert_eq!(Config::parse(text).unwrap().autoreply, None);
+    }
+
+    fn autoreply_table(lines: &str) -> String {
+        base() + "[autoreply]\n" + lines
+    }
+
+    #[test]
+    fn autoreply_configured() {
+        let text = autoreply_table("message = \"Hello, I'm bot. I won't respond to you in next 2 hours\"\npause = \"2h\"\n");
+        let autoreply = Config::parse(&text).unwrap().autoreply.unwrap();
+        assert_eq!(autoreply.message, "Hello, I'm bot. I won't respond to you in next 2 hours");
+        assert_eq!(autoreply.pause, Duration::from_secs(2 * 3600));
+    }
+
+    #[test]
+    fn autoreply_without_a_pause() {
+        let autoreply = Config::parse(&autoreply_table("message = \"Away\"\n")).unwrap().autoreply.unwrap();
+        assert_eq!(autoreply.pause, Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn no_autoreply_table() {
+        assert_eq!(Config::parse(&base()).unwrap().autoreply, None);
+    }
+
+    #[test]
+    fn autoreply_without_a_message() {
+        let msg = rejected(&autoreply_table("pause = \"2h\"\n"));
+        assert!(msg.contains("`autoreply.message`"), "{msg}");
+    }
+
+    #[test]
+    fn autoreply_with_a_malformed_pause() {
+        for pause in ["\"2 hours\"", "\"30\"", "\"30m2h\"", "\"400d\"", "30"] {
+            let msg = rejected(&autoreply_table(&format!("message = \"Away\"\npause = {pause}\n")));
+            assert!(msg.contains("`autoreply.pause`") && msg.contains("`1h30m`"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn autoreply_with_a_blank_or_wrong_message() {
+        for message in ["\"  \"", "5", &format!("\"{}\"", "x".repeat(1024))] {
+            let msg = rejected(&autoreply_table(&format!("message = {message}\n")));
+            assert!(msg.contains("`autoreply.message`"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn autoreply_not_a_table_or_with_another_key() {
+        let msg = rejected(&(base() + "autoreply = \"Away\"\n"));
+        assert!(msg.contains("`autoreply`"), "{msg}");
+        let msg = rejected(&autoreply_table("message = \"Away\"\ntext = \"x\"\n"));
+        assert!(msg.contains("`autoreply.text`"), "{msg}");
     }
 
     fn xmpp_table(lines: &str) -> String {

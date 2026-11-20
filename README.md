@@ -324,6 +324,7 @@ One TOML file; see `russelbot.example.toml`.
 | `perms` | no | Two tables, `[perms.autoaccept]` and `[perms.except]`, that say which teleport offers, inventory offers and scripts' permission requests the bot accepts by itself, see [Permission requests](#permission-requests). Default: none |
 | `rlv` | no | `true` to start with RLV on: the bot then reads the `@` commands of scripted objects the avatar owns, see [RLV](#rlv). Default: `false` |
 | `xmpp` | no | A table, `[xmpp]`, that makes the bot an XMPP component, see [XMPP gateway](#xmpp-gateway). Default: no XMPP connection |
+| `autoreply` | no | A table, `[autoreply]`, with `message` (the text) and `pause` (default `"1h"`): the bot answers avatars' instant messages by itself, see [Autoreplies](#autoreplies). Default: no autoreplies |
 
 `persist` takes these forms:
 
@@ -375,6 +376,10 @@ Configs written for earlier versions still load, but these things changed:
   up on the grid: it is compared with the avatars whose offers wait, so a
   name nobody offered under is answered with "there is no teleport offer
   from ..." where it used to be "the grid knows no avatar named ...".
+* With `rlv = true`, `recvim`, `recvim_sec` and `recvimfrom`, which the
+  bot used to keep without an effect, now hide the instant messages they
+  name and answer their senders, as an RLV viewer does. A restriction an
+  object holds takes effect as soon as the new version runs.
 * Inventory offers and scripts' requests for permissions, which the bot
   used to drop unread, are written to the log and wait for
   `rslbot ctl accept`. Nothing is accepted by itself without a `perms`
@@ -393,9 +398,12 @@ Put the printed value in `password_hash` and leave `password` out.
 
 The bot reads local chat the avatar hears and instant messages sent to it,
 from avatars and from objects, and writes each one to standard error. It
-never answers by itself; it talks only when told to through the
-[control socket](#control-socket). The instant messages it sends that way
-are recorded too, as kind `im_out`. Group chat, offers (teleport offers
+talks only when told to through the [control socket](#control-socket) or
+the [XMPP gateway](#xmpp-gateway), and answers instant messages by itself
+only with an [autoreply](#autoreplies) and when RLV `recvim` hides them
+(see [Restrictions](#restrictions)). The instant messages it sends on
+command are recorded too, as kind `im_out`, and those automatic answers as
+kind `im_auto`. Group chat, offers (teleport offers
 and requests included; those appear on standard error only), invitations
 and typing notifications are not recorded.
 
@@ -408,8 +416,8 @@ exit with status 2 before it logs in.
 | Column | Content |
 |---|---|
 | `time` | UTC, `YYYY-MM-DDTHH:MM:SSZ`: when the bot received the message, or when it was sent for an IM stored offline |
-| `kind` | Chat: `whisper`, `say`, `shout`, `region`, `owner`, `direct`, `debug`. IM: `im` (from an avatar), `object` (from a script), `im_out` (sent by the bot) |
-| `avatar_name` | The speaker; for an object, its owner; for `im_out`, the recipient |
+| `kind` | Chat: `whisper`, `say`, `shout`, `region`, `owner`, `direct`, `debug`. IM: `im` (from an avatar), `object` (from a script), `im_out` (sent by the bot on command), `im_auto` (an automatic answer the bot sent) |
+| `avatar_name` | The speaker; for an object, its owner; for `im_out` and `im_auto`, the recipient |
 | `display_name` | That avatar's display name |
 | `object_name` | The object's name; empty for an avatar |
 | `object_uuid` | The object's UUID; empty for an avatar |
@@ -425,6 +433,13 @@ name the recipient, for example (tabs shown as `<TAB>`):
 
 ```
 2026-11-18T17:04:23Z<TAB>im_out<TAB>Jane Doe<TAB>JD<TAB><TAB><TAB>are you there?
+```
+
+An automatic answer follows the row of the message it answers:
+
+```
+2026-11-20T10:00:00Z<TAB>im<TAB>Jane Doe<TAB>JD<TAB><TAB><TAB>hi
+2026-11-20T10:00:00Z<TAB>im_auto<TAB>Jane Doe<TAB>JD<TAB><TAB><TAB>back later
 ```
 
 Chat the bot says on channel 0 comes back from the simulator and is logged
@@ -1049,6 +1064,7 @@ These restrictions have an effect:
 | `sendchannel`, `sendchannel_sec`, `sendchannel_except:CHANNEL` | Chat on other channels than 0 is refused, except on a channel that `sendchannel:CHANNEL` names; or on the one channel named. The bot's own replies to RLV queries always go out |
 | `sendim`, `sendim_sec`, `sendimto:UUID` | `im` is refused, for everyone but those `sendim:UUID` names, or for the one avatar |
 | `startim`, `startimto:UUID` | `im` is refused to an avatar the bot has not exchanged an instant message with since the login |
+| `recvim`, `recvim_sec`, `recvimfrom:UUID` | An instant message from an avatar, from everyone but those `recvim:UUID` names or from the one avatar, is hidden: it is recorded, and passed to the XMPP owners, as `(blocked by RLV: recvim)`, and the sender gets the answer RLV viewers send, "The Resident you messaged is currently prevented from reading your instant messages at the moment, please try again later.", in place of any [autoreply](#autoreplies). A message stored while the avatar was offline is hidden too, but not answered. Messages from objects are not hidden |
 | `unsit` | While the avatar sits: `stand`, `sit` (which leaves the seat), `tp` and `accept tp` are refused |
 | `sit` | `sit UUID` and `sit ground` are refused |
 | `sittp`, `sittp:DISTANCE` | `sit UUID` is refused when the object is farther than 1.5 m, or the distance given, from the avatar |
@@ -1097,12 +1113,12 @@ where a viewer would tell them.
 
 All other restrictions of the API are kept and reported, and have no
 effect: `rlv status` marks them `(no effect)`. They are about what a viewer
-shows its user, or about things the bot does not do: `recvchat`, `recvim`,
+shows its user, or about things the bot does not do: `recvchat`,
 `recvemote` and their variants, `showloc`, `shownames`, the map, hovertext
 and camera restrictions, `fly`, `edit`, `rez`, `share`, `sendgesture`,
 `tplm`, `standtp`, `defaultwear`, `setgroup`, `setdebug`, `setenv`, and
-everything about the shared `#RLV` folder. The message log and `status`
-are yours and are never censored. A restriction the API does not have,
+everything about the shared `#RLV` folder. Apart from what `recvim` hides,
+the message log and `status` are yours and are never censored. A restriction the API does not have,
 and `@notify`, are not kept and are noted in the log as not supported.
 
 Two things a viewer does for restrictions the bot does not: it does not
@@ -1444,6 +1460,66 @@ These commands work whether or not the avatar is connected. Like `rlv
 mode`, they are not saved: a restarted bot starts from its config. A
 change of the rules does not accept what waits already, and it does not
 take back what a script was granted.
+
+### Autoreplies
+
+With an `[autoreply]` table in the config the bot answers an avatar that
+sends it an instant message, and then leaves that avatar alone for the
+pause:
+
+```toml
+[autoreply]
+message = "Hello, I'm bot. I won't respond to you in next 2 hours"
+pause = "2h"
+```
+
+`pause` is a whole number and a unit for each of `d`, `h`, `m` and `s`
+that is needed, in that order and without spaces: `90s`, `30m`, `2h`,
+`1h30m`, at most 365 days. `"0"` answers every message. Without `pause` it
+is one hour.
+
+* Only instant messages from avatars are answered. Objects, the grid,
+  group chats, and messages stored while the avatar was offline get no
+  answer.
+* An avatar's pause starts when the bot answers it, and when the bot sends
+  it an instant message on command: `rslbot ctl im`, or an owner's message
+  through the [XMPP gateway](#xmpp-gateway). An avatar you are talking to
+  is not told the bot will not answer. Messages from the avatar during its
+  pause do not make the pause longer.
+* The answer goes out the way a viewer's Do Not Disturb autoresponse does:
+  viewers show it as automatic, and neither viewers nor this bot answer
+  one, so two bots cannot answer each other forever.
+* It is recorded as kind `im_auto`, see [Chat and IM logs](#chat-and-im-logs),
+  and not passed to the XMPP owners.
+* With RLV on, `sendim` and `sendimto` hold an answer back; the log says
+  so, and the avatar's pause does not start. A message `recvim` hides gets
+  the RLV viewers' answer instead, see [Restrictions](#restrictions).
+
+While the bot runs:
+
+```sh
+rslbot ctl autoreply message "New autoreply from the bot"
+rslbot ctl autoreply pause 30m
+rslbot ctl autoreply refresh    # forget every avatar's pause
+rslbot ctl autoreply off
+rslbot ctl autoreply on         # with the text it had
+rslbot ctl autoreply status
+```
+
+`autoreply message` also switches autoreply on; `on` is refused while
+there is no text. A new pause applies at once, also to the avatars already
+answered. `status` prints:
+
+```
+autoreply: on
+message: New autoreply from the bot
+pause: 30m
+avatars in their pause: 2
+```
+
+These commands work whether or not the avatar is connected, no RLV
+restriction refuses them, and they are not saved: a restarted bot starts
+from its config. The pauses are kept across logins until the bot stops.
 
 ### Exit status and limits
 

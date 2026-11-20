@@ -364,6 +364,10 @@ pub fn chat_from_viewer(agent: &Agent, text: &str, chat_type: u8, channel: i32) 
 
 /// Instant-message dialog: an ordinary message.
 pub const IM_PLAIN: u8 = 0;
+/// Instant-message dialog: a viewer's automatic answer, sent in Do Not
+/// Disturb mode (`IM_DO_NOT_DISTURB_AUTO_RESPONSE`, formerly
+/// `IM_BUSY_AUTO_RESPONSE`). Viewers never answer it.
+pub const IM_AUTO_RESPONSE: u8 = 20;
 /// Instant-message dialog: an offer to teleport the recipient to the sender.
 pub const IM_TELEPORT_OFFER: u8 = 22;
 /// Instant-message dialog: a request to be teleported to the recipient.
@@ -377,12 +381,12 @@ pub const IM_TASK_INVENTORY_OFFERED: u8 = 9;
 const TELEPORT_VIA_LURE: u32 = 1 << 2;
 
 /// ImprovedInstantMessage, Low 254, Zerocoded: an instant message from the
-/// agent to another avatar. For a plain message the conversation id is the
-/// two agent ids combined, which is how viewers pair a reply with the
-/// message; other dialogs carry no id.
+/// agent to another avatar. For a plain message and an automatic answer
+/// the conversation id is the two agent ids combined, which is how viewers
+/// pair a reply with the message; other dialogs carry no id.
 pub fn instant_message(agent: &Agent, from_name: &str, to: Uuid, position: Vector3, dialog: u8, text: &str) -> Outgoing {
     let conversation = match dialog {
-        IM_PLAIN => Uuid::from_u128(agent.agent_id.as_u128() ^ to.as_u128()),
+        IM_PLAIN | IM_AUTO_RESPONSE => Uuid::from_u128(agent.agent_id.as_u128() ^ to.as_u128()),
         _ => Uuid::nil(),
     };
     instant_message_with(agent, from_name, to, position, dialog, conversation, text, &[0])
@@ -1913,6 +1917,16 @@ mod tests {
             (from_agent, from_name.as_str(), dialog, text.as_str()),
             (agent().agent_id, "Sit Bot", 0, "hello")
         );
+    }
+
+    #[test]
+    fn automatic_answer_is_in_the_conversation_of_a_plain_message() {
+        let to = Uuid::from_bytes([0x0F; 16]);
+        let msg = instant_message(&agent(), "Sit Bot", to, [0.0; 3], IM_AUTO_RESPONSE, "Away");
+        let Ok(Incoming::InstantMessage { dialog, id, text, .. }) = decode(msg.id, &msg.body) else {
+            panic!("not an instant message")
+        };
+        assert_eq!((dialog, id, text.as_str()), (20, Uuid::from_bytes([0xA1 ^ 0x0F; 16]), "Away"));
     }
 
     #[test]

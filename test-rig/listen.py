@@ -2,7 +2,8 @@
 """Rig helper: logs in as the estate owner next to the bot and listens, to
 exercise the bot's control socket. For SECONDS it prints every line of local
 chat it hears and every instant message it gets, and answers each instant
-message from the bot with "pong: <text>". It also prints where the bot's
+message from the bot with "pong: <text>", but never an automatic answer
+(dialog 20), which it prints with its dialog. It also prints where the bot's
 avatar is and what it is attached to whenever that changes, answers the
 bot's request for a teleport with an offer, prints the offers the bot
 sends, and says when the bot's avatar starts or stops sitting on the ground,
@@ -10,15 +11,18 @@ what is attached to it, which animations it plays and which sounds it
 triggers. Stands in for watching with a viewer. Start it while the bot is
 seated in Target, then use `rslbot ctl`.
 
-Usage: listen.py [SECONDS] [prim] [offer=N]   (default: 30 seconds)
+Usage: listen.py [SECONDS] [prim] [offer=N] [im=T1,T2,...]   (default: 30 seconds)
 
   prim      rez a box near the bot with the library script DefaultWithTouch,
             which says "Touched." when clicked, and print its UUID; the box
             goes to the trash at the end
   offer=N   after N seconds, offer the bot a teleport it did not ask for
+  im=T,...  T seconds after listening starts, send the bot the instant
+            message "hello <T>", for each T given
 
 Output lines:
   chat <type> <name>: <text>          im <name> <id>: <text>
+  autoresponse <name> <id>: <text>    (dialog 20)      sent im: <text>
   bot at <x> <y> <z> parent <local id>   (parent 0: not sitting on an object)
   teleport request from <name>: <text>   teleport offer from <name>: <text>
   touch prim <uuid>
@@ -35,6 +39,7 @@ ARGS = sys.argv[1:]
 SECONDS = float(next((a for a in ARGS if a.replace(".", "").isdigit()), 30.0))
 PRIM = "prim" in ARGS
 OFFER_AFTER = next((float(a[6:]) for a in ARGS if a.startswith("offer=")), None)
+IM_AT = sorted(float(t) for a in ARGS if a.startswith("im=") for t in a[3:].split(",") if t)
 BOT = uuid.UUID("7e570000-0000-4000-8000-0000000000b0")
 # SIT_GROUND and SIT_GROUND_CONSTRAINED, from OpenSim's avataranimations.xml.
 GROUND_SITS = {uuid.UUID("1c7600d6-661f-b87b-efe2-d7421eb93c86").bytes,
@@ -254,6 +259,10 @@ while time.time() < deadline:
         offer_teleport(BOT.bytes, "Join me, unasked")
         print("offered the bot a teleport", flush=True)
         OFFER_AFTER = None
+    while IM_AT and time.time() >= started + IM_AT[0]:
+        text = "hello %g" % IM_AT.pop(0)
+        reply(BOT.bytes, text)
+        print("sent im:", text, flush=True)
     mid, payload = backlog.pop(0) if backlog else receive()
     if mid == ("H", 1):
         send(b"\x02", payload[:1], reliable=False)
@@ -314,6 +323,8 @@ while time.time() < deadline:
             print("im %s %s: %s" % (name, im_id, text), flush=True)
             if sender != agent:
                 reply(sender, "pong: " + text)
+        elif dialog == 20:  # an automatic answer: printed, never answered
+            print("autoresponse %s %s: %s" % (name, im_id, text), flush=True)
         elif dialog == 26:  # a request to be teleported here: grant it
             print("teleport request from %s: %s" % (name, text), flush=True)
             offer_teleport(sender, "Join me in Target")

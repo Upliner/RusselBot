@@ -1,6 +1,7 @@
 //! rslbot: logs an avatar in to a Second Life or OpenSimulator grid, gets it
 //! to a target region, sits it on a target object and keeps it there.
 
+mod autoreply;
 mod backoff;
 mod caps;
 mod commands;
@@ -26,9 +27,10 @@ mod udp {
 mod xml;
 mod xmpp;
 
+use autoreply::Autoreply;
 use commands::{Commands, Grid, SentIm};
 use config::{Config, Persist, PersistOverride, Place, RlvPersist, Sit, Source};
-use control::{Request, Response, RlvRequest};
+use control::{AutoreplyRequest, Request, Response, RlvRequest};
 use login::Outcome;
 use msglog::{Channel, Logs, Recorder};
 use names::{Lookup, Search};
@@ -44,6 +46,11 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use udp::messages::Vector3;
 use uuid::Uuid;
+
+/// What RLV viewers answer an instant message `recvim` hides with
+/// (RLVa's `blocked_recvim_remote`).
+const RLV_RECVIM_REPLY: &str =
+    "The Resident you messaged is currently prevented from reading your instant messages at the moment, please try again later.";
 
 const EXIT_OK: i32 = 0;
 const EXIT_FATAL: i32 = 1;
@@ -216,6 +223,8 @@ struct Bot {
     held_stand: Option<String>,
     /// The XMPP gateway, when the config has one.
     xmpp: Option<xmpp::gateway::Gateway>,
+    /// Whether and with what the bot answers instant messages by itself.
+    autoreply: Autoreply,
     /// Stands in for a session's view of the world, which tests have none of.
     #[cfg(test)]
     world: Option<Box<dyn World>>,
@@ -452,6 +461,10 @@ impl Bot {
             grid: None,
             // Before the first login, which may take a while.
             xmpp: config.xmpp.as_ref().map(|xmpp| xmpp::gateway::Gateway::start(xmpp, events.clone())),
+            autoreply: match &config.autoreply {
+                Some(auto) => Autoreply::new(Some(auto.message.clone()), auto.pause),
+                None => Autoreply::new(None, autoreply::DEFAULT_PAUSE),
+            },
             reconciler: Reconciler::new(goal(book.held(), config_start(&config))),
             book,
             startup: Some(config.persist),
@@ -845,9 +858,12 @@ impl Bot {
 
     /// Carries out a command from the control socket.
     fn control(&mut self, request: Request, reply: Sender<Response>, now: Instant) -> Flow {
-        // While RLV is in override, the next command but these four is
+        // While RLV is in override, the next command but these five is
         // exempt from the restrictions, and RLV is on again with it.
-        let never = matches!(request, Request::Rlv(_) | Request::Status | Request::Perms(_) | Request::Quit);
+        let never = matches!(
+            request,
+            Request::Rlv(_) | Request::Status | Request::Perms(_) | Request::Autoreply(_) | Request::Quit
+        );
         let exempt = !never && self.rlv.take_override(request.name());
         match request {
             Request::Status => {
@@ -885,6 +901,15 @@ impl Bot {
                 let _ = reply.send(Response::Ok(Some(self.rlv.status())));
             }
             Request::Rlv(RlvRequest::Cmd(text)) => self.rlv_command(&text, &reply, now),
+            Request::Autoreply(request) => {
+                let _ = reply.send(match self.autoreply_command(request, now) {
+                    Ok(answer) => Response::Ok(Some(answer)),
+                    Err(reason) => {
+                        info!("control: autoreply refused: {reason}");
+                        Response::Error(reason)
+                    }
+                });
+            }
             Request::Quit => {
                 info!("control: quit");
                 let _ = reply.send(Response::Ok(None));
@@ -1117,8 +1142,111 @@ impl Bot {
         }
     }
 
-    /// Puts an instant message the bot sent into the message log.
+    /// Carries out an `autoreply` command; returns its answer.
+    fn autoreply_command(&mut self, request: AutoreplyRequest, now: Instant) -> Result<String, String> {
+        let auto = &mut self.autoreply;
+        let answer = match request {
+            AutoreplyRequest::Status => return Ok(auto.status(now)),
+            AutoreplyRequest::Message(text) => {
+                autoreply::check_message(&text)?;
+                let answer = format!("autoreply: on, message: {text}");
+                auto.set_text(text);
+                answer
+            }
+            AutoreplyRequest::Pause(text) => {
+                let pause = autoreply::parse_duration(&text)?;
+                auto.set_pause(pause);
+                format!("autoreply pause: {}", autoreply::format_duration(pause))
+            }
+            AutoreplyRequest::Refresh => match auto.refresh(now) {
+                1 => "autoreply: forgot the pause of 1 avatar".to_string(),
+                count => format!("autoreply: forgot the pauses of {count} avatars"),
+            },
+            AutoreplyRequest::On | AutoreplyRequest::Off => {
+                let on = matches!(request, AutoreplyRequest::On);
+                let state = if on { "on" } else { "off" };
+                match auto.switch(on)? {
+                    true => format!("autoreply: {state}"),
+                    false => format!("autoreply: already {state}; nothing changed"),
+                }
+            }
+        };
+        info!("control: {answer}");
+        Ok(answer)
+    }
+
+    /// An instant message arrived: RLV may hide it, and the bot may answer
+    /// it by itself.
+    fn im_received(&mut self, mut message: session::Message, now: Instant) {
+        let session::Source::Avatar { id: from, name } = &message.source else {
+            return self.record(Channel::Im, message, now);
+        };
+        let (from, name) = (*from, name.clone());
+        self.commands.im_received(from);
+        // A message stored while the avatar was offline gets no answer.
+        let live = message.sent_at.is_none();
+        let limits = Bot::own_limits(&self.rlv, false, None);
+        let (hidden, barred) = (limits.recvim(from), limits.im(from, true));
+        if let Err(refusal) = hidden {
+            message.text = format!("(blocked by RLV: {})", refusal.rule);
+            self.record(Channel::Im, message, now);
+            if live {
+                self.answer(from, name, RLV_RECVIM_REPLY.to_string(), now);
+            }
+            return;
+        }
+        self.record(Channel::Im, message, now);
+        if !live {
+            return;
+        }
+        let Some(text) = self.autoreply.answer(from, now).map(str::to_string) else {
+            return;
+        };
+        if let Err(refusal) = barred {
+            return info!(
+                "autoreply: not sent to {}: {} is in force, held by {}",
+                commands::whom(from, &name),
+                refusal.rule,
+                refusal.holder
+            );
+        }
+        if self.answer(from, name, text, now) {
+            self.autoreply.sent(from, now);
+        }
+    }
+
+    /// Sends `to` an automatic answer and records it; returns whether it
+    /// went out.
+    fn answer(&mut self, to: Uuid, name: String, text: String, now: Instant) -> bool {
+        if let Err(why) = self.send_autoresponse(to, &text, now) {
+            info!("autoreply: not sent to {}: {why}", commands::whom(to, &name));
+            return false;
+        }
+        let message = session::Message {
+            kind: "im_auto".to_string(),
+            source: session::Source::Avatar { id: to, name },
+            sent_at: None,
+            text,
+        };
+        self.record(Channel::Im, message, now);
+        true
+    }
+
+    fn send_autoresponse(&mut self, to: Uuid, text: &str, now: Instant) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(grid) = self.grid.as_mut() {
+            return grid.autoresponse(to, text);
+        }
+        match self.session.as_mut() {
+            Some(session) => session.autoresponse(to, text, now),
+            None => Err(session::NOT_CONNECTED.to_string()),
+        }
+    }
+
+    /// Puts an instant message the bot sent into the message log. The
+    /// avatar it went to is in its autoreply pause from now on.
     fn record_sent(&mut self, sent: SentIm, now: Instant) {
+        self.autoreply.sent(sent.to, now);
         let source = session::Source::Avatar {
             id: sent.to,
             name: sent.name,
@@ -1461,12 +1589,7 @@ impl Bot {
                     self.rlv_heard(issuer, text, now);
                 }
             }
-            SessionEvent::InstantMessage(message) => {
-                if let session::Source::Avatar { id, .. } = &message.source {
-                    self.commands.im_received(*id);
-                }
-                self.record(Channel::Im, message, now)
-            }
+            SessionEvent::InstantMessage(message) => self.im_received(message, now),
             SessionEvent::DisplayNamesUrl(url) => {
                 if url.is_none() {
                     debug!("the simulator has no display-name service");
@@ -3143,6 +3266,287 @@ mod tests {
         // All of it is recorded as what it is.
         assert_eq!(bot.recorder.flush_all(Instant::now()).len(), 5);
     }
+    // ------------------------------------------------------ autoreply
+
+    fn answering(more: &str) -> Bot {
+        let mut bot = bot(full(&format!("{more}[autoreply]\nmessage = \"Away\"\npause = \"2h\"\n")));
+        bot.grid = Some(commands::tests::FakeGrid::default());
+        bot
+    }
+
+    fn jane_id() -> Uuid {
+        Uuid::from_bytes([0x1a; 16])
+    }
+
+    fn im_from(id: Uuid, name: &str, text: &str) -> SessionEvent {
+        SessionEvent::InstantMessage(session::Message {
+            kind: "im".to_string(),
+            source: session::Source::Avatar {
+                id,
+                name: name.to_string(),
+            },
+            sent_at: None,
+            text: text.to_string(),
+        })
+    }
+
+    fn janes(text: &str) -> SessionEvent {
+        im_from(jane_id(), "Jane Doe", text)
+    }
+
+    /// The automatic answers sent since the last call.
+    fn answers(bot: &mut Bot) -> Vec<(Uuid, String)> {
+        let calls = std::mem::take(&mut bot.grid.as_mut().unwrap().calls);
+        calls
+            .into_iter()
+            .filter_map(|call| match call {
+                commands::tests::Call::AutoIm(to, text) => Some((to, text)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The instant messages recorded since the last call: kind and text.
+    fn recorded(bot: &mut Bot) -> Vec<(String, String)> {
+        let records = bot.recorder.flush_all(Instant::now());
+        records.into_iter().map(|record| (record.kind, record.text)).collect()
+    }
+
+    fn pair(kind: &str, text: &str) -> (String, String) {
+        (kind.to_string(), text.to_string())
+    }
+
+    #[test]
+    fn an_instant_message_is_answered_once_within_the_pause() {
+        let mut bot = answering("");
+        hear(&mut bot, janes("hi"));
+        assert_eq!(answers(&mut bot), [(jane_id(), "Away".to_string())]);
+        assert_eq!(recorded(&mut bot), [pair("im", "hi"), pair("im_auto", "Away")]);
+        hear(&mut bot, janes("hello?"));
+        assert_eq!(answers(&mut bot), []);
+        // Another avatar has a pause of its own.
+        hear(&mut bot, im_from(Uuid::from_bytes([0x2b; 16]), "John Roe", "hi"));
+        assert_eq!(answers(&mut bot).len(), 1);
+    }
+
+    #[test]
+    fn objects_the_grid_and_stored_messages_are_not_answered() {
+        let mut bot = answering("");
+        let object = session::Message {
+            kind: "object".to_string(),
+            source: session::Source::Object {
+                id: Some(Uuid::from_bytes([7; 16])),
+                name: "Collar".to_string(),
+                owner: jane_id(),
+            },
+            sent_at: None,
+            text: "locked".to_string(),
+        };
+        hear(&mut bot, SessionEvent::InstantMessage(object));
+        let grid = session::Message {
+            kind: "im".to_string(),
+            source: session::Source::System {
+                name: "Second Life".to_string(),
+            },
+            sent_at: None,
+            text: "maintenance".to_string(),
+        };
+        hear(&mut bot, SessionEvent::InstantMessage(grid));
+        let SessionEvent::InstantMessage(mut stored) = janes("earlier") else {
+            unreachable!()
+        };
+        stored.sent_at = Some(1_700_000_000);
+        hear(&mut bot, SessionEvent::InstantMessage(stored));
+        assert_eq!(answers(&mut bot), []);
+        assert_eq!(recorded(&mut bot).len(), 3);
+        // The stored message started no pause.
+        hear(&mut bot, janes("hi"));
+        assert_eq!(answers(&mut bot).len(), 1);
+    }
+
+    #[test]
+    fn nothing_is_answered_without_an_autoreply_table() {
+        let mut bot = bot(full(""));
+        bot.grid = Some(commands::tests::FakeGrid::default());
+        hear(&mut bot, janes("hi"));
+        assert_eq!(answers(&mut bot), []);
+        assert_eq!(recorded(&mut bot), [pair("im", "hi")]);
+    }
+
+    #[test]
+    fn an_answer_that_cannot_be_sent_is_not_recorded_and_starts_no_pause() {
+        let mut bot = answering("");
+        bot.grid.as_mut().unwrap().offline = true;
+        hear(&mut bot, janes("hi"));
+        assert_eq!(recorded(&mut bot), [pair("im", "hi")]);
+        bot.grid.as_mut().unwrap().offline = false;
+        hear(&mut bot, janes("hi"));
+        assert_eq!(answers(&mut bot).len(), 1);
+    }
+
+    #[test]
+    fn an_instant_message_on_command_starts_the_pause() {
+        let mut bot = answering("");
+        ok(&mut bot, &format!("im\t{}\tone moment", jane_id()));
+        bot.names_resolved(vec![], vec![jane_id()], Instant::now());
+        assert!(bot
+            .grid
+            .as_mut()
+            .unwrap()
+            .calls
+            .iter()
+            .any(|call| matches!(call, commands::tests::Call::Im(..))));
+        hear(&mut bot, janes("ok"));
+        assert_eq!(answers(&mut bot), []);
+    }
+
+    #[test]
+    fn sendim_holds_an_autoreply_back_and_startim_does_not() {
+        let mut bot = answering("rlv = true\n");
+        ok(&mut bot, "rlv\tcmd\t@sendim=n");
+        hear(&mut bot, janes("hi"));
+        assert_eq!(answers(&mut bot), []);
+        assert_eq!(recorded(&mut bot), [pair("im", "hi")]);
+        // Held back, the answer started no pause.
+        ok(&mut bot, "rlv\tcmd\t@sendim=y,startim=n");
+        hear(&mut bot, janes("hi"));
+        assert_eq!(answers(&mut bot), [(jane_id(), "Away".to_string())]);
+    }
+
+    #[test]
+    fn recvim_hides_a_message_and_rlv_answers_it() {
+        let mut bot = answering("rlv = true\n");
+        ok(&mut bot, "rlv\tcmd\t@recvim=n");
+        hear(&mut bot, janes("are you there?"));
+        assert_eq!(answers(&mut bot), [(jane_id(), RLV_RECVIM_REPLY.to_string())]);
+        assert_eq!(
+            recorded(&mut bot),
+            [pair("im", "(blocked by RLV: recvim)"), pair("im_auto", RLV_RECVIM_REPLY)]
+        );
+        // Every blocked message is answered, and none starts a pause.
+        hear(&mut bot, janes("hello?"));
+        assert_eq!(answers(&mut bot), [(jane_id(), RLV_RECVIM_REPLY.to_string())]);
+        ok(&mut bot, "rlv\tcmd\t@recvim=y");
+        hear(&mut bot, janes("hi"));
+        assert_eq!(answers(&mut bot), [(jane_id(), "Away".to_string())]);
+    }
+
+    #[test]
+    fn recvim_answers_whether_autoreply_is_on_or_not() {
+        let mut bot = bot(full("rlv = true\n"));
+        bot.grid = Some(commands::tests::FakeGrid::default());
+        ok(&mut bot, &format!("rlv\tcmd\t@recvimfrom:{}=n", jane_id()));
+        hear(&mut bot, janes("hi"));
+        assert_eq!(answers(&mut bot), [(jane_id(), RLV_RECVIM_REPLY.to_string())]);
+        hear(&mut bot, im_from(Uuid::from_bytes([0x2b; 16]), "John Roe", "hi"));
+        assert_eq!(answers(&mut bot), []);
+        let rule = format!("recvimfrom:{}", jane_id());
+        assert_eq!(
+            recorded(&mut bot),
+            [
+                pair("im", &format!("(blocked by RLV: {rule})")),
+                pair("im_auto", RLV_RECVIM_REPLY),
+                pair("im", "hi")
+            ]
+        );
+    }
+
+    #[test]
+    fn recvim_exceptions_rlv_off_objects_and_stored_messages() {
+        let mut bot = answering("rlv = true\n");
+        ok(&mut bot, &format!("rlv\tcmd\t@recvim=n,recvim:{}=add", jane_id()));
+        hear(&mut bot, janes("hi"));
+        assert_eq!(answers(&mut bot), [(jane_id(), "Away".to_string())]);
+        recorded(&mut bot);
+        // A stored message is hidden, and not answered.
+        let SessionEvent::InstantMessage(mut stored) = im_from(Uuid::from_bytes([0x2b; 16]), "John Roe", "earlier") else {
+            unreachable!()
+        };
+        stored.sent_at = Some(1_700_000_000);
+        hear(&mut bot, SessionEvent::InstantMessage(stored));
+        assert_eq!(answers(&mut bot), []);
+        assert_eq!(recorded(&mut bot), [pair("im", "(blocked by RLV: recvim)")]);
+        // An object's message is not blocked.
+        let object = session::Message {
+            kind: "object".to_string(),
+            source: session::Source::Object {
+                id: Some(Uuid::from_bytes([7; 16])),
+                name: "Collar".to_string(),
+                owner: jane_id(),
+            },
+            sent_at: None,
+            text: "locked".to_string(),
+        };
+        hear(&mut bot, SessionEvent::InstantMessage(object));
+        assert_eq!(recorded(&mut bot), [pair("object", "locked")]);
+        // With RLV off nothing is blocked.
+        ok(&mut bot, "rlv\tmode\toff");
+        hear(&mut bot, im_from(Uuid::from_bytes([0x2b; 16]), "John Roe", "hi"));
+        assert_eq!(answers(&mut bot), [(Uuid::from_bytes([0x2b; 16]), "Away".to_string())]);
+        assert_eq!(recorded(&mut bot), [pair("im", "hi"), pair("im_auto", "Away")]);
+    }
+
+    #[test]
+    fn autoreply_command_changes_the_setting() {
+        let mut bot = answering("");
+        assert_eq!(
+            ok(&mut bot, "autoreply\tstatus"),
+            "autoreply: on\nmessage: Away\npause: 2h\navatars in their pause: 0"
+        );
+        assert_eq!(
+            ok(&mut bot, "autoreply\tmessage\tNew autoreply from the bot"),
+            "autoreply: on, message: New autoreply from the bot"
+        );
+        assert_eq!(ok(&mut bot, "autoreply\tpause\t30m"), "autoreply pause: 30m");
+        hear(&mut bot, janes("hi"));
+        assert_eq!(answers(&mut bot), [(jane_id(), "New autoreply from the bot".to_string())]);
+        hear(&mut bot, janes("hi"));
+        assert_eq!(answers(&mut bot), []);
+        assert!(ok(&mut bot, "autoreply\tstatus").ends_with("pause: 30m\navatars in their pause: 1"));
+        assert_eq!(ok(&mut bot, "autoreply\trefresh"), "autoreply: forgot the pause of 1 avatar");
+        hear(&mut bot, janes("hi"));
+        assert_eq!(answers(&mut bot).len(), 1);
+        assert_eq!(ok(&mut bot, "autoreply\toff"), "autoreply: off");
+        assert_eq!(ok(&mut bot, "autoreply\toff"), "autoreply: already off; nothing changed");
+        hear(&mut bot, im_from(Uuid::from_bytes([0x2b; 16]), "John Roe", "hi"));
+        assert_eq!(answers(&mut bot), []);
+        assert_eq!(ok(&mut bot, "autoreply\ton"), "autoreply: on");
+        hear(&mut bot, im_from(Uuid::from_bytes([0x2b; 16]), "John Roe", "hi"));
+        assert_eq!(
+            answers(&mut bot),
+            [(Uuid::from_bytes([0x2b; 16]), "New autoreply from the bot".to_string())]
+        );
+        assert_eq!(ok(&mut bot, "autoreply\trefresh"), "autoreply: forgot the pauses of 2 avatars");
+    }
+
+    #[test]
+    fn autoreply_command_refusals_change_nothing() {
+        let mut plain = bot(full(""));
+        assert!(refused(&mut plain, "autoreply\ton").contains("`autoreply message TEXT`"));
+        assert!(ok(&mut plain, "autoreply\tstatus").starts_with("autoreply: off\nmessage: (none)\npause: 1h"));
+        let mut bot = answering("");
+        let reason = refused(&mut bot, "autoreply\tpause\tsoon");
+        assert!(
+            reason.contains("`soon` is not a duration") && reason.contains("`1h30m`"),
+            "{reason}"
+        );
+        assert!(refused(&mut bot, "autoreply\tmessage\t   ").contains("blank"));
+        assert!(refused(&mut bot, &format!("autoreply\tmessage\t{}", "x".repeat(1024))).contains("1023"));
+        assert_eq!(
+            ok(&mut bot, "autoreply\tstatus"),
+            "autoreply: on\nmessage: Away\npause: 2h\navatars in their pause: 0"
+        );
+    }
+
+    #[test]
+    fn autoreply_command_is_never_refused_by_rlv_and_leaves_override_alone() {
+        let mut bot = bot(full("rlv = true\n"));
+        ok(&mut bot, "rlv\tcmd\t@sendim=n,recvim=n,sendchat=n");
+        ok(&mut bot, "rlv\tmode\toverride");
+        assert_eq!(ok(&mut bot, "autoreply\tpause\t10m"), "autoreply pause: 10m");
+        assert!(ok(&mut bot, "rlv\tstatus").starts_with("rlv: override"));
+    }
+
     // ------------------------------------------------ permission requests
 
     fn holder(perms: &str) -> Bot {
@@ -3491,6 +3895,10 @@ mod tests {
             assert!(answer(&mut rig).contains("\nim AVATAR MESSAGE...\n"));
             rig.from_owner(DOMAIN, &"x".repeat(8193));
             assert!(answer(&mut rig).contains("8192"));
+            rig.from_owner(DOMAIN, "autoreply message back soon");
+            assert_eq!(answer(&mut rig), "autoreply: on, message: back soon");
+            rig.from_owner(DOMAIN, "autoreply off");
+            assert_eq!(answer(&mut rig), "autoreply: off");
         }
 
         #[test]
@@ -3503,6 +3911,22 @@ mod tests {
             assert_eq!(rig.calls(), [Call::Im(jane(), "see you later".into())]);
             rig.next();
             assert_eq!(answer(&mut rig), format!("sent to Jane Doe <{}>", jane()));
+            // Jane is in her autoreply pause now: her answer gets none.
+            ok(&mut rig.bot, "autoreply\tmessage\tAway");
+            let message = session::Message {
+                kind: "im".to_string(),
+                source: session::Source::Avatar {
+                    id: jane(),
+                    name: "Jane Doe".to_string(),
+                },
+                sent_at: None,
+                text: "ok".to_string(),
+            };
+            assert!(matches!(
+                rig.bot.apply(SessionEvent::InstantMessage(message), Instant::now()),
+                Flow::Continue
+            ));
+            assert!(!rig.calls().iter().any(|call| matches!(call, Call::AutoIm(..))));
             // The sent IM is recorded, and not passed to the owners.
             rig.bot.names_resolved(vec![janes_names()], vec![], Instant::now());
             rig.bot.service_messages();

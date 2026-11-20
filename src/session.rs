@@ -750,6 +750,12 @@ impl<N: Net> Session<N> {
         self.send_im(to, messages::IM_PLAIN, text, now)
     }
 
+    /// Sends the avatar `to` an automatic answer, as a viewer in Do Not
+    /// Disturb mode does.
+    pub fn autoresponse(&mut self, to: Uuid, text: &str, now: Instant) -> Result<(), String> {
+        self.send_im(to, messages::IM_AUTO_RESPONSE, text, now)
+    }
+
     fn send_im(&mut self, to: Uuid, dialog: u8, text: &str, now: Instant) -> Result<(), String> {
         self.present()?;
         let position = self.sim.position.unwrap_or_default();
@@ -2801,6 +2807,18 @@ mod tests {
     }
 
     #[test]
+    fn sends_automatic_answers() {
+        let mut rig = Rig::entered();
+        let to = Uuid::from_bytes([0x0F; 16]);
+        assert_eq!(rig.session.autoresponse(to, "Away", rig.now), Ok(()));
+        let sent = rig.sent();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].is_reliable());
+        let expected = messages::instant_message(&rig.agent(), "Sit Bot", to, [10.0, 20.0, 30.0], 20, "Away");
+        assert_eq!((sent[0].id, &sent[0].body), (messages::IMPROVED_INSTANT_MESSAGE, &expected.body));
+    }
+
+    #[test]
     fn avatar_search_is_sent_and_its_answer_reported() {
         let mut rig = Rig::entered();
         let query = Uuid::from_bytes([0x33; 16]);
@@ -2830,6 +2848,7 @@ mod tests {
             let now = rig.now;
             assert_eq!(rig.session.say(0, 1, "hello", now), Err(NOT_CONNECTED.to_string()));
             assert_eq!(rig.session.instant_message(to, "hello", now), Err(NOT_CONNECTED.to_string()));
+            assert_eq!(rig.session.autoresponse(to, "Away", now), Err(NOT_CONNECTED.to_string()));
             assert_eq!(rig.session.find_avatar(to, "jane doe", now), Err(NOT_CONNECTED.to_string()));
             let chatty = [
                 messages::CHAT_FROM_VIEWER,

@@ -60,7 +60,8 @@ pub struct Delivery {
 }
 
 /// The delivery of a record, if it is one the owners receive: local chat,
-/// and instant messages received (not `im_out`).
+/// and instant messages received (not `im_out`, nor the automatic answers
+/// `im_auto`).
 pub fn delivery(record: &Record) -> Option<Delivery> {
     match record.channel {
         Channel::Chat => Some(Delivery {
@@ -68,7 +69,7 @@ pub fn delivery(record: &Record) -> Option<Delivery> {
             body: chat_line(record),
             nick: None,
         }),
-        Channel::Im if record.kind == "im_out" => None,
+        Channel::Im if record.kind == "im_out" || record.kind == "im_auto" => None,
         Channel::Im => {
             let from_object = !record.object_name.is_empty() || record.object_uuid.is_some();
             Some(match (from_object, record.object_uuid, record.avatar_uuid) {
@@ -203,9 +204,14 @@ mod tests {
         assert_eq!(delivery(&unknown).unwrap().from, Some(id(1).to_string()));
         let sent = Record {
             kind: "im_out".into(),
-            ..im
+            ..im.clone()
         };
         assert_eq!(delivery(&sent), None);
+        let answered = Record {
+            kind: "im_auto".into(),
+            ..im
+        };
+        assert_eq!(delivery(&answered), None);
     }
 
     #[test]

@@ -63,6 +63,9 @@ Usage: rslbot ctl say MESSAGE...
        rslbot ctl rlv status
        rslbot ctl rlv reset
        rslbot ctl rlv cmd COMMAND...
+       rslbot ctl autoreply message TEXT...
+       rslbot ctl autoreply pause DURATION
+       rslbot ctl autoreply refresh | on | off | status
        rslbot ctl quit
 
 Sends a command to a running bot that has `socket = true` in its config.
@@ -138,6 +141,15 @@ an object had sent them, such as `rlv cmd @versionnum=5` or
 each; its restrictions are its own, apart from every object's, and it is
 refused while RLV is off. None of the switches is saved.
 
+`autoreply message` sets the text the bot answers an avatar's instant
+message with, and switches autoreply on. After answering an avatar, or
+after `im` to it, the bot does not answer it again for the pause, which
+`autoreply pause` sets: `90s`, `30m`, `2h`, `1h30m`, or `0` to answer every
+message. `autoreply refresh` forgets every avatar's pause; `autoreply on`
+and `off` switch it on with the text it has and off; `autoreply status`
+prints all of this. None of it is saved; the config's `[autoreply]` table
+is.
+
 The socket address is taken from the environment variable RUSSELBOT_SOCK
 when it is set.";
 
@@ -203,6 +215,7 @@ pub enum Request {
     Status,
     Rlv(RlvRequest),
     Perms(PermsRequest),
+    Autoreply(AutoreplyRequest),
     Quit,
 }
 
@@ -220,6 +233,7 @@ impl Request {
             Request::AskTp { .. } => "requesttp",
             Request::Accept { .. } => "accept",
             Request::Perms(_) => "perms",
+            Request::Autoreply(_) => "autoreply",
             Request::SendTp { .. } => "sendtp",
             Request::Touch(_) => "touch",
             Request::Persist { .. } => "persist",
@@ -251,6 +265,20 @@ pub enum PermsRequest {
         kind: String,
         who: Vec<String>,
     },
+    Status,
+}
+
+/// The `autoreply` commands.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AutoreplyRequest {
+    /// `autoreply message TEXT...`: the words joined with spaces, still to
+    /// be checked.
+    Message(String),
+    /// `autoreply pause DURATION`, still to be read.
+    Pause(String),
+    Refresh,
+    On,
+    Off,
     Status,
 }
 
@@ -501,6 +529,29 @@ impl Request {
                     }
                 };
                 Ok(Request::Rlv(rlv))
+            }
+            "autoreply" => {
+                const FORMS: &str = "`autoreply` takes `message TEXT...`, `pause DURATION`, `refresh`, `on`, `off` or `status`";
+                let mut fields = fields.into_iter();
+                let form = fields.next();
+                let rest: Vec<String> = fields.collect();
+                let bare = |request: AutoreplyRequest, name: &str| match rest.is_empty() {
+                    true => Ok(Request::Autoreply(request)),
+                    false => Err(format!("`autoreply {name}` takes no arguments")),
+                };
+                match form.as_deref() {
+                    Some("message") if rest.is_empty() => Err("`autoreply message` takes the text to answer with".to_string()),
+                    Some("message") => Ok(Request::Autoreply(AutoreplyRequest::Message(rest.join(" ")))),
+                    Some("pause") => match <[String; 1]>::try_from(rest) {
+                        Ok([duration]) => Ok(Request::Autoreply(AutoreplyRequest::Pause(duration))),
+                        Err(_) => Err("`autoreply pause` takes 1 argument, a duration such as `30m` or `2h`".to_string()),
+                    },
+                    Some("refresh") => bare(AutoreplyRequest::Refresh, "refresh"),
+                    Some("on") => bare(AutoreplyRequest::On, "on"),
+                    Some("off") => bare(AutoreplyRequest::Off, "off"),
+                    Some("status") => bare(AutoreplyRequest::Status, "status"),
+                    _ => Err(FORMS.to_string()),
+                }
             }
             "home" => arguments(0).map(|()| Request::Home),
             "status" => arguments(0).map(|()| Request::Status),
@@ -1073,6 +1124,48 @@ mod tests {
                 who: strings(&["all"]),
             }))
         );
+    }
+
+    #[test]
+    fn autoreply_requests_are_read() {
+        let read = |line: &str| Request::decode(line.as_bytes());
+        let auto = |request| Ok(Request::Autoreply(request));
+        assert_eq!(
+            read("autoreply\tmessage\tNew autoreply from the bot"),
+            auto(AutoreplyRequest::Message("New autoreply from the bot".to_string()))
+        );
+        assert_eq!(
+            read("autoreply\tmessage\tback\tin\tan\thour"),
+            auto(AutoreplyRequest::Message("back in an hour".to_string()))
+        );
+        assert_eq!(read("autoreply\tpause\t30m"), auto(AutoreplyRequest::Pause("30m".to_string())));
+        assert_eq!(read("autoreply\trefresh"), auto(AutoreplyRequest::Refresh));
+        assert_eq!(read("autoreply\ton"), auto(AutoreplyRequest::On));
+        assert_eq!(read("autoreply\toff"), auto(AutoreplyRequest::Off));
+        assert_eq!(read("autoreply\tstatus"), auto(AutoreplyRequest::Status));
+        assert_eq!(read("autoreply\tstatus").unwrap().name(), "autoreply");
+    }
+
+    #[test]
+    fn malformed_autoreply_requests_are_refused() {
+        let refused = |line: &str| Request::decode(line.as_bytes()).unwrap_err();
+        for line in ["autoreply", "autoreply\tclear", "autoreply\tOn"] {
+            let reason = refused(line);
+            assert!(
+                reason.contains("`message TEXT...`") && reason.contains("`status`"),
+                "{line}: {reason}"
+            );
+        }
+        assert!(refused("autoreply\tmessage").contains("text"));
+        for line in ["autoreply\tpause", "autoreply\tpause\t1h\t30m"] {
+            assert!(refused(line).contains("`autoreply pause` takes 1 argument"), "{line}");
+        }
+        for form in ["refresh", "on", "off", "status"] {
+            assert_eq!(
+                refused(&format!("autoreply\t{form}\tnow")),
+                format!("`autoreply {form}` takes no arguments")
+            );
+        }
     }
 
     #[test]

@@ -625,3 +625,34 @@ and with the bot using it too, `ctl im` by name reached that avatar
 Seen in a viewer as well: the avatar seated on the prim in `Target`. Not covered on this rig:
 a region that stays offline while the
 rest of the grid is up, and anything specific to Second Life.
+
+## Autoreplies
+
+Run on 2026-11-20 with the debug build, the config of item 1 plus
+`persist = "cfg"`, `socket = true`, `rlv = true`, `log_im = "im.tsv"` and
+
+```toml
+[autoreply]
+message = "Hello, I'm bot. I won't respond to you in next 2 minutes"
+pause = "2m"
+```
+
+and a `RUSSELBOT_SOCK` of the run's own. `test-rig/listen.py` with
+`im=T1,T2,...` sends the bot `hello <T>` that many seconds after it starts
+listening, prints the automatic answers it gets as `autoresponse` lines
+(dialog 20), and never answers those. `ctl` is `rslbot ctl` on that socket.
+
+| # | Inject | Expected | Result (2026-11-20, OpenSim 9d00a55552) |
+|---|---|---|---|
+| 179 | `listen.py 135 im=3,8,128` | `hello 3` answered with the text as an `autoresponse` in the conversation of a plain IM; `hello 8` not answered; `hello 128`, after the pause, answered; `im.tsv` has each `im` row and after the first and third an `im_auto` row | Pass. OpenSim passes dialog 20 on; the answer's conversation id is the two avatar ids combined (`...001a`), as for a plain IM |
+| 180 | `ctl autoreply refresh`; an IM | `forgot the pauses of 0 avatars` (the pause of 179 had run out); the IM answered | Pass |
+| 181 | `ctl im "Rig Owner" one moment`, then the helper's `pong` and an IM | Neither is answered | Pass. Checked again on its own (`refresh`, then `ctl im "Rig Owner" brb`, then an IM): no answer to the `pong` or the IM |
+| 182 | `ctl autoreply off`; an IM | `autoreply: off`; not answered | Pass |
+| 183 | `ctl autoreply on`; `ctl autoreply refresh`; `ctl rlv cmd @recvim=n`; an IM | The helper gets "The Resident you messaged is currently prevented from reading your instant messages at the moment, please try again later." as an `autoresponse`; `im.tsv` has `(blocked by RLV: recvim)` in place of the text, then the `im_auto` row | Pass |
+| 184 | `ctl rlv cmd @recvim=y,sendim=n`; an IM | Recorded with its text, not answered; `autoreply: not sent to Rig Owner <uuid>: sendim is in force, held by the operator` | Pass. The `autoreply: not sent` line comes before the `im` line on standard error: the message waits the moment its names take, the log line does not |
+| 185 | `ctl rlv cmd @sendim=y`; an IM; `ctl autoreply status` | Answered (the held-back answer started no pause); the status lists `on`, the text, `pause: 2m` and the avatars in their pause | Pass |
+
+Not covered on this rig: a viewer showing the answer (no viewer was at
+hand), stored offline IMs (the rig cannot produce them), IMs from
+scripts, and two bots with autoreply on (both unit-tested: a bot drops
+dialog 20 unread). Nothing of this has been tried on Second Life.

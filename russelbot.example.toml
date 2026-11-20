@@ -157,3 +157,20 @@ sit = "00000000-0000-0000-0000-000000000000"
 # server = "127.0.0.1:5347"
 # secret = "the component_secret of the server"
 # owners = ["me@example.org"]
+
+# Autoreplies: the bot answers an avatar that sends it an instant message
+# with `message`, then stays quiet towards that avatar for `pause`. An
+# instant message the bot sends an avatar on command (`rslbot ctl im`, or
+# an owner's message through the XMPP gateway) starts that avatar's pause
+# too. Objects, group chats and messages stored while the avatar was
+# offline get no answer. The answer goes out the way a viewer's Do Not
+# Disturb autoresponse does, so viewers mark it as automatic and never
+# answer it. `pause` is written as `90s`, `30m`, `2h` or `1h30m` (units d,
+# h, m and s in that order), or `0` to answer every message; it defaults
+# to 1h. While the bot runs, `rslbot ctl autoreply message TEXT`,
+# `autoreply pause DURATION`, `autoreply refresh` (forget every avatar's
+# pause), `autoreply on|off` and `autoreply status` change and show this.
+# A table too.
+# [autoreply]
+# message = "Hello, I'm bot. I won't respond to you in next 2 hours"
+# pause = "2h"
