@@ -122,14 +122,14 @@ The command SHALL be answered with an error and do nothing further when no entry
 - **THEN** the command exits with status 1 saying there is no such item, and nothing is sent to the simulator
 
 ### Requirement: Inventory is read on demand
-The bot SHALL ask the grid about the inventory only to carry out a command that needs it and, while `restore_attachments` is on, to restore attachments after a login (see `avatar-outfit`, "Restoring attachments after a login"). It SHALL NOT keep what it learned for a later command: every command sees the inventory as the grid has it then. The `inventory` command and every lookup of an item or folder SHALL be answered with an error, and SHALL ask the grid nothing, when the avatar is not connected to a region or is in the middle of a teleport or a logout, and when the simulator the avatar is on offers no inventory service. A command whose lookup is under way when the session is lost or the avatar changes simulator SHALL be answered with an error. Reading the inventory SHALL NOT delay the bot's simulator traffic and SHALL NOT change the bot's placement mode.
+The bot SHALL ask the grid about the inventory only to carry out a command that needs it, to find the folder an inventory offer it accepts goes into (see `permission-requests`, "Accepting a request"), for which it reads the top level of the inventory and nothing below it, and, while `restore_attachments` is on, to restore attachments after a login (see `avatar-outfit`, "Restoring attachments after a login"). It SHALL NOT keep what it learned for a later command or a later offer: every command and every accepted offer sees the inventory as the grid has it then. The `inventory` command and every lookup of an item or folder SHALL be answered with an error, and SHALL ask the grid nothing, when the avatar is not connected to a region or is in the middle of a teleport or a logout, and when the simulator the avatar is on offers no inventory service. A command whose lookup is under way when the session is lost or the avatar changes simulator SHALL be answered with an error. Reading the inventory SHALL NOT delay the bot's simulator traffic and SHALL NOT change the bot's placement mode.
 
 #### Scenario: No command, no inventory traffic
-- **WHEN** the bot runs for an hour with `restore_attachments = false` and is given none of the commands that name an inventory item or folder
+- **WHEN** the bot runs for an hour with `restore_attachments = false`, is given none of the commands that name an inventory item or folder, and accepts no inventory offer
 - **THEN** it has asked the grid for no inventory folder and no inventory item
 
 #### Scenario: No command and no outfit service
-- **WHEN** the bot runs for an hour with `restore_attachments` on, on a grid whose simulator offers no outfit service, and is given none of those commands
+- **WHEN** the bot runs for an hour with `restore_attachments` on, on a grid whose simulator offers no outfit service, is given none of those commands, and accepts no inventory offer
 - **THEN** it has asked the grid for no inventory folder and no inventory item
 
 #### Scenario: Change made in a viewer
@@ -147,6 +147,14 @@ The bot SHALL ask the grid about the inventory only to carry out a command that 
 #### Scenario: Listing while seated
 - **WHEN** `rslbot ctl inventory` is run in holding mode while the avatar is seated
 - **THEN** the avatar stays seated, stays connected, and the bot stays in holding mode
+
+#### Scenario: Inventory offer that waits
+- **WHEN** an avatar gives the bot's avatar an item and the offer is not accepted
+- **THEN** the bot has asked the grid for no inventory folder
+
+#### Scenario: Inventory offer accepted
+- **WHEN** an inventory offer is accepted, by itself or with `rslbot ctl accept inventory`
+- **THEN** the bot has asked the grid for the folders at the top of My Inventory and for nothing else of the inventory
 
 ### Requirement: Inventory commands appear in the operator log
 The bot SHALL write a line to its operator log for every `inventory` command it carries out, saying which folder and filters were asked for and how many entries were listed, and for every one it refuses, with the reason. The entries themselves SHALL NOT be written to the operator log.

@@ -29,6 +29,7 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `scan_distance` | no | Number of metres, from 1 to 1024. When present the bot learns the objects within that distance from the moment it enters a region, for the `touch` command. When absent it learns them only when `touch` is first used, within 32 metres |
 | `restore_attachments` | no | Boolean; when true the bot attaches again, after each login, the objects the avatar's Current Outfit folder lists and the simulator did not bring (see `avatar-outfit`, "Restoring attachments after a login"). Defaults to true |
 | `rlv` | no | Boolean; when true the bot starts with RLV on and reads the RLV commands of the objects the avatar owns (see `rlv-commands`). Defaults to false |
+| `perms` | no | Table saying which requests the bot accepts by itself (see `permission-requests`); its form is given below. Without it the bot accepts none by itself |
 
 `persist` SHALL be accepted in these forms:
 
@@ -41,6 +42,8 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | A table with any of the keys `atstart`, `position`, `sit` and `rlv` | As described below the table |
 
 In the table form, `atstart` is a boolean that says whether the bot holds anything once the config placement is reached; `position` and `sit`, each `"cur"` or `"cfg"`, are the values for the location and for the sit state; and `rlv`, `"drop"` or `"follow"`, is the RLV persist setting the bot starts with (see `rlv-commands`, "RLV persist setting"). `atstart` SHALL default to true when the table has `position` or `sit`, and to false otherwise. While `atstart` is true, a `position` or `sit` that is left out of the table is `"cur"`, so `atstart = true` alone is the same as `persist = "cur"`. While `atstart` is false the bot holds nothing once the config placement is reached, as with `persist = "off"`. The `rlv` key SHALL NOT affect `atstart`. The RLV persist setting SHALL be `"drop"` when the table has no `rlv` key, with every other form of `persist`, and without `persist`.
+
+`perms` SHALL be a table with any of the keys `autoaccept` and `except`, each of them a table whose keys are kinds of request: `tp`, `inventory`, `anim`, `attach`, `controls` and `camera`. A value under `autoaccept` is the auto-accept rule the bot starts with for that kind: the string `"all"` or the boolean `true` for the rule `all`, an array of entries for a list, and the boolean `false` for an empty list, which is also the rule of a kind without a key. A value under `except` SHALL be an array of entries, the exceptions the bot starts with for that kind. An entry SHALL be a string holding a UUID or an avatar's name, written `First Last`, `first.last` or as a single word (see `permission-requests`, "Auto-accept rules"). An entry that is given twice in one array SHALL count once.
 
 A relative `log_chat` or `log_im` path SHALL be taken relative to the directory the bot was started in. A config that uses `object` SHALL behave exactly as the same config with that value under `sit`, and the bot SHALL write a line to standard error at startup that names `object` as deprecated and `sit` as its replacement.
 
@@ -160,8 +163,28 @@ A relative `log_chat` or `log_im` path SHALL be taken relative to the directory 
 - **WHEN** the config contains `rlv = true`
 - **THEN** the bot starts with RLV on
 
+#### Scenario: Perms not mentioned
+- **WHEN** the config has no `perms` table
+- **THEN** the bot starts with an empty auto-accept list and no exceptions for every kind
+
+#### Scenario: Auto-accept lists
+- **WHEN** the config ends with a `[perms.autoaccept]` table containing `tp = ["Avatar1", "Avatar2"]` and `inventory = ["Owner Resident", "11111111-2222-3333-4444-555555555555"]`
+- **THEN** the bot starts with those two entries as the rule for `tp`, those two as the rule for `inventory`, and empty lists for the other kinds
+
+#### Scenario: All with an exception
+- **WHEN** the config has `anim = "all"` under `[perms.autoaccept]` and `anim = ["01234567-9abc-defe-dcba-987654321000"]` under `[perms.except]`
+- **THEN** the bot starts with the rule `all` for `anim` and that UUID as its one exception
+
+#### Scenario: Booleans
+- **WHEN** the config has `attach = true` and `controls = false` under `[perms.autoaccept]`
+- **THEN** the bot starts with the rule `all` for `attach` and an empty list for `controls`
+
+#### Scenario: Exceptions without a rule
+- **WHEN** the config has a `[perms.except]` table and no `[perms.autoaccept]` table
+- **THEN** the bot starts normally, with the exceptions and an empty list for every kind
+
 ### Requirement: Config validation before any network activity
-The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `atstart`, `position`, `sit` and `rlv`, with a `position` or `sit` other than `"cur"` and `"cfg"`, with an `atstart` that is not a boolean, with an `rlv` other than `"drop"` and `"follow"`, or with `atstart = false` together with `position` or `sit`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, a `restore_attachments` that is not a boolean, an `rlv` that is not a boolean, and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
+The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `atstart`, `position`, `sit` and `rlv`, with a `position` or `sit` other than `"cur"` and `"cfg"`, with an `atstart` that is not a boolean, with an `rlv` other than `"drop"` and `"follow"`, or with `atstart = false` together with `position` or `sit`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, a `restore_attachments` that is not a boolean, an `rlv` that is not a boolean, a `perms` that is not in its form (a value that is not a table, a key other than `autoaccept` and `except`, an `autoaccept` or `except` that is not a table, a key in either that is not a kind of request, a value under `autoaccept` that is neither `"all"`, a boolean nor an array of strings, a value under `except` that is not an array of strings, an entry that is neither a UUID nor a name of one or two words, the entry `"all"` inside an array, or one entry both in a kind's `autoaccept` array and in its `except` array), and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
 
 #### Scenario: Both password forms given
 - **WHEN** the config contains both `password` and `password_hash`
@@ -254,6 +277,26 @@ The bot SHALL validate the whole config before contacting any server. It SHALL r
 #### Scenario: RLV option of the wrong type
 - **WHEN** the config contains `rlv = "on"`
 - **THEN** the bot prints an error naming `rlv` and exits with status 2
+
+#### Scenario: Unknown kind of request
+- **WHEN** the config has `money = "all"` under `[perms.autoaccept]`
+- **THEN** the bot prints an error naming `perms.autoaccept.money` and the kinds there are, and exits with status 2
+
+#### Scenario: Malformed entry
+- **WHEN** the config has `tp = ["Jane van Doe"]` under `[perms.autoaccept]`
+- **THEN** the bot prints an error naming `perms.autoaccept.tp` and the entry, and exits with status 2
+
+#### Scenario: All inside a list
+- **WHEN** the config has `anim = ["all"]` under `[perms.autoaccept]`
+- **THEN** the bot prints an error naming `perms.autoaccept.anim` that says to write `anim = "all"`, and exits with status 2
+
+#### Scenario: Exceptions that are not a list
+- **WHEN** the config has `anim = "all"` under `[perms.except]`
+- **THEN** the bot prints an error naming `perms.except.anim` and exits with status 2
+
+#### Scenario: Entry both accepted and excepted
+- **WHEN** the config has `anim = ["Jane Doe"]` under `[perms.autoaccept]` and `anim = ["jane.doe"]` under `[perms.except]`
+- **THEN** the bot prints an error naming both keys and the entry, and exits with status 2
 
 ### Requirement: Password hash subcommand
 The bot SHALL provide a `hash` subcommand that reads a password from standard input and prints the corresponding hash on standard output as `$1$` followed by the 32 lowercase hexadecimal digits of the MD5 digest of the password. The password SHALL NOT be accepted as a command-line argument. When standard input is a terminal the password SHALL NOT be echoed. A trailing line ending SHALL NOT be part of the hashed password. An empty password SHALL be rejected with a non-zero exit status.
