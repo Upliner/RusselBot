@@ -98,11 +98,20 @@ sit = "00000000-0000-0000-0000-000000000000"
 #             "follow" makes the result the place it holds. It says nothing
 #             about `atstart`. `rslbot ctl rlv persist` changes it while the
 #             bot runs.
+#   override  What the bot does by itself to get back to the place it
+#             holds whatever RLV restrictions say: "tp" its teleports
+#             there, "sit" its sits there, or both in an array. Without it
+#             a restriction such as `@tploc=n` holds the bot where it is,
+#             also after a region restart has put the avatar elsewhere.
+#             It says nothing about `atstart`, and never applies to
+#             commands. `rslbot ctl rlv persist override` changes it while
+#             the bot runs.
 # [persist]
 # atstart = true
 # position = "cur"
 # sit = "cfg"
 # rlv = "follow"
+# override = ["sit", "tp"]
 
 # Which requests the bot accepts by itself; without this it accepts none and
 # every request waits for `rslbot ctl accept KIND`. These are tables too.

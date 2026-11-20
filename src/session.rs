@@ -152,7 +152,59 @@ pub enum SessionEvent {
         owner: Uuid,
         group: Uuid,
     },
+    /// An object the simulator had described is gone: deleted, detached,
+    /// or out of what the simulator shows.
+    ObjectGone(Uuid),
+    /// The avatar has left a region for another. `worn` are the objects
+    /// the old simulator had described that were on the avatar, the prims
+    /// of its attachments: they come along, everything else stays behind.
+    RegionLeft {
+        worn: Vec<Uuid>,
+    },
 }
+
+/// What kind of thing an object is, as far as the simulator has shown.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Placement {
+    /// On a point of the bot avatar's heads-up display.
+    Hud,
+    /// Attached to the bot's avatar elsewhere.
+    Worn,
+    /// Attached to this other avatar; nil when the simulator has not
+    /// described that avatar.
+    WornBy(Uuid),
+    /// Rezzed in the region.
+    InWorld,
+    /// Not described by the simulator.
+    Unknown,
+}
+
+/// An object as the simulator has described it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Thing {
+    pub placement: Placement,
+    /// The prims of the linkset the object is part of, the object first.
+    pub prims: Vec<Uuid>,
+    /// How far the object is from the avatar, in metres.
+    pub distance: Option<f32>,
+}
+
+impl Thing {
+    /// An object the simulator has not described.
+    pub fn unknown(object: Uuid) -> Thing {
+        Thing {
+            placement: Placement::Unknown,
+            prims: vec![object],
+            distance: None,
+        }
+    }
+}
+
+/// The attachment points of the heads-up display.
+const HUD_POINTS: std::ops::RangeInclusive<u8> = 31..=38;
+/// How many parents are followed from an object: a child prim of an
+/// attachment is two below the avatar.
+const MAX_DEPTH: usize = 8;
 
 /// An inventory offer as it arrived. The item is in the avatar's inventory
 /// already; accepting files it and tells the giver.
@@ -319,6 +371,12 @@ struct Sim {
     /// region-local id, which is what it takes touches by.
     objects: HashMap<Uuid, u32>,
     local_ids: HashMap<u32, Uuid>,
+    /// The parent of each described object whose update named one, by
+    /// region-local id; zero for an object without a parent.
+    parents: HashMap<u32, u32>,
+    /// Where each described object is, as last reported: in the region,
+    /// or relative to its parent when it has one.
+    places: HashMap<u32, Vector3>,
     /// Objects mentioned as cached, which the bot would have to ask about.
     undescribed: HashSet<u32>,
     /// When the bot started asking about them, if it has.
@@ -460,6 +518,10 @@ impl<N: Net> Session<N> {
     fn open_circuit(&mut self, generation: u64, addr: SocketAddr, seed_capability: &str, now: Instant) {
         self.fail_touches();
         self.fail_attaches();
+        if self.sim.entered {
+            let worn = self.worn_prims();
+            self.events.push(SessionEvent::RegionLeft { worn });
+        }
         self.sim = Sim::new(generation, now);
         self.seat_confirmed = None;
         self.own_parent = None;
@@ -570,6 +632,9 @@ impl<N: Net> Session<N> {
     /// An update about the object with this region-local id says where it
     /// is: of interest when it is the avatar or its seat.
     fn moved(&mut self, local_id: u32, transform: Transform) {
+        if self.sim.local_ids.contains_key(&local_id) {
+            self.sim.places.insert(local_id, transform.position);
+        }
         if self.sim.own_local == Some(local_id) {
             self.sim.own_offset = Some(transform.position);
         } else if local_id != 0 && self.own_parent == Some(local_id) {
@@ -760,8 +825,10 @@ impl<N: Net> Session<N> {
         let sim = &mut self.sim;
         sim.undescribed.remove(&local_id);
         if sim.objects.len() < MAX_OBJECTS || sim.objects.contains_key(&object) {
-            if let Some(old) = sim.objects.insert(object, local_id) {
+            if let Some(old) = sim.objects.insert(object, local_id).filter(|old| *old != local_id) {
                 sim.local_ids.remove(&old);
+                sim.parents.remove(&old);
+                sim.places.remove(&old);
             }
             sim.local_ids.insert(local_id, object);
         }
@@ -828,17 +895,107 @@ impl<N: Net> Session<N> {
         worn.map(|(item, worn)| (*item, worn.point)).collect()
     }
 
-    /// The inventory item of the attachment on the avatar whose root prim
-    /// is `object`, as far as the simulator has described it.
+    /// The described object with this region-local id and its parents, up
+    /// to the one that has none or whose parent is not known.
+    fn lineage(&self, local_id: u32) -> Vec<u32> {
+        let mut lineage = vec![local_id];
+        while lineage.len() < MAX_DEPTH {
+            match self.sim.parents.get(&lineage[lineage.len() - 1]) {
+                Some(parent) if *parent != 0 && !lineage.contains(parent) => lineage.push(*parent),
+                _ => break,
+            }
+        }
+        lineage
+    }
+
+    /// The attachment the object with this local id is, or is a part of,
+    /// with the inventory item it was made from.
+    fn attachment_of(&self, local_id: u32) -> Option<(Uuid, Attachment)> {
+        let lineage = self.lineage(local_id);
+        let root = |(item, worn): (&Uuid, &Attachment)| lineage.contains(&worn.local_id).then_some((*item, *worn));
+        self.sim.attachments.iter().find_map(root)
+    }
+
+    /// The prims of the linkset whose root has this local id: the root
+    /// and what names it as its parent.
+    fn linkset(&self, root: u32) -> Vec<Uuid> {
+        let children = self
+            .sim
+            .parents
+            .iter()
+            .filter(|(_, parent)| **parent == root)
+            .map(|(child, _)| *child);
+        let prims = std::iter::once(root).chain(children);
+        prims.filter_map(|local_id| self.sim.local_ids.get(&local_id).copied()).collect()
+    }
+
+    /// Where in the region the object with this local id is: where the
+    /// topmost of its parents is.
+    fn place(&self, local_id: u32) -> Option<Vector3> {
+        let lineage = self.lineage(local_id);
+        self.sim.places.get(lineage.last()?).copied()
+    }
+
+    /// The inventory item of the attachment on the avatar that `object`
+    /// is, or is a prim of, as far as the simulator has described it.
     pub fn attached_item(&self, object: Uuid) -> Option<Uuid> {
         let local_id = *self.sim.objects.get(&object)?;
         let own = self.sim.own_local?;
-        let worn = self
-            .sim
-            .attachments
-            .iter()
-            .find(|(_, worn)| worn.local_id == local_id && worn.parent == own);
-        worn.map(|(item, _)| *item)
+        let (item, worn) = self.attachment_of(local_id)?;
+        (worn.parent == own).then_some(item)
+    }
+
+    /// The prims of the attachment on the avatar made from `item`.
+    pub fn attachment_prims(&self, item: Uuid) -> Vec<Uuid> {
+        match self.sim.attachments.get(&item) {
+            Some(worn) if Some(worn.parent) == self.sim.own_local => self.linkset(worn.local_id),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The prims of everything attached to the avatar.
+    fn worn_prims(&self) -> Vec<Uuid> {
+        let own = self.sim.own_local;
+        let worn = self.sim.attachments.values().filter(|worn| Some(worn.parent) == own);
+        worn.flat_map(|worn| self.linkset(worn.local_id)).collect()
+    }
+
+    /// What `object` is, which prims belong to it, and how far it is from
+    /// the avatar, as far as the simulator has described it.
+    pub fn thing(&self, object: Uuid) -> Thing {
+        let Some(local_id) = self.sim.objects.get(&object).copied() else {
+            return Thing::unknown(object);
+        };
+        let lineage = self.lineage(local_id);
+        let (placement, root, at) = match self.attachment_of(local_id) {
+            Some((_, worn)) if Some(worn.parent) == self.sim.own_local => {
+                let placement = if HUD_POINTS.contains(&worn.point) {
+                    Placement::Hud
+                } else {
+                    Placement::Worn
+                };
+                (placement, worn.local_id, self.sim.position)
+            }
+            Some((_, worn)) => {
+                let wearer = self.sim.local_ids.get(&worn.parent).copied().unwrap_or_default();
+                (Placement::WornBy(wearer), worn.local_id, self.place(worn.parent))
+            }
+            None => {
+                let root = lineage[lineage.len() - 1];
+                (Placement::InWorld, root, self.place(root))
+            }
+        };
+        let mut prims = vec![object];
+        prims.extend(self.linkset(root).into_iter().filter(|prim| *prim != object));
+        let distance = match (at, self.sim.position) {
+            (Some(at), Some(avatar)) => Some([0, 1, 2].map(|i| (at[i] - avatar[i]).powi(2)).iter().sum::<f32>().sqrt()),
+            _ => None,
+        };
+        Thing {
+            placement,
+            prims,
+            distance,
+        }
     }
 
     /// The simulator described an object that carries an inventory item's
@@ -1118,6 +1275,9 @@ impl<N: Net> Session<N> {
                 let own_id = self.agent.agent_id;
                 for object in &objects {
                     self.learn(object.full_id, object.local_id, now);
+                    if self.sim.local_ids.contains_key(&object.local_id) {
+                        self.sim.parents.insert(object.local_id, object.parent_id);
+                    }
                 }
                 for object in &objects {
                     if object.full_id != own_id {
@@ -1164,6 +1324,9 @@ impl<N: Net> Session<N> {
             Incoming::ObjectsCompressed(objects) => {
                 for object in objects {
                     self.learn(object.full_id, object.local_id, now);
+                    if let Some(parent) = object.parent_id.filter(|_| self.sim.local_ids.contains_key(&object.local_id)) {
+                        self.sim.parents.insert(object.local_id, parent);
+                    }
                     if let Some(transform) = object.transform {
                         self.moved(object.local_id, transform);
                     }
@@ -1189,10 +1352,16 @@ impl<N: Net> Session<N> {
             Incoming::ObjectsKilled(local_ids) => {
                 for local_id in local_ids {
                     self.sim.undescribed.remove(&local_id);
-                    if let Some(object) = self.sim.local_ids.remove(&local_id) {
+                    self.sim.parents.remove(&local_id);
+                    self.sim.places.remove(&local_id);
+                    let gone = self.sim.local_ids.remove(&local_id);
+                    if let Some(object) = gone {
                         self.sim.objects.remove(&object);
                     }
                     self.attachment_killed(local_id);
+                    if let Some(object) = gone {
+                        self.events.push(SessionEvent::ObjectGone(object));
+                    }
                 }
             }
             Incoming::KickUser { reason } => self.lose(format!("kicked: {reason}")),
@@ -1438,6 +1607,8 @@ impl Sim {
             next_agent_update: now,
             objects: HashMap::new(),
             local_ids: HashMap::new(),
+            parents: HashMap::new(),
+            places: HashMap::new(),
             undescribed: HashSet::new(),
             scan_started: None,
             wanted: Vec::new(),
@@ -2191,7 +2362,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(2, messages::USE_CIRCUIT_CODE, 1), (2, messages::COMPLETE_AGENT_MOVEMENT, 2)]
         );
-        assert_eq!(rig.events(), [], "arrival is reported once the new handshake is done");
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::RegionLeft { worn: vec![] }],
+            "arrival is reported once the new handshake is done"
+        );
 
         rig.enter("Target", ((1001 * 256) << 32) | (1000 * 256));
         assert_eq!(rig.events(), [SessionEvent::RegionEntered("Target".into())]);
@@ -2229,7 +2404,13 @@ mod tests {
         let mut rig = Rig::seated();
         rig.session.handle_caps(1, finish(), rig.now);
         rig.enter("Elsewhere", HOME_HANDLE);
-        assert_eq!(rig.events(), [SessionEvent::RegionEntered("Elsewhere".into())]);
+        assert_eq!(
+            rig.events(),
+            [
+                SessionEvent::RegionLeft { worn: vec![] },
+                SessionEvent::RegionEntered("Elsewhere".into())
+            ]
+        );
     }
 
     #[test]
@@ -2238,7 +2419,10 @@ mod tests {
         start_teleport(&mut rig);
         rig.session.handle_caps(1, finish(), rig.now);
         rig.advance(secs(30));
-        assert!(matches!(&rig.events()[..], [SessionEvent::Lost(_)]));
+        assert!(matches!(
+            &rig.events()[..],
+            [SessionEvent::RegionLeft { .. }, SessionEvent::Lost(_)]
+        ));
     }
 
     // ------------------------------------------------------ chat and IMs
@@ -2829,7 +3013,13 @@ mod tests {
 
         rig.session.handle_caps(1, finish(), rig.now);
         rig.enter("Elsewhere", HOME_HANDLE + 256);
-        assert_eq!(rig.events(), [SessionEvent::RegionEntered("Elsewhere".into())]);
+        assert_eq!(
+            rig.events(),
+            [
+                SessionEvent::RegionLeft { worn: vec![] },
+                SessionEvent::RegionEntered("Elsewhere".into())
+            ]
+        );
     }
 
     #[test]
@@ -3273,7 +3463,10 @@ mod tests {
         assert_eq!(rig.session.touch(object(9), rig.now), Ok(Touch::Waiting));
         rig.sent();
         rig.session.handle_caps(1, finish(), rig.now);
-        assert_eq!(rig.events(), [SessionEvent::TouchFailed(object(9))]);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::TouchFailed(object(9)), SessionEvent::RegionLeft { worn: vec![] }]
+        );
         rig.enter("Elsewhere", HOME_HANDLE + 256);
         rig.events();
         // A new region: nothing known, and no scan until it is needed again.
@@ -3441,9 +3634,11 @@ mod tests {
         rig.receive(messages::OBJECT_UPDATE_COMPRESSED, &body);
         assert_eq!(rig.events(), []);
         assert_eq!(rig.attached(), []);
-        // Their going is nothing to report either.
+        // Their going is the going of two objects, and no detach.
         rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[RADIO_LOCAL, 702]));
-        assert_eq!(rig.events(), []);
+        let gone = rig.events();
+        assert_eq!(gone.len(), 2);
+        assert!(gone.iter().all(|event| matches!(event, SessionEvent::ObjectGone(_))), "{gone:?}");
     }
 
     #[test]
@@ -3476,10 +3671,13 @@ mod tests {
         rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[RADIO_LOCAL]));
         assert_eq!(
             rig.events(),
-            [SessionEvent::Detached {
-                item: radio_item(),
-                point: 5
-            }]
+            [
+                SessionEvent::Detached {
+                    item: radio_item(),
+                    point: 5
+                },
+                SessionEvent::ObjectGone(radio_object())
+            ]
         );
         assert_eq!(rig.attached(), []);
         // Attached again, by a script or a viewer, it is known again.
@@ -3523,9 +3721,15 @@ mod tests {
         rig.events();
         start_teleport(&mut rig);
         rig.session.handle_caps(1, finish(), rig.now);
-        // Forgotten with the circuit, without a word: nothing was detached.
+        // Forgotten with the circuit, and nothing was detached: it is
+        // named as what came along.
         assert_eq!(rig.attached(), []);
-        assert_eq!(rig.events(), []);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::RegionLeft {
+                worn: vec![radio_object()]
+            }]
+        );
         rig.enter("Target", ((1001 * 256) << 32) | (1000 * 256));
         assert_eq!(rig.events(), [SessionEvent::RegionEntered("Target".into())]);
         // The new simulator numbers things its own way.
@@ -3642,10 +3846,13 @@ mod tests {
         rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[RADIO_LOCAL]));
         assert_eq!(
             rig.events(),
-            [SessionEvent::Detached {
-                item: radio_item(),
-                point: 5
-            }]
+            [
+                SessionEvent::Detached {
+                    item: radio_item(),
+                    point: 5
+                },
+                SessionEvent::ObjectGone(radio_object())
+            ]
         );
         rig.advance(DETACH_LIMIT);
         assert_eq!(rig.events(), []);
@@ -3673,7 +3880,11 @@ mod tests {
         rig.session.handle_caps(1, finish(), rig.now);
         assert_eq!(
             rig.events(),
-            [SessionEvent::AttachFailed(radio_item()), SessionEvent::DetachFailed(hat)]
+            [
+                SessionEvent::AttachFailed(radio_item()),
+                SessionEvent::DetachFailed(hat),
+                SessionEvent::RegionLeft { worn: vec![] }
+            ]
         );
         let mut rig = Rig::standing();
         rig.session.attach(&radio(), 0, rig.now).unwrap();
@@ -3765,5 +3976,125 @@ mod tests {
         rig.session.handle_caps(7, CapsEvent::Inventory(urls), rig.now);
         assert_eq!(rig.events(), []);
         assert_eq!(rig.sent_ids(), []);
+    }
+
+    // --------------------------------------------- where described objects are
+
+    impl Rig {
+        /// A full update describing a prim: in the region when `parent` is
+        /// 0, and relative to its parent otherwise.
+        fn prim(&mut self, full_id: Uuid, local_id: u32, parent: u32, position: Vector3) {
+            let block = wire::Block {
+                full_id,
+                local_id,
+                parent_id: parent,
+                data: wire::object_data(position, [0.0; 3], false),
+                worn: None,
+            };
+            self.receive(messages::OBJECT_UPDATE, &wire::object_blocks(&[block]));
+        }
+    }
+
+    fn sorted(mut prims: Vec<Uuid>) -> Vec<Uuid> {
+        prims.sort();
+        prims
+    }
+
+    #[test]
+    fn a_described_object_is_placed_by_what_it_hangs_on() {
+        // The avatar stands at 10, 20, 30.
+        let mut rig = Rig::standing();
+        let (door, knob) = (object(0x30), object(0x31));
+        rig.prim(door, 800, 0, [13.0, 24.0, 30.0]);
+        rig.prim(knob, 801, 800, [0.5, 0.0, 0.0]);
+        let thing = rig.session.thing(knob);
+        assert_eq!(thing.placement, Placement::InWorld);
+        // The touched prim first, then the rest of its linkset.
+        assert_eq!(thing.prims, [knob, door]);
+        // A child prim is where its root is.
+        assert_eq!(thing.distance, Some(5.0));
+        assert_eq!(rig.session.thing(door).prims, [door, knob]);
+        assert_eq!(rig.session.attached_item(knob), None);
+
+        // The avatar's own attachment, and a prim of it.
+        let dial = object(0x32);
+        rig.attachment(radio_object(), RADIO_LOCAL, OWN_LOCAL, 5, radio_item());
+        rig.prim(dial, 705, RADIO_LOCAL, [0.1, 0.0, 0.0]);
+        let thing = rig.session.thing(dial);
+        assert_eq!((thing.placement, thing.distance), (Placement::Worn, Some(0.0)));
+        assert_eq!(thing.prims, [dial, radio_object()]);
+        assert_eq!(rig.session.attached_item(dial), Some(radio_item()));
+        assert_eq!(rig.session.attached_item(radio_object()), Some(radio_item()));
+        assert_eq!(rig.session.attachment_prims(radio_item()), sorted(vec![radio_object(), dial]));
+
+        // One on the heads-up display, described in the compressed form.
+        let (meter, meter_item) = (object(0x28), object(0x27));
+        rig.attachment_compressed(meter, 701, OWN_LOCAL, 35, meter_item);
+        assert_eq!(rig.session.thing(meter).placement, Placement::Hud);
+
+        // Another avatar's attachment is where that avatar is.
+        let (jane, hat, hat_item) = (object(0x40), object(0x41), object(0x42));
+        rig.prim(jane, 300, 0, [20.0, 20.0, 30.0]);
+        rig.attachment(hat, 310, 300, 2, hat_item);
+        let thing = rig.session.thing(hat);
+        assert_eq!((thing.placement, thing.distance), (Placement::WornBy(jane), Some(10.0)));
+        assert_eq!(rig.session.attached_item(hat), None);
+        assert!(rig.session.attachment_prims(hat_item).is_empty());
+
+        // What the simulator has not described is unknown.
+        assert_eq!(rig.session.thing(object(0x55)), Thing::unknown(object(0x55)));
+        // One described without a place is known, but not how far it is.
+        let far = object(0x56);
+        rig.receive(messages::OBJECT_UPDATE_COMPRESSED, &wire::object_update_compressed(&[(far, 900)]));
+        let thing = rig.session.thing(far);
+        assert_eq!((thing.placement, thing.distance), (Placement::InWorld, None));
+    }
+
+    #[test]
+    fn a_described_object_is_followed_when_it_moves_and_gone_when_killed() {
+        let mut rig = Rig::standing();
+        let (door, knob) = (object(0x30), object(0x31));
+        rig.prim(door, 800, 0, [13.0, 24.0, 30.0]);
+        rig.prim(knob, 801, 800, [0.5, 0.0, 0.0]);
+        rig.events();
+        // A terse update moves it; one about an object not described is nothing.
+        rig.terse(800, false, [10.0, 20.0, 33.0]);
+        rig.terse(4000, false, [1.0, 1.0, 1.0]);
+        assert_eq!(rig.session.thing(knob).distance, Some(3.0));
+        // The avatar moving changes the distance as well.
+        rig.receive(messages::TELEPORT_LOCAL, &wire::teleport_local([10.0, 20.0, 37.0]));
+        assert_eq!(rig.session.thing(door).distance, Some(4.0));
+        assert_eq!(rig.events(), [], "a teleport inside the region leaves nothing behind");
+        // Killed, each is reported gone, and what is left stands alone.
+        rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[801, 4000]));
+        assert_eq!(rig.events(), [SessionEvent::ObjectGone(knob)]);
+        assert_eq!(rig.session.thing(knob), Thing::unknown(knob));
+        assert_eq!(rig.session.thing(door).prims, [door]);
+        rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[800]));
+        assert_eq!(rig.events(), [SessionEvent::ObjectGone(door)]);
+    }
+
+    #[test]
+    fn leaving_a_region_names_what_is_on_the_avatar() {
+        let mut rig = Rig::standing();
+        let (door, dial) = (object(0x30), object(0x32));
+        let (jane, hat) = (object(0x40), object(0x41));
+        rig.prim(door, 800, 0, [13.0, 24.0, 30.0]);
+        rig.attachment(radio_object(), RADIO_LOCAL, OWN_LOCAL, 5, radio_item());
+        rig.prim(dial, 705, RADIO_LOCAL, [0.1, 0.0, 0.0]);
+        rig.prim(jane, 300, 0, [20.0, 20.0, 30.0]);
+        rig.attachment(hat, 310, 300, 2, object(0x42));
+        rig.events();
+        start_teleport(&mut rig);
+        rig.session.handle_caps(1, finish(), rig.now);
+        let events = rig.events();
+        let [SessionEvent::RegionLeft { worn }] = &events[..] else {
+            panic!("expected the region to be left, got {events:?}");
+        };
+        // The attachment and its prim, not the door and not another's hat.
+        assert_eq!(sorted(worn.clone()), sorted(vec![radio_object(), dial]));
+        // Nothing of the old region is known in the new one.
+        rig.enter("Target", ((1001 * 256) << 32) | (1000 * 256));
+        assert_eq!(rig.session.thing(door), Thing::unknown(door));
     }
 }

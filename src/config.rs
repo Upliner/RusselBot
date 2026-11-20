@@ -51,6 +51,29 @@ pub enum Persist {
     },
 }
 
+/// The persist override setting: the sorts of the bot's own steps towards
+/// what it holds that RLV restrictions do not hold back.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PersistOverride {
+    /// Sitting on the held seat or the ground, and standing up for a held
+    /// `stand`.
+    pub sit: bool,
+    /// Teleporting to the held location.
+    pub tp: bool,
+}
+
+impl PersistOverride {
+    /// The setting as `rlv status` shows it.
+    pub fn words(self) -> &'static str {
+        match (self.sit, self.tp) {
+            (false, false) => "none",
+            (true, false) => "sit",
+            (false, true) => "tp",
+            (true, true) => "sit, tp",
+        }
+    }
+}
+
 /// What a forced RLV movement does to the placement the bot holds.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RlvPersist {
@@ -94,6 +117,8 @@ pub struct Config {
     pub rlv: bool,
     /// The RLV persist setting the bot starts with.
     pub rlv_persist: RlvPersist,
+    /// The persist override setting the bot starts with.
+    pub persist_override: PersistOverride,
     /// Which requests the bot accepts by itself when it starts.
     pub perms: Rules,
 }
@@ -186,7 +211,7 @@ fn log_path(value: Option<toml::Value>, key: &str) -> Result<Option<PathBuf>, Co
 }
 
 const PERSIST_FORMS: &str = "`persist` must be \"cur\", \"cfg\", \"off\" (or false), an array \
-     [position, sit] of \"cur\" and \"cfg\", or a table with the keys `atstart`, `position`, `sit` and `rlv`";
+     [position, sit] of \"cur\" and \"cfg\", or a table with the keys `atstart`, `position`, `sit`, `rlv` and `override`";
 
 fn source(value: &toml::Value) -> Option<Source> {
     match value.as_str() {
@@ -197,8 +222,9 @@ fn source(value: &toml::Value) -> Option<Source> {
 }
 
 /// The config's `persist`: what the bot holds once the config placement is
-/// reached, and the RLV persist setting, which only the table form can set.
-fn persist(value: Option<toml::Value>) -> Result<(Persist, RlvPersist), ConfigError> {
+/// reached, and the RLV persist setting and the persist override setting,
+/// which only the table form can set.
+fn persist(value: Option<toml::Value>) -> Result<(Persist, RlvPersist, PersistOverride), ConfigError> {
     let both = |source| Persist::On {
         position: source,
         sit: source,
@@ -218,7 +244,27 @@ fn persist(value: Option<toml::Value>) -> Result<(Persist, RlvPersist), ConfigEr
         Some(toml::Value::Table(table)) => return persist_table(&table),
         Some(_) => return err(PERSIST_FORMS),
     };
-    Ok((setting, RlvPersist::Drop))
+    Ok((setting, RlvPersist::Drop, PersistOverride::default()))
+}
+
+/// The `override` key of the `persist` table: `"sit"`, `"tp"`, or an array
+/// of these, each counting once.
+fn persist_override(value: &toml::Value) -> Result<PersistOverride, ConfigError> {
+    const FORMS: &str = "`persist.override` must be \"sit\", \"tp\" or an array of these";
+    let words: Vec<&toml::Value> = match value {
+        toml::Value::String(_) => vec![value],
+        toml::Value::Array(items) => items.iter().collect(),
+        _ => return err(FORMS),
+    };
+    let mut setting = PersistOverride::default();
+    for word in words {
+        match word.as_str() {
+            Some("sit") => setting.sit = true,
+            Some("tp") => setting.tp = true,
+            _ => return err(FORMS),
+        }
+    }
+    Ok(setting)
 }
 
 /// The entries of one array under `perms`, each of them once.
@@ -295,8 +341,9 @@ fn perms(value: Option<toml::Value>) -> Result<Rules, ConfigError> {
 
 /// The table form of `persist`. `atstart` says whether anything is held
 /// once the config placement is reached; `position` and `sit` imply it.
-fn persist_table(table: &toml::Table) -> Result<(Persist, RlvPersist), ConfigError> {
+fn persist_table(table: &toml::Table) -> Result<(Persist, RlvPersist, PersistOverride), ConfigError> {
     let (mut position, mut sit, mut atstart, mut rlv) = (None, None, None, RlvPersist::Drop);
+    let mut overridden = PersistOverride::default();
     for (key, value) in table {
         match key.as_str() {
             "position" | "sit" => {
@@ -314,9 +361,10 @@ fn persist_table(table: &toml::Table) -> Result<(Persist, RlvPersist), ConfigErr
                     _ => return err("`persist.rlv` must be \"drop\" or \"follow\""),
                 }
             }
+            "override" => overridden = persist_override(value)?,
             _ => {
                 return err(format!(
-                    "`persist` has no key `{key}`; its keys are `atstart`, `position`, `sit` and `rlv`"
+                    "`persist` has no key `{key}`; its keys are `atstart`, `position`, `sit`, `rlv` and `override`"
                 ))
             }
         }
@@ -340,7 +388,7 @@ fn persist_table(table: &toml::Table) -> Result<(Persist, RlvPersist), ConfigErr
         },
         false => Persist::Off,
     };
-    Ok((setting, rlv))
+    Ok((setting, rlv, overridden))
 }
 
 impl Config {
@@ -426,7 +474,7 @@ impl Config {
             )),
         };
 
-        let (persist, rlv_persist) = persist(raw.persist)?;
+        let (persist, rlv_persist, persist_override) = persist(raw.persist)?;
         let log_chat = log_path(raw.log_chat, "log_chat")?;
         let log_im = log_path(raw.log_im, "log_im")?;
         let fetch_offline_im = flag(raw.fetch_offline_im, "fetch_offline_im")?;
@@ -464,6 +512,7 @@ impl Config {
             restore_attachments,
             rlv,
             rlv_persist,
+            persist_override,
             perms,
         })
     }
@@ -635,6 +684,58 @@ mod tests {
         // `position` and `sit` imply it, and may say so as well.
         assert_eq!(table("atstart = true\nsit = \"cfg\"\n").persist, held(Source::Cur, Source::Cfg));
         assert_eq!(table("sit = \"cfg\"\nrlv = \"follow\"\n").persist, held(Source::Cur, Source::Cfg));
+    }
+
+    #[test]
+    fn the_persist_override_setting_comes_from_the_table_only() {
+        let setting = |sit, tp| PersistOverride { sit, tp };
+        let table = |keys: &str| Config::parse(&(base() + "[persist]\n" + keys)).unwrap();
+        // Not mentioned: empty, whatever the form of `persist`.
+        assert_eq!(Config::parse(&base()).unwrap().persist_override, setting(false, false));
+        for form in [
+            "persist = \"cfg\"\n",
+            "persist = [\"cfg\", \"cur\"]\n",
+            "[persist]\nsit = \"cfg\"\n",
+        ] {
+            assert_eq!(
+                Config::parse(&(base() + form)).unwrap().persist_override,
+                setting(false, false),
+                "{form}"
+            );
+        }
+        assert_eq!(table("override = []\n").persist_override, setting(false, false));
+        // One word, or an array in which each counts once.
+        let teleports = table("sit = \"cfg\"\noverride = \"tp\"\n");
+        assert_eq!(teleports.persist_override, setting(false, true));
+        assert_eq!(teleports.persist, held(Source::Cur, Source::Cfg));
+        assert_eq!(table("override = \"sit\"\n").persist_override, setting(true, false));
+        assert_eq!(table("override = [\"sit\", \"tp\"]\n").persist_override, setting(true, true));
+        assert_eq!(
+            table("override = [\"tp\", \"sit\", \"tp\"]\n").persist_override,
+            setting(true, true)
+        );
+        // It says nothing about `atstart`, and leaves the RLV persist setting alone.
+        let alone = table("override = \"sit\"\n");
+        assert_eq!((alone.persist, alone.rlv_persist), (Persist::Off, RlvPersist::Drop));
+        assert_eq!(table("rlv = \"follow\"\noverride = \"tp\"\n").rlv_persist, RlvPersist::Follow);
+        assert_eq!(setting(false, false).words(), "none");
+        assert_eq!(setting(true, true).words(), "sit, tp");
+    }
+
+    #[test]
+    fn a_bad_persist_override_is_rejected() {
+        for value in ["\"stand\"", "true", "[\"tp\", \"home\"]", "[1]", "\"TP\"", "{ sit = true }"] {
+            let reason = Config::parse(&(base() + &format!("[persist]\noverride = {value}\n")))
+                .unwrap_err()
+                .0;
+            assert!(
+                reason.contains("`persist.override`") && reason.contains("\"sit\"") && reason.contains("\"tp\""),
+                "{value}: {reason}"
+            );
+        }
+        // The message about an unknown key names the new one too.
+        let reason = Config::parse(&(base() + "[persist]\nlocation = \"cur\"\n")).unwrap_err().0;
+        assert!(reason.contains("`override`"), "{reason}");
     }
 
     #[test]

@@ -750,6 +750,9 @@ pub struct CompressedObject {
     pub full_id: Uuid,
     pub local_id: u32,
     pub transform: Option<Transform>,
+    /// Region-local id of the parent, zero when the object has none;
+    /// missing when the update is too short to say.
+    pub parent_id: Option<u32>,
     /// Set when the update names the inventory item the object was
     /// attached from; missing also when its optional fields do not read.
     pub attachment: Option<Worn>,
@@ -966,10 +969,11 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
                 let (full_id, local_id) = (data.uuid()?, data.u32()?);
                 // Whatever is too short to hold them describes the object
                 // all the same.
+                let mut parent_id = None;
                 let (transform, attachment) = match compressed_motion(&mut data) {
                     Ok((state, position, rotation)) => (
                         Transform::checked(position, unpack(rotation)),
-                        compressed_attachment(&mut data, state).unwrap_or(None),
+                        compressed_attachment(&mut data, state, &mut parent_id).unwrap_or(None),
                     ),
                     Err(_) => (None, None),
                 };
@@ -977,6 +981,7 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
                     full_id,
                     local_id,
                     transform,
+                    parent_id,
                     attachment,
                 });
             }
@@ -1174,14 +1179,16 @@ const PARTICLE_BLOCK: usize = 86;
 /// the sound (0x10, 25 bytes) and the name-values (0x100, a string).
 /// Strings end with a NUL. Returns the attachment the name-values make of
 /// the object, if they do; an error when the data ends early, in which
-/// case nothing is made of what was read.
-fn compressed_attachment(data: &mut Reader, state: u8) -> Decoded<Option<Worn>> {
+/// case nothing is made of what was read but the parent, which is put
+/// into `parent` as soon as it is known.
+fn compressed_attachment(data: &mut Reader, state: u8, parent: &mut Option<u32>) -> Decoded<Option<Worn>> {
     let flags = data.u32()?;
     data.skip(16)?; // OwnerID
     if flags & COMPRESSED_ANGULAR_VELOCITY != 0 {
         data.skip(12)?;
     }
     let parent_id = if flags & COMPRESSED_PARENT != 0 { data.u32()? } else { 0 };
+    *parent = Some(parent_id);
     if flags & COMPRESSED_TREE != 0 {
         data.skip(1)?;
     } else if flags & COMPRESSED_SCRATCH_PAD != 0 {
@@ -2032,6 +2039,7 @@ mod tests {
             full_id,
             local_id,
             transform: None,
+            parent_id: None,
             attachment: None,
         };
         assert_eq!(

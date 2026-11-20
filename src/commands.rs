@@ -10,9 +10,11 @@ use crate::inventory::{self, Clothes, Entry, Failed, Item, ListArgs, Outcome, Re
 use crate::names::Names;
 use crate::perms::{self, Ask, Kind, Owner, Rules};
 use crate::persist::{Location, SitState};
-use crate::session::{InventoryOffer, Touch, ATTACH_LIMIT, DETACH_LIMIT, NOT_CONNECTED};
+use crate::reconciler::same_region;
+use crate::rlv::{Limits, Refusal, Restrictions, Sitting, Who};
+use crate::session::{InventoryOffer, Thing, Touch, ATTACH_LIMIT, DETACH_LIMIT, NOT_CONNECTED};
 use crate::udp::messages::{Vector3, MAX_TEXT};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -167,12 +169,20 @@ pub fn exact_match<'a>(name: &str, avatars: &'a [(Uuid, String)]) -> Option<&'a 
     avatars.iter().find(|(_, full)| full.to_lowercase() == name)
 }
 
-/// Who asks for a command: the operator through the control socket, or an
-/// object the avatar owns through an RLV command.
+/// Who asks for something: the operator through the control socket, a
+/// sender of RLV commands, or the bot itself.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Origin {
     Operator,
-    Rlv,
+    /// The operator's one command that `rlv mode override` exempts from
+    /// the restrictions.
+    Exempt,
+    /// A force command of this sender: an object the avatar owns, or the
+    /// operator through `rlv cmd`.
+    Rlv(Who),
+    /// What the bot does by itself: accepting offers and requests,
+    /// restoring attachments.
+    Bot,
 }
 
 /// How the operator log marks the operator's commands.
@@ -182,10 +192,41 @@ impl Origin {
     /// How the operator log marks a command of this origin.
     fn tag(self) -> &'static str {
         match self {
-            Origin::Operator => CONTROL,
-            Origin::Rlv => "rlv",
+            Origin::Operator | Origin::Exempt => CONTROL,
+            Origin::Rlv(_) => "rlv",
+            Origin::Bot => "bot",
         }
     }
+
+    /// Whether this is a command of the operator's own.
+    fn is_operator(self) -> bool {
+        matches!(self, Origin::Operator | Origin::Exempt)
+    }
+
+    /// The restrictions that are in force for what this origin does: none
+    /// for the exempt command, and for a sender of RLV commands all but
+    /// its own.
+    pub fn limits(self, kept: Option<&Restrictions>) -> Limits<'_> {
+        match self {
+            Origin::Exempt => Limits::none(),
+            Origin::Rlv(who) => Limits::new(kept, Some(who)),
+            Origin::Operator | Origin::Bot => Limits::new(kept, None),
+        }
+    }
+
+    /// A refusal as this origin is told it: the operator with the way
+    /// past it.
+    fn refused(self, refusal: Refusal) -> String {
+        match self.is_operator() {
+            true => refusal.answer(),
+            false => refusal.short(),
+        }
+    }
+}
+
+/// How far it is from one place in a region to another, in metres.
+fn distance(from: Vector3, to: Vector3) -> f32 {
+    [0, 1, 2].map(|i| (to[i] - from[i]).powi(2)).iter().sum::<f32>().sqrt()
 }
 
 /// The part of a session the commands use. Everything that sends refuses
@@ -242,6 +283,15 @@ pub trait Grid {
     /// Accepts the inventory offer `transaction` of `to`, an avatar or the
     /// owner of the giving object, and has the item filed in `folder`.
     fn accept_inventory(&mut self, to: Uuid, from_object: bool, transaction: Uuid, folder: Uuid, now: Instant) -> Result<(), String>;
+    /// The RLV restrictions that are in force: none while RLV is off.
+    fn restrictions(&self) -> Option<&Restrictions>;
+    /// Whether, and on what, the avatar sits, as far as is known.
+    fn sitting(&self) -> Sitting;
+    /// What `object` is, which prims belong to it and how far it is, as
+    /// far as the simulator has described it.
+    fn thing(&self, object: Uuid) -> Thing;
+    /// The prims of the attachment on the avatar made from `item`.
+    fn attachment_prims(&self, item: Uuid) -> Vec<Uuid>;
 }
 
 /// An inventory offer that is being accepted: the grid is being asked
@@ -365,6 +415,8 @@ struct Detaching {
     gone: Vec<Item>,
     /// Those the simulator did not take off in time.
     stuck: Vec<Item>,
+    /// What a restriction kept on the point, and which.
+    kept: Option<String>,
 }
 
 /// An instant message that went out, for the message log.
@@ -402,6 +454,8 @@ struct Waiting {
     /// The avatar as the command gave it.
     given: String,
     then: After,
+    /// Whose command it is: the operator's, exempt or not.
+    origin: Origin,
     reply: Sender<Response>,
     deadline: Instant,
 }
@@ -449,8 +503,12 @@ pub struct Commands {
     queries: u128,
     /// How long an asked avatar's teleport offer is accepted unprompted.
     offer_timeout: Duration,
-    /// The avatars asked for a teleport, and when.
-    asked: HashMap<Uuid, Instant>,
+    /// The avatars asked for a teleport, when, and whether the command
+    /// that asked was exempt from the RLV restrictions.
+    asked: HashMap<Uuid, (Instant, bool)>,
+    /// The avatars the bot has exchanged instant messages with in this
+    /// session: a message to one of them starts no conversation.
+    talking: HashSet<Uuid>,
     /// Which requests are accepted without the operator.
     rules: Rules,
     /// The requests that were not, and can still be accepted on command.
@@ -528,6 +586,7 @@ impl Commands {
             queries: 0,
             offer_timeout,
             asked: HashMap::new(),
+            talking: HashSet::new(),
             rules: Rules::default(),
             requests: perms::Waiting::default(),
             undecided: Vec::new(),
@@ -567,10 +626,26 @@ impl Commands {
         self.told.push(line);
     }
 
+    /// The restrictions in force for the command that is being carried out.
+    fn limits<'a, G: Grid>(&self, grid: &'a G) -> Limits<'a> {
+        self.origin.limits(grid.restrictions())
+    }
+
+    /// A refusal as whoever gave that command is told it.
+    fn refused(&self, refusal: Refusal) -> String {
+        self.origin.refused(refusal)
+    }
+
+    /// An avatar sent the bot an instant message: the two are talking.
+    pub fn im_received(&mut self, from: Uuid) {
+        self.talking.insert(from);
+    }
+
     /// Carries out `request` on `grid` and answers on `reply`: now, or once
     /// the grid has resolved a name or the simulator has said how it ended.
     /// Returns the instant message sent. `persist`, `home`, `status` and
     /// `quit` are the bot's own business and never get here.
+    #[cfg(test)]
     pub fn handle<G: Grid>(&mut self, request: Request, reply: Sender<Response>, grid: Option<&mut G>, now: Instant) -> Option<SentIm> {
         self.handle_from(Origin::Operator, request, reply, grid, now)
     }
@@ -586,32 +661,7 @@ impl Commands {
         now: Instant,
     ) -> Option<SentIm> {
         self.origin = origin;
-        let command = match &request {
-            Request::Say(_) => "say",
-            Request::Shout(_) => "shout",
-            Request::Whisper(_) => "whisper",
-            Request::Im { .. } => "im",
-            Request::Stand => "stand",
-            Request::Sit(_) => "sit",
-            Request::Tp(_) => "tp",
-            Request::AskTp { .. } => "requesttp",
-            Request::Accept { .. } => "accept",
-            Request::Perms(_) => "perms",
-            Request::SendTp { .. } => "sendtp",
-            Request::Touch(_) => "touch",
-            Request::Persist { .. } => "persist",
-            Request::Home => "home",
-            Request::Status => "status",
-            Request::Rlv(_) => "rlv",
-            Request::Quit => "quit",
-            Request::Inventory(_) => "inventory",
-            Request::Attach { .. } => "attach",
-            Request::Wear(_) => "wear",
-            Request::Detach(_) => "detach",
-            Request::Anim { stop: false, .. } => "anim play",
-            Request::Anim { stop: true, .. } => "anim stop",
-            Request::Sound(_) => "sound",
-        };
+        let command = request.name();
         let done = match request {
             Request::Say(message) => self.say(&message, grid, now),
             Request::Shout(message) => self.say_plainly(SHOUT, &message, grid, now),
@@ -682,29 +732,47 @@ impl Commands {
 
     fn say<G: Grid>(&mut self, message: &str, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
         let chat = parse_chat(message, self.last_channel)?;
-        let grid = grid.ok_or(NOT_CONNECTED)?;
-        grid.say(chat.channel, chat.chat_type, &chat.text, now)?;
+        let done = self.speak(&chat, grid.ok_or(NOT_CONNECTED)?, now)?;
         self.last_channel = chat.channel;
-        let how = match chat.chat_type {
-            WHISPER => "whispered",
-            SHOUT => "shouted",
-            _ => "said",
-        };
-        crate::info!("control: {how} on channel {}: {}", chat.channel, chat.text);
-        Ok(Done::Answer(None))
+        Ok(done)
+    }
+
+    /// Says what the RLV restrictions leave of `chat`: on other channels,
+    /// at another volume or shortened, which the answer then says.
+    fn speak<G: Grid>(&mut self, chat: &Chat, grid: &mut G, now: Instant) -> Result<Done, String> {
+        let spoken = self.limits(&*grid).chat(chat.channel, chat.chat_type, &chat.text);
+        let spoken = spoken.map_err(|refusal| self.refused(refusal))?;
+        for said in &spoken.utterances {
+            grid.say(said.channel, said.volume, &said.text, now)?;
+            let how = match said.volume {
+                WHISPER => "whispered",
+                SHOUT => "shouted",
+                _ => "said",
+            };
+            crate::info!("control: {how} on channel {}: {}", said.channel, said.text);
+        }
+        for change in &spoken.changes {
+            crate::info!("rlv: say: {change}");
+        }
+        Ok(Done::Answer((!spoken.changes.is_empty()).then(|| spoken.changes.join("; "))))
     }
 
     /// `shout` and `whisper`: the message as it is, on channel 0.
     fn say_plainly<G: Grid>(&mut self, chat_type: u8, message: &str, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
         check_text(message)?;
-        grid.ok_or(NOT_CONNECTED)?.say(0, chat_type, message, now)?;
-        let how = if chat_type == SHOUT { "shouted" } else { "whispered" };
-        crate::info!("control: {how} on channel 0: {message}");
-        Ok(Done::Answer(None))
+        let chat = Chat {
+            channel: 0,
+            chat_type,
+            text: message.to_string(),
+        };
+        self.speak(&chat, grid.ok_or(NOT_CONNECTED)?, now)
     }
 
     fn stand<G: Grid>(&mut self, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
-        grid.ok_or(NOT_CONNECTED)?.stand(now)?;
+        let grid = grid.ok_or(NOT_CONNECTED)?;
+        let allowed = self.limits(&*grid).stand(grid.sitting());
+        allowed.map_err(|refusal| self.refused(refusal))?;
+        grid.stand(now)?;
         self.went_manual = true;
         crate::info!("{}: standing up", self.origin.tag());
         self.stood_up();
@@ -722,8 +790,16 @@ impl Commands {
     fn sit<G: Grid>(&mut self, target: &str, reply: &Sender<Response>, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
         let target = parse_sit(target)?;
         let grid = grid.ok_or(NOT_CONNECTED)?;
+        let sitting = grid.sitting();
         let object = match target {
             SitTarget::Ground => {
+                // A forced ground sit is held by `unsit` on an object only.
+                let leaving = match (self.origin, sitting) {
+                    (Origin::Rlv(_), Sitting::Ground) => Sitting::No,
+                    _ => sitting,
+                };
+                let allowed = self.limits(&*grid).sit_ground(leaving);
+                allowed.map_err(|refusal| self.refused(refusal))?;
                 grid.sit_ground(now)?;
                 self.went_manual = true;
                 self.remember_sit(SitState::Ground);
@@ -732,6 +808,8 @@ impl Commands {
             }
             SitTarget::Object(object) => object,
         };
+        let allowed = self.limits(&*grid).sit(sitting, grid.thing(object).distance);
+        allowed.map_err(|refusal| self.refused(refusal))?;
         grid.sit(object, now)?;
         self.went_manual = true;
         self.remember_sit(SitState::Object(object));
@@ -740,6 +818,24 @@ impl Commands {
             refuse(origin.tag(), "sit", &earlier, "superseded by a newer sit command".to_string());
         }
         Ok(Done::Parked)
+    }
+
+    /// Whether the restrictions let the command that is being carried
+    /// out teleport the avatar to `position` in `region`. A forced
+    /// teleport is not held by `tplocal`.
+    fn may_teleport<G: Grid>(&self, grid: &G, region: &str, position: Vector3) -> Result<(), String> {
+        let limits = self.limits(grid);
+        let sitting = grid.sitting();
+        let allowed = match self.origin {
+            Origin::Rlv(_) => limits.forced_teleport(sitting),
+            _ => {
+                let here = grid.region().is_some_and(|here| same_region(&here, region));
+                // From a place that is not known, any place is far.
+                let local = here.then(|| grid.position().map_or(f32::INFINITY, |from| distance(from, position)));
+                limits.teleport(sitting, local)
+            }
+        };
+        allowed.map_err(|refusal| self.refused(refusal))
     }
 
     fn tp<G: Grid>(&mut self, args: &[String], reply: &Sender<Response>, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
@@ -753,10 +849,11 @@ impl Commands {
             Some(z) => z,
             None => return Err("the avatar's height is not known; give z".to_string()),
         };
+        self.may_teleport(&*grid, &region, [to.x, to.y, z])?;
         grid.teleport(&region, [to.x, to.y, z], now)?;
         self.went_manual = true;
         crate::info!("{}: teleporting to \"{region}\" at {}, {}, {z}", self.origin.tag(), to.x, to.y);
-        if self.origin == Origin::Operator {
+        if self.origin.is_operator() {
             self.last_tp = Some(Location {
                 region,
                 position: [to.x, to.y, z],
@@ -774,7 +871,7 @@ impl Commands {
 
     /// What a `sit` command named, for `last_cmd`: the operator's only.
     fn remember_sit(&mut self, sit: SitState) {
-        if self.origin == Origin::Operator {
+        if self.origin.is_operator() {
             self.last_sit = Some(sit);
         }
     }
@@ -782,15 +879,26 @@ impl Commands {
     /// A teleport for RLV to a point given in the grid's own coordinates:
     /// `position` in the region with this handle. `ctl tp` has no such
     /// form; it ends as a `tp` does, with nobody waiting for the answer.
-    pub fn tp_global<G: Grid>(&mut self, handle: u64, position: Vector3, grid: Option<&mut G>, now: Instant) -> Result<(), String> {
-        grid.ok_or(NOT_CONNECTED)?.teleport_to(handle, position, now)?;
+    pub fn tp_global<G: Grid>(
+        &mut self,
+        handle: u64,
+        position: Vector3,
+        who: Who,
+        grid: Option<&mut G>,
+        now: Instant,
+    ) -> Result<(), String> {
+        let grid = grid.ok_or(NOT_CONNECTED)?;
+        let origin = Origin::Rlv(who);
+        let allowed = origin.limits(grid.restrictions()).forced_teleport(grid.sitting());
+        allowed.map_err(|refusal| refusal.short())?;
+        grid.teleport_to(handle, position, now)?;
         self.went_manual = true;
         let [x, y, z] = position;
         let (east, north) = (handle >> 32, handle & 0xffff_ffff);
         crate::info!("rlv: teleporting to {x}, {y}, {z} in the region at {east}, {north}");
         // Nobody reads the answer; the slot says whose teleport is under way.
         let (reply, _) = std::sync::mpsc::channel();
-        self.origin = Origin::Rlv;
+        self.origin = origin;
         self.park_teleport(&reply);
         self.origin = Origin::Operator;
         Ok(())
@@ -798,7 +906,10 @@ impl Commands {
 
     fn touch<G: Grid>(&mut self, object: &str, reply: &Sender<Response>, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
         let object = Uuid::parse_str(object.trim()).map_err(|_| format!("\"{}\" is not an object's UUID", object.trim()))?;
-        match grid.ok_or(NOT_CONNECTED)?.touch(object, now)? {
+        let grid = grid.ok_or(NOT_CONNECTED)?;
+        let allowed = self.limits(&*grid).touch(&grid.thing(object));
+        allowed.map_err(|refusal| self.refused(refusal))?;
+        match grid.touch(object, now)? {
             Touch::Sent => {
                 crate::info!("control: touched {object}");
                 Ok(Done::Answer(None))
@@ -849,14 +960,10 @@ impl Commands {
             folder: args.folder.clone(),
             recursive: args.recursive,
         };
-        self.start(
-            grid.ok_or(NOT_CONNECTED)?,
-            what,
-            Then::List(args),
-            "inventory",
-            reply,
-            now + inventory::LIMIT,
-        )
+        let grid = grid.ok_or(NOT_CONNECTED)?;
+        let allowed = self.limits(&*grid).inventory();
+        allowed.map_err(|refusal| self.refused(refusal))?;
+        self.start(grid, what, Then::List(args), "inventory", reply, now + inventory::LIMIT)
     }
 
     /// Looks the item a command names up, for `then` to go on with.
@@ -936,6 +1043,8 @@ impl Commands {
                 if !grid.outfit_service() {
                     return Err(inventory::NO_OUTFIT_SERVICE.to_string());
                 }
+                let allowed = self.limits(&*grid).unwear(kind);
+                allowed.map_err(|refusal| self.refused(refusal))?;
                 crate::info!(
                     "{}: taking off every {} the avatar wears",
                     self.origin.tag(),
@@ -1021,6 +1130,9 @@ impl Commands {
                     if !grid.outfit_service() {
                         return Err(inventory::NO_OUTFIT_SERVICE.to_string());
                     }
+                    let replaces = item.asset_type == inventory::ASSET_BODY_PART;
+                    let allowed = self.limits(&*grid).wear(item.subtype(), replaces);
+                    allowed.map_err(|refusal| self.refused(refusal))?;
                     crate::info!("control: wearing {}", item.show());
                     self.start(grid, What::Wear(item), Then::Outfit { put_on: true }, command, reply, deadline)
                 }
@@ -1032,9 +1144,11 @@ impl Commands {
             },
             (Then::Detach { .. }, Outcome::Found(item)) => match item.asset_type {
                 inventory::ASSET_OBJECT => {
-                    if !grid.attached().iter().any(|(attached, _)| *attached == item.id) {
+                    let Some((_, point)) = grid.attached().into_iter().find(|(attached, _)| *attached == item.id) else {
                         return Err(format!("{} is not attached", item.show()));
-                    }
+                    };
+                    let allowed = self.limits(&*grid).detach(point, &grid.attachment_prims(item.id));
+                    allowed.map_err(|refusal| self.refused(refusal))?;
                     grid.detach(item.id, now)?;
                     crate::info!("{}: detaching {}", self.origin.tag(), item.show());
                     self.detaching.push(Detaching {
@@ -1043,6 +1157,7 @@ impl Commands {
                         waiting: vec![item],
                         gone: Vec::new(),
                         stuck: Vec::new(),
+                        kept: None,
                     });
                     Ok(Done::Parked)
                 }
@@ -1051,6 +1166,8 @@ impl Commands {
                     if !grid.outfit_service() {
                         return Err(inventory::NO_OUTFIT_SERVICE.to_string());
                     }
+                    let allowed = self.limits(&*grid).unwear(item.subtype());
+                    allowed.map_err(|refusal| self.refused(refusal))?;
                     crate::info!("{}: taking off {}", self.origin.tag(), item.show());
                     let what = What::TakeOff(Clothes::Item(item));
                     self.start(grid, what, Then::Outfit { put_on: false }, command, reply, deadline)
@@ -1068,12 +1185,30 @@ impl Commands {
                 if still.is_empty() {
                     return Err(format!("nothing is attached to {}", inventory::point_name(point)));
                 }
-                let mut waiting = Vec::new();
-                for id in still {
-                    grid.detach(id, now)?;
-                    // An item the inventory did not describe goes by its id.
+                // An item the inventory did not describe goes by its id.
+                let described = |id: Uuid| {
                     let described = found.iter().find(|item| item.id == id).cloned();
-                    waiting.push(described.unwrap_or(Item { id, ..Item::default() }));
+                    described.unwrap_or(Item { id, ..Item::default() })
+                };
+                // What a restriction holds on the point stays there.
+                let (mut free, mut held) = (Vec::new(), Vec::new());
+                for id in still {
+                    match self.limits(&*grid).detach(point, &grid.attachment_prims(id)) {
+                        Ok(()) => free.push(id),
+                        Err(refusal) => held.push((described(id), refusal)),
+                    }
+                }
+                let kept = held.first().map(|(_, refusal)| {
+                    let stayed: Vec<Item> = held.iter().map(|(item, _)| item.clone()).collect();
+                    format!("{} stayed on: {}", names(&stayed), self.refused(refusal.clone()))
+                });
+                if free.is_empty() {
+                    return Err(kept.unwrap_or_default());
+                }
+                let mut waiting = Vec::new();
+                for id in free {
+                    grid.detach(id, now)?;
+                    waiting.push(described(id));
                 }
                 crate::info!(
                     "{}: detaching {} from {}",
@@ -1087,6 +1222,7 @@ impl Commands {
                     waiting,
                     gone: Vec::new(),
                     stuck: Vec::new(),
+                    kept,
                 });
                 Ok(Done::Parked)
             }
@@ -1143,6 +1279,10 @@ impl Commands {
         if let Some((_, on)) = grid.attached().iter().find(|(attached, _)| *attached == item.id) {
             return Err(format!("{} is attached to {} already", item.show(), inventory::point_name(*on)));
         }
+        // Without a point named, the object goes where it was last.
+        let goes_to = point.or(Some(item.subtype()).filter(|last| *last != 0));
+        let allowed = self.limits(&*grid).attach(goes_to);
+        allowed.map_err(|refusal| self.refused(refusal))?;
         grid.attach(&item, point.unwrap_or(0), now)?;
         let place = point.map_or("the point it was last on".to_string(), inventory::point_name);
         crate::info!("control: attaching {} to {place}", item.show());
@@ -1295,8 +1435,19 @@ impl Commands {
         let (settled, detaching): (Vec<_>, Vec<_>) = std::mem::take(&mut self.detaching).into_iter().partition(|d| d.waiting.is_empty());
         self.detaching = detaching;
         for detach in settled {
+            // What a restriction kept on is the operator's to know; a
+            // force command has done what it could.
+            let kept = detach.kept.filter(|_| detach.origin.is_operator());
             if detach.stuck.is_empty() {
-                let _ = detach.reply.send(Response::Ok(Some(format!("detached {}", names(&detach.gone)))));
+                match kept {
+                    Some(kept) => {
+                        let reason = format!("detached {}; {kept}", names(&detach.gone));
+                        refuse(detach.origin.tag(), "detach", &detach.reply, reason);
+                    }
+                    None => {
+                        let _ = detach.reply.send(Response::Ok(Some(format!("detached {}", names(&detach.gone)))));
+                    }
+                }
                 continue;
             }
             let mut reason = format!(
@@ -1306,6 +1457,9 @@ impl Commands {
             );
             if !detach.gone.is_empty() {
                 reason.push_str(&format!("; detached {}", names(&detach.gone)));
+            }
+            if let Some(kept) = kept {
+                reason.push_str(&format!("; {kept}"));
             }
             refuse(detach.origin.tag(), "detach", &detach.reply, reason);
         }
@@ -1379,6 +1533,12 @@ impl Commands {
             return;
         }
         for item in missing {
+            // What an `attach` would be refused for is left off.
+            let goes_to = Some(item.subtype()).filter(|last| *last != 0);
+            if let Err(refusal) = Origin::Bot.limits(grid.restrictions()).attach(goes_to) {
+                self.tell(format!("attachment: {} not restored: {}", item.show(), refusal.short()));
+                continue;
+            }
             match grid.attach(&item, 0, now) {
                 Ok(()) => {
                     self.tell(format!(
@@ -1448,6 +1608,7 @@ impl Commands {
             name,
             given,
             then,
+            origin: self.origin,
             reply: reply.clone(),
             deadline,
         });
@@ -1459,12 +1620,15 @@ impl Commands {
         let who = whom(id, &name);
         match then {
             After::Im(text) => {
+                let allowed = self.limits(&*grid).im(id, self.talking.contains(&id));
+                allowed.map_err(|refusal| self.refused(refusal))?;
                 grid.instant_message(id, &text, now)?;
+                self.talking.insert(id);
                 Ok(Done::Sent(format!("sent to {who}"), SentIm { to: id, name, text }))
             }
             After::RequestTp(message) => {
                 grid.request_teleport(id, &message, now)?;
-                self.asked.insert(id, now);
+                self.asked.insert(id, (now, self.origin == Origin::Exempt));
                 self.went_manual = true;
                 crate::info!("control: asked {who} for a teleport");
                 Ok(Done::Answer(Some(format!("asked {who} for a teleport"))))
@@ -1495,9 +1659,16 @@ impl Commands {
         self.waiting = waiting;
         for command in answered {
             let Waiting {
-                name, given, then, reply, ..
+                name,
+                given,
+                then,
+                origin,
+                reply,
+                ..
             } = command;
             let what = then.command();
+            // What follows is still that command, exempt or not.
+            self.origin = origin;
             let done = match (exact_match(&name, avatars), grid.as_deref_mut()) {
                 (None, _) => Err(format!("the grid knows no avatar named \"{given}\"")),
                 (Some(_), None) => Err(NOT_CONNECTED.to_string()),
@@ -1506,6 +1677,7 @@ impl Commands {
                     self.act(grid, *id, proper.clone(), then, now)
                 }
             };
+            self.origin = Origin::Operator;
             sent.extend(finish(CONTROL, what, done, &reply));
         }
         sent
@@ -1596,6 +1768,8 @@ impl Commands {
         self.requests.clear();
         self.undecided.clear();
         self.wanted_names.clear();
+        // The conversations were this session's.
+        self.talking.clear();
     }
 
     /// When `tick` next has something to do.
@@ -1741,7 +1915,12 @@ impl Commands {
                 (_, Some(who)) => format!("no request of kind `{kind}` from {who} waits"),
             });
         };
-        let done = self.accept(&request, Some(reply), grid, now);
+        // A restriction leaves the request waiting, as any other reason does.
+        let barred = Commands::barred(&request, self.limits(&*grid), grid.sitting());
+        let done = match barred {
+            Some(refusal) => Err(self.refused(refusal)),
+            None => self.accept(&request, Some(reply), grid, now),
+        };
         match &done {
             // It keeps its place among the waiting ones.
             Err(_) => {
@@ -1752,6 +1931,21 @@ impl Commands {
             Ok(_) => self.tell(format!("control: accept {kind}: {}: accepted", request.describe())),
         }
         done
+    }
+
+    /// The restriction that keeps `request` from being accepted, if one
+    /// does: `tplure` and a seated `unsit` for a teleport offer,
+    /// `denypermission` for a script that asks to attach or to take
+    /// controls.
+    fn barred(request: &perms::Request, limits: Limits, sitting: Sitting) -> Option<Refusal> {
+        match (&request.ask, &request.sender) {
+            (Ask::Tp { .. }, perms::Sender::Avatar { id, .. }) => limits.lure(*id).err().or(limits.stand(sitting).err()),
+            (Ask::Tp { .. }, _) => limits.stand(sitting).err(),
+            (Ask::Script { .. }, _) if request.kinds().iter().any(|kind| matches!(kind, Kind::Attach | Kind::Controls)) => {
+                limits.denies_permissions()
+            }
+            _ => None,
+        }
     }
 
     /// Does what a viewer does when its user accepts the dialog. A
@@ -1820,7 +2014,23 @@ impl Commands {
     /// Accepts a request if the rules say so, and otherwise leaves it to
     /// the operator.
     fn decide<G: Grid>(&mut self, request: perms::Request, grid: Option<&mut G>, now: Instant) {
-        let kinds = request.kinds();
+        let mut kinds = request.kinds();
+        // RLV comes before the rules: it may drop the request, hold the
+        // avatar on its seat, or grant what the rules would not.
+        let (barred, granted) = match grid.as_deref() {
+            Some(grid) => {
+                let limits = Origin::Bot.limits(grid.restrictions());
+                (Commands::barred(&request, limits, grid.sitting()), limits.grants_permissions())
+            }
+            None => (None, false),
+        };
+        let script = matches!(request.ask, Ask::Script { .. });
+        if let Some(refusal) = barred.as_ref().filter(|_| script) {
+            return self.tell(format!("{}: dropped: {}", request.describe(), refusal.short()));
+        }
+        if granted && script {
+            kinds.retain(|kind| !matches!(kind, Kind::Attach | Kind::Controls));
+        }
         if let Err(kind) = self.rules.decide(&kinds, &request.sender) {
             let why = match kinds.len() {
                 1 => "waits".to_string(),
@@ -1828,9 +2038,10 @@ impl Commands {
             };
             return self.wait(request, &why);
         }
-        let done = match grid {
-            Some(grid) => self.accept(&request, None, grid, now),
-            None => Err(NOT_CONNECTED.to_string()),
+        let done = match (grid, barred) {
+            (_, Some(refusal)) => Err(refusal.short()),
+            (Some(grid), None) => self.accept(&request, None, grid, now),
+            (None, None) => Err(NOT_CONNECTED.to_string()),
         };
         match done {
             // Said when the answer has gone out.
@@ -1861,16 +2072,66 @@ impl Commands {
         let asked = self
             .asked
             .remove(&from)
-            .is_some_and(|at| now.duration_since(at) <= self.offer_timeout);
-        if !asked {
+            .filter(|(at, _)| now.duration_since(*at) <= self.offer_timeout);
+        // The offer that answers an exempt `requesttp` is exempt with it.
+        let origin = match asked {
+            Some((_, true)) => Origin::Exempt,
+            _ => Origin::Bot,
+        };
+        let (dropped, seated, wanted) = match grid.as_deref() {
+            Some(grid) => {
+                let limits = origin.limits(grid.restrictions());
+                (limits.lure(from).err(), limits.stand(grid.sitting()).err(), limits.accepts_tp(from))
+            }
+            None => (None, None, false),
+        };
+        if let Some(refusal) = dropped {
+            return self.tell(format!("{}: dropped: {}", request.describe(), refusal.short()));
+        }
+        if asked.is_none() && !wanted {
             return self.decide(request, grid, now);
         }
-        match grid
-            .ok_or(NOT_CONNECTED.to_string())
-            .and_then(|grid| grid.accept_teleport(lure, now))
-        {
-            Ok(()) => self.tell(format!("{}: accepted, as requested", request.describe())),
-            Err(reason) => self.wait(request, &format!("cannot be accepted now: {reason}")),
+        let accepted = match (seated, grid) {
+            (Some(refusal), _) => Err(refusal.short()),
+            (None, None) => Err(NOT_CONNECTED.to_string()),
+            (None, Some(grid)) => grid.accept_teleport(lure, now),
+        };
+        match (accepted, asked) {
+            (Ok(()), Some(_)) => self.tell(format!("{}: accepted, as requested", request.describe())),
+            (Ok(()), None) => {
+                // Nobody asked for this one: the bot stops holding its place.
+                self.went_manual = true;
+                self.tell(format!("{}: accepted for RLV, which holds `accepttp`", request.describe()));
+            }
+            (Err(reason), _) => self.wait(request, &format!("cannot be accepted now: {reason}")),
+        }
+    }
+
+    /// An avatar asks to be teleported to the bot's avatar. RLV may drop
+    /// the request, or have the bot answer it with an offer; otherwise it
+    /// is the operator's to answer.
+    pub fn teleport_requested<G: Grid>(&mut self, from: Uuid, name: &str, text: &str, grid: Option<&mut G>, now: Instant) {
+        let who = whom(from, name.trim());
+        let Some(grid) = grid else {
+            return self.tell(format!("{who} asks to be teleported here ({text}); `rslbot ctl sendtp` offers it"));
+        };
+        let limits = Origin::Bot.limits(grid.restrictions());
+        let (dropped, answers) = (limits.tp_request(from).err(), limits.answers_tp_request(from));
+        if let Some(refusal) = dropped {
+            return self.tell(format!("request of {who} to be teleported here: dropped: {}", refusal.short()));
+        }
+        if !answers {
+            return self.tell(format!("{who} asks to be teleported here ({text}); `rslbot ctl sendtp` offers it"));
+        }
+        let offered = grid.region().ok_or(NOT_CONNECTED.to_string()).and_then(|region| {
+            let message = format!("Join me in {region}");
+            grid.offer_teleport(from, &message, now)
+        });
+        match offered {
+            Ok(()) => self.tell(format!(
+                "offered {who} a teleport, as asked, for RLV, which holds `accepttprequest`"
+            )),
+            Err(reason) => self.tell(format!("{who} asks to be teleported here; no offer could be sent: {reason}")),
         }
     }
 
@@ -2265,9 +2526,16 @@ pub(crate) mod tests {
         pub(crate) attached: Vec<(Uuid, u8)>,
         /// The simulator has not said yet which services it has.
         pub(crate) settling: bool,
-        /// The attachments on the avatar by their root prim, with the item
+        /// The attachments on the avatar by their prims, with the item
         /// each was made from.
         pub(crate) worn: Vec<(Uuid, Uuid)>,
+        /// The RLV restrictions that are kept.
+        pub(crate) kept: Restrictions,
+        /// RLV is off: none of them is in force.
+        pub(crate) rlv_off: bool,
+        pub(crate) sitting: Sitting,
+        /// What the simulator has described, object by object.
+        pub(crate) things: Vec<(Uuid, Thing)>,
     }
 
     impl Default for FakeGrid {
@@ -2284,6 +2552,10 @@ pub(crate) mod tests {
                 attached: Vec::new(),
                 settling: false,
                 worn: Vec::new(),
+                kept: Restrictions::default(),
+                rlv_off: false,
+                sitting: Sitting::No,
+                things: Vec::new(),
             }
         }
     }
@@ -2419,6 +2691,19 @@ pub(crate) mod tests {
             self.check()?;
             self.calls.push(Call::Sound(sound));
             Ok(())
+        }
+        fn restrictions(&self) -> Option<&Restrictions> {
+            (!self.rlv_off).then_some(&self.kept)
+        }
+        fn sitting(&self) -> Sitting {
+            self.sitting
+        }
+        fn thing(&self, object: Uuid) -> Thing {
+            let described = self.things.iter().find(|(id, _)| *id == object);
+            described.map_or(Thing::unknown(object), |(_, thing)| thing.clone())
+        }
+        fn attachment_prims(&self, item: Uuid) -> Vec<Uuid> {
+            self.worn.iter().filter(|(_, of)| *of == item).map(|(prim, _)| *prim).collect()
         }
     }
 
@@ -5139,5 +5424,652 @@ pub(crate) mod tests {
         let told = rig.told();
         assert!(told.len() == 1 && told[0].starts_with("attachments not restored: "), "{told:?}");
         assert_eq!(rig.commands.next_deadline(), None);
+    }
+
+    // ------------------------------------------------- RLV restrictions
+
+    use crate::session::Placement;
+
+    /// The attached collar that holds most of the restrictions here.
+    fn collar() -> Uuid {
+        Uuid::from_bytes([0xC0; 16])
+    }
+
+    impl Rig {
+        fn hold_as(&mut self, who: Who, name: &str, text: &str) {
+            let (behaviour, option) = match text.split_once(':') {
+                Some((behaviour, option)) => (behaviour, Some(option)),
+                None => (text, None),
+            };
+            self.grid.kept.set(who, name, behaviour, option);
+        }
+
+        /// The collar sets these restrictions.
+        fn hold(&mut self, texts: &[&str]) {
+            for text in texts {
+                self.hold_as(Who::Object(collar()), "Collar", text);
+            }
+        }
+
+        fn lift_all(&mut self) {
+            self.grid.kept.reset();
+        }
+
+        /// The simulator has described `object` as this.
+        fn described(&mut self, object: Uuid, placement: Placement, distance: f32) {
+            let thing = Thing {
+                placement,
+                prims: vec![object],
+                distance: Some(distance),
+            };
+            self.grid.things.push((object, thing));
+        }
+
+        fn exempt(&mut self, request: Request) -> Receiver<Response> {
+            let (reply, answer) = mpsc::channel();
+            self.commands
+                .handle_from(Origin::Exempt, request, reply, Some(&mut self.grid), self.now);
+            answer
+        }
+
+        fn tp(&mut self, words: &[&str]) -> Receiver<Response> {
+            self.command(Request::Tp(Rig::words(words)))
+        }
+    }
+
+    /// The error of a command a restriction refused: it names the
+    /// restriction and the way past it.
+    fn held_back(answer: &Receiver<Response>, rule: &str) -> String {
+        let reason = error(answer);
+        assert!(
+            reason.starts_with(&format!("refused by RLV: {rule}, held by ")) && reason.contains("`rslbot ctl rlv mode override`"),
+            "{reason}"
+        );
+        reason
+    }
+
+    #[test]
+    fn a_refused_command_names_the_restriction_its_holder_and_override() {
+        let mut rig = Rig::new();
+        rig.hold(&["unsit"]);
+        rig.grid.sitting = Sitting::Object;
+        let reason = held_back(&rig.command(Request::Stand), "unsit");
+        assert!(reason.contains(&format!("Collar <{}>", collar())), "{reason}");
+        assert_eq!(rig.calls(), []);
+        assert!(!rig.commands.take_manual());
+        // The operator's own restriction, set with `rlv cmd`.
+        rig.lift_all();
+        rig.hold_as(Who::Operator, "", "tploc");
+        let reason = held_back(&rig.tp(&["128", "128", "25", "Elsewhere"]), "tploc");
+        assert!(reason.contains("held by the operator"), "{reason}");
+        assert_eq!(rig.calls(), []);
+        assert!(!rig.commands.take_manual());
+        assert_eq!(rig.commands.last_tp(), None);
+    }
+
+    #[test]
+    fn no_restriction_is_in_force_while_rlv_is_off_or_for_the_exempt_command() {
+        let mut rig = Rig::new();
+        rig.hold(&["unsit", "sendchat", "tploc"]);
+        rig.grid.sitting = Sitting::Object;
+        held_back(&rig.command(Request::Stand), "unsit");
+        // The command override exempts is carried out as if nothing were kept.
+        assert_eq!(rig.exempt(Request::Stand).try_recv(), Ok(Response::Ok(None)));
+        assert_eq!(rig.exempt(Request::Say("hello".into())).try_recv(), Ok(Response::Ok(None)));
+        assert_eq!(rig.calls(), [Call::Stand, Call::Say(0, SAY, "hello".into())]);
+        // It counts as the operator's command where that matters.
+        let answer = rig.exempt(Request::Tp(Rig::words(&["128", "128", "25", "Elsewhere"])));
+        not_answered(&answer);
+        assert!(rig.commands.last_tp().is_some());
+        rig.calls();
+        // And the next one is held to them again.
+        held_back(&rig.command(Request::Stand), "unsit");
+        // With RLV off everything is as it is without restrictions.
+        rig.grid.rlv_off = true;
+        assert_eq!(rig.command(Request::Stand).try_recv(), Ok(Response::Ok(None)));
+        assert_eq!(rig.say("hello").try_recv(), Ok(Response::Ok(None)));
+        assert_eq!(rig.calls(), [Call::Stand, Call::Say(0, SAY, "hello".into())]);
+    }
+
+    #[test]
+    fn chat_is_refused_changed_or_redirected_as_the_restrictions_say() {
+        let mut rig = Rig::new();
+        rig.hold(&["sendchat"]);
+        held_back(&rig.say("hello there"), "sendchat");
+        assert_eq!(rig.calls(), []);
+        // An emote goes through shortened, and the answer says so.
+        let text = ok(&rig.say("/me nods slowly. Then she speaks at length")).unwrap();
+        assert!(text.contains("shortened") && text.contains("sendchat"), "{text}");
+        assert_eq!(rig.calls(), [Call::Say(0, SAY, "/me nods slowly".into())]);
+        held_back(&rig.say("/me says \"hello\""), "sendchat");
+        // A shout becomes normal chat, by the command and by the chat bar.
+        rig.lift_all();
+        rig.hold(&["chatshout"]);
+        let text = ok(&rig.command(Request::Shout("over here".into()))).unwrap();
+        assert!(text.contains("chatshout"), "{text}");
+        assert!(ok(&rig.say("/shout over here")).is_some());
+        assert_eq!(
+            rig.calls(),
+            [Call::Say(0, SAY, "over here".into()), Call::Say(0, SAY, "over here".into())]
+        );
+        // Everything is whispered.
+        rig.lift_all();
+        rig.hold(&["chatnormal"]);
+        rig.say("hello");
+        rig.command(Request::Whisper("psst".into()));
+        assert_eq!(
+            rig.calls(),
+            [Call::Say(0, WHISPER, "hello".into()), Call::Say(0, WHISPER, "psst".into())]
+        );
+        // Redirected chat leaves channel 0, and `sendchat` has nothing to discard.
+        rig.lift_all();
+        rig.hold(&["redirchat:5", "sendchat"]);
+        let text = ok(&rig.say("hello")).unwrap();
+        assert!(text.contains("channel 5") && text.contains("redirchat:5"), "{text}");
+        assert_eq!(rig.calls(), [Call::Say(5, SAY, "hello".into())]);
+        // Private channels, but for the excepted one; `//` still means the
+        // channel that was named last.
+        rig.lift_all();
+        rig.hold(&["sendchannel", "sendchannel:7"]);
+        held_back(&rig.say("/8 open"), "sendchannel");
+        assert_eq!(rig.say("/7 open").try_recv(), Ok(Response::Ok(None)));
+        assert_eq!(rig.say("//again").try_recv(), Ok(Response::Ok(None)));
+        assert_eq!(rig.calls(), [Call::Say(7, SAY, "open".into()), Call::Say(7, SAY, "again".into())]);
+    }
+
+    #[test]
+    fn instant_messages_are_held_by_sendim_and_startim() {
+        let mut rig = Rig::new();
+        rig.hold(&["sendim"]);
+        let (answer, sent) = rig.im(&jane().to_string(), "hello");
+        held_back(&answer, "sendim");
+        assert_eq!((sent, rig.calls()), (None, vec![]));
+        // Another reason comes first: nobody by that name.
+        let (answer, _) = rig.im("Nobody Here", "hello");
+        let query = rig.lookup("nobody here");
+        rig.found(query, &[]);
+        assert!(error(&answer).contains("knows no avatar"));
+        // The restriction is looked at once the avatar is known.
+        let (answer, _) = rig.im("Jane Doe", "hello");
+        let query = rig.lookup("jane doe");
+        assert_eq!(rig.found(query, &jane_found()), []);
+        held_back(&answer, "sendim");
+        // One avatar barred, the others not.
+        rig.lift_all();
+        rig.hold(&[&format!("sendimto:{}", jane())]);
+        held_back(&rig.im(&jane().to_string(), "hello").0, &format!("sendimto:{}", jane()));
+        assert!(rig.im(&john().to_string(), "hello").1.is_some());
+        rig.calls();
+        // No new conversations: Jane has written since the login, John has not.
+        let mut rig = Rig::new();
+        rig.hold(&["startim"]);
+        rig.commands.im_received(jane());
+        assert!(rig.im(&jane().to_string(), "hi").1.is_some());
+        held_back(&rig.im(&john().to_string(), "hi").0, "startim");
+        assert_eq!(rig.calls(), [Call::Im(jane(), "hi".into())]);
+        // One the bot wrote to before the restriction is a conversation too.
+        rig.lift_all();
+        assert!(rig.im(&john().to_string(), "hi").1.is_some());
+        rig.hold(&["startim"]);
+        assert!(rig.im(&john().to_string(), "again").1.is_some());
+        // They end with the session.
+        rig.commands.session_lost();
+        held_back(&rig.im(&john().to_string(), "hi").0, "startim");
+    }
+
+    #[test]
+    fn sitting_and_standing_are_held_by_unsit_sit_and_sittp() {
+        let (chair, bench, stool) = (other_object(), Uuid::from_bytes([0x61; 16]), Uuid::from_bytes([0x62; 16]));
+        let sit = |object: Uuid| Request::Sit(object.to_string());
+        let mut rig = Rig::new();
+        rig.hold(&["unsit"]);
+        // Standing: sitting down is no standing up.
+        not_answered(&rig.command(sit(chair)));
+        assert_eq!(rig.calls(), [Call::Sit(chair)]);
+        // Seated: no standing up, and no changing seats.
+        rig.grid.sitting = Sitting::Object;
+        held_back(&rig.command(Request::Stand), "unsit");
+        held_back(&rig.command(sit(bench)), "unsit");
+        held_back(&rig.command(Request::Sit("ground".into())), "unsit");
+        rig.grid.sitting = Sitting::Ground;
+        held_back(&rig.command(Request::Stand), "unsit");
+        assert_eq!(rig.calls(), []);
+        assert!(rig.commands.take_manual(), "the first sit went manual");
+        assert!(!rig.commands.take_manual(), "a refused command does not");
+        // No sitting at all.
+        let mut rig = Rig::new();
+        rig.hold(&["sit"]);
+        held_back(&rig.command(sit(chair)), "sit");
+        held_back(&rig.command(Request::Sit("ground".into())), "sit");
+        rig.lift_all();
+        rig.hold(&["interact"]);
+        held_back(&rig.command(sit(chair)), "interact");
+        // From afar: 10 m is too far, 1 m is not, and an object of unknown
+        // place counts as too far.
+        rig.lift_all();
+        rig.hold(&["sittp"]);
+        rig.described(chair, Placement::InWorld, 10.0);
+        rig.described(stool, Placement::InWorld, 1.0);
+        held_back(&rig.command(sit(chair)), "sittp");
+        not_answered(&rig.command(sit(stool)));
+        let reason = held_back(&rig.command(sit(bench)), "sittp");
+        assert!(reason.contains("does not know how far"), "{reason}");
+        assert_eq!(rig.calls(), [Call::Sit(stool)]);
+        assert_eq!(rig.commands.last_sit(), Some(SitState::Object(stool)));
+    }
+
+    #[test]
+    fn teleports_are_held_by_tploc_tplocal_and_a_seated_unsit() {
+        let mut rig = Rig::new();
+        rig.hold(&["tploc"]);
+        held_back(&rig.tp(&["128", "128", "25", "Elsewhere"]), "tploc");
+        held_back(&rig.tp(&["12", "20", "30"]), "tploc");
+        // Inside the region only; the avatar is in `Home` at 10, 20, 30.
+        rig.lift_all();
+        rig.hold(&["tplocal"]);
+        held_back(&rig.tp(&["200", "200", "25"]), "tplocal");
+        held_back(&rig.tp(&["200", "200", "25", "home"]), "tplocal");
+        not_answered(&rig.tp(&["128", "128", "25", "Elsewhere"]));
+        assert_eq!(rig.calls(), [Call::Teleport("Elsewhere".into(), [128.0, 128.0, 25.0])]);
+        // Within the distance the holder gives.
+        rig.lift_all();
+        rig.hold(&["tplocal:10"]);
+        not_answered(&rig.tp(&["14", "23", "30"]));
+        held_back(&rig.tp(&["30", "20", "30"]), "tplocal:10");
+        assert_eq!(rig.calls(), [Call::Teleport("Home".into(), [14.0, 23.0, 30.0])]);
+        // Seated and held.
+        rig.lift_all();
+        rig.hold(&["unsit"]);
+        rig.grid.sitting = Sitting::Object;
+        held_back(&rig.tp(&["128", "128", "25", "Elsewhere"]), "unsit");
+        rig.offer(jane(), "Jane Doe", Uuid::from_bytes([0x71; 16]));
+        held_back(&rig.accept("tp", None), "unsit");
+        assert_eq!(rig.calls(), []);
+        // The offer still waits, and is accepted once the avatar stands.
+        rig.grid.sitting = Sitting::No;
+        not_answered(&rig.accept("tp", None));
+        assert_eq!(rig.calls(), [Call::AcceptTp(Uuid::from_bytes([0x71; 16]))]);
+    }
+
+    #[test]
+    fn touching_is_held_by_what_the_object_is() {
+        let (door, lever, button) = (other_object(), Uuid::from_bytes([0x61; 16]), Uuid::from_bytes([0x62; 16]));
+        let touch = |object: Uuid| Request::Touch(object.to_string());
+        let mut rig = Rig::new();
+        rig.described(door, Placement::InWorld, 1.0);
+        rig.described(lever, Placement::InWorld, 1.0);
+        rig.described(button, Placement::InWorld, 6.0);
+        rig.described(collar(), Placement::Worn, 0.0);
+        rig.hold(&["touchworld", &format!("touchworld:{lever}")]);
+        held_back(&rig.command(touch(door)), "touchworld");
+        assert_eq!(rig.command(touch(lever)).try_recv(), Ok(Response::Ok(None)));
+        assert_eq!(rig.command(touch(collar())).try_recv(), Ok(Response::Ok(None)));
+        assert_eq!(rig.calls(), [Call::Touch(lever), Call::Touch(collar())]);
+        rig.lift_all();
+        rig.hold(&["touchattachself", "fartouch"]);
+        held_back(&rig.command(touch(collar())), "touchattachself");
+        held_back(&rig.command(touch(button)), "fartouch");
+        assert_eq!(rig.command(touch(door)).try_recv(), Ok(Response::Ok(None)));
+        // An object that holds `touchme` can be touched, but not under `interact`.
+        rig.lift_all();
+        rig.hold(&["touchall"]);
+        rig.hold_as(Who::Object(lever), "Lever", "touchme");
+        held_back(&rig.command(touch(door)), "touchall");
+        assert_eq!(rig.command(touch(lever)).try_recv(), Ok(Response::Ok(None)));
+        rig.hold(&["interact"]);
+        held_back(&rig.command(touch(lever)), "interact");
+        rig.calls();
+        // An object the simulator has not described is looked for as before
+        // when nothing in force could concern it.
+        rig.lift_all();
+        rig.hold(&["touchhud"]);
+        rig.grid.touch = Ok(Touch::Waiting);
+        not_answered(&rig.command(touch(Uuid::from_bytes([0x63; 16]))));
+    }
+
+    fn cuff() -> Item {
+        item("Cuff", ASSET_OBJECT, 5)
+    }
+
+    fn badge() -> Item {
+        item("Badge", ASSET_OBJECT, 0)
+    }
+
+    #[test]
+    fn a_locked_attachment_stays_on() {
+        let mut rig = Rig::new();
+        // The collar is the object of `Cuff`, and a child prim of it holds the lock.
+        let child = Uuid::from_bytes([0xC1; 16]);
+        rig.grid.attached = vec![(cuff().id, 5), (watch().id, 5)];
+        rig.grid.worn = vec![(collar(), cuff().id), (child, cuff().id)];
+        rig.hold_as(Who::Object(child), "Cuff", "detach");
+        let answer = rig.with_item(Request::Detach("Objects/Cuff".into()), &cuff());
+        let reason = held_back(&answer, "detach");
+        assert!(reason.contains(&format!("Cuff <{child}>")), "{reason}");
+        assert_eq!(rig.calls(), []);
+        // What is not locked comes off.
+        let answer = rig.with_item(Request::Detach("Objects/Watch".into()), &watch());
+        not_answered(&answer);
+        assert_eq!(rig.calls(), [Call::Detach(watch().id)]);
+        rig.sim_detached(&watch());
+        // The whole point: the watch goes, the cuff stays, and the answer says so.
+        rig.grid.attached = vec![(cuff().id, 5), (watch().id, 5)];
+        let answer = rig.command(Request::Detach("left hand".into()));
+        let (id, _) = rig.job();
+        rig.answer(id, Ok(Outcome::Items(vec![cuff(), watch()])));
+        assert_eq!(rig.calls(), [Call::Detach(watch().id)]);
+        assert!(rig.sim_detached(&watch()));
+        let reason = error(&answer);
+        assert!(
+            reason.starts_with("detached \"Watch\"")
+                && reason.contains("\"Cuff\"")
+                && reason.contains("stayed on: refused by RLV: detach, held by Cuff"),
+            "{reason}"
+        );
+        // Nothing on the point can go: nothing is sent.
+        let answer = rig.command(Request::Detach("left hand".into()));
+        let (id, _) = rig.job();
+        rig.answer(id, Ok(Outcome::Items(vec![cuff()])));
+        let reason = error(&answer);
+        assert!(reason.contains("\"Cuff\"") && reason.contains("stayed on"), "{reason}");
+        assert_eq!(rig.calls(), []);
+        // Unlocked, it comes off.
+        rig.lift_all();
+        not_answered(&rig.with_item(Request::Detach("Objects/Cuff".into()), &cuff()));
+        assert_eq!(rig.calls(), [Call::Detach(cuff().id)]);
+    }
+
+    #[test]
+    fn attachment_points_are_locked_full_or_empty() {
+        let mut rig = Rig::new();
+        rig.grid.attached = vec![(watch().id, 5)];
+        rig.hold(&["detach:left hand"]);
+        held_back(
+            &rig.with_item(Request::Detach("Objects/Watch".into()), &watch()),
+            "detach:left hand",
+        );
+        let attach = rig.attach("Objects/Radio", Some("left hand"));
+        held_back(&rig.with_item(attach, &radio()), "detach:left hand");
+        // The radio was last on the left hand: without a point it would go there.
+        let attach = rig.attach("Objects/Radio", None);
+        held_back(&rig.with_item(attach, &radio()), "detach:left hand");
+        // Elsewhere it may go.
+        let attach = rig.attach("Objects/Radio", Some("chest"));
+        not_answered(&rig.with_item(attach, &radio()));
+        assert_eq!(rig.calls(), [Call::Attach(radio(), 1)]);
+        // Nothing may be attached anywhere.
+        let mut rig = Rig::new();
+        rig.hold(&["addattach"]);
+        let attach = rig.attach("Objects/Radio", None);
+        held_back(&rig.with_item(attach, &radio()), "addattach");
+        // `wear` of an object is an attach.
+        held_back(&rig.with_item(Request::Wear("Objects/Radio".into()), &radio()), "addattach");
+        // A point that is not known beforehand may be the closed one.
+        rig.lift_all();
+        rig.hold(&["addattach:chest"]);
+        let attach = rig.attach("Objects/Badge", None);
+        let reason = held_back(&rig.with_item(attach, &badge()), "addattach:chest");
+        assert!(reason.contains("not known"), "{reason}");
+        let attach = rig.attach("Objects/Badge", Some("right hand"));
+        not_answered(&rig.with_item(attach, &badge()));
+        // One whose last point is known and open goes there.
+        let attach = rig.attach("Objects/Radio", None);
+        not_answered(&rig.with_item(attach, &radio()));
+        assert_eq!(rig.calls(), [Call::Attach(badge(), 6), Call::Attach(radio(), 0)]);
+        // Nothing may be detached.
+        rig.lift_all();
+        rig.hold(&["remattach"]);
+        rig.grid.attached = vec![(watch().id, 5)];
+        held_back(&rig.with_item(Request::Detach("Objects/Watch".into()), &watch()), "remattach");
+    }
+
+    #[test]
+    fn clothing_is_held_by_addoutfit_and_remoutfit() {
+        let mut rig = Rig::new();
+        rig.grid.outfit = true;
+        rig.hold(&["remoutfit:shirt"]);
+        held_back(&rig.command(Request::Detach("shirt".into())), "remoutfit:shirt");
+        held_back(
+            &rig.with_item(Request::Detach("Clothing/Blue shirt".into()), &shirt()),
+            "remoutfit:shirt",
+        );
+        assert_eq!(rig.grid.jobs.len(), 0);
+        not_answered(&rig.command(Request::Detach("pants".into())));
+        assert!(matches!(rig.job().1, What::TakeOff(_)));
+        // Putting it on is another matter.
+        not_answered(&rig.with_item(Request::Wear("Clothing/Blue shirt".into()), &shirt()));
+        assert!(matches!(rig.job().1, What::Wear(_)));
+        rig.lift_all();
+        rig.hold(&["addoutfit"]);
+        held_back(&rig.with_item(Request::Wear("Clothing/Blue shirt".into()), &shirt()), "addoutfit");
+        assert_eq!(rig.grid.jobs.len(), 0);
+    }
+
+    #[test]
+    fn the_inventory_is_closed_by_showinv_but_items_can_still_be_named() {
+        let mut rig = Rig::new();
+        rig.hold(&["showinv"]);
+        held_back(&rig.inventory(&["Objects"]), "showinv");
+        assert_eq!(rig.grid.jobs.len(), 0);
+        let attach = rig.attach("Objects/Radio", None);
+        not_answered(&rig.with_item(attach, &radio()));
+        assert_eq!(rig.calls(), [Call::Attach(radio(), 0)]);
+    }
+
+    #[test]
+    fn restoring_leaves_out_what_an_attach_would_be_refused_for() {
+        let mut rig = Rig::new();
+        rig.hold_as(Who::Operator, "", "addattach:chest");
+        let chest_badge = item("Badge", ASSET_OBJECT, 1);
+        let id = rig.compare();
+        rig.listed(id, &[chest_badge.clone(), watch()]);
+        assert_eq!(rig.calls(), [Call::Attach(watch(), 0)]);
+        let told = rig.told();
+        let left_out: Vec<&String> = told.iter().filter(|line| line.contains("not restored")).collect();
+        assert_eq!(left_out.len(), 1, "{told:?}");
+        assert!(
+            left_out[0].contains("\"Badge\"") && left_out[0].contains("addattach:chest, held by the operator"),
+            "{told:?}"
+        );
+    }
+
+    // ------------------------------------- offers and requests under RLV
+
+    #[test]
+    fn tplure_drops_the_offers_it_forbids() {
+        let mut rig = Rig::new();
+        rig.commands.set_rules(Rules::default());
+        rig.hold(&["tplure"]);
+        rig.offer(jane(), "Jane Doe", lure(0x71));
+        assert_eq!(rig.calls(), []);
+        assert!(error(&rig.accept("tp", None)).contains("no teleport offer waits"));
+        let told = rig.told();
+        assert!(
+            told.iter()
+                .any(|line| line.contains("Jane Doe") && line.contains("dropped: tplure, held by Collar")),
+            "{told:?}"
+        );
+        // Also one the bot asked for.
+        ok(&rig.command(Request::AskTp {
+            to: jane().to_string(),
+            message: String::new(),
+        }));
+        rig.calls();
+        rig.offer(jane(), "Jane Doe", lure(0x72));
+        assert_eq!(rig.calls(), []);
+        assert!(error(&rig.accept("tp", None)).contains("no teleport offer waits"));
+        // An excepted avatar's offer is decided as without `tplure`: it waits.
+        rig.hold(&[&format!("tplure:{}", jane())]);
+        rig.offer(jane(), "Jane Doe", lure(0x73));
+        not_answered(&rig.accept("tp", None));
+        assert_eq!(rig.calls(), [Call::AcceptTp(lure(0x73))]);
+    }
+
+    #[test]
+    fn an_offer_that_waits_is_not_accepted_while_tplure_forbids_it() {
+        let mut rig = Rig::new();
+        rig.offer(jane(), "Jane Doe", lure(0x71));
+        rig.hold(&["tplure"]);
+        held_back(&rig.accept("tp", Some("Jane Doe")), "tplure");
+        assert_eq!(rig.calls(), []);
+        // It still waits.
+        rig.lift_all();
+        not_answered(&rig.accept("tp", Some("Jane Doe")));
+        assert_eq!(rig.calls(), [Call::AcceptTp(lure(0x71))]);
+    }
+
+    #[test]
+    fn the_offer_that_answers_an_exempt_requesttp_is_exempt_too() {
+        let mut rig = Rig::new();
+        rig.hold(&["tplure"]);
+        rig.grid.sitting = Sitting::Object;
+        rig.hold(&["unsit"]);
+        ok(&rig.exempt(Request::AskTp {
+            to: jane().to_string(),
+            message: String::new(),
+        }));
+        rig.calls();
+        rig.offer(jane(), "Jane Doe", lure(0x71));
+        assert_eq!(rig.calls(), [Call::AcceptTp(lure(0x71))]);
+        // One offer per request: the next is dropped.
+        rig.offer(jane(), "Jane Doe", lure(0x72));
+        assert_eq!(rig.calls(), []);
+    }
+
+    #[test]
+    fn accepttp_has_the_bot_accept_offers_by_itself() {
+        let mut rig = Rig::new();
+        rig.hold(&[&format!("accepttp:{}", jane())]);
+        rig.offer(jane(), "Jane Doe", lure(0x71));
+        assert_eq!(rig.calls(), [Call::AcceptTp(lure(0x71))]);
+        assert!(rig.commands.take_manual(), "accepting moves the avatar");
+        // Not from anyone else.
+        rig.offer(john(), "John Roe", lure(0x72));
+        assert_eq!(rig.calls(), []);
+        assert!(!rig.commands.take_manual());
+        // Without an option, from anyone.
+        rig.hold(&["accepttp"]);
+        rig.offer(john(), "John Roe", lure(0x73));
+        assert_eq!(rig.calls(), [Call::AcceptTp(lure(0x73))]);
+        rig.commands.take_manual();
+        // `tplure` comes first.
+        rig.hold(&["tplure"]);
+        rig.offer(john(), "John Roe", lure(0x74));
+        assert_eq!(rig.calls(), []);
+        // A seated `unsit` makes the offer wait for the operator.
+        rig.lift_all();
+        rig.hold(&["accepttp", "unsit"]);
+        rig.grid.sitting = Sitting::Object;
+        rig.offer(john(), "John Roe", lure(0x75));
+        assert_eq!(rig.calls(), []);
+        assert!(!rig.commands.take_manual());
+        rig.grid.sitting = Sitting::No;
+        not_answered(&rig.accept("tp", None));
+        assert_eq!(rig.calls(), [Call::AcceptTp(lure(0x75))]);
+    }
+
+    #[test]
+    fn a_rule_does_not_take_a_seated_avatar_off_a_seat_unsit_holds() {
+        let mut rig = Rig::new();
+        ok(&rig.command(Request::Perms(PermsRequest::Autoaccept {
+            kind: "tp".into(),
+            who: vec!["all".into()],
+        })));
+        rig.hold(&["unsit"]);
+        rig.grid.sitting = Sitting::Object;
+        rig.offer(jane(), "Jane Doe", lure(0x71));
+        assert_eq!(rig.calls(), []);
+        assert!(!rig.commands.take_manual());
+        assert_eq!(rig.waiting().len(), 1);
+        // And under `tplure` the rule accepts nothing: the offer is dropped.
+        rig.hold(&["tplure"]);
+        rig.offer(john(), "John Roe", lure(0x72));
+        assert_eq!(rig.waiting().len(), 1);
+    }
+
+    #[test]
+    fn requests_to_be_teleported_here_are_answered_or_dropped_for_rlv() {
+        let mut rig = Rig::new();
+        // Without RLV's say they are the operator's to answer.
+        rig.commands
+            .teleport_requested(jane(), "Jane Doe", "please", Some(&mut rig.grid), rig.now);
+        assert_eq!(rig.calls(), []);
+        let told = rig.told();
+        assert!(
+            told.len() == 1 && told[0].contains("asks to be teleported here") && told[0].contains("sendtp"),
+            "{told:?}"
+        );
+        rig.hold(&["accepttprequest"]);
+        rig.commands
+            .teleport_requested(jane(), "Jane Doe", "please", Some(&mut rig.grid), rig.now);
+        assert_eq!(rig.calls(), [Call::OfferTp(jane(), "Join me in Home".into())]);
+        assert!(!rig.commands.take_manual());
+        // `tprequest` comes first.
+        rig.hold(&["tprequest"]);
+        rig.told();
+        rig.commands
+            .teleport_requested(jane(), "Jane Doe", "please", Some(&mut rig.grid), rig.now);
+        assert_eq!(rig.calls(), []);
+        let told = rig.told();
+        assert!(told.len() == 1 && told[0].contains("dropped: tprequest"), "{told:?}");
+        // Only the avatar that is named.
+        rig.lift_all();
+        rig.hold(&[&format!("accepttprequest:{}", jane())]);
+        rig.commands
+            .teleport_requested(john(), "John Roe", "", Some(&mut rig.grid), rig.now);
+        assert_eq!(rig.calls(), []);
+    }
+
+    #[test]
+    fn acceptpermission_grants_attach_and_controls_whatever_the_rules() {
+        let mut rig = Rig::new();
+        rig.hold(&["acceptpermission"]);
+        rig.janes_asks(ball(), ATTACH | CONTROLS);
+        assert_eq!(rig.calls(), [Call::Grant(ball(), script_of(ball()), ATTACH | CONTROLS)]);
+        // The other kinds still follow their rules.
+        rig.janes_asks(other_ball(), CONTROLS | ANIM);
+        assert_eq!(rig.calls(), []);
+        assert_eq!(rig.waiting().len(), 1);
+        // The rules themselves are what they were.
+        assert!(
+            rig.perms_status().iter().any(|line| line.starts_with("controls: none")),
+            "{:?}",
+            rig.perms_status()
+        );
+    }
+
+    #[test]
+    fn denypermission_drops_requests_for_attach_and_controls() {
+        let mut rig = Rig::new();
+        ok(&rig.command(Request::Perms(PermsRequest::Autoaccept {
+            kind: "attach".into(),
+            who: vec!["all".into()],
+        })));
+        rig.hold(&["denypermission", "acceptpermission"]);
+        rig.janes_asks(ball(), ATTACH);
+        assert_eq!(rig.calls(), []);
+        assert_eq!(rig.waiting().len(), 0);
+        assert!(error(&rig.accept("attach", None)).contains("no request"));
+        // Animations are not its business.
+        rig.janes_asks(ball(), ANIM);
+        assert_eq!(rig.waiting().len(), 1);
+    }
+
+    #[test]
+    fn a_request_that_waits_is_not_decided_again_when_a_restriction_is_set() {
+        let mut rig = Rig::new();
+        rig.janes_asks(ball(), CONTROLS);
+        assert_eq!(rig.waiting().len(), 1);
+        rig.hold(&["acceptpermission"]);
+        assert_eq!((rig.calls(), rig.waiting().len()), (vec![], 1));
+        // The same script's next request is granted.
+        rig.janes_asks(ball(), CONTROLS);
+        assert_eq!(rig.calls(), [Call::Grant(ball(), script_of(ball()), CONTROLS)]);
+        // Under `denypermission` one that waits cannot be accepted, and waits on.
+        rig.janes_asks(other_ball(), ANIM | CONTROLS);
+        rig.lift_all();
+        rig.hold(&["denypermission"]);
+        held_back(&rig.accept("controls", None), "denypermission");
+        assert_eq!(rig.waiting().len(), 1);
     }
 }

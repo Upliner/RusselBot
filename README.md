@@ -13,7 +13,9 @@ stand, sit elsewhere, teleport, exchange teleport offers and touch objects,
 and to use what the avatar owns: list its inventory, attach and detach
 objects, play animations and sounds, and (on Second Life) change clothing.
 With [RLV](#rlv) switched on, scripted objects the avatar owns can ask for
-some of the same: sit, stand, teleport, take things off. And it can answer
+some of the same: sit, stand, teleport, take things off. They can also
+hold the avatar to restrictions, which then bind the bot and your commands
+alike. And it can answer
 what a viewer answers with a dialog: teleport offers, inventory offers and
 scripts' requests for permissions are [accepted by
 itself](#permission-requests) from the avatars and objects the config
@@ -90,6 +92,15 @@ with `rlv = true`, wearing a collar and a relay, near objects named
   `@getstatus` eight times, after `@unsit=n`, and got no answer. A bare
   `@clear` was noted as
   malformed in these runs, wrongly; it is read as a command since.
+
+RLV restrictions are verified by unit tests and on the local OpenSim
+(`docs/test-rig.md`, items 142 to 157, 2026-11-20): restrictions held by a
+rezzed and by a worn object and by `rlv cmd`, commands refused for them,
+`@getstatus`, a locked attachment, the three modes, `rlv reset`, the bot's
+own teleport and sit held back and released, and the persist override
+setting from the config and by command. Nothing about restrictions has
+been tried on Second Life: the collar, the handcuffs and the `corestat`
+objects of the runs below now hold the avatar to what they send.
 
 Not tried there: `@detach` and `@detachme` (on the local OpenSim only,
 `docs/test-rig.md`, item 116), `@tpto` to another region and by global
@@ -314,10 +325,20 @@ One TOML file; see `russelbot.example.toml`.
 | `atstart` | `true` or `false`: whether the bot holds anything once the avatar is at the place above. Default: `true` when the table has `position` or `sit`, `false` otherwise. `atstart = true` alone is `persist = "cur"`; `atstart = false` together with `position` or `sit` is an error |
 | `position`, `sit` | Each `"cur"` or `"cfg"`, as in the array; one that is left out is `"cur"` |
 | `rlv` | `"drop"` or `"follow"`: what a sit, stand or teleport forced through [RLV](#rlv) does to the place the bot holds. Default: `"drop"`. It says nothing about `atstart`, so a table with only `rlv = "follow"` holds nothing at the start |
+| `override` | `"sit"`, `"tp"` or an array of both: what the bot does by itself towards the place it holds whatever RLV restrictions say, see [What the bot does by itself](#what-the-bot-does-by-itself). Default: nothing. Like `rlv`, it says nothing about `atstart` |
 
 ### Upgrading
 
 Configs written for earlier versions still load, but these things changed:
+
+* With `rlv = true`, the restrictions that objects set are obeyed now.
+  Earlier versions noted every one of them as not supported; a collar or a
+  piece of furniture that sent them all along now holds the avatar, your
+  `rslbot ctl` commands and the bot's own return to its place. See
+  [Restrictions](#restrictions); `rslbot ctl rlv status` shows what is
+  held, `rlv reset` and `rlv mode off` are the ways out, and
+  `override = "tp"` in the `[persist]` table keeps the bot returning to
+  its place.
 
 * The bot used to hold `position` and the `sit` UUID for as long as it
   ran: it teleported back when the avatar was moved to another region and
@@ -449,10 +470,13 @@ target/release/rslbot ctl rlv cmd @versionnum=5     # an RLV command, by hand
 | `home` | The same as `persist last last`: hold the place last persisted again, or the configured one when nothing was persisted |
 | `perms autoaccept KIND WHO...`, `perms revoke KIND WHO...` | Add to, or take away from, the requests of a kind the bot accepts by itself; `WHO` is `all`, or avatars and objects. See [Permission requests](#permission-requests) |
 | `perms status` | Print what is accepted by itself for each kind, and the requests that wait |
-| `rlv mode on`, `rlv mode off` | Switch [RLV](#rlv) on or off |
+| `rlv mode on`, `rlv mode off` | Switch [RLV](#rlv) on or off. Off keeps the restrictions and applies none |
+| `rlv mode override` | Let the next command through whatever the [restrictions](#restrictions) say; see [Override](#override) |
 | `rlv persist follow`, `rlv persist drop` | What a sit, stand or teleport forced through RLV does to the place the bot holds |
-| `rlv status` | Print whether RLV is on, and the `rlv persist` setting |
-| `rlv cmd COMMAND...` | Carry out RLV commands as if an object had sent them, and print what became of each |
+| `rlv persist override none`, `sit`, `tp`, `sit tp` | What the bot does by itself whatever the restrictions say; see [What the bot does by itself](#what-the-bot-does-by-itself) |
+| `rlv status` | Print the RLV mode, the two `rlv persist` settings, and the restrictions that are kept |
+| `rlv reset` | Forget every restriction |
+| `rlv cmd COMMAND...` | Carry out RLV commands as if an object had sent them, and print what became of each. Restrictions given this way are held apart from every object's |
 | `status` | Print where the avatar is |
 | `quit` | Log out and stop the bot, like Ctrl-C |
 
@@ -499,6 +523,11 @@ A sit, stand or teleport that a scripted object forces through [RLV](#rlv)
 counts as the command it is carried out as: it switches holding off too.
 With `rlv persist follow` the bot holds the result instead; see
 [Forced movement and the place the bot holds](#forced-movement-and-the-place-the-bot-holds).
+
+With RLV on, the bot's own steps towards the place it holds are held to
+the RLV restrictions as your commands are: it waits where a restriction
+forbids the teleport or the sit, unless the `[persist]` table's `override`
+says otherwise. See [What the bot does by itself](#what-the-bot-does-by-itself).
 
 ### Holding a place
 
@@ -876,27 +905,27 @@ version and do nothing for an avatar that does not answer.
 RLV is off unless the config has `rlv = true` or `rslbot ctl rlv mode on`
 was given. While it is off the bot does not read such lines at all, and
 nothing below applies. **While it is on, every object the avatar owns,
-worn or rezzed in the region, can make the avatar sit, stand and teleport
-and can take attachments and clothing off it, without the operator.**
+worn or rezzed in the region, can make the avatar sit, stand and teleport,
+can take attachments and clothing off it, and can forbid it, the bot and
+you most of what the bot does, without the operator.**
 That is what RLV is for; switch it on only for an avatar whose objects you
 trust.
 
 ```sh
 target/release/rslbot ctl rlv mode on
-target/release/rslbot ctl rlv status       # rlv: on / persist: drop
+target/release/rslbot ctl rlv status       # rlv: on / persist: drop / persist override: none / restrictions: none
 target/release/rslbot ctl rlv mode off
 ```
 
 The switch is not saved: a restarted bot starts from its config.
 
-What the bot implements is a first step, and it says so: it reports
-version 0.1.0 of the API, far below any viewer's, so that a script that
-looks at the number sees an incomplete implementation. **No restriction is
-implemented.** A command such as `@detach=n` or `@sittp=n` is noted in the
-log as not supported and holds nobody to anything: the avatar is not
-restricted, and every `rslbot ctl` command works as before. A script that
-only asks for the version and then assumes its restrictions hold is wrong
-about this avatar.
+What the bot implements is a part of the API, and it says so: it reports
+version 0.1.0, far below any viewer's, so that a script that looks at the
+number sees an incomplete implementation. Restrictions are kept, and those
+that concern something the bot does are enforced; see
+[Restrictions](#restrictions). The others are kept and have no effect, and
+some queries, `@notify` and the shared `#RLV` folder are missing. A script
+that reads back its restrictions with `@getstatus` gets what it set.
 
 A message is read as RLV commands when an object says it to its owner and
 it starts with `@`. Several commands follow the one `@`, separated by
@@ -913,6 +942,8 @@ These queries are answered, by saying the reply on the channel named
 | `@version=CHANNEL` | `RestrainedLife viewer v0.1.0 (RusselBot 0.1.0)`, with the bot's own version in the parentheses |
 | `@versionnew=CHANNEL` | `RestrainedLove viewer v0.1.0 (RusselBot 0.1.0)` |
 | `@versionnum=CHANNEL` | `10000` |
+| `@getstatus=CHANNEL` | The restrictions the asking object holds, each with a `/` in front: `/detach/sendim`. `@getstatus:PART;SEPARATOR=CHANNEL` leaves out those that do not contain `PART` and puts `SEPARATOR` in place of the `/` |
+| `@getstatusall=CHANNEL` | The same for the restrictions of every holder |
 
 These commands are carried out, each the way the `rslbot ctl` command
 beside it is, with the same checks and refusals:
@@ -941,13 +972,13 @@ look in) is ignored. Nobody waits for the outcome of these commands: it is
 in the log, as it is for the commands they stand for. None of them counts
 as the last `tp` or `sit` command for `persist last_cmd`.
 
-Everything else is noted in the log as not supported and has no effect:
-all restrictions, `@clear`, `@notify`, the other queries (`@getstatus`,
-`@getsitid`, `@getoutfit`, `@getattach`, `@getinv`, `@versionnumbl`, ...),
+What is left is noted in the log as not supported and has no effect:
+restrictions the API does not have, `@notify`, the other queries
+(`@getsitid`, `@getoutfit`, `@getattach`, `@getinv`, `@versionnumbl`, ...),
 everything that names inventory folders (`@attach:...`, `@detachall:...`,
 `@detach:FOLDER`), and `@detach=force` and `@remoutfit=force` without an
 option, which would take everything off. An instant message that says
-`@version` is not answered either. Three limits of what is carried out:
+`@version` is not answered either. Two limits of what is carried out:
 
 * `@tpto:X/Y/Z` takes regions to be 256 metres square, which they are on
   Second Life. On a grid with larger regions use the form with the
@@ -955,12 +986,193 @@ option, which would take everything off. An instant message that says
   Second Life they run into the hundreds of thousands. Numbers that are
   both below 256 are refused, as they are most likely meant for a place
   inside a region, which is `@tpto:REGION/X/Y/Z`.
-* `@detachme` works when the script is in the attachment's root prim. From
-  a child prim the bot cannot tell which attachment is meant, and refuses.
 * Commands that arrive while the avatar cannot act, during the login or a
   teleport, are kept (up to 64 messages) and carried out in order once it
   is in a region. They are dropped when the session is lost and when RLV
   is switched off.
+
+#### Restrictions
+
+A restriction is an RLV command that ends in `=n` or `=add`; `=y` or `=rem`
+lifts it again. `@sendim=n` forbids instant messages, `@sendim:UUID=add` is
+an exception to that for one avatar, and `@clear` lifts everything its
+sender set (`@clear=tp` everything with `tp` in it). The bot keeps
+restrictions the way a viewer does:
+
+* Each belongs to the object that set it, its *holder*. What two objects
+  both set holds until both have lifted it, and no object can lift or
+  clear another's.
+* An object's restrictions end with the object: when it is detached or
+  deleted, when the avatar leaves the region without wearing it, and when
+  the session is lost. Scripts set theirs again when they are rezzed or
+  attached, as the API tells them to. An attachment keeps its restrictions
+  through a teleport.
+* Nothing is saved: a restarted bot keeps no restriction.
+
+While RLV is on, the restrictions apply to everything the bot does for the
+avatar: to your `rslbot ctl` commands, to what the bot does by itself, and
+to RLV force commands. A command that a restriction forbids does nothing
+and exits with status 1:
+
+```
+$ rslbot ctl stand
+refused by RLV: unsit, held by Collar <2f1a...>; `rslbot ctl rlv mode override` lets one command through
+```
+
+`rslbot ctl rlv status` lists what is kept, each restriction with its
+holder; see [When the bot is held](#when-the-bot-is-held) for the ways out.
+
+These restrictions have an effect:
+
+| Restriction | Effect |
+|---|---|
+| `sendchat` | `say`, `shout` and `whisper` on channel 0 are refused. An emote (`/me ...`) and other text starting with `/` still go out, cut off at the first `.` and to 30 and 15 characters, and are refused when they contain one of `()"-*=_^`. `emote` held by anyone leaves emotes whole |
+| `chatshout`, `chatwhisper`, `chatnormal` | On channel 0 a shout, or a whisper, is said at normal volume; with `chatnormal` everything is whispered. The command succeeds and its answer says what was changed |
+| `redirchat:CHANNEL`, `rediremote:CHANNEL` | Text, or an emote, for channel 0 is said on that channel instead |
+| `sendchannel`, `sendchannel_sec`, `sendchannel_except:CHANNEL` | Chat on other channels than 0 is refused, except on a channel that `sendchannel:CHANNEL` names; or on the one channel named. The bot's own replies to RLV queries always go out |
+| `sendim`, `sendim_sec`, `sendimto:UUID` | `im` is refused, for everyone but those `sendim:UUID` names, or for the one avatar |
+| `startim`, `startimto:UUID` | `im` is refused to an avatar the bot has not exchanged an instant message with since the login |
+| `unsit` | While the avatar sits: `stand`, `sit` (which leaves the seat), `tp` and `accept tp` are refused |
+| `sit` | `sit UUID` and `sit ground` are refused |
+| `sittp`, `sittp:DISTANCE` | `sit UUID` is refused when the object is farther than 1.5 m, or the distance given, from the avatar |
+| `interact` | `sit UUID` and every `touch` are refused |
+| `tploc` | `tp` is refused |
+| `tplocal`, `tplocal:DISTANCE` | `tp` inside the region the avatar is in is refused, unless every holder gives a distance and the destination is within the smallest |
+| `tplure`, `tplure_sec` | Teleport offers are dropped as they arrive, also the answer to a `requesttp`, and one that waits cannot be accepted; `tplure:UUID` names avatars whose offers are still taken |
+| `accepttp`, `accepttp:UUID` | The bot accepts teleport offers by itself, from anyone or from that avatar, whatever the `perms` rules say |
+| `tprequest`, `tprequest_sec` | A request to be teleported to the avatar is dropped; `tprequest:UUID` names exceptions |
+| `accepttprequest`, `accepttprequest:UUID` | The bot answers such a request with a teleport offer by itself |
+| `touchall`, `touchworld`, `touchthis:UUID`, `touchattach`, `touchattachself`, `touchattachother`, `touchhud`, `fartouch`, `touchfar` | `touch` is refused according to what the object is: rezzed in the region, attached to the avatar or to another, on the HUD, or farther than 1.5 m (or the distance given). `touchworld:UUID` and `touchme`, held by the object itself, are exceptions |
+| `detach`, held by an attachment | That attachment cannot be detached |
+| `detach:POINT`, `remattach`, `remattach:POINT`, `addattach`, `addattach:POINT` | Nothing can be detached from, or attached to, that attachment point, or any |
+| `addoutfit`, `addoutfit:KIND`, `remoutfit`, `remoutfit:KIND` | No clothing, or none of that kind, can be put on, or taken off |
+| `acceptpermission`, `denypermission` | A script's request to attach or to take controls is granted by itself, or dropped, whatever the `perms` rules say |
+| `showinv` | `inventory` is refused; items can still be named in other commands |
+| `permissive` | Every restriction counts only the exceptions of its own holder, as the `_sec` ones always do |
+
+A few notes on these. An exception counts whoever holds it, except against
+a `_sec` restriction and under `permissive`, where it has to come from the
+holder of the restriction. `detach POINT` takes off what it may and
+answers with an error naming what stayed on. `attach` without a body part
+puts an object where it was last; when the inventory records no such
+point and some point is closed, it is refused, since the bot cannot tell
+where the simulator would put it. Distances are measured to the object's
+own position, where a viewer measures to the spot that was clicked, and an
+object the simulator has not described to the bot counts as too far. That
+matters for `sittp` and `fartouch`: without `scan_distance` in the config
+the simulator describes few objects to the bot, so most sits and touches
+are refused under them, and the bot's own sit on the seat it holds waits
+after every arrival. Set `scan_distance`, with which the seat is known
+within a second of arriving, or `override = "sit"` in the `[persist]`
+table.
+Nothing is sent to an avatar whose offer, request or message was dropped,
+where a viewer would tell them.
+
+All other restrictions of the API are kept and reported, and have no
+effect: `rlv status` marks them `(no effect)`. They are about what a viewer
+shows its user, or about things the bot does not do: `recvchat`, `recvim`,
+`recvemote` and their variants, `showloc`, `shownames`, the map, hovertext
+and camera restrictions, `fly`, `edit`, `rez`, `share`, `sendgesture`,
+`tplm`, `standtp`, `defaultwear`, `setgroup`, `setdebug`, `setenv`, and
+everything about the shared `#RLV` folder. The message log and `status`
+are yours and are never censored. A restriction the API does not have,
+and `@notify`, are not kept and are noted in the log as not supported.
+
+Two things a viewer does for restrictions the bot does not: it does not
+put a locked attachment back on when a script kicks it off, and it does
+not take off again what a script attaches to a locked point.
+
+RLV force commands are held to restrictions too: `@sit` by `sit`,
+`interact`, `sittp` and a seated `unsit`; `@sitground` by `sit`; `@unsit`
+by `unsit`; `@tpto` by `tploc` and a seated `unsit`; `@detach`,
+`@remattach` and `@detachme` leave locked attachments on; `@remoutfit` by
+`remoutfit`. **An object's own restrictions never stand in the way of its
+own force commands**: a chair that holds `unsit` can still unseat the
+avatar, and a cage that holds `sittp` can still seat it from afar.
+
+#### Override
+
+```sh
+target/release/rslbot ctl rlv mode override
+target/release/rslbot ctl stand              # carried out, whatever is held
+```
+
+`rlv mode override` exempts your next command from every restriction. RLV
+is on again the moment that command arrives, whatever becomes of it: a
+command that fails for a reason of its own, or that no restriction
+concerns, uses the override up as well. Only `status`, `perms`, `quit` and
+the `rlv` commands never do. For `requesttp` the exemption includes
+accepting the one offer that answers it; for `persist` and `home` it
+includes the bot's own way to the place they name, until the avatar is
+there for the first time.
+
+Override changes nothing else. What objects send is read as before, their
+force commands and `rlv cmd` are held to the restrictions, offers are
+dropped and accepted as before. It has no time limit: `rlv status` shows
+`rlv: override` until a command has used it, or `rlv mode on` takes it
+back. It cannot be had while RLV is off.
+
+#### What the bot does by itself
+
+A bot that [holds a place](#holding-a-place) is held to the restrictions
+like you are: it does not teleport back while `tploc` is in force, does not
+sit down again under `sit` or beyond `sittp`, and does not stand up under
+`unsit`. It stays in holding mode and waits; a step that is held back is
+not a failed attempt, so no delay grows. The log says once what waits and
+for which restriction, and once when it no longer does:
+
+```
+rlv: holding back the teleport to "Target": tploc, held by Cage <8c40...>
+rlv: no longer holding back the teleport to "Target"
+```
+
+`persist` and `home` are never refused: they change what the bot holds,
+and its way there is held back or not as above. A login is never held
+back. [Restoring attachments](#attachments) leaves out what an `attach`
+would be refused for.
+
+That is what restrictions are for, and it is often not what a bot is for.
+After a region restart the avatar finds itself in a hub, still wearing a
+collar that holds `tploc`, and the place it is to hold is the region whose
+objects restrict it. The **persist override setting** takes a sort of step
+out of the restrictions for good:
+
+```toml
+[persist]
+override = ["sit", "tp"]
+```
+
+```sh
+target/release/rslbot ctl rlv persist override tp       # or: sit, sit tp, none
+```
+
+| Word | The bot does by itself, whatever is held |
+|---|---|
+| `tp` | Teleport to the place it holds |
+| `sit` | Sit on the seat it holds or on the ground, and stand up when what it holds is `stand` |
+
+It is empty unless the config or the command says otherwise, a value given
+by command is not saved, and `rlv status` shows it as `persist override:`.
+It covers the bot's own steps only: your `tp` is still refused under
+`tploc`, and so is a forced `@tpto`. The log names each restriction a step
+went past. Do not confuse it with `rlv mode override`, which exempts one
+command of yours, once.
+
+#### When the bot is held
+
+```sh
+target/release/rslbot ctl rlv status          # what is held, and by whom
+target/release/rslbot ctl rlv mode override   # one command through...
+target/release/rslbot ctl home                # ...for instance back to the held place
+target/release/rslbot ctl rlv reset           # forget every restriction
+target/release/rslbot ctl rlv mode off        # or apply none, and keep them
+```
+
+`rlv reset` clears everything, in any mode, and tells the objects nothing:
+one that sets a restriction afterwards holds it. `rlv mode off` keeps what
+is stored, applies none of it, and reads no further commands; when RLV is
+switched on again the stored restrictions are in force as they are, which
+may no longer be what the objects think.
 
 #### Forced movement and the place the bot holds
 
@@ -1016,25 +1228,32 @@ operator persists another place.
 
 #### RLV commands by hand
 
-`rlv cmd` carries out RLV commands as if an object had sent them, with the
-avatar itself as the sender, to try what an object would get. The leading
-`@` may be left out, and the words of the command are joined with single
-spaces:
+`rlv cmd` carries out RLV commands as if an object had sent them, to try
+what an object would get. The leading `@` may be left out, and the words of
+the command are joined with single spaces:
 
 ```sh
 target/release/rslbot ctl rlv cmd @versionnum=5
 target/release/rslbot ctl rlv cmd @tpto:Blue Lagoon/128/128/25=force
-target/release/rslbot ctl rlv cmd @versionnew=5,detach=n
+target/release/rslbot ctl rlv cmd @sendim=n,getstatus=5
+target/release/rslbot ctl rlv cmd @clear
 ```
 
 It prints one line per command: the command, and the reply that was said
-for a query, `ok` for a command that was carried out or begun, or the
-reason it was not. The first example prints `versionnum=5: 10000` and
-says `10000` on channel 5 as well. The exit status is 0 when every command
-was carried out and 1 otherwise, as for the last example, whose second line
-is `detach=n: not supported`. `rlv cmd` does not wait for a sit, a
-teleport or a detach to end; that is in the log. It is refused while RLV
-is off, and `@detachme` has no meaning in it.
+for a query, `ok` for a restriction and for a force command that was
+carried out or begun, or the reason it was not. The first example prints
+`versionnum=5: 10000` and says `10000` on channel 5 as well; the third
+prints `sendim=n: ok` and `getstatus=5: /sendim`. The exit status is 0 when
+every command was carried out and 1 otherwise. `rlv cmd` does not wait for
+a sit, a teleport or a detach to end; that is in the log.
+
+Like the RLV console of a viewer, `rlv cmd` is a holder of its own:
+restrictions given with it are held by `operator`, apart from every
+object's. `rlv cmd @clear` clears those and no object's, no object's
+`@clear` touches them, and they last until they are lifted, `rlv reset`,
+or the end of the bot process, across logins. Its force commands are held
+to the restrictions of the objects and not to its own. It is refused while
+RLV is off, and `@detachme` has no meaning in it.
 
 ### Permission requests
 
@@ -1055,6 +1274,13 @@ A script may ask for several permissions at once, and such a request has
 all their kinds. A script that asks for anything else (to take money from
 the avatar, to teleport it, ...) is never granted anything, by itself or
 on command; the log says which permission stood in the way.
+
+With [RLV](#rlv) on, restrictions come before all of this: `tplure` drops
+teleport offers, `denypermission` drops a script's request to attach or to
+take controls, `accepttp` and `acceptpermission` have the bot accept what
+the rules below would leave waiting, and a seated avatar under `unsit`
+goes nowhere. The rules themselves are not changed by any of it. See
+[Restrictions](#restrictions).
 
 Without a `perms` table in the config the bot accepts nothing by itself,
 except a teleport offer it asked for with `requesttp`. Every request is

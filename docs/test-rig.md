@@ -463,6 +463,44 @@ All of these are unit-tested. OpenSim sends the debit request of item 129
 to an avatar that is not the object's owner; whether Second Life does is
 not known. Nothing of this has been tried on Second Life.
 
+## RLV restrictions
+
+Run on 2026-11-20 with the debug build, the config of item 1 plus
+`socket = true`, `rlv = true`, `persist = "cfg"` and `log_chat`, a
+`RUSSELBOT_SOCK` of the run's own, the `Relay box` and the wearable
+`Relay` of `test-rig/relay.py`, and the prim `<bench>` of `rezprim.py`.
+`say /77 X` makes every relay that hears it say `X` to the bot, so the box
+and the worn relay each become the holder of what is said. `console: X` is
+typed on the OpenSim console.
+
+| # | Inject | Expected | Result (2026-11-20, OpenSim 9d00a55552) |
+|---|---|---|---|
+| 142 | Seated: `rlv status`; `say /77 @unsit=n`; `rlv status`; `stand`; `tp 128 128 25 Home` | Four lines ending in `restrictions: none`; then `restrictions: 1` and `Relay box <uuid>: unsit`; both commands refused with status 1, naming `unsit`, the box and `rlv mode override`; the avatar stays seated, `mode: holding` | Pass |
+| 143 | `rlv cmd @sendim=n,getstatus=5`; `im "Rig Owner" hi`; `rlv cmd @clear`; `rlv status` | `sendim=n: ok` and `getstatus=5: /sendim`; the `im` refused naming `sendim, held by the operator`; `clear: ok`; the box's `unsit` is still listed | Pass |
+| 144 | `rlv mode override`; `stand`; `rlv status` | `rlv: override`; the avatar stands; `rlv: on again; \`stand\` was exempt`; `placement: manual`; `rlv: on` | Pass |
+| 145 | `say /77 @clear`; `say /77 @getstatus=5`; `say /77 @sendchat=n,chatshout=n,touchworld=n,fartouch=n`; `say /77 @getstatus=5` | `clear: lifted 1 restriction`; the reply `""` is said on channel 5; then `/sendchat/chatshout/touchworld/fartouch` | Pass. The simulator delivers the empty reply: the box says `heard on 5: ` with nothing after it, then `heard on 5: /sendchat/chatshout/touchworld/fartouch` |
+| 146 | With those four held: `say hello there`; `say /me nods slowly. Then she speaks at length`; `touch <bench>`; `say /77 @touchworld:<bench>=add,fartouch=y`; `touch <bench>`; `say /77 @sendchat=y`; `shout over here`; `rlv reset` | Refused naming `sendchat`; `/me nods slowly` is said and the answer is `shortened to "/me nods slowly", because of sendchat, ...`; refused naming `touchworld`; touched; `over here` at normal volume with `said at normal volume instead of shouted, because of chatshout, ...`; `rlv reset: 3 restrictions cleared` | Pass |
+| 147 | `home`; `attach "RLV gear/Relay" chest`; `say /77 @detach=n`; `detach "RLV gear/Relay"`; `detach chest` | The box and the worn relay each hold `detach`; the first refused naming `detach, held by Relay <uuid>`, the second with `"Relay" <item> stayed on: refused by RLV: detach, ...`; nothing is detached | Pass |
+| 148 | `say /77 @detach:left hand=n,addattach=n`; `rlv mode override`; `detach "RLV gear/Relay"`; `rlv status`; `attach "RLV gear/Relay" chest` | The relay is detached; `rlv: dropped 3 restrictions of Relay <uuid>: the object is gone`; the box's three are still listed; the attach is refused naming `addattach` and the box | Pass |
+| 149 | `rlv reset`; `attach "RLV gear/Relay" chest`; `say /77 @tploc=n`; `console: teleport user Sit Bot Home/128/128/25`; `rlv status`; `status`; `say /77 @tploc=y` | `rlv: dropped 1 restriction of Relay box <uuid>: the avatar left its region`; the worn relay keeps `tploc`; one line `rlv: holding back the teleport to "Target": tploc, held by Relay <uuid>`, no teleport, the avatar stays in `Home`; after the lift `no longer holding back ...`, the teleport, `seated` | Pass: the relay had the same UUID in `Home`; back and seated 4 s after the lift |
+| 150 | `say /77 @tploc=n,sit=n`; `console: teleport ... Home`; `rlv persist override tp`; in `Target`, `say /77 @sit=y`; `rlv persist override none` | Held back; then `rlv: the teleport to "Target" goes ahead although tploc, held by Relay <uuid>: persist override tp`; in `Target`, `rlv: holding back the sit on <seat>: sit, held by Relay <uuid>`; after the lift the avatar sits at once | Pass |
+| 151 | With `tploc` held by the worn relay: `console: teleport ... Home`; `rlv mode override`; `home`; when seated, `console: teleport ... Home` again; `say /77 @tploc=y` | Held back; `rlv: on again; \`home\` was exempt`, the teleport and the sit; the second time the teleport is held back again until the lift | Pass |
+| 152 | Seated: `say /77 @unsit=n`; `persist cur stand`; `status`; `rlv persist override sit` | The persist is answered with status 0 and `... stand`; `rlv: holding back the stand: unsit, held by Relay <uuid>`, the avatar stays seated, `mode: holding`; then `rlv: standing up although unsit, ...: persist override sit` and `seat: none` | Pass |
+| 153 | Config: a `[persist]` table with `position = "cfg"`, `sit = "cfg"` and `override = "tp"`. `rlv status`; `say /77 @tploc=n`; `console: teleport ... Home` | `rlv: persist override: tp` at startup and `persist override: tp` in the status; `goes ahead although tploc ...` at once, back in `Target` | Pass |
+| 154 | Item 153 with `rlv cmd @sittp=n` given first; then `console: kick user Sit Bot bye`; `rlv status`; `rlv cmd @clear` | In `Target`: `rlv: holding back the sit on <seat>: sittp, held by the operator (the bot does not know how far the object is)`; after the kick `rlv: dropped 1 restriction of 1 object: the session ended`, a login 10 s later that nothing holds back, `operator: sittp` still listed and the sit still held back; after the clear the avatar sits | Pass. Without `scan_distance` the simulator does not describe the seat to the bot after an arrival, so `sittp` holds the sit back for as long as it is in force; see item 157 |
+| 155 | The box alone: `say /77 @unsit=n`; `stand`; `say /77 @unsit=force` | The operator's `stand` is refused; the box's own force command is carried out: `rlv: Relay box <uuid>: unsit=force: as \`stand\``, the avatar stands, `placement: manual` | Pass |
+| 156 | `say /77 @sendchat=n`; `say hello`; `rlv mode off`; `say hello`; `say /77 @sendchat=y`; `rlv cmd @clear`; `rlv status`; `rlv mode on`; `say hello` | Refused; said; the lift is not read while off; `rlv cmd` refused naming `rlv mode on`; the status lists `Relay box <uuid>: sendchat` under `rlv: off`; once on, refused again | Pass |
+| 157 | Config of item 1 plus `scan_distance = 64`: `rlv cmd @sittp:20=n`; a login (see the result); then `rlv cmd @clear,sittp=n`; `stand`; `sit <seat>` | After the arrival `holding back the sit ... (the bot does not know how far the object is)`, and as soon as the scan has described the seat `no longer holding back ...` and `seated`; with the plain `sittp` the `sit` is refused with `(the object is 2.0 m away)` | Pass: held back and released within the same second. The teleport to `Home` that was to bring this about ended in `session lost: event queue reports no such session` 4 s after the bot started its teleport back, so the arrival was that of the next login. That loss was seen this once and not looked into; items 149 to 153 made the same teleport five times without `scan_distance` and without a loss |
+
+Not covered on this rig: a region restart that leaves the avatar in a hub
+(OpenSim's restart ends the session), teleport offers and requests under
+`tplure`, `accepttp`, `tprequest` and `accepttprequest`, script permission
+requests under `acceptpermission` and `denypermission`, clothing (no
+outfit service), a restriction set from a child prim of an attachment, the
+heads-up display and other avatars' attachments, and instant messages
+under `startim`. All of these are unit-tested. Nothing of this has been
+tried on Second Life.
+
 Not covered: Windows, where the socket is TCP. On Second Life, looking a
 name up through `AvatarPickerRequest` found nobody (2026-11-18, an avatar
 that had just messaged the bot); the capability is what viewers use there,
