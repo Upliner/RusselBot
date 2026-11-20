@@ -72,6 +72,63 @@ OpenSim seats an avatar on a prim from any distance in the region, so the
 "too far to sit" case cannot be produced on this rig; the repositioning
 teleport is exercised by deleting the prim instead (item 8).
 
+## XMPP server (Prosody)
+
+The XMPP gateway is tried against a local Prosody (tested with 13.0.7;
+Arch/Manjaro: `sudo pacman -S prosody`). `test-rig/setup.sh` writes its
+config to `test-rig/prosody/prosody.cfg.lua` (git-ignored) from
+`test-rig/config/prosody.cfg.lua.in` and registers two accounts on the
+virtual host `rig.test`, each with its name as password:
+
+| Account | Role |
+|---|---|
+| `owner@rig.test` | owner of the bot |
+| `stranger@rig.test` | anyone else |
+
+and the component `bot.rig.test` with the secret `rigsecret` on
+`127.0.0.1:5347`. Clients connect to `127.0.0.1:5222` without TLS. Start it
+in the foreground, as your own user:
+
+```sh
+prosody --config test-rig/prosody/prosody.cfg.lua -F
+```
+
+`prosodyctl --config test-rig/prosody/prosody.cfg.lua check config` must end
+with "All checks passed". (The full `check` also complains about DNS and
+certificates, which the rig has none of.)
+
+Prosody also offers STARTTLS, with a certificate for `rig.test` signed by
+a CA of the rig's own, `test-rig/prosody/certs/rig-ca.crt`, which
+`setup.sh` makes once. Desktop clients need it:
+
+- Gajim: add the account `owner@rig.test` (password `owner`), and under
+  the account's connection settings set the host `127.0.0.1`, port 5222.
+  It asks once whether to trust the certificate.
+- Dino insists on STARTTLS, accepts only certificates the system trusts and
+  has no field for the server's address. So `rig.test` has to resolve and
+  the CA has to be trusted, which takes root (undo with the same commands,
+  `trust anchor --remove` and deleting the line):
+
+  ```sh
+  echo '127.0.0.1 rig.test' | sudo tee -a /etc/hosts
+  sudo trust anchor test-rig/prosody/certs/rig-ca.crt
+  ```
+
+`test-rig/xmpp.py ACCOUNT [ACTION...]` is a minimal client for the
+checklists: it logs in, sends presence, carries out actions such as
+`msg:bot.rig.test:status` or `sub:bot.rig.test`, and prints every stanza it
+receives. Any desktop client works too, with the account and server
+`127.0.0.1`, port 5222, encryption off.
+
+The bot's config gets the table:
+
+```toml
+[xmpp]
+component = "bot.rig.test"
+secret = "rigsecret"
+owners = ["owner@rig.test"]
+```
+
 ## Failure-injection checklist
 
 Console commands are typed on the OpenSim console. The console command
@@ -507,6 +564,57 @@ outfit service), a restriction set from a child prim of an attachment, the
 heads-up display and other avatars' attachments, and instant messages
 under `startim`. All of these are unit-tested. Nothing of this has been
 tried on Second Life.
+
+## XMPP gateway
+
+Run on 2026-11-20 with the debug build, Prosody 13.0.7 as described in
+[XMPP server (Prosody)](#xmpp-server-prosody), the config of item 1 without
+`sit` plus `socket = true`, `log_chat`, `log_im`, a `RUSSELBOT_SOCK` of the
+run's own and the `[xmpp]` table given there. The owner's side is
+`test-rig/xmpp.py owner ...`, the stranger's `test-rig/xmpp.py stranger
+...`; `listen.py` answers the bot's IMs with `pong: <text>`, `talk.py`
+speaks as `Rig Owner` (address `rig.owner@bot.rig.test`).
+
+| # | Inject | Expected | Result (2026-11-20, OpenSim 9d00a55552, Prosody 13.0.7) |
+|---|---|---|---|
+| 165 | Prosody stopped; start the bot; start Prosody after about 40 s | the avatar logs in at once; `cannot connect` lines with `next attempt in` 5, 10, 20, 40 s; `component bot.rig.test connected` at the next attempt after Prosody is up | Pass: attempts at 03:30:46, :51, 03:31:01, :21; Prosody up at 03:31:28; connected at 03:32:01, the avatar in `Target` from 03:30:46 on |
+| 166 | Owner: `sub:bot.rig.test sub:local@bot.rig.test` | `subscribed` for both, then the domain available with status `Target` and `local@` available | Pass |
+| 167 | Owner: `msg:bot.rig.test:status` | one message from the domain with the text `rslbot ctl status` prints | Pass: `connected: yes`, `region: Target`, ... `mode: manual` |
+| 168 | `listen.py 40`; owner: `msg:rig.owner@bot.rig.test:hello from xmpp` | Rig Owner gets the IM; `im_out` in the log; the `pong` comes back from `rig.owner@bot.rig.test` with the nickname `Rig Owner` | Pass |
+| 169 | Owner to `local@bot.rig.test`: `hello everyone`, `/shout come here`, `/5 open` | said, shouted, and said on channel 5; the owner gets the bot's own lines from `local@` | Pass: `listen.py` heard say and shout; the two relays answered `heard on 5: open`, and all four lines came back from `local@` as `Sit Bot: hello everyone`, `Sit Bot shouts: come here`, `Relay: heard on 5: open`, `Relay box: heard on 5: open` |
+| 170 | Owner to `obj-<uuid>@bot.rig.test`: `hi` | an error `feature-not-implemented` with a text; nothing to the grid | Pass |
+| 171 | `talk.py` while the owner is online | `Rig Owner: hello from the rig`, `Rig Owner whispers: psst`, `Rig Owner shouts: HEY`, the line with a tab and a line break as it was, `are you there?` from `rig.owner@` with nickname, `Object: Script running` | Pass |
+| 172 | Stranger: `msg:jane.doe@bot.rig.test:hello`, `msg:bot.rig.test:quit`, `sub:bot.rig.test` | two `forbidden` errors, `unsubscribed`; log lines naming `stranger@rig.test/rig`; the bot keeps running | Pass |
+| 173 | Owner: `tp 128 128 25 Home`, then `tp 128 128 25 Target` | an answer to each when the teleport ends; the domain's status follows the region | Pass: `arrived in Home`, `arrived in Target`; during each teleport the domain shows away `not in a region` and `local@` offline for a moment, as the presence table has it for a bot between regions |
+| 174 | Stop Prosody; `talk.py`; start Prosody, the owner online | the six messages after reconnecting, in order, each with a delay stamp of the time it was heard | Pass: all six with stamps 03:34:01 to 03:34:05. Prosody was down 35 s, so the delay had grown to 40 s and the component came back 40 s after Prosody |
+| 175 | Prosody stopped and started again 7 s later | connected again within 10 s of Prosody accepting connections; the avatar stays online | Pass: Prosody up at 03:38:41, connected at 03:38:48 |
+| 176 | Owner: `msg:bot.rig.test:quit` | `ok`, then unavailable presence from both addresses; the bot logs out and exits 0 | Pass (before a fix the same day, the unavailable presence went out twice) |
+| 177 | Config with a wrong `secret` | `the server refused: not-authorized (...)` naming `bot.rig.test`, retried after 5 and 10 s; the secret nowhere in the log; `rslbot ctl status` answered | Pass |
+| 178 | Owner: `im "Rig Owner" see you later` and `help` to the domain | `sent to Rig Owner <uuid>` once the name is found; the command list | Pass |
+
+### Desktop clients
+
+Tried on 2026-11-20 with Gajim 2.6.0 and Dino 0.5.1, both logged in as
+`owner@rig.test` over STARTTLS at once, while the rig bot ran in `Target`
+and `listen.py` answered IMs as Rig Owner. The owner, by hand: presence of
+`bot.rig.test` and `local@`, `status`, `hi` to `rig.owner@bot.rig.test`,
+`hi` to `no.body@bot.rig.test`, `test` to `local@`, `tp 128 128 25 Home`.
+Then Prosody was stopped at 03:57:27, the bot sent Rig Owner two IMs
+whose pongs were recorded at 03:57:27 and 03:57:30, and Prosody was started
+again at 03:58:25; both clients were logged in again before the component
+reconnected at 03:58:41.
+
+| Client | What it showed |
+|---|---|
+| Gajim 2.6.0 | Everything as the specification describes, by the owner's account of it: presence, the answers, the nickname, the failed message, the delayed pongs |
+| Dino 0.5.1 | Received the messages. Could not send: Dino starts every new conversation with OMEMO on (its default encryption) and refuses to send to an address that publishes no OMEMO devices, which no address of the gateway does. Switching the conversation to "Unencrypted" with the lock icon in the message box is Dino's way round it. After that, by the owner's account and the bot's log: an IM to Rig Owner (in Cyrillic) went out and its pong came back with the nickname `Rig Owner`, a line in local chat was said, and `hi` to `no.body@bot.rig.test` showed as failed with the reason (`im refused: the grid knows no avatar named "no.body"` at 04:03:37) |
+| Conversations | Not tried (Android) |
+
+Not covered on this rig: a hypergrid visitor's address, an IM from a
+script, offline IMs (which the rig cannot produce), an avatar with a display name of its
+own, a server that stops reading (unit tests only), and more than 500
+messages waiting (unit tests only).
+
 
 Not covered: Windows, where the socket is TCP. On Second Life, looking a
 name up through `AvatarPickerRequest` found nobody (2026-11-18, an avatar

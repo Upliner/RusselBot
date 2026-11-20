@@ -42,6 +42,12 @@ pub struct Record {
     pub object_name: String,
     pub object_uuid: Option<Uuid>,
     pub text: String,
+    /// The avatar who sent it, or the recipient of one the bot sent; not
+    /// written to the logs.
+    pub avatar_uuid: Option<Uuid>,
+    /// It was stored while the avatar was offline, and `time` is when it
+    /// was sent.
+    pub offline: bool,
 }
 
 struct Entry {
@@ -142,6 +148,11 @@ impl Recorder {
     fn record(&self, entry: Entry, now: Instant) -> Record {
         let names = entry.needs.and_then(|id| self.cached(id, now).cloned().flatten());
         let (legacy, display) = names.map(|n| (n.legacy, n.display)).unwrap_or_default();
+        let avatar_uuid = match &entry.message.source {
+            Source::Avatar { id, .. } if !id.is_nil() => Some(*id),
+            _ => None,
+        };
+        let offline = entry.message.sent_at.is_some();
         let (avatar_name, object_name, object_uuid) = match entry.message.source {
             // The simulator names the speaker itself; the recipient of an
             // IM sent by UUID is known by the looked-up name only.
@@ -158,6 +169,8 @@ impl Recorder {
             object_name,
             object_uuid,
             text: entry.message.text,
+            avatar_uuid,
+            offline,
         }
     }
 
@@ -352,6 +365,16 @@ mod tests {
             object_name: String::new(),
             object_uuid: None,
             text: text.into(),
+            avatar_uuid: None,
+            offline: false,
+        }
+    }
+
+    /// `record` as the avatar `by` sent it (or was sent it).
+    fn by(by: u8, record: Record) -> Record {
+        Record {
+            avatar_uuid: Some(id(by)),
+            ..record
         }
     }
 
@@ -428,7 +451,7 @@ mod tests {
         assert_eq!(rec.next_deadline(), Some(now + NAME_WAIT));
 
         rec.names_resolved(vec![(id(1), jane())], vec![], now);
-        assert_eq!(rec.flush(now), [record("Jane Doe", "JD", "hello")]);
+        assert_eq!(rec.flush(now), [by(1, record("Jane Doe", "JD", "hello"))]);
         assert_eq!(rec.next_deadline(), None);
     }
 
@@ -463,7 +486,7 @@ mod tests {
         assert_eq!(rec.take_lookups(), [id(1)]);
         rec.names_resolved(vec![(id(1), jane())], vec![], now);
         let records = rec.flush(now);
-        assert_eq!(records, [im_record("im_out", "Jane Doe", "JD", "are you there?")]);
+        assert_eq!(records, [by(1, im_record("im_out", "Jane Doe", "JD", "are you there?"))]);
         assert_eq!(records[0].row(), "2026-11-18T17:04:23Z\tim_out\tJane Doe\tJD\t\t\tare you there?\n");
         assert_eq!(records[0].log_line(), "im [im_out] Jane Doe (JD): are you there?");
     }
@@ -475,14 +498,14 @@ mod tests {
         rec.push(Channel::Im, sent(1, "", "hello"), T0, now);
         assert_eq!(rec.take_lookups(), [id(1)]);
         rec.names_resolved(vec![(id(1), jane())], vec![], now);
-        assert_eq!(rec.flush(now), [im_record("im_out", "Jane Doe", "JD", "hello")]);
+        assert_eq!(rec.flush(now), [by(1, im_record("im_out", "Jane Doe", "JD", "hello"))]);
 
         // A recipient the grid cannot name still gets its row.
         rec.push(Channel::Im, sent(2, "", "anyone?"), T0, now);
         assert_eq!(rec.take_lookups(), [id(2)]);
         assert_eq!(rec.flush(now + NAME_WAIT - Duration::from_millis(1)), []);
         let records = rec.flush(now + NAME_WAIT);
-        assert_eq!(records, [im_record("im_out", "", "", "anyone?")]);
+        assert_eq!(records, [by(2, im_record("im_out", "", "", "anyone?"))]);
         assert_eq!(records[0].row(), "2026-11-18T17:04:23Z\tim_out\t\t\t\t\tanyone?\n");
     }
 
@@ -499,10 +522,10 @@ mod tests {
         assert_eq!(rec.take_lookups(), [id(1)], "one lookup serves both");
         rec.names_resolved(vec![(id(1), jane())], vec![], now);
         let expected = [
-            im_record("im_out", "Jane Doe", "JD", "are you there?"),
+            by(1, im_record("im_out", "Jane Doe", "JD", "are you there?")),
             Record {
                 time: T0 + 2,
-                ..im_record("im", "Jane Doe", "JD", "yes")
+                ..by(1, im_record("im", "Jane Doe", "JD", "yes"))
             },
         ];
         assert_eq!(rec.flush(now), expected);
@@ -540,7 +563,7 @@ mod tests {
         rec.push(Channel::Chat, said(1, "Jane Doe", "hello"), T0, now);
         // No lookup service is known, so nothing is even handed out.
         assert_eq!(rec.flush(now + NAME_WAIT - Duration::from_millis(1)), []);
-        assert_eq!(rec.flush(now + NAME_WAIT), [record("Jane Doe", "", "hello")]);
+        assert_eq!(rec.flush(now + NAME_WAIT), [by(1, record("Jane Doe", "", "hello"))]);
     }
 
     #[test]
@@ -550,7 +573,7 @@ mod tests {
         rec.push(Channel::Chat, said(1, "Jane Doe", "hello"), T0, now);
         let ids = rec.take_lookups();
         rec.lookup_failed(&ids);
-        assert_eq!(rec.flush(now), [record("Jane Doe", "", "hello")]);
+        assert_eq!(rec.flush(now), [by(1, record("Jane Doe", "", "hello"))]);
 
         rec.push(Channel::Chat, said(1, "Jane Doe", "again"), T0, now);
         assert_eq!(rec.take_lookups(), [id(1)]);
@@ -565,7 +588,7 @@ mod tests {
         let later = now + CACHE_LIFETIME - Duration::from_secs(1);
         rec.push(Channel::Chat, said(1, "Jane Doe", "hello"), T0, later);
         assert!(!rec.has_lookups());
-        assert_eq!(rec.flush(later), [record("Jane Doe", "JD", "hello")]);
+        assert_eq!(rec.flush(later), [by(1, record("Jane Doe", "JD", "hello"))]);
 
         let expired = now + CACHE_LIFETIME;
         rec.push(Channel::Chat, said(1, "Jane Doe", "hello"), T0, expired);
@@ -633,13 +656,41 @@ mod tests {
     }
 
     #[test]
+    fn records_carry_the_avatars_uuid_but_not_in_the_logs() {
+        let now = Instant::now();
+        let mut rec = Recorder::default();
+        rec.names_resolved(vec![(id(1), jane())], vec![(id(9))], now);
+        let im = Message {
+            kind: "im".into(),
+            ..said(1, "Jane Doe", "hi")
+        };
+        rec.push(Channel::Im, im, T0, now);
+        rec.push(Channel::Im, sent(1, "Jane Doe", "hello"), T0, now);
+        let object_im = Message {
+            kind: "object".into(),
+            ..object_said(9, "locked")
+        };
+        rec.push(Channel::Im, object_im, T0, now);
+        let records = rec.flush(now);
+        assert_eq!(
+            records.iter().map(|r| r.avatar_uuid).collect::<Vec<_>>(),
+            [Some(id(1)), Some(id(1)), None]
+        );
+        assert_eq!(records[0].row(), "2026-11-18T17:04:23Z\tim\tJane Doe\tJD\t\t\thi\n");
+        assert_eq!(records[0].log_line(), "im [im] Jane Doe (JD): hi");
+        assert!(records.iter().all(|r| !r.offline));
+    }
+
+    #[test]
     fn stored_messages_keep_the_time_they_were_sent() {
         let now = Instant::now();
         let mut rec = Recorder::default();
         let mut message = said(1, "Jane Doe", "earlier");
         message.sent_at = Some(1_700_000_000);
         rec.push(Channel::Im, message, T0, now);
-        assert_eq!(rec.flush_all(now)[0].time, 1_700_000_000);
+        let record = &rec.flush_all(now)[0];
+        assert_eq!(record.time, 1_700_000_000);
+        assert!(record.offline);
     }
 
     #[test]
@@ -652,7 +703,7 @@ mod tests {
         assert_eq!(rec.flush(now), []);
         assert_eq!(
             rec.flush_all(now),
-            [record("John Roe", "", "first"), record("Jane Doe", "JD", "second")]
+            [by(1, record("John Roe", "", "first")), by(2, record("Jane Doe", "JD", "second"))]
         );
         assert_eq!(rec.flush_all(now), []);
     }

@@ -8,3 +8,4 @@
 /sla.toml
 *.tsv
 *.log
+/test-rig/prosody/

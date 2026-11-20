@@ -24,6 +24,7 @@ mod udp {
     pub mod packet;
 }
 mod xml;
+mod xmpp;
 
 use commands::{Commands, Grid, SentIm};
 use config::{Config, Persist, PersistOverride, Place, RlvPersist, Sit, Source};
@@ -213,9 +214,14 @@ struct Bot {
     /// stand likewise: what it is and why, as the log has it.
     held_step: Option<(String, String)>,
     held_stand: Option<String>,
+    /// The XMPP gateway, when the config has one.
+    xmpp: Option<xmpp::gateway::Gateway>,
     /// Stands in for a session's view of the world, which tests have none of.
     #[cfg(test)]
     world: Option<Box<dyn World>>,
+    /// Stands in for the session where commands use the grid, in tests.
+    #[cfg(test)]
+    grid: Option<commands::tests::FakeGrid>,
 }
 
 /// The way to the avatar's inventory: the worker, and what the login and
@@ -442,6 +448,10 @@ impl Bot {
             held_stand: None,
             #[cfg(test)]
             world: None,
+            #[cfg(test)]
+            grid: None,
+            // Before the first login, which may take a while.
+            xmpp: config.xmpp.as_ref().map(|xmpp| xmpp::gateway::Gateway::start(xmpp, events.clone())),
             reconciler: Reconciler::new(goal(book.held(), config_start(&config))),
             book,
             startup: Some(config.persist),
@@ -580,6 +590,14 @@ impl Bot {
 
     /// The grid answered an avatar search: the commands waiting for it go on.
     fn avatars_found(&mut self, query: Uuid, avatars: &[(Uuid, String)], now: Instant) {
+        #[cfg(test)]
+        if let Some(grid) = self.grid.as_mut() {
+            for sent in self.commands.avatars_found(query, avatars, Some(grid), now) {
+                self.record_sent(sent, now);
+            }
+            self.follow_commands();
+            return;
+        }
         let mut live = live(
             &mut self.session,
             &self.search_url,
@@ -878,6 +896,14 @@ impl Bot {
                 } else {
                     commands::Origin::Operator
                 };
+                #[cfg(test)]
+                if let Some(grid) = self.grid.as_mut() {
+                    if let Some(sent) = self.commands.handle_from(origin, request, reply, Some(grid), now) {
+                        self.record_sent(sent, now);
+                    }
+                    self.follow_commands();
+                    return Flow::Continue;
+                }
                 let mut live = live(
                     &mut self.session,
                     &self.search_url,
@@ -1133,8 +1159,12 @@ impl Bot {
                 self.names_failed(&unanswered, Instant::now());
             }
         }
-        for record in self.recorder.flush(Instant::now()) {
+        let now = Instant::now();
+        for record in self.recorder.flush(now) {
             self.logs.write(&record);
+            if let Some(xmpp) = &mut self.xmpp {
+                xmpp.record(&record, now);
+            }
         }
     }
 
@@ -1167,8 +1197,53 @@ impl Bot {
 
     /// Writes every message still waiting for names; for use on the way out.
     fn flush_messages(&mut self) {
-        for record in self.recorder.flush_all(Instant::now()) {
+        let now = Instant::now();
+        for record in self.recorder.flush_all(now) {
             self.logs.write(&record);
+            if let Some(xmpp) = &mut self.xmpp {
+                xmpp.record(&record, now);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------- XMPP
+
+    /// The presence of the gateway's addresses for the bot's state now.
+    fn xmpp_wanted(&self) -> xmpp::presence::Presence {
+        let region = self.session.as_ref().and_then(|session| session.region());
+        xmpp::presence::presence(region, self.stopping)
+    }
+
+    /// Sends the owners what changed of the gateway's presence.
+    fn xmpp_presence(&mut self) {
+        let wanted = self.xmpp_wanted();
+        if let Some(xmpp) = &mut self.xmpp {
+            xmpp.update_presence(&wanted);
+        }
+    }
+
+    /// Something from the component connection; an owner's request is
+    /// carried out as the control socket's are.
+    fn xmpp_event(&mut self, event: xmpp::conn::XmppEvent, now: Instant) -> Flow {
+        let wanted = self.xmpp_wanted();
+        let Some(xmpp) = &mut self.xmpp else {
+            return Flow::Continue;
+        };
+        let Some(command) = xmpp.handle(event, &wanted) else {
+            return Flow::Continue;
+        };
+        let xmpp::gateway::Command { request, reply, waiting } = command;
+        let flow = self.control(request, reply, now);
+        if let Some(xmpp) = &mut self.xmpp {
+            xmpp.waited(waiting);
+        }
+        flow
+    }
+
+    /// The bot is done: the gateway's addresses go offline.
+    fn xmpp_stop(&mut self) {
+        if let Some(xmpp) = &mut self.xmpp {
+            xmpp.stop();
         }
     }
 
@@ -1595,6 +1670,7 @@ impl Bot {
         match (event, &mut self.session) {
             (Event::Signal, _) => return self.stop(),
             (Event::Control { request, reply }, _) => return self.control(request, reply, now),
+            (Event::Xmpp(event), _) => return self.xmpp_event(event, now),
             (Event::AvatarsFound { query, avatars }, _) => self.avatars_found(query, &avatars, now),
             (Event::AvatarSearchFailed { query, reason }, _) => self.commands.lookup_failed(query, &reason),
             (Event::Datagram { generation, data }, Some(session)) => session.handle_datagram(generation, &data, now),
@@ -1802,6 +1878,7 @@ fn run_bot(config_path: &Path) -> i32 {
     let mut bot = Bot::new(config, logs, events);
     let code = run_loop(&mut bot, &incoming);
     bot.flush_messages();
+    bot.xmpp_stop();
     code
 }
 
@@ -1814,6 +1891,7 @@ fn run_loop(bot: &mut Bot, incoming: &Receiver<Event>) -> i32 {
         bot.decide_requests(Instant::now());
         bot.restore_attachments(Instant::now());
         bot.service_messages();
+        bot.xmpp_presence();
         let mut wake = Instant::now() + IDLE_WAIT;
         if !bot.stopping {
             match bot.reconcile() {
@@ -3176,5 +3254,470 @@ mod tests {
         assert!(grid.calls.contains(&commands::tests::Call::Grant(ball, script, 0x10)));
         assert_eq!(grid.jobs.len(), 1, "the folder for the notecard is being looked for");
         assert!(!bot.reconciler.is_manual());
+    }
+
+    // ------------------------------------------------------------- XMPP
+
+    mod gateway {
+        use super::*;
+        use crate::xmpp::conn::tests::{Fake, SECRET};
+        use crate::xmpp::stanza::escape_text;
+        use commands::tests::{Call, FakeGrid};
+
+        const OWNER: &str = "owner@rig.test";
+        const DOMAIN: &str = "bot.rig.test";
+
+        fn jane() -> Uuid {
+            Uuid::from_bytes([0x1a; 16])
+        }
+
+        fn collar() -> Uuid {
+            Uuid::from_bytes([0xc0; 16])
+        }
+
+        fn janes_names() -> (Uuid, names::Names) {
+            let names = names::Names {
+                legacy: "Jane Doe".into(),
+                display: "Janey".into(),
+            };
+            (jane(), names)
+        }
+
+        /// A bot with a gateway whose server is `fake`, and on a simulator
+        /// that takes everything when `grid`.
+        struct Rig {
+            bot: Bot,
+            incoming: Receiver<Event>,
+            fake: Fake,
+        }
+
+        impl Rig {
+            fn new(grid: bool) -> Rig {
+                let fake = Fake::new();
+                let config = full(&format!(
+                    "[xmpp]\ncomponent = \"{DOMAIN}\"\nserver = \"{}\"\nsecret = \"{SECRET}\"\nowners = [\"{OWNER}\"]\n",
+                    fake.address()
+                ));
+                let (events, incoming) = mpsc::channel();
+                let mut bot = Bot::new(config, Logs::open(None, None).ok().unwrap(), events);
+                if grid {
+                    bot.grid = Some(FakeGrid::default());
+                }
+                Rig { bot, incoming, fake }
+            }
+
+            fn connected(grid: bool) -> Rig {
+                let mut rig = Rig::new(grid);
+                rig.connect();
+                rig.fake.expect(&format!("from='local@{DOMAIN}' to='{OWNER}'/>"));
+                rig
+            }
+
+            fn connect(&mut self) {
+                self.fake.accept();
+                assert!(matches!(self.next(), Flow::Continue));
+            }
+
+            /// Handles the next event, as the main loop does.
+            fn next(&mut self) -> Flow {
+                let event = self.incoming.recv_timeout(Duration::from_secs(5)).expect("an event");
+                let flow = self.bot.handle(event);
+                self.bot.service_messages();
+                self.bot.xmpp_presence();
+                flow
+            }
+
+            fn from(&mut self, from: &str, to: &str, body: &str) -> Flow {
+                self.fake.send(&format!(
+                    "<message type='chat' from='{from}' to='{to}' id='m1'><body>{}</body></message>",
+                    escape_text(body)
+                ));
+                self.next()
+            }
+
+            fn from_owner(&mut self, to: &str, body: &str) -> Flow {
+                self.from(&format!("{OWNER}/phone"), to, body)
+            }
+
+            fn calls(&mut self) -> Vec<Call> {
+                std::mem::take(&mut self.bot.grid.as_mut().unwrap().calls)
+            }
+
+            /// The name lookup the last command started.
+            fn lookup(&mut self) -> Uuid {
+                match &self.calls()[..] {
+                    [Call::Find(query, _)] => *query,
+                    other => panic!("expected a lookup, got {other:?}"),
+                }
+            }
+
+            /// Records a message whose names are known, as the session
+            /// hands it over.
+            fn heard(&mut self, channel: Channel, message: session::Message, names: Vec<(Uuid, names::Names)>) {
+                let now = Instant::now();
+                self.bot.names_resolved(names, vec![], now);
+                self.bot.record(channel, message, now);
+                self.bot.service_messages();
+            }
+
+            fn quiet(&mut self) -> String {
+                self.fake.rest(Duration::from_millis(150))
+            }
+        }
+
+        fn message(kind: &str, source: session::Source, text: &str) -> session::Message {
+            session::Message {
+                kind: kind.into(),
+                source,
+                sent_at: None,
+                text: text.into(),
+            }
+        }
+
+        fn from_jane(kind: &str, text: &str) -> session::Message {
+            message(
+                kind,
+                session::Source::Avatar {
+                    id: jane(),
+                    name: "Jane Doe".into(),
+                },
+                text,
+            )
+        }
+
+        #[test]
+        fn on_connect_presence_comes_first_then_what_waited_then_live_messages() {
+            let mut rig = Rig::new(false);
+            // Recorded before the server accepted the component.
+            rig.heard(Channel::Chat, from_jane("say", "early"), vec![janes_names()]);
+            rig.connect();
+            rig.heard(Channel::Chat, from_jane("say", "live"), vec![janes_names()]);
+            let written = rig.fake.expect("<body>Janey (Jane Doe): live</body></message>");
+            let domain = written.find(&format!(
+                "<presence from='{DOMAIN}' to='{OWNER}'><show>away</show><status>not in a region</status></presence>"
+            ));
+            let local = written.find(&format!("<presence type='unavailable' from='local@{DOMAIN}' to='{OWNER}'/>"));
+            let early = written.find("<body>Janey (Jane Doe): early</body><delay xmlns='urn:xmpp:delay'");
+            let live = written.find(&format!(
+                "<message type='chat' from='local@{DOMAIN}' to='{OWNER}'><body>Janey (Jane Doe): live</body></message>"
+            ));
+            assert!(
+                domain.is_some() && local.is_some() && early.is_some() && live.is_some(),
+                "{written}"
+            );
+            assert!(domain < local && local < early && early < live, "{written}");
+        }
+
+        #[test]
+        fn strangers_are_refused_and_discovery_and_ping_answer_anyone() {
+            let mut rig = Rig::connected(true);
+            let stranger = "someone@elsewhere.org/x";
+            assert!(matches!(rig.from(stranger, &format!("jane.doe@{DOMAIN}"), "hello"), Flow::Continue));
+            let error = rig.fake.expect("</message>");
+            assert!(
+                error.contains("type='error'") && error.contains("<forbidden ") && error.contains(&format!("to='{stranger}'")),
+                "{error}"
+            );
+            assert!(matches!(rig.from(stranger, DOMAIN, "quit"), Flow::Continue));
+            assert!(rig.fake.expect("</message>").contains("<forbidden "));
+            assert!(!rig.bot.stopping);
+            assert_eq!(rig.calls(), []);
+
+            rig.fake
+                .send(&format!("<presence type='subscribe' from='someone@elsewhere.org' to='{DOMAIN}'/>"));
+            rig.next();
+            assert_eq!(
+                rig.fake.expect("/>"),
+                format!("<presence type='unsubscribed' from='{DOMAIN}' to='someone@elsewhere.org'/>")
+            );
+
+            rig.fake.send(&format!(
+                "<iq type='get' id='d1' from='{stranger}' to='{DOMAIN}'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>"
+            ));
+            rig.next();
+            let disco = rig.fake.expect("</iq>");
+            assert!(
+                disco.contains("type='result'") && disco.contains("category='gateway'") && disco.contains("urn:xmpp:ping"),
+                "{disco}"
+            );
+            rig.fake.send(&format!(
+                "<iq type='get' id='p1' from='{stranger}' to='local@{DOMAIN}'><ping xmlns='urn:xmpp:ping'/></iq>"
+            ));
+            rig.next();
+            assert_eq!(
+                rig.fake.expect("/>"),
+                format!("<iq type='result' from='local@{DOMAIN}' to='{stranger}' id='p1'/>")
+            );
+            rig.fake.send(&format!(
+                "<iq type='get' id='v1' from='{OWNER}/phone' to='jane.doe@{DOMAIN}'><vCard xmlns='vcard-temp'/></iq>"
+            ));
+            rig.next();
+            assert!(rig.fake.expect("</iq>").contains("<service-unavailable "));
+            // Error stanzas are never answered.
+            rig.fake.send(&format!(
+                "<message type='error' from='{stranger}' to='{DOMAIN}'><error type='cancel'/></message>"
+            ));
+            rig.next();
+            assert_eq!(rig.quiet(), "");
+        }
+
+        /// The body of the next message from the control contact.
+        fn answer(rig: &mut Rig) -> String {
+            let message = rig.fake.expect("</message>");
+            assert!(
+                message.starts_with(&format!("<message type='chat' from='{DOMAIN}' to='{OWNER}/phone'>")),
+                "{message}"
+            );
+            let body = message.split_once("<body>").unwrap().1.split_once("</body>").unwrap().0;
+            body.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+        }
+
+        #[test]
+        fn commands_are_answered_as_the_control_socket_answers_them() {
+            let mut rig = Rig::connected(false);
+            rig.from_owner(DOMAIN, "status");
+            assert_eq!(answer(&mut rig), rig.bot.status());
+            rig.from_owner(DOMAIN, "sit ground");
+            let reason = refused(&mut rig.bot, "sit\tground");
+            assert_eq!(answer(&mut rig), format!("error: {reason}"));
+            rig.from_owner(DOMAIN, "im \"Jane Doe hi");
+            let unclosed = answer(&mut rig);
+            assert!(unclosed.starts_with("error: ") && unclosed.contains("quote"), "{unclosed}");
+            rig.from_owner(DOMAIN, "dance");
+            assert!(answer(&mut rig).starts_with("error: "));
+            rig.from_owner(DOMAIN, "");
+            assert!(answer(&mut rig).contains("help"));
+            rig.from_owner(DOMAIN, "help");
+            assert!(answer(&mut rig).contains("\nim AVATAR MESSAGE...\n"));
+            rig.from_owner(DOMAIN, &"x".repeat(8193));
+            assert!(answer(&mut rig).contains("8192"));
+        }
+
+        #[test]
+        fn owners_messages_become_commands_ims_and_chat() {
+            let mut rig = Rig::connected(true);
+            // Name with a space: the answer comes once the name is found.
+            rig.from_owner(DOMAIN, "im \"Jane Doe\" see you later");
+            let query = rig.lookup();
+            rig.bot.avatars_found(query, &[(jane(), "Jane Doe".into())], Instant::now());
+            assert_eq!(rig.calls(), [Call::Im(jane(), "see you later".into())]);
+            rig.next();
+            assert_eq!(answer(&mut rig), format!("sent to Jane Doe <{}>", jane()));
+            // The sent IM is recorded, and not passed to the owners.
+            rig.bot.names_resolved(vec![janes_names()], vec![], Instant::now());
+            rig.bot.service_messages();
+            assert_eq!(rig.quiet(), "");
+
+            // Reply to an avatar: the address stands for the UUID now.
+            rig.from_owner(&format!("jane.doe@{DOMAIN}"), "see you");
+            assert_eq!(rig.calls(), [Call::Im(jane(), "see you".into())]);
+            assert_eq!(rig.quiet(), "");
+
+            // Unknown name.
+            rig.from_owner(&format!("no.body@{DOMAIN}"), "hi");
+            let query = rig.lookup();
+            rig.bot.avatars_found(query, &[], Instant::now());
+            rig.next();
+            let error = rig.fake.expect("</message>");
+            assert!(
+                error.contains("type='error'") && error.contains("<item-not-found ") && error.contains("no.body"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("from='no.body@{DOMAIN}' to='{OWNER}/phone' id='m1'")),
+                "{error}"
+            );
+            assert_eq!(rig.calls(), []);
+
+            // Reply to an object.
+            rig.from_owner(&format!("obj-{}@{DOMAIN}", collar()), "hi");
+            assert!(rig.fake.expect("</message>").contains("<feature-not-implemented "));
+            assert_eq!(rig.calls(), []);
+
+            // Typing notification.
+            rig.fake.send(&format!(
+                "<message type='chat' from='{OWNER}/phone' to='jane.doe@{DOMAIN}'><composing xmlns='http://jabber.org/protocol/chatstates'/></message>"
+            ));
+            rig.next();
+            assert_eq!(rig.calls(), []);
+            assert_eq!(rig.quiet(), "");
+
+            // Owner speaks in local chat, with the chat-bar forms.
+            rig.from_owner(&format!("local@{DOMAIN}"), "hello everyone");
+            rig.from_owner(&format!("local@{DOMAIN}"), "/shout come here");
+            rig.from_owner(&format!("local@{DOMAIN}"), "/7 open");
+            assert_eq!(
+                rig.calls(),
+                [
+                    Call::Say(0, 1, "hello everyone".into()),
+                    Call::Say(0, 2, "come here".into()),
+                    Call::Say(7, 1, "open".into())
+                ]
+            );
+            assert_eq!(rig.quiet(), "");
+
+            // Too long.
+            rig.from_owner(&format!("local@{DOMAIN}"), &"x".repeat(2000));
+            assert!(rig.fake.expect("</message>").contains("<not-acceptable "));
+            assert_eq!(rig.calls(), []);
+        }
+
+        #[test]
+        fn a_teleport_does_not_hold_back_other_contacts() {
+            let mut rig = Rig::connected(true);
+            rig.bot.names_resolved(vec![janes_names()], vec![], Instant::now());
+            rig.heard(Channel::Im, from_jane("im", "hello"), vec![janes_names()]);
+            rig.fake.expect("</message>");
+            rig.from_owner(DOMAIN, "tp 128 128 25 Home");
+            assert!(matches!(&rig.calls()[..], [Call::Teleport(region, _)] if region == "Home"));
+            rig.from_owner(&format!("jane.doe@{DOMAIN}"), "hi");
+            assert_eq!(rig.calls(), [Call::Im(jane(), "hi".into())]);
+            assert_eq!(rig.quiet(), "", "no answer to the teleport yet");
+            rig.bot.commands.arrived("Home");
+            rig.next();
+            assert!(answer(&mut rig).contains("Home"));
+        }
+
+        #[test]
+        fn a_seventeenth_waiting_command_is_answered_as_busy() {
+            let mut rig = Rig::connected(true);
+            for n in 0..16 {
+                rig.from_owner(DOMAIN, &format!("im \"Name{n} Doe\" hi"));
+                rig.lookup();
+            }
+            assert_eq!(rig.bot.xmpp.as_ref().unwrap().waiting(), 16);
+            rig.from_owner(DOMAIN, "im \"Name16 Doe\" hi");
+            assert!(answer(&mut rig).starts_with("error: the bot is busy"));
+            assert_eq!(rig.calls(), []);
+        }
+
+        #[test]
+        fn instant_messages_and_chat_reach_the_owners() {
+            let mut rig = Rig::connected(true);
+            // IM from an avatar, with its display name as nickname.
+            rig.heard(Channel::Im, from_jane("im", "hello"), vec![janes_names()]);
+            assert_eq!(
+                rig.fake.expect("</message>"),
+                format!(
+                    "<message type='chat' from='jane.doe@{DOMAIN}' to='{OWNER}'><body>hello</body>\
+                     <nick xmlns='http://jabber.org/protocol/nick'>Janey</nick></message>"
+                )
+            );
+            // IM from an object.
+            let object = session::Source::Object {
+                id: Some(collar()),
+                name: "Collar".into(),
+                owner: jane(),
+            };
+            rig.heard(Channel::Im, message("object", object, "locked"), vec![janes_names()]);
+            let im = rig.fake.expect("</message>");
+            assert!(
+                im.starts_with(&format!("<message type='chat' from='obj-{}@{DOMAIN}'", collar())),
+                "{im}"
+            );
+            assert!(im.contains("<body>locked</body>") && im.contains(">Collar</nick>"), "{im}");
+            // Offline IM, with the time it was sent.
+            let mut stored = from_jane("im", "while you were out");
+            stored.sent_at = Some(1_795_021_463);
+            rig.heard(Channel::Im, stored, vec![janes_names()]);
+            assert!(rig.fake.expect("</message>").contains("stamp='2026-11-18T17:04:23Z'"));
+            // From the grid itself: the control contact.
+            let grid = session::Source::System {
+                name: "Second Life".into(),
+            };
+            rig.heard(Channel::Im, message("im", grid, "maintenance"), vec![]);
+            assert!(rig
+                .fake
+                .expect("</message>")
+                .contains(&format!("from='{DOMAIN}' to='{OWNER}'><body>Second Life: maintenance</body>")));
+
+            // Chat heard, shout and emote, an object to its owner.
+            rig.heard(Channel::Chat, from_jane("say", "hi all"), vec![janes_names()]);
+            assert!(rig
+                .fake
+                .expect("</message>")
+                .contains(&format!("from='local@{DOMAIN}' to='{OWNER}'><body>Janey (Jane Doe): hi all</body>")));
+            let bob = Uuid::from_bytes([0xb0; 16]);
+            let bobs = names::Names {
+                legacy: "bob Resident".into(),
+                display: String::new(),
+            };
+            let by_bob = |kind: &str, text: &str| {
+                message(
+                    kind,
+                    session::Source::Avatar {
+                        id: bob,
+                        name: "bob Resident".into(),
+                    },
+                    text,
+                )
+            };
+            rig.heard(Channel::Chat, by_bob("shout", "HEY"), vec![(bob, bobs.clone())]);
+            rig.heard(Channel::Chat, by_bob("say", "/me waves"), vec![(bob, bobs)]);
+            assert!(rig.fake.expect("</message>").contains("<body>bob Resident shouts: HEY</body>"));
+            assert!(rig.fake.expect("</message>").contains("<body>bob Resident waves</body>"));
+            let owner_say = message(
+                "owner",
+                session::Source::Object {
+                    id: Some(collar()),
+                    name: "Collar".into(),
+                    owner: jane(),
+                },
+                "ready",
+            );
+            rig.heard(Channel::Chat, owner_say, vec![janes_names()]);
+            assert!(rig.fake.expect("</message>").contains("<body>Collar [owner]: ready</body>"));
+
+            // An IM sent through the control socket is not passed on.
+            ok(&mut rig.bot, &format!("im\t{}\thi", jane()));
+            rig.bot.names_resolved(vec![janes_names()], vec![], Instant::now());
+            rig.bot.service_messages();
+            assert_eq!(rig.quiet(), "");
+            rig.calls();
+
+            // Message that looks like a command, with the gateway on.
+            rig.heard(Channel::Im, from_jane("im", "say hello"), vec![janes_names()]);
+            assert!(rig
+                .fake
+                .expect("</message>")
+                .contains(&format!("from='jane.doe@{DOMAIN}' to='{OWNER}'><body>say hello</body>")));
+            assert_eq!(rig.calls(), []);
+        }
+
+        #[test]
+        fn bot_stopped() {
+            let mut rig = Rig::connected(false);
+            rig.bot.flush_messages();
+            rig.bot.xmpp_stop();
+            let written = rig.fake.expect("</stream:stream>");
+            assert_eq!(
+                written,
+                format!(
+                    "<presence type='unavailable' from='{DOMAIN}' to='{OWNER}'/>\
+                     <presence type='unavailable' from='local@{DOMAIN}' to='{OWNER}'/></stream:stream>"
+                )
+            );
+        }
+
+        #[test]
+        fn quit_is_answered_before_the_addresses_go_offline() {
+            let mut rig = Rig::connected(false);
+            assert!(matches!(rig.from_owner(DOMAIN, "quit"), Flow::Exit(EXIT_OK)));
+            // As the main loop would before it ends.
+            rig.bot.xmpp_presence();
+            rig.bot.flush_messages();
+            rig.bot.xmpp_stop();
+            let written = rig.fake.expect("</stream:stream>");
+            let ok = written.find("<body>ok</body>").expect("ok");
+            let offline = written.find("type='unavailable'").expect("offline");
+            assert!(ok < offline, "{written}");
+            // Not again on the way out (`local@` was offline already).
+            assert_eq!(written.matches("type='unavailable'").count(), 1, "{written}");
+        }
+
+        #[test]
+        fn no_xmpp_table_no_gateway() {
+            assert!(bot(full("")).xmpp.is_none());
+        }
     }
 }

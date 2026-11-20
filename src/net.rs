@@ -59,6 +59,8 @@ pub enum Event {
         request: Request,
         reply: Sender<Response>,
     },
+    /// What the XMPP component connection reports.
+    Xmpp(crate::xmpp::conn::XmppEvent),
     /// The operator asked the bot to stop.
     Signal,
 }

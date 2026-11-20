@@ -139,3 +139,21 @@ sit = "00000000-0000-0000-0000-000000000000"
 #
 # [perms.except]
 # anim = ["01234567-9abc-defe-dcba-987654321000"]
+
+# The XMPP (Jabber) gateway: the bot connects to an XMPP server on this host
+# as an external component and owns the domain `component` there. The
+# owners' XMPP accounts then see every avatar the bot exchanges instant
+# messages with as a contact (jane.doe@russel.sl.example.org), local chat as
+# the contact local@russel.sl.example.org, and send commands, as
+# `rslbot ctl` takes them, to russel.sl.example.org itself. Everyone else is
+# refused. The server needs the component in its config; for Prosody:
+#   component_interfaces = { "127.0.0.1" }
+#   Component "russel.sl.example.org"
+#       component_secret = "..."
+# `server` is the server's component port (default 127.0.0.1:5347). The
+# connection is not encrypted, so it must stay on this host. A table too.
+# [xmpp]
+# component = "russel.sl.example.org"
+# server = "127.0.0.1:5347"
+# secret = "the component_secret of the server"
+# owners = ["me@example.org"]

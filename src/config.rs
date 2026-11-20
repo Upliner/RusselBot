@@ -121,6 +121,44 @@ pub struct Config {
     pub persist_override: PersistOverride,
     /// Which requests the bot accepts by itself when it starts.
     pub perms: Rules,
+    /// The XMPP gateway, when the config has an `[xmpp]` table.
+    pub xmpp: Option<XmppConfig>,
+}
+
+/// The default address of the XMPP server's component port.
+pub const DEFAULT_XMPP_SERVER: &str = "127.0.0.1:5347";
+
+/// A secret that never shows in debug output.
+#[derive(Clone, PartialEq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(text: impl Into<String>) -> Secret {
+        Secret(text.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("***")
+    }
+}
+
+/// The `[xmpp]` table: the bot as an external component of an XMPP server
+/// on this host.
+#[derive(Debug, Clone, PartialEq)]
+pub struct XmppConfig {
+    /// The component's domain, in lower case.
+    pub component: String,
+    /// `host:port` of the server's component port, on this host.
+    pub server: String,
+    pub secret: Secret,
+    /// Bare addresses in lower case, each once.
+    pub owners: Vec<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -155,6 +193,7 @@ struct Raw {
     restore_attachments: Option<toml::Value>,
     rlv: Option<toml::Value>,
     perms: Option<toml::Value>,
+    xmpp: Option<toml::Value>,
 }
 
 /// Hashes a plain password into the form grids accept: `$1$` + MD5 hex.
@@ -339,6 +378,129 @@ fn perms(value: Option<toml::Value>) -> Result<Rules, ConfigError> {
     Ok(rules)
 }
 
+const XMPP_KEYS: &str = "`component`, `server`, `secret` and `owners`";
+
+/// Whether `name` is a domain name: dot-separated labels of letters,
+/// digits, `-` and `_`, none of them empty or starting or ending with `-`.
+fn is_domain(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 1023
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+}
+
+/// Whether `host` is this host: `localhost` or a loopback address, an
+/// IPv6 one in brackets.
+fn is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return v6.parse::<std::net::Ipv6Addr>().is_ok_and(|ip| ip.is_loopback());
+    }
+    host.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The `[xmpp]` table.
+fn xmpp(value: Option<toml::Value>) -> Result<Option<XmppConfig>, ConfigError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let toml::Value::Table(table) = value else {
+        return err(format!("`xmpp` must be a table with the keys {XMPP_KEYS}"));
+    };
+    let (mut component, mut server, mut secret, mut owners) = (None, None, None, None);
+    for (key, value) in table {
+        match key.as_str() {
+            "component" => component = Some(value),
+            "server" => server = Some(value),
+            "secret" => secret = Some(value),
+            "owners" => owners = Some(value),
+            _ => return err(format!("`xmpp.{key}` is not a key of `xmpp`; its keys are {XMPP_KEYS}")),
+        }
+    }
+
+    let component = match required(component, "xmpp.component")? {
+        toml::Value::String(name) => name.trim().to_lowercase(),
+        _ => return err("`xmpp.component` must be a domain name, such as \"russel.sl.example.org\""),
+    };
+    if component.contains('@') || component.contains('/') {
+        return err(format!(
+            "`xmpp.component` is \"{component}\", which is an account or an address with a resource; \
+             it must be a domain name of its own, such as \"russel.sl.example.org\""
+        ));
+    }
+    if !is_domain(&component) {
+        return err(format!("`xmpp.component` is \"{component}\", which is not a domain name"));
+    }
+
+    let server = match server {
+        None => DEFAULT_XMPP_SERVER.to_string(),
+        Some(toml::Value::String(address)) => address.trim().to_string(),
+        Some(_) => return err("`xmpp.server` must be a string `host:port`, such as \"127.0.0.1:5347\""),
+    };
+    let Some((host, port)) = server.rsplit_once(':') else {
+        return err(format!(
+            "`xmpp.server` is \"{server}\"; it must be `host:port`, such as \"127.0.0.1:5347\""
+        ));
+    };
+    if !port.parse::<u16>().is_ok_and(|port| port > 0) {
+        return err(format!(
+            "`xmpp.server` has the port \"{port}\"; it must be a number from 1 to 65535"
+        ));
+    }
+    if !is_loopback(host) {
+        return err(format!(
+            "`xmpp.server` is on \"{host}\": the component connection is not encrypted and must stay \
+             on this host, so the host must be `localhost` or a loopback address such as 127.0.0.1"
+        ));
+    }
+
+    let secret = match required(secret, "xmpp.secret")? {
+        toml::Value::String(secret) if !secret.is_empty() => Secret::new(secret),
+        _ => return err("`xmpp.secret` must be a non-empty string"),
+    };
+
+    const OWNERS: &str = "`xmpp.owners` must be a non-empty array of bare XMPP addresses `user@domain`";
+    let toml::Value::Array(entries) = required(owners, "xmpp.owners")? else {
+        return err(OWNERS);
+    };
+    if entries.is_empty() {
+        return err(OWNERS);
+    }
+    let mut list: Vec<String> = Vec::new();
+    for entry in entries {
+        let Some(text) = entry.as_str() else {
+            return err(OWNERS);
+        };
+        let address = text.trim().to_lowercase();
+        let bare = match address.split_once('@') {
+            Some((user, domain)) => !user.is_empty() && !user.contains(['/', '"', '&', '\'', '<', '>', ':', ' ']) && is_domain(domain),
+            None => false,
+        };
+        if !bare {
+            return err(format!(
+                "`xmpp.owners` has the entry \"{text}\", which is not a bare address; write `user@domain`, without a resource"
+            ));
+        }
+        if !list.contains(&address) {
+            list.push(address);
+        }
+    }
+
+    Ok(Some(XmppConfig {
+        component,
+        server,
+        secret,
+        owners: list,
+    }))
+}
+
 /// The table form of `persist`. `atstart` says whether anything is held
 /// once the config placement is reached; `position` and `sit` imply it.
 fn persist_table(table: &toml::Table) -> Result<(Persist, RlvPersist, PersistOverride), ConfigError> {
@@ -493,6 +655,7 @@ impl Config {
         let restore_attachments = flag_or(raw.restore_attachments, "restore_attachments", true)?;
         let rlv = flag(raw.rlv, "rlv")?;
         let perms = perms(raw.perms)?;
+        let xmpp = xmpp(raw.xmpp)?;
 
         Ok(Config {
             login_url,
@@ -514,6 +677,7 @@ impl Config {
             rlv_persist,
             persist_override,
             perms,
+            xmpp,
         })
     }
 }
@@ -1142,6 +1306,159 @@ mod tests {
         assert_eq!(*rules.rule(Kind::Anim), Rule::All);
         assert_eq!(*rules.rule(Kind::Attach), Rule::All);
         assert_eq!(rules.exceptions(Kind::Anim), [entry("01234567-9abc-defe-dcba-987654321000")]);
+    }
+
+    fn xmpp_table(lines: &str) -> String {
+        base() + "[xmpp]\n" + lines
+    }
+
+    const XMPP_MINIMAL: &str = "component = \"Russel.SL.example.org\"\nsecret = \"s3cret\"\nowners = [\"me@example.org\"]\n";
+
+    #[test]
+    fn xmpp_gateway_configured() {
+        let xmpp = Config::parse(&xmpp_table(XMPP_MINIMAL)).unwrap().xmpp.unwrap();
+        assert_eq!(xmpp.component, "russel.sl.example.org");
+        assert_eq!(xmpp.server, "127.0.0.1:5347");
+        assert_eq!(xmpp.secret.expose(), "s3cret");
+        assert_eq!(xmpp.owners, ["me@example.org"]);
+    }
+
+    #[test]
+    fn xmpp_server_port_given() {
+        for server in ["localhost:5348", "127.0.0.2:5348", "[::1]:5348", "LOCALHOST:5348"] {
+            let text = xmpp_table(&format!("{XMPP_MINIMAL}server = \"{server}\"\n"));
+            assert_eq!(Config::parse(&text).unwrap().xmpp.unwrap().server, server);
+        }
+    }
+
+    #[test]
+    fn xmpp_not_mentioned() {
+        assert_eq!(Config::parse(&base()).unwrap().xmpp, None);
+    }
+
+    #[test]
+    fn xmpp_owners_count_once_in_lower_case() {
+        let text = xmpp_table(
+            "component = \"bot.rig.test\"\nsecret = \"x\"\nowners = [\"Me@Example.org\", \"me@example.org\", \"you@rig.test\"]\n",
+        );
+        assert_eq!(
+            Config::parse(&text).unwrap().xmpp.unwrap().owners,
+            ["me@example.org", "you@rig.test"]
+        );
+    }
+
+    #[test]
+    fn xmpp_table_without_owners() {
+        for owners in ["", "owners = []\n", "owners = \"me@example.org\"\n", "owners = [1]\n"] {
+            let msg = rejected(&xmpp_table(&format!("component = \"bot.rig.test\"\nsecret = \"x\"\n{owners}")));
+            assert!(msg.contains("`xmpp.owners`"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn xmpp_owner_with_a_resource() {
+        for owner in ["me@example.org/phone", "example.org", "@example.org", "me@", "me@exa mple.org"] {
+            let msg = rejected(&xmpp_table(&format!(
+                "component = \"bot.rig.test\"\nsecret = \"x\"\nowners = [\"{owner}\"]\n"
+            )));
+            assert!(
+                msg.contains("`xmpp.owners`") && msg.contains(owner) && msg.contains("`user@domain`"),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn xmpp_component_that_is_an_account() {
+        for component in ["bot@example.org", "example.org/res", "", "bad..domain", "-x.org", "a b.org"] {
+            let msg = rejected(&xmpp_table(&format!(
+                "component = \"{component}\"\nsecret = \"x\"\nowners = [\"me@example.org\"]\n"
+            )));
+            assert!(msg.contains("`xmpp.component`"), "{msg}");
+        }
+        let msg = rejected(&xmpp_table("component = 5\nsecret = \"x\"\nowners = [\"me@example.org\"]\n"));
+        assert!(msg.contains("`xmpp.component`"), "{msg}");
+        let msg = rejected(&xmpp_table("secret = \"x\"\nowners = [\"me@example.org\"]\n"));
+        assert!(msg.contains("`xmpp.component`"), "{msg}");
+    }
+
+    #[test]
+    fn xmpp_server_on_another_host() {
+        for server in ["xmpp.example.org:5347", "192.0.2.10:5347", "[2001:db8::1]:5347", "0.0.0.0:5347"] {
+            let msg = rejected(&xmpp_table(&format!("{XMPP_MINIMAL}server = \"{server}\"\n")));
+            assert!(
+                msg.contains("`xmpp.server`") && msg.contains("not encrypted") && msg.contains("this host"),
+                "{msg}"
+            );
+        }
+        for server in ["localhost", "localhost:0", "localhost:65536", "localhost:x", "[::1]"] {
+            let msg = rejected(&xmpp_table(&format!("{XMPP_MINIMAL}server = \"{server}\"\n")));
+            assert!(msg.contains("`xmpp.server`"), "{msg}");
+        }
+        let msg = rejected(&xmpp_table(&format!("{XMPP_MINIMAL}server = 5347\n")));
+        assert!(msg.contains("`xmpp.server`"), "{msg}");
+    }
+
+    #[test]
+    fn xmpp_secret_must_be_given() {
+        for secret in ["", "secret = \"\"\n", "secret = 1\n"] {
+            let msg = rejected(&xmpp_table(&format!(
+                "component = \"bot.rig.test\"\n{secret}owners = [\"me@example.org\"]\n"
+            )));
+            assert!(msg.contains("`xmpp.secret`"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn unknown_key_in_the_xmpp_table() {
+        let msg = rejected(&xmpp_table(&format!("{XMPP_MINIMAL}password = \"x\"\n")));
+        assert!(msg.contains("`xmpp.password`"), "{msg}");
+        for key in ["`component`", "`server`", "`secret`", "`owners`"] {
+            assert!(msg.contains(key), "{msg}");
+        }
+        let msg = rejected(&(base() + "xmpp = \"bot.rig.test\"\n"));
+        assert!(msg.contains("`xmpp`"), "{msg}");
+    }
+
+    #[test]
+    fn the_xmpp_secret_stays_out_of_debug_output_and_errors() {
+        let secret = "Very-Secret-42";
+        let cfg = Config::parse(&xmpp_table(&format!(
+            "component = \"bot.rig.test\"\nsecret = \"{secret}\"\nowners = [\"me@example.org\"]\n"
+        )))
+        .unwrap();
+        let shown = format!("{cfg:?} {:?} {:#?}", cfg.xmpp, cfg);
+        assert!(!shown.contains(secret), "{shown}");
+        assert!(shown.contains("***"));
+        for broken in [
+            format!("component = \"bot@rig.test\"\nsecret = \"{secret}\"\nowners = [\"me@example.org\"]\n"),
+            format!("component = \"bot.rig.test\"\nsecret = \"{secret}\"\nowners = [\"me\"]\n"),
+            format!("component = \"bot.rig.test\"\nsecret = \"{secret}\"\nserver = \"10.0.0.1:1\"\nowners = [\"me@x.org\"]\n"),
+            format!("component = \"bot.rig.test\"\nsecret = \"{secret}\"\nowners = [\"me@x.org\"]\nother = 1\n"),
+        ] {
+            let msg = rejected(&xmpp_table(&broken));
+            assert!(!msg.contains(secret), "{msg}");
+        }
+    }
+
+    #[test]
+    fn example_file_is_valid_with_its_xmpp_table_enabled() {
+        let text = include_str!("../russelbot.example.toml");
+        let mut enabled = text.to_string();
+        for line in [
+            "# [xmpp]",
+            "# component = \"russel.sl.example.org\"",
+            "# server = \"127.0.0.1:5347\"",
+            "# secret = \"the component_secret of the server\"",
+            "# owners = [\"me@example.org\"]",
+        ] {
+            assert_eq!(text.matches(&format!("\n{line}\n")).count(), 1, "{line} is not once in the example");
+            enabled = enabled.replace(&format!("\n{line}\n"), &format!("\n{}\n", &line[2..]));
+        }
+        let xmpp = Config::parse(&enabled).unwrap().xmpp.unwrap();
+        assert_eq!(xmpp.component, "russel.sl.example.org");
+        assert_eq!(xmpp.server, "127.0.0.1:5347");
+        assert_eq!(xmpp.owners, ["me@example.org"]);
     }
 
     #[test]

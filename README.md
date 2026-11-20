@@ -19,7 +19,9 @@ alike. And it can answer
 what a viewer answers with a dialog: teleport offers, inventory offers and
 scripts' requests for permissions are [accepted by
 itself](#permission-requests) from the avatars and objects the config
-names, and wait for a command otherwise.
+names, and wait for a command otherwise. As an [XMPP gateway](#xmpp-gateway)
+it puts the avatar's instant messages, local chat and commands into an
+ordinary Jabber client.
 
 ## Status
 
@@ -212,6 +214,18 @@ waiting. Nothing of this has been tried on Second Life: that it takes the
 bot's answers to an inventory offer and to a script's permission request
 as the bot builds them is known from the viewer's source only.
 
+The [XMPP gateway](#xmpp-gateway) is verified by unit tests, against a fake
+component server in the tests, and on the local OpenSim with a local
+Prosody 13 (`docs/test-rig.md`, items 165 to 178, 2026-11-20): starting
+before the server, IMs and local chat both ways, commands, a stranger
+refused, messages kept while Prosody was down and delivered with their
+times, a restart, a wrong secret and `quit`. The rig's client is a minimal
+script of the project's own; Gajim 2.6.0 and Dino 0.5.1 were tried on the
+rig too. Gajim showed everything as described. Dino showed everything as
+well, but sends only once a conversation is switched to unencrypted (see
+"Encryption" under [XMPP gateway](#xmpp-gateway)). Conversations,
+ejabberd and Second Life have not been tried.
+
 ## Build
 
 Needs Rust 1.100 (pinned in `rust-toolchain.toml`; rustup picks it up).
@@ -309,6 +323,7 @@ One TOML file; see `russelbot.example.toml`.
 | `restore_attachments` | no | `false` to keep the bot from attaching again, after each login, what the Current Outfit folder lists and the simulator did not bring; see [Attachments](#attachments). Default: `true` |
 | `perms` | no | Two tables, `[perms.autoaccept]` and `[perms.except]`, that say which teleport offers, inventory offers and scripts' permission requests the bot accepts by itself, see [Permission requests](#permission-requests). Default: none |
 | `rlv` | no | `true` to start with RLV on: the bot then reads the `@` commands of scripted objects the avatar owns, see [RLV](#rlv). Default: `false` |
+| `xmpp` | no | A table, `[xmpp]`, that makes the bot an XMPP component, see [XMPP gateway](#xmpp-gateway). Default: no XMPP connection |
 
 `persist` takes these forms:
 
@@ -1456,3 +1471,143 @@ On Windows the socket is TCP on `127.0.0.1:47115` instead, and
 it and speak as the avatar, so enable it only on a machine you do not
 share. The Windows side has not been run or compiled: this project is
 built and tested on Linux.
+
+## XMPP gateway
+
+The bot can be an XMPP (Jabber) gateway: it connects to an XMPP server on
+the same host as an external component (XEP-0114) and owns a domain there,
+such as `russel.sl.example.org`. The owners' XMPP accounts then use the
+avatar from any XMPP client, on any device: every avatar it exchanges
+instant messages with is a contact, local chat is a contact, and commands
+go to the domain itself. The XMPP server keeps the history and the offline
+messages and pushes to phones, as for any other contact. Several bots, on
+one grid or several, are several components with domains of their own on
+the same server, and can share one owner account.
+
+### Setting it up
+
+1. Add the component to the XMPP server. For Prosody:
+
+   ```lua
+   component_interfaces = { "127.0.0.1" }
+   Component "russel.sl.example.org"
+       component_secret = "a long random secret"
+   ```
+
+   For ejabberd, a `ejabberd_service` listener does the same:
+
+   ```yaml
+   listen:
+     -
+       port: 5347
+       ip: "127.0.0.1"
+       module: ejabberd_service
+       hosts:
+         "russel.sl.example.org":
+           password: "a long random secret"
+   ```
+
+   The component connection is plain TCP authenticated by the shared
+   secret, without encryption: keep the component port on `127.0.0.1`. The
+   bot refuses a `server` that is not on this host.
+
+2. Add the `[xmpp]` table at the end of the bot's config:
+
+   ```toml
+   [xmpp]
+   component = "russel.sl.example.org"
+   secret = "a long random secret"
+   owners = ["me@example.org"]
+   ```
+
+   | Key of `[xmpp]` | Required | Meaning |
+   |---|---|---|
+   | `component` | yes | The domain the component owns; letter case does not matter |
+   | `server` | no | `host:port` of the server's component port; the host must be `localhost` or a loopback address. Default: `127.0.0.1:5347` |
+   | `secret` | yes | The server's secret for the component. It never appears in the bot's log or errors |
+   | `owners` | yes | Bare addresses (`user@domain`, no resource) of the accounts that may use the gateway |
+
+3. Restart the bot, and add `russel.sl.example.org` and
+   `local@russel.sl.example.org` to the owner's contacts. Messages arrive
+   without that too, but most clients show presence, and some show
+   messages, only for contacts on the list.
+
+The component connects when the bot starts, before the first login, and
+stays connected whether or not the avatar is on a grid. When the server is
+not there, refuses the secret or drops the connection, the bot logs why and
+tries again after 5 seconds, doubling the delay up to 5 minutes, and back
+to 5 seconds after a connection the server accepted. None of this ever
+holds up the grid session.
+
+### Addresses
+
+| Address | What it is |
+|---|---|
+| `russel.sl.example.org` | The bot: commands, and the bot's state as presence |
+| `local@russel.sl.example.org` | Local chat |
+| `jane.doe@russel.sl.example.org` | The avatar Jane Doe; `bob@...` for `bob Resident` |
+| `<uuid>@russel.sl.example.org` | An avatar by UUID: one whose name is not known, or would give one of the other addresses (`local Resident`, say) |
+| `obj-<uuid>@russel.sl.example.org` | An object that sent an IM |
+
+An avatar's address is made from its legacy name in lower case, `first` or
+`first.last`, with the characters an address cannot hold escaped as
+XEP-0106 says: a hypergrid visitor `Ann.Lee @osgrid.org:8002` is
+`ann.lee.\40osgrid.org\3a8002@...`.
+
+**Instant messages.** An IM to the avatar comes from the sender's address,
+with the display name as nickname, as soon as the bot records it (see
+[Chat and IM logs](#chat-and-im-logs)). Offline IMs fetched at login carry
+the time they were sent. A message to an avatar's address is sent to it as
+`im` sends it, and the reply goes to the UUID the address came from, so
+avatars the grid's search does not know, such as hypergrid visitors, can be
+answered. To start a conversation, write to `first.last@...`: the name is
+looked up as `im` looks it up. A refused or failed IM comes back as an
+error with the reason, which most clients show on the message. IMs from
+objects come from `obj-<uuid>@...` with the object's name as nickname and
+cannot be answered; an IM from the grid itself comes from the domain.
+
+**Local chat.** Every line the avatar hears arrives from `local@...` as
+`Name: text`: the display name with the legacy name in parentheses,
+` shouts` or ` whispers` after the name, `[owner]` and the like for other
+kinds (`Collar [owner]: ready`), and `/me` emotes as `Name waves`. A
+message to `local@...` is said as `say` says it, so `/shout`, `/whisper`,
+`/7 text` and `//` work as in a viewer's chat bar. The avatar's own lines
+come back as the simulator delivers them.
+
+**Commands.** A message to the domain is one command line, read as
+`rslbot ctl` reads its arguments: `status`, `tp 128 128 25 Home`,
+`im "Jane Doe" see you later`. An argument with spaces goes in double
+quotes; inside them `\"` is a double quote and `\\` a backslash. Every
+command is answered with one message: its text, `ok`, or `error: ` and the
+reason. `help` lists the commands. A command that takes time, such as a
+teleport, is answered when it ends and does not hold up the other
+contacts; at most 16 commands wait for their answers at once.
+
+**Presence.** The domain is online with the region's name as status while
+the avatar is in a region, away with `not in a region` otherwise, and
+offline once the bot stops; `local@...` is online while the avatar is in a
+region. Avatars' addresses always show as offline.
+
+**Who may use it.** Only the `owners`, from any of their devices. Anyone
+else gets an error for every message, a refusal for every subscription,
+and a line in the bot's log. Service discovery and ping are answered to
+anyone.
+
+**Encryption.** The gateway cannot take OMEMO-encrypted messages: it is
+not an end of the conversation that holds keys, so its addresses publish
+none. Clients that turn OMEMO on by themselves must be told to send
+unencrypted to these addresses. Dino starts every new conversation with
+OMEMO and then refuses to send; switch the conversation to "Unencrypted"
+with the lock icon in the message box (or make that Dino's default). The
+messages travel between the owner's client and the server over TLS as
+usual, and between the server and the bot over the loopback interface.
+
+Messages for the owners that come while the component is not connected
+wait, the newest 500 of them, and are delivered with their time once it is
+connected again; the log says how many were dropped.
+
+Not supported yet: the friends list and friends' online status, a group
+chat room for local chat or for groups, the avatars nearby, profile
+pictures, ad-hoc command forms, delivery receipts, IMs sent with
+`rslbot ctl` in the XMPP conversation, TLS on the component connection,
+and a server on another host.

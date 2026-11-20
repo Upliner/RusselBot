@@ -1,0 +1,39 @@
+-- Prosody for the RusselBot test rig: one virtual host with two accounts
+-- and one external component for the bot. `test-rig/setup.sh` writes the
+-- real config from this file into test-rig/prosody/, with @RIG_PROSODY@
+-- replaced by that directory. Everything listens on 127.0.0.1 only.
+
+data_path = "@RIG_PROSODY@/data"
+pidfile = "@RIG_PROSODY@/prosody.pid"
+log = {
+    { levels = { min = "info" }, to = "file", filename = "@RIG_PROSODY@/prosody.log" };
+    { levels = { min = "info" }, to = "console" };
+}
+
+interfaces = { "127.0.0.1" }
+c2s_ports = { 5222 }
+s2s_ports = { }
+http_ports = { }
+https_ports = { }
+-- The bot's component connection: plain TCP on the loopback interface.
+component_interfaces = { "127.0.0.1" }
+component_ports = { 5347 }
+
+modules_enabled = {
+    "roster"; "saslauth"; "tls"; "disco"; "ping"; "presence"; "carbons";
+    "offline"; "time"; "version"; "uptime";
+}
+modules_disabled = { "s2s"; "http"; "admin_shell"; "posix" }
+
+-- TLS with the rig's own CA (see setup.sh) for clients that insist on it;
+-- plain logins over the loopback interface for the rig's scripts.
+certificates = "@RIG_PROSODY@/certs"
+c2s_require_encryption = false
+allow_unencrypted_plain_auth = true
+authentication = "internal_hashed"
+storage = "internal"
+
+VirtualHost "rig.test"
+
+Component "bot.rig.test"
+    component_secret = "rigsecret"

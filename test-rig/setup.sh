@@ -9,6 +9,36 @@ rig=$(cd "$(dirname "$0")" && pwd)
 source=${OPENSIM_SRC:-$rig/../references/opensim}
 sim=$rig/opensim
 
+# Prosody for the XMPP gateway, when it is installed: a config in
+# test-rig/prosody (git-ignored) with the accounts owner@rig.test and
+# stranger@rig.test and the component bot.rig.test.
+xmpp=$rig/prosody
+if command -v prosodyctl >/dev/null 2>&1; then
+    mkdir -p "$xmpp/data" "$xmpp/certs"
+    sed -e "s|@RIG_PROSODY@|$xmpp|g" "$rig/config/prosody.cfg.lua.in" > "$xmpp/prosody.cfg.lua"
+    # TLS for clients that insist on it (Dino): a CA of the rig's own and a
+    # certificate for rig.test signed by it. Trust rig-ca.crt to use them.
+    certs=$xmpp/certs
+    if [ ! -f "$certs/rig.test.crt" ] && command -v openssl >/dev/null 2>&1; then
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=RusselBot test rig CA" \
+            -keyout "$certs/rig-ca.key" -out "$certs/rig-ca.crt" 2>/dev/null
+        openssl req -newkey rsa:2048 -nodes -subj "/CN=rig.test" \
+            -keyout "$certs/rig.test.key" -out "$certs/rig.test.csr" 2>/dev/null
+        printf 'subjectAltName=DNS:rig.test\nextendedKeyUsage=serverAuth\n' > "$certs/rig.test.ext"
+        openssl x509 -req -in "$certs/rig.test.csr" -CA "$certs/rig-ca.crt" -CAkey "$certs/rig-ca.key" \
+            -CAcreateserial -days 3650 -extfile "$certs/rig.test.ext" -out "$certs/rig.test.crt" 2>/dev/null
+        rm -f "$certs/rig.test.csr" "$certs/rig.test.ext"
+    fi
+    for account in owner stranger; do
+        if [ ! -d "$xmpp/data/rig%2etest/accounts" ] || [ ! -f "$xmpp/data/rig%2etest/accounts/$account.dat" ]; then
+            prosodyctl --config "$xmpp/prosody.cfg.lua" register "$account" rig.test "$account" >/dev/null
+        fi
+    done
+    echo "Prosody ready. Start it with: prosody --config $xmpp/prosody.cfg.lua -F"
+else
+    echo "Prosody is not installed; skipping the XMPP part of the rig." >&2
+fi
+
 if ! dotnet --list-sdks 2>/dev/null | grep -q '^8\.'; then
     echo "The .NET 8 SDK is required to build OpenSim and was not found." >&2
     echo "Install it (Arch/Manjaro: sudo pacman -S dotnet-sdk-8.0) and run this again." >&2
