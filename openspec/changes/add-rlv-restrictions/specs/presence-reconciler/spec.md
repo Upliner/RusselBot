@@ -12,6 +12,8 @@ While an RLV restriction is in force (see `rlv-restrictions`, "When restrictions
 | sit on the ground | `sit ground` | `sit` |
 | the stand a `persist` or `home` calls for, when the held sit state does not match the seat the avatar is on | `stand` | `sit` |
 
+A sit on the held object that a restriction holds back because the bot does not know how far the object is SHALL start the object scan (see `rlv-restrictions`, "Objects the bot does not know"), so that the step is no longer held back once the object is described and within reach.
+
 A step whose sort the persist override setting names SHALL be started as if no restriction were kept: no restriction SHALL hold it back, `unsit` while the avatar sits among them. The setting SHALL change nothing else: the operator's commands, RLV force commands, the acceptance of offers and requests and the restoring of attachments SHALL be held to restrictions whatever it names.
 
 A login SHALL never be held back. A step that is held back is not a failed attempt: it SHALL NOT lengthen any backoff delay, SHALL NOT count as a sit failure, and SHALL NOT make the bot give up. The bot SHALL stay in holding mode with its held placement unchanged, and SHALL choose its next action anew whenever a restriction is set, lifted or dropped, whenever the RLV mode or the persist override setting changes, and whenever what the simulator shows of the avatar changes. It SHALL write one line to the operator log when a step starts being held back, naming the step, the restriction and a holder of it, and one when the step is no longer held back; it SHALL NOT repeat the line while nothing changes. When it starts a step that a restriction would hold back but for the persist override setting, the step's line in the operator log SHALL name the restriction and say that the setting lets the step through.
@@ -69,3 +71,11 @@ The `persist` and `home` commands SHALL be carried out whatever restrictions are
 #### Scenario: Switched while a step waits
 - **WHEN** the teleport to `Target` is held back because of `tploc` and `rslbot ctl rlv persist override tp` is run
 - **THEN** the bot starts the teleport at once
+
+#### Scenario: Seat not described yet
+- **WHEN** `scan_distance` is not configured, the persist override setting is empty, a collar holds `sittp:20`, and the avatar arrives 2 metres from the seat the bot holds, which the simulator has only mentioned
+- **THEN** the bot scans, and seats the avatar as soon as the seat is described; the operator log says that the sit was held back and that it no longer is
+
+#### Scenario: Seat out of reach
+- **WHEN** the same happens with `sittp` held without a distance
+- **THEN** once the seat is described the sit stays held back, and the log gives the seat's distance

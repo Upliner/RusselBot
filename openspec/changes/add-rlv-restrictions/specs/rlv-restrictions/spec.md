@@ -218,7 +218,7 @@ Nothing SHALL be sent to the recipient in place of a refused message. An option 
 - **THEN** the first is sent and the second is refused naming `startim`
 
 ### Requirement: Sitting and standing
-While the avatar sits, on an object or on the ground, and `unsit` is in force, the bot SHALL NOT make the avatar leave its seat: `stand` (and `unsit`) SHALL be refused, `sit` SHALL be refused, since it leaves the seat for another, and every teleport SHALL be refused, as "Teleports and teleport offers" says. While `sit` is in force, `sit <uuid>` and `sit ground` SHALL be refused. While `interact` is in force, `sit <uuid>` SHALL be refused. While `sittp` is in force, `sit <uuid>` SHALL be refused when the object is farther from the avatar than the smallest distance its holders give, a `sittp` without a readable distance giving 1.5 metres; an object whose place the bot does not know SHALL count as too far.
+While the avatar sits, on an object or on the ground, and `unsit` is in force, the bot SHALL NOT make the avatar leave its seat: `stand` (and `unsit`) SHALL be refused, `sit` SHALL be refused, since it leaves the seat for another, and every teleport SHALL be refused, as "Teleports and teleport offers" says. While `sit` is in force, `sit <uuid>` and `sit ground` SHALL be refused. While `interact` is in force, `sit <uuid>` SHALL be refused. While `sittp` is in force, `sit <uuid>` SHALL be refused when the object is farther from the avatar than the smallest distance its holders give, a `sittp` without a readable distance giving 1.5 metres. An object the bot does not know SHALL be looked for first (see "Objects the bot does not know"); one whose place is not known after that SHALL count as too far.
 
 #### Scenario: Cannot stand
 - **WHEN** a chair's script holds `unsit` while the avatar sits on the chair, and `rslbot ctl stand` is run
@@ -245,8 +245,61 @@ While the avatar sits, on an object or on the ground, and `unsit` is in force, t
 - **THEN** the command is refused
 
 #### Scenario: Object of unknown place
-- **WHEN** a cage holds `sittp` and `rslbot ctl sit <uuid>` names an object the simulator has not described to the bot
+- **WHEN** a cage holds `sittp` and `rslbot ctl sit <uuid>` names an object the simulator does not describe to the bot within the time it is looked for
 - **THEN** the command is refused, saying that the bot does not know how far the object is
+
+### Requirement: Objects the bot does not know
+Some restrictions are applied to an object by how far it is from the avatar or by what it is: `sittp`, and the rows of "Touching". The bot knows that only of objects the simulator has described to it, and without `scan_distance` it has few described (see `avatar-commands`, "Object scan"). When such a restriction is in force and has to be applied to an object the bot does not know, the bot SHALL look for the object before it decides: it SHALL start the object scan if none has started in the region, and SHALL give the object until 10 seconds after the start of that scan to be described.
+
+- A `sit <uuid>` and a `touch <uuid>` command SHALL wait for it. The command SHALL be carried out or refused when the object has been described, by what is known of it and by the restrictions that are in force then, and SHALL be answered as it is without the wait. When the time passes without the object being described, a `sit` SHALL be refused as for an object that is too far, saying that the bot does not know how far the object is, and a `touch` as `avatar-commands` says for an unknown object. Once the scan has had its 10 seconds, an object the bot does not know SHALL be decided at once.
+- A forced `@sit` SHALL wait in the same way, whether it is carried out as a `sit` command or, while the RLV persist setting is `follow`, through a persist. Nothing SHALL be persisted and the placement mode SHALL NOT change before it is carried out; a forced `@sit` that is refused after the wait SHALL change nothing. For `rlv cmd` a forced `@sit` that waits counts as begun: its line is `ok`, and what becomes of it is in the operator log.
+- A sit of the bot's own on the seat it holds SHALL start the scan and stay held back until the seat is described (see `presence-reconciler`, "Steps that RLV restrictions forbid are held back"); it has no time limit.
+
+An object that is described without a place the bot can read SHALL count as too far. A command that waits SHALL be answered with an error when the session is lost or the avatar leaves the region first. The bot SHALL NOT look for an object while no restriction that is in force needs it: without `sittp` a `sit` is carried out at once, as it is without this capability, and an exempt command (see "Override exempts one command") never waits for a restriction's sake.
+
+#### Scenario: Sit that waits for its seat
+- **WHEN** `scan_distance` is not configured, a collar holds `sittp:20`, and `rslbot ctl sit <uuid>` names a chair 3 metres from the avatar that the simulator has only mentioned
+- **THEN** the bot scans, and once the chair is described the avatar is seated on it and the command exits with status 0
+
+#### Scenario: Seat that turns out to be too far
+- **WHEN** a collar holds `sittp` and `rslbot ctl sit <uuid>` names a chair 10 metres from the avatar that the simulator has only mentioned
+- **THEN** once the chair is described the command exits with status 1 naming `sittp` and how far the chair is, and the avatar does not sit
+
+#### Scenario: Seat that is never described
+- **WHEN** a collar holds `sittp` and `rslbot ctl sit <uuid>` names an object that does not exist
+- **THEN** the command exits with status 1 within 11 seconds, naming `sittp` and saying that the bot does not know how far the object is
+
+#### Scenario: After the scan has had its time
+- **WHEN** the same command is run again a minute later
+- **THEN** it is refused at once
+
+#### Scenario: No restriction, no wait
+- **WHEN** no `sittp` is in force and `rslbot ctl sit <uuid>` names an object the bot does not know
+- **THEN** the sit is handed to the simulator at once and no scan is started
+
+#### Scenario: Touch under a restriction
+- **WHEN** a collar holds `touchattach` and `rslbot ctl touch <uuid>` names a door rezzed in the region that the simulator has only mentioned
+- **THEN** the bot scans, and once the door is described it is touched
+
+#### Scenario: Forced sit that waits
+- **WHEN** the RLV persist setting is `drop`, a collar holds `sittp:20`, and a bench the avatar owns says `@sit:<bench>=force` to its owner while the bot does not know the bench, which is 3 metres from the avatar
+- **THEN** the bot scans, and once the bench is described the avatar is seated on it and the bot is in manual mode
+
+#### Scenario: Followed sit that waits
+- **WHEN** the same happens while the RLV persist setting is `follow`
+- **THEN** the held placement stays what it was until the bench is described, and the bench then becomes the held seat
+
+#### Scenario: Followed sit that is refused after the wait
+- **WHEN** the RLV persist setting is `follow`, a collar holds `sittp`, and a bench 10 metres from the avatar that the bot does not know says `@sit:<bench>=force` to its owner
+- **THEN** once the bench is described the operator log says the command was refused because of `sittp`, and the placement mode and the held placement are what they were
+
+#### Scenario: By hand
+- **WHEN** a collar holds `sittp:20` and `rslbot ctl rlv cmd @sit:<uuid>=force` names a chair the bot does not know
+- **THEN** the command prints `sit:<uuid>=force: ok` without waiting for the chair to be described
+
+#### Scenario: Region left while waiting
+- **WHEN** a `sit` waits for its object to be described and the avatar is teleported to another region
+- **THEN** the command exits with status 1
 
 ### Requirement: Teleports and teleport offers
 While `tploc` is in force, `tp` SHALL be refused. While `tplocal` is in force, a `tp` to the region the avatar is in SHALL be refused, unless every holder's `tplocal` gives a distance and the destination is within the smallest of them from the avatar. While the avatar sits and `unsit` is in force, `tp` and `accept tp` (and `accepttp`) SHALL be refused.
@@ -304,7 +357,7 @@ The `touch <uuid>` command (see `avatar-commands`) SHALL be refused as this tabl
 | `touchhud:<uuid>` | a touch of that HUD |
 | `fartouch` or `touchfar`, with or without a distance | a touch of an object farther from the avatar than the smallest distance given, 1.5 metres where none is given; an object on the bot's avatar counts as at no distance, and one whose place the bot does not know as too far |
 
-An object that holds `touchme`, or a part of which holds it, SHALL be touchable whatever the rows of this table other than `interact` say.
+An object that holds `touchme`, or a part of which holds it, SHALL be touchable whatever the rows of this table other than `interact` say. While a row of this table is in force, an object the bot does not know SHALL be looked for before any row is applied to it (see "Objects the bot does not know"), and the rows SHALL be applied to what it then is; one that is not described in that time SHALL be refused as a `touch` of an unknown object is (see `avatar-commands`, "Touch command").
 
 #### Scenario: Nothing in-world
 - **WHEN** a collar holds `touchworld` and `rslbot ctl touch <uuid>` names a door rezzed in the region
@@ -448,7 +501,7 @@ An RLV force command (see `rlv-commands`, "Force commands"), from an object or f
 | `@detach` and `@remattach` with a point or a UUID, `@detachme=force` | for each attachment concerned, what keeps a `detach` of it from being carried out: the attachments that cannot be detached stay, and the command is refused when none can |
 | `@remoutfit:<kind>=force` | `remoutfit`, `remoutfit:<kind>` |
 
-For this, the restrictions that the sender of the force command itself holds SHALL NOT count: an object's own restrictions never stand in the way of its own force commands, and neither do the operator's restrictions in the way of `rlv cmd`. No other restriction SHALL refuse a force command. The check SHALL be made when the command is dealt with. For as long as the object a followed `@sit` named is the held seat because of that command (see `rlv-commands`, "Forced movement and the held placement"), the restrictions its sender holds SHALL NOT count against the bot's steps towards that seat either.
+For this, the restrictions that the sender of the force command itself holds SHALL NOT count: an object's own restrictions never stand in the way of its own force commands, and neither do the operator's restrictions in the way of `rlv cmd`. No other restriction SHALL refuse a force command. The check SHALL be made when the command is dealt with, or, for a forced `@sit` on an object the bot does not know, when that object has been looked for (see "Objects the bot does not know"). For as long as the object a followed `@sit` named is the held seat because of that command (see `rlv-commands`, "Forced movement and the held placement"), the restrictions its sender holds SHALL NOT count against the bot's steps towards that seat either.
 
 #### Scenario: Another object's restriction
 - **WHEN** a collar holds `unsit`, the avatar sits on a chair, and a bench the avatar owns says `@sit:<bench>=force` to its owner
