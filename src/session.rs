@@ -107,6 +107,13 @@ pub enum SessionEvent {
     Touched(Uuid),
     /// A touch gave up waiting: the object did not turn up.
     TouchFailed(Uuid),
+    /// An object `look_for` waited for has been described, and the update
+    /// that described it has been taken in whole: its parent and its place
+    /// are known as far as that update told them.
+    Described(Uuid),
+    /// An object `look_for` waited for was not described within the scan's
+    /// time, or the region was left or the session ended first.
+    NotDescribed(Uuid),
     /// The answer to `find_avatar`: the avatars the grid offers for the
     /// name, as id and `First Last`.
     AvatarsFound {
@@ -323,6 +330,17 @@ pub enum Touch {
     Waiting,
 }
 
+/// What became of looking for an object.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Look {
+    /// The simulator has described it.
+    Known,
+    /// A scan is looking for it. Ends in `Described` or `NotDescribed`.
+    Waiting,
+    /// The scan in this region has had its time and did not turn it up.
+    GaveUp,
+}
+
 /// An object the simulator describes as made from an inventory item and
 /// worn: the root prim of an attachment, on the bot's avatar or another.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -383,6 +401,8 @@ struct Sim {
     scan_started: Option<Instant>,
     /// Touches waiting for their object to be described, with their deadline.
     wanted: Vec<(Uuid, Instant)>,
+    /// Objects `look_for` waits to see described, with their deadline.
+    sought: Vec<(Uuid, Instant)>,
     /// Attachments the simulator has described, by inventory item. One
     /// counts as attached to the avatar while its parent is `own_local`:
     /// the avatar's own description may come after its attachments'.
@@ -502,7 +522,7 @@ impl<N: Net> Session<N> {
             Some(sim.opened_at + HANDSHAKE_LIMIT)
         });
         consider(self.sit_deadline);
-        consider(sim.wanted.iter().map(|(_, deadline)| *deadline).min());
+        consider(sim.wanted.iter().chain(&sim.sought).map(|(_, deadline)| *deadline).min());
         consider(
             sim.awaited_attach
                 .iter()
@@ -843,6 +863,32 @@ impl<N: Net> Session<N> {
         for (object, _) in std::mem::take(&mut self.sim.wanted) {
             self.events.push(SessionEvent::TouchFailed(object));
         }
+        for (object, _) in std::mem::take(&mut self.sim.sought) {
+            self.events.push(SessionEvent::NotDescribed(object));
+        }
+    }
+
+    /// Reports the objects `look_for` waits for that an update just
+    /// described. Called once the whole update has been taken in.
+    fn report_sought(&mut self) {
+        if self.sim.sought.is_empty() {
+            return;
+        }
+        let objects = &self.sim.objects;
+        let (found, sought) = std::mem::take(&mut self.sim.sought)
+            .into_iter()
+            .partition(|(object, _)| objects.contains_key(object));
+        self.sim.sought = sought;
+        for (object, _) in found {
+            self.events.push(SessionEvent::Described(object));
+        }
+    }
+
+    /// The deadline of a wait for an object that starts now: 10 seconds
+    /// after the scan in this region started, which this starts if need be.
+    fn scan_deadline(&mut self, now: Instant) -> Instant {
+        self.start_scan(now);
+        self.sim.scan_started.unwrap_or(now) + TOUCH_WAIT
     }
 
     /// Clicks `object` once. An object the simulator has not described is
@@ -853,8 +899,7 @@ impl<N: Net> Session<N> {
             self.send_touch(local_id, now);
             return Ok(Touch::Sent);
         }
-        self.start_scan(now);
-        let deadline = self.sim.scan_started.unwrap_or(now) + TOUCH_WAIT;
+        let deadline = self.scan_deadline(now);
         if now >= deadline {
             return Err(self.unknown_object(object));
         }
@@ -862,6 +907,34 @@ impl<N: Net> Session<N> {
             self.sim.wanted.push((object, deadline));
         }
         Ok(Touch::Waiting)
+    }
+
+    /// Looks for `object` without doing anything to it: known when the
+    /// simulator has described it; otherwise the scan is started if need
+    /// be, and the object is waited for until 10 seconds after the scan
+    /// started, which a touch shares.
+    pub fn look_for(&mut self, object: Uuid, now: Instant) -> Result<Look, String> {
+        self.present()?;
+        if self.knows(object) {
+            return Ok(Look::Known);
+        }
+        let deadline = self.scan_deadline(now);
+        if now >= deadline {
+            return Ok(Look::GaveUp);
+        }
+        if !self.sim.sought.iter().any(|(sought, _)| *sought == object) {
+            self.sim.sought.push((object, deadline));
+        }
+        Ok(Look::Waiting)
+    }
+
+    /// Starts the scan in this region, if it has not started, without
+    /// waiting for anything in particular. Nothing while the avatar is
+    /// not in a region.
+    pub fn scan(&mut self, now: Instant) {
+        if self.present().is_ok() {
+            self.start_scan(now);
+        }
     }
 
     /// Whether the simulator has described `object` in this region.
@@ -1139,6 +1212,11 @@ impl<N: Net> Session<N> {
         for (object, _) in late {
             self.events.push(SessionEvent::TouchFailed(object));
         }
+        let (late, sought) = std::mem::take(&mut self.sim.sought).into_iter().partition(|(_, at)| now >= *at);
+        self.sim.sought = sought;
+        for (object, _) in late {
+            self.events.push(SessionEvent::NotDescribed(object));
+        }
         let (late, awaited) = std::mem::take(&mut self.sim.awaited_attach)
             .into_iter()
             .partition(|(_, at)| now >= *at);
@@ -1320,6 +1398,7 @@ impl<N: Net> Session<N> {
                     }
                     self.update_seat();
                 }
+                self.report_sought();
             }
             Incoming::ObjectsCompressed(objects) => {
                 for object in objects {
@@ -1334,6 +1413,7 @@ impl<N: Net> Session<N> {
                         self.attachment_described(worn.item, object.local_id, worn.parent_id, worn.point);
                     }
                 }
+                self.report_sought();
             }
             Incoming::ObjectsMoved(objects) => {
                 for (local_id, trasform) in objects {
@@ -1612,6 +1692,7 @@ impl Sim {
             undescribed: HashSet::new(),
             scan_started: None,
             wanted: Vec::new(),
+            sought: Vec::new(),
             attachments: HashMap::new(),
             awaited_attach: Vec::new(),
             awaited_detach: Vec::new(),
@@ -4096,5 +4177,107 @@ mod tests {
         // Nothing of the old region is known in the new one.
         rig.enter("Target", ((1001 * 256) << 32) | (1000 * 256));
         assert_eq!(rig.session.thing(door), Thing::unknown(door));
+    }
+
+    // ------------------------------------------------- looking for objects
+
+    #[test]
+    fn an_object_looked_for_is_asked_about_and_reported_with_its_place() {
+        let mut rig = Rig::standing();
+        let (door, knob) = (object(0x30), object(0x31));
+        rig.receive(messages::OBJECT_UPDATE_CACHED, &wire::object_update_cached(&[800, 801]));
+        assert_eq!(requests(&rig.sent()), Vec::<Vec<u8>>::new(), "no scan before it is needed");
+
+        assert_eq!(rig.session.look_for(knob, rig.now), Ok(Look::Waiting));
+        let asked = requests(&rig.sent());
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0][32], 2, "both mentioned objects are asked about");
+        assert!(rig.session.next_deadline() <= rig.now + TOUCH_WAIT);
+        assert_eq!(rig.events(), []);
+
+        // The child comes first in the update; the event comes after the
+        // root, so that the place is known when it is read.
+        let blocks = [
+            wire::Block {
+                full_id: knob,
+                local_id: 801,
+                parent_id: 800,
+                data: wire::object_data([0.5, 0.0, 0.0], [0.0; 3], false),
+                worn: None,
+            },
+            wire::Block {
+                full_id: door,
+                local_id: 800,
+                parent_id: 0,
+                data: wire::object_data([13.0, 24.0, 30.0], [0.0; 3], false),
+                worn: None,
+            },
+        ];
+        rig.receive(messages::OBJECT_UPDATE, &wire::object_blocks(&blocks));
+        assert_eq!(rig.events(), [SessionEvent::Described(knob)]);
+        let thing = rig.session.thing(knob);
+        assert_eq!((thing.placement, thing.distance), (Placement::InWorld, Some(5.0)));
+        assert_eq!(rig.sent_ids(), [], "looking touches nothing");
+
+        // Known now, and not waited for again.
+        assert_eq!(rig.session.look_for(knob, rig.now), Ok(Look::Known));
+        rig.advance(secs(11));
+        assert_eq!(rig.events(), []);
+    }
+
+    #[test]
+    fn an_object_never_described_is_given_up_on_with_the_scan() {
+        let mut rig = Rig::standing();
+        let chair = object(0x30);
+        assert_eq!(rig.session.look_for(chair, rig.now), Ok(Look::Waiting));
+        rig.advance(secs(4));
+        // A second look, and a touch, share the scan's deadline.
+        assert_eq!(rig.session.look_for(chair, rig.now), Ok(Look::Waiting));
+        assert_eq!(rig.session.touch(object(0x31), rig.now), Ok(Touch::Waiting));
+        rig.advance(secs(5));
+        assert_eq!(rig.events(), []);
+        rig.advance(secs(1));
+        let mut events = rig.events();
+        events.sort_by_key(|event| format!("{event:?}"));
+        assert_eq!(events, [SessionEvent::NotDescribed(chair), SessionEvent::TouchFailed(object(0x31))]);
+        // The scan has had its time: the next look gives up at once.
+        assert_eq!(rig.session.look_for(chair, rig.now), Ok(Look::GaveUp));
+        rig.advance(secs(30));
+        assert_eq!(rig.events(), []);
+        // Described later all the same, it is known.
+        rig.prim(chair, 900, 0, [11.0, 20.0, 30.0]);
+        assert_eq!(rig.events(), [], "nobody waits for it any more");
+        assert_eq!(rig.session.look_for(chair, rig.now), Ok(Look::Known));
+    }
+
+    #[test]
+    fn leaving_the_region_ends_a_wait() {
+        let mut rig = Rig::standing();
+        let chair = object(0x30);
+        assert_eq!(rig.session.look_for(chair, rig.now), Ok(Look::Waiting));
+        start_teleport(&mut rig);
+        rig.session.handle_caps(1, finish(), rig.now);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::NotDescribed(chair), SessionEvent::RegionLeft { worn: vec![] }]
+        );
+        // Not in a region while the teleport runs.
+        assert_eq!(rig.session.look_for(chair, rig.now), Err(NOT_CONNECTED.to_string()));
+    }
+
+    #[test]
+    fn a_scan_can_be_started_alone() {
+        let mut rig = Rig::standing();
+        rig.receive(messages::OBJECT_UPDATE_CACHED, &wire::object_update_cached(&[800]));
+        rig.session.scan(rig.now);
+        assert_eq!(
+            requests(&rig.sent()),
+            [messages::request_multiple_objects(&rig.agent(), &[800]).body]
+        );
+        rig.prim(object(0x30), 800, 0, [13.0, 24.0, 30.0]);
+        assert_eq!(rig.events(), [], "nothing was waited for");
+        // A second start changes nothing.
+        rig.session.scan(rig.now);
+        assert_eq!(requests(&rig.sent()), Vec::<Vec<u8>>::new());
     }
 }

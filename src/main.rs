@@ -34,7 +34,7 @@ use names::{Lookup, Search};
 use net::{Event, RealNet};
 use persist::{Book, Location, LocationArg, Placement, SitArg, SitState, World};
 use reconciler::{Action, Decision, Goal, Reconciler, SeatGoal};
-use rlv::{After, Follow, Issuer, Limits, OwnStep, Restrictions, Rlv, Sitting, Step, Verdict, Who};
+use rlv::{After, Check, Command, Follow, Issuer, Limits, OwnStep, Restrictions, Rlv, Sitting, Step, Verdict, Who};
 use session::{Seat, Session, SessionEvent, Touch};
 use std::io::{BufRead, IsTerminal};
 use std::path::Path;
@@ -198,6 +198,10 @@ struct Bot {
     /// Who sent the followed forced sit that made the held seat what it
     /// is: its own restrictions do not hold the bot's steps towards it.
     seat_sender: Option<Who>,
+    /// Followed forced sits on objects the simulator has not described,
+    /// waiting for them to be looked for: the sender, the command and the
+    /// object.
+    seats_sought: Vec<(Issuer, Command, Uuid)>,
     /// The held placement was set by a `persist` or `home` that override
     /// exempted and has not been reached yet: no restriction holds the
     /// bot's steps towards it.
@@ -262,6 +266,12 @@ impl Grid for Live<'_> {
     }
     fn attachment_prims(&self, item: Uuid) -> Vec<Uuid> {
         self.session.attachment_prims(item)
+    }
+    fn look_for(&mut self, object: Uuid, now: Instant) -> Result<session::Look, String> {
+        self.session.look_for(object, now)
+    }
+    fn unknown_object(&self, object: Uuid) -> String {
+        self.session.unknown_object(object)
     }
     fn say(&mut self, channel: i32, chat_type: u8, text: &str, now: Instant) -> Result<(), String> {
         self.session.say(channel, chat_type, text, now)
@@ -425,6 +435,7 @@ impl Bot {
             follow: Follow::default(),
             follow_seat: false,
             seat_sender: None,
+            seats_sought: Vec::new(),
             exempt_placement: false,
             stand_owed: false,
             held_step: None,
@@ -516,6 +527,8 @@ impl Bot {
         self.inventory.generation = None;
         self.commands.session_lost();
         self.rlv.forget_waiting();
+        // What they waited to see described was in this session.
+        self.seats_sought.clear();
         // The objects of the next session are other objects.
         self.rlv.session_ended();
         // And the avatar of the next one sits on nothing.
@@ -966,33 +979,73 @@ impl Bot {
                 ));
                 continue;
             }
-            let follows = self.rlv.follows();
-            let was_manual = self.reconciler.is_manual();
-            let step = {
-                let mut live = live(
-                    &mut self.session,
-                    &self.search_url,
-                    &self.avatar_searches,
-                    &self.inventory,
-                    &self.rlv,
-                );
-                rlv::deal(&command, issuer, follows, &mut self.commands, live.as_mut(), now)
-            };
-            let outcome = match step {
-                Step::Said(said) => Ok(Some(said)),
-                Step::Done => Ok(None),
-                Step::Moved(movement) => {
-                    let after = self.follow.moved(movement, follows, was_manual);
-                    self.go_manual();
-                    self.after_forced(after, "", now);
-                    Ok(None)
-                }
-                Step::HoldSeat(object) => self.hold_seat(issuer, &command.text, object, now).map(|()| None),
-                Step::Failed(reason) => Err(reason),
-            };
+            let outcome = self.rlv_force(issuer, &command, now);
             outcomes.push((command.text, outcome));
         }
         outcomes
+    }
+
+    /// Deals with one RLV command that is neither a restriction nor a
+    /// clear, and with what becomes of it.
+    fn rlv_force(&mut self, issuer: &Issuer, command: &Command, now: Instant) -> Result<Option<String>, String> {
+        let follows = self.rlv.follows();
+        let was_manual = self.reconciler.is_manual();
+        let step = {
+            let mut live = live(
+                &mut self.session,
+                &self.search_url,
+                &self.avatar_searches,
+                &self.inventory,
+                &self.rlv,
+            );
+            rlv::deal(command, issuer, follows, &mut self.commands, live.as_mut(), now)
+        };
+        match step {
+            Step::Said(said) => Ok(Some(said)),
+            Step::Done => Ok(None),
+            Step::Moved(movement) => {
+                let after = self.follow.moved(movement, follows, was_manual);
+                self.go_manual();
+                self.after_forced(after, "", now);
+                Ok(None)
+            }
+            Step::HoldSeat(object) => self.hold_seat(issuer, &command.text, object, now).map(|()| None),
+            // Begun: nothing is persisted until the seat has been looked for.
+            Step::Sought(object) => {
+                self.seats_sought.push((issuer.clone(), command.clone(), object));
+                Ok(None)
+            }
+            Step::Failed(reason) => Err(reason),
+        }
+    }
+
+    /// `object` has been described, or the time to look for it is over:
+    /// the commands that waited for it are dealt with again, by the
+    /// restrictions in force now.
+    fn looked_for(&mut self, object: Uuid, described: bool, now: Instant) {
+        {
+            let mut live = live(
+                &mut self.session,
+                &self.search_url,
+                &self.avatar_searches,
+                &self.inventory,
+                &self.rlv,
+            );
+            match described {
+                true => self.commands.described(object, live.as_mut(), now),
+                false => self.commands.not_described(object, live.as_mut(), now),
+            }
+        }
+        // A forced sit carried out now moves the avatar as a command does.
+        self.follow_commands();
+        let (found, sought) = std::mem::take(&mut self.seats_sought)
+            .into_iter()
+            .partition(|(_, _, sought)| *sought == object);
+        self.seats_sought = sought;
+        for (issuer, command, _) in found {
+            // The outcome is in the log; nobody waits for it.
+            let _ = self.rlv_force(&issuer, &command, now);
+        }
     }
 
     /// A forced sit that is followed: the object becomes the held seat at
@@ -1276,6 +1329,8 @@ impl Bot {
             // What an object held ends with the object, in every mode.
             SessionEvent::ObjectGone(object) => self.rlv.object_gone(object),
             SessionEvent::RegionLeft { worn } => self.rlv.region_left(&worn),
+            SessionEvent::Described(object) => self.looked_for(object, true, now),
+            SessionEvent::NotDescribed(object) => self.looked_for(object, false, now),
             SessionEvent::TouchFailed(object) => {
                 let reason = match &self.session {
                     Some(session) => session.unknown_object(object),
@@ -1474,7 +1529,22 @@ impl Bot {
             _ => return false,
         };
         let limits = Bot::own_limits(&self.rlv, self.exempt_placement, self.seat_sender);
-        match rlv::own_step(limits, sitting(session), step, self.rlv.overridden()) {
+        // A seat the simulator has not described may be near enough once
+        // it is: the scan is to find it. The step waits as long as it takes.
+        let look = match held.sit {
+            SitState::Object(object) if matches!(action, Action::Sit) => {
+                let thing = session.thing(object);
+                matches!(limits.sit_on(sitting(session), &thing), Check::LookFirst(_))
+            }
+            _ => false,
+        };
+        let verdict = rlv::own_step(limits, sitting(session), step, self.rlv.overridden());
+        if look && matches!(verdict, Verdict::HeldBack(_)) {
+            if let Some(session) = self.session.as_mut() {
+                session.scan(Instant::now());
+            }
+        }
+        match verdict {
             Verdict::Go => {
                 self.not_held_back();
                 false
@@ -2660,6 +2730,36 @@ mod tests {
         moved(&mut bot, commands::Origin::Operator, Request::Stand);
         bot.follow_commands();
         assert_eq!(bot.seat_sender, None);
+    }
+
+    #[test]
+    fn a_followed_sit_that_waits_persists_nothing_until_its_seat_is_described() {
+        let mut bot = follower();
+        let held = bot.book.held().clone();
+        // What the bot keeps when `deal` answers `Step::Sought`.
+        let sought = || {
+            let command = rlv::parse(&format!("@sit:{}=force", bench())).remove(0).unwrap();
+            (collar(), command, bench())
+        };
+        bot.seats_sought.push(sought());
+        // Another object described changes nothing.
+        hear(&mut bot, SessionEvent::Described(Uuid::from_bytes([0x55; 16])));
+        assert_eq!(bot.book.held(), &held);
+        assert!(!bot.follow_seat && bot.seat_sender.is_none());
+        assert_eq!(bot.seats_sought.len(), 1);
+        // The bench described: dealt with again, and held as a followed sit.
+        hear(&mut bot, SessionEvent::Described(bench()));
+        assert!(bot.seats_sought.is_empty());
+        assert_eq!(bot.book.held().to_string(), format!("Home/40/50/22 {}", bench()));
+        assert!(bot.follow_seat);
+        assert_eq!(bot.seat_sender, Some(Who::Object(collar().id)));
+        assert!(!bot.reconciler.is_manual());
+        // A session lost forgets what waited, and persists nothing.
+        let mut bot = follower();
+        bot.seats_sought.push(sought());
+        hear(&mut bot, SessionEvent::Lost("kicked".to_string()));
+        assert!(bot.seats_sought.is_empty());
+        assert_eq!(bot.book.held(), &held);
     }
 
     #[test]

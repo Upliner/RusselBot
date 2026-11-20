@@ -305,7 +305,7 @@ One TOML file; see `russelbot.example.toml`.
 | `fetch_offline_im` | no | `true` to also fetch IMs stored while the avatar was offline. Default: `false` |
 | `socket` | no | `true` to listen on the control socket, see [Control socket](#control-socket). Default: `false` |
 | `requesttp_timeout` | no | Minutes after `requesttp` during which the asked avatar's teleport offer is accepted. Default: `10` |
-| `scan_distance` | no | Metres (1 to 1024) within which objects are learned from the start, for `touch`; see [Touching objects](#touching-objects). Default: learn within 32 m when `touch` is first used |
+| `scan_distance` | no | Metres (1 to 1024) within which objects are learned from the start, for `touch`; see [Touching objects](#touching-objects). Default: learn within 32 m when `touch` is first used, or when an RLV restriction such as `sittp` needs an object the bot does not know |
 | `restore_attachments` | no | `false` to keep the bot from attaching again, after each login, what the Current Outfit folder lists and the simulator did not bring; see [Attachments](#attachments). Default: `true` |
 | `perms` | no | Two tables, `[perms.autoaccept]` and `[perms.except]`, that say which teleport offers, inventory offers and scripts' permission requests the bot accepts by itself, see [Permission requests](#permission-requests). Default: none |
 | `rlv` | no | `true` to start with RLV on: the bot then reads the `@` commands of scripted objects the avatar owns, see [RLV](#rlv). Default: `false` |
@@ -657,9 +657,11 @@ rest it has to ask (a scan), and that costs traffic, so it asks only when
 there is a reason:
 
 - Without `scan_distance`, nothing extra is sent until `touch` names an
-  object the bot does not know. That first `touch` starts a scan of the
-  objects within 32 m and waits up to 10 seconds for the object to turn
-  up; later ones answer at once. A new region starts over.
+  object the bot does not know, or an RLV restriction such as `sittp` or
+  `fartouch` has to be applied to one (see [Restrictions](#restrictions)).
+  The first of these starts a scan of the objects within 32 m and waits up
+  to 10 seconds for the object to turn up; later ones answer at once. A
+  new region starts over.
 - With `scan_distance = N`, the bot scans from the moment it enters a
   region and asks the simulator to describe objects within N metres, so
   `touch` answers at once and reaches further, at the price of that
@@ -1057,14 +1059,24 @@ answers with an error naming what stayed on. `attach` without a body part
 puts an object where it was last; when the inventory records no such
 point and some point is closed, it is refused, since the bot cannot tell
 where the simulator would put it. Distances are measured to the object's
-own position, where a viewer measures to the spot that was clicked, and an
-object the simulator has not described to the bot counts as too far. That
-matters for `sittp` and `fartouch`: without `scan_distance` in the config
-the simulator describes few objects to the bot, so most sits and touches
-are refused under them, and the bot's own sit on the seat it holds waits
-after every arrival. Set `scan_distance`, with which the seat is known
-within a second of arriving, or `override = "sit"` in the `[persist]`
-table.
+own position, where a viewer measures to the spot that was clicked.
+
+Under `sittp` and the touch restrictions the bot has to know how far an
+object is and what it is, which it knows only of objects the simulator has
+described to it; without `scan_distance` in the config that is few of
+them. So when one of these restrictions has to be applied to an object the
+bot does not know, it looks for the object first: it starts the scan of
+[Touching objects](#touching-objects), if none is running in the region,
+and gives the object until 10 seconds after the start of that scan. A
+`sit` or `touch` command, and a forced `@sit`, wait for that and are then
+decided by what the object turns out to be; `rlv cmd` answers a forced
+`@sit` with `ok` at once. An object that is not described in that time,
+because it does not exist or is beyond the scan's 32 m (or
+`scan_distance`), counts as too far, and once the scan has had its 10
+seconds such an object is decided at once. The bot's own sit on the seat
+it holds is held back until the seat is described, which after an arrival
+takes about a second, and has no time limit. Without such a restriction
+nothing is looked for, and a `sit` goes out at once as it always has.
 Nothing is sent to an avatar whose offer, request or message was dropped,
 where a viewer would tell them.
 

@@ -14,7 +14,7 @@ pub use crate::control::RlvMode as Mode;
 use crate::control::{Request, Response};
 use crate::inventory;
 use crate::persist::SitState;
-use crate::session::{Message, Placement, Source, Thing, NOT_CONNECTED};
+use crate::session::{Look, Message, Placement, Source, Thing, NOT_CONNECTED};
 use crate::udp::messages::Vector3;
 use std::collections::VecDeque;
 use std::fmt;
@@ -650,6 +650,45 @@ impl Refusal {
     }
 }
 
+/// The behaviours of the rows of "Touching": held, they concern a touch.
+const TOUCH_ROWS: [&str; 11] = [
+    "interact",
+    "touchall",
+    "touchworld",
+    "touchworld_sec",
+    "touchthis",
+    "touchattach",
+    "touchattachself",
+    "touchattachother",
+    "touchhud",
+    "fartouch",
+    "touchfar",
+];
+
+/// What the restrictions say of something done to an object, which, when
+/// the simulator has not described it, may turn out to be near or far,
+/// in-world or worn.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Check {
+    /// Allowed whatever the object turns out to be.
+    Allowed,
+    /// Allowed for some of what the object may turn out to be: it is to
+    /// be looked for first, and decided by what it then is. The refusal
+    /// is why it would not be done as things stand, where that is known.
+    LookFirst(Option<Refusal>),
+    /// Refused whatever the object turns out to be.
+    Refused(Refusal),
+}
+
+impl From<Result<(), Refusal>> for Check {
+    fn from(result: Result<(), Refusal>) -> Check {
+        match result {
+            Ok(()) => Check::Allowed,
+            Err(refusal) => Check::Refused(refusal),
+        }
+    }
+}
+
 /// What an option of a restriction may name.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Target {
@@ -848,6 +887,25 @@ impl<'a> Limits<'a> {
         Limits::ok(self.out_of_reach(&["sittp"], distance))
     }
 
+    /// Sitting on an object the simulator has not described, whose
+    /// distance is therefore not known.
+    pub fn sit_undescribed(&self, sitting: Sitting) -> Check {
+        match self.sit(sitting, None) {
+            Ok(()) => Check::Allowed,
+            // Near enough, it would be allowed: worth looking for.
+            Err(refusal) if self.sit(sitting, Some(0.0)).is_ok() => Check::LookFirst(Some(refusal)),
+            Err(refusal) => Check::Refused(refusal),
+        }
+    }
+
+    /// Sitting on `thing`, described or not.
+    pub fn sit_on(&self, sitting: Sitting, thing: &Thing) -> Check {
+        match thing.placement {
+            Placement::Unknown => self.sit_undescribed(sitting),
+            _ => Check::from(self.sit(sitting, thing.distance)),
+        }
+    }
+
     pub fn sit_ground(&self, sitting: Sitting) -> Result<(), Refusal> {
         Limits::ok(self.in_force("sit"))?;
         self.stand(sitting)
@@ -975,6 +1033,51 @@ impl<'a> Limits<'a> {
         }
         let distance = if own { Some(0.0) } else { thing.distance };
         Limits::ok(self.out_of_reach(&["fartouch", "touchfar"], distance))
+    }
+
+    /// Touching `object`, which the simulator has not described. Allowed
+    /// when no row of the touch restrictions is held; refused when every
+    /// kind of thing it may turn out to be, near or far, would be; to be
+    /// looked for otherwise.
+    pub fn touch_undescribed(&self, object: Uuid) -> Check {
+        let row = |rule: &Rule| match rule.behaviour.as_str() {
+            // With an option these are exceptions.
+            "touchworld" | "touchworld_sec" => rule.option.is_none(),
+            "interact" => rule.option.is_none(),
+            behaviour => TOUCH_ROWS.contains(&behaviour),
+        };
+        if !self.holders().any(|holder| holder.rules.iter().any(row)) {
+            return Check::Allowed;
+        }
+        let thing = |placement, distance| Thing {
+            placement,
+            prims: vec![object],
+            distance: Some(distance),
+        };
+        let mut refusal = self.touch(&Thing::unknown(object)).err();
+        let mut allowed = refusal.is_none();
+        for placement in [Placement::Hud, Placement::Worn, Placement::WornBy(Uuid::nil()), Placement::InWorld] {
+            for distance in [0.0, f32::INFINITY] {
+                match self.touch(&thing(placement, distance)) {
+                    Ok(()) => allowed = true,
+                    Err(found) => {
+                        refusal.get_or_insert(found);
+                    }
+                }
+            }
+        }
+        match (allowed, refusal) {
+            (false, Some(refusal)) => Check::Refused(refusal),
+            (_, refusal) => Check::LookFirst(refusal),
+        }
+    }
+
+    /// Touching `thing`, described or not.
+    pub fn touch_on(&self, thing: &Thing) -> Check {
+        match thing.placement {
+            Placement::Unknown => self.touch_undescribed(thing.prims[0]),
+            _ => Check::from(self.touch(thing)),
+        }
     }
 
     /// Attaching something to `point`; `None` when the simulator chooses.
@@ -1211,6 +1314,11 @@ pub enum Step {
     /// A forced sit that is to be followed: nothing was done yet. The bot
     /// persists this object as its seat, which seats the avatar.
     HoldSeat(Uuid),
+    /// A forced sit that is to be followed, on this object, which the
+    /// simulator has not described: it is being looked for, and the
+    /// command is to be dealt with again once it is described or the
+    /// time to look has passed.
+    Sought(Uuid),
     /// Not carried out, and why.
     Failed(String),
 }
@@ -1369,10 +1477,27 @@ pub fn deal<G: Grid>(
             if follow {
                 // Left to the bot, which is held to the restrictions as
                 // the sit would be: all but the sender's own.
-                if let Some(grid) = &grid {
-                    let limits = Limits::new(grid.restrictions(), Some(issuer.who()));
-                    if let Err(refusal) = limits.sit(grid.sitting(), grid.thing(object).distance) {
-                        return refused(refusal.short());
+                if let Some(grid) = grid {
+                    let check = Limits::new(grid.restrictions(), Some(issuer.who())).sit_on(grid.sitting(), &grid.thing(object));
+                    match check {
+                        Check::Allowed => {}
+                        Check::Refused(refusal) => return refused(refusal.short()),
+                        Check::LookFirst(why) => match grid.look_for(object, now) {
+                            Ok(Look::Waiting) => {
+                                let why = why.map(|refusal| format!(": {}", refusal.short())).unwrap_or_default();
+                                crate::info!("rlv: {issuer}: {text}: looking for {object} first{why}");
+                                return Step::Sought(object);
+                            }
+                            // Decided by what is known now: too far when
+                            // it was not found.
+                            Ok(Look::Known | Look::GaveUp) => {
+                                let limits = Limits::new(grid.restrictions(), Some(issuer.who()));
+                                if let Err(refusal) = limits.sit(grid.sitting(), grid.thing(object).distance) {
+                                    return refused(refusal.short());
+                                }
+                            }
+                            Err(reason) => return refused(reason),
+                        },
                     }
                 }
                 return Step::HoldSeat(object);
@@ -3270,6 +3395,130 @@ mod tests {
         // Another object's does.
         assert!(failed(rig.deal_from(&cuff(), &sit)).starts_with("sittp, held by Collar"));
         assert_eq!(rig.calls(), []);
+    }
+
+    /// The simulator has described the chair now, this far away.
+    fn chair_described(rig: &mut Rig, distance: f32) {
+        let thing = Thing {
+            placement: Placement::InWorld,
+            prims: vec![chair()],
+            distance: Some(distance),
+        };
+        rig.grid.things.push((chair(), thing));
+    }
+
+    #[test]
+    fn a_forced_sit_waits_for_its_seat_to_be_described() {
+        let mut rig = Rig::new();
+        rig.deal_from(&cuff(), "@sittp:20=n");
+        let sit = format!("@sit:{}=force", chair());
+        // Begun: the bench is looked for, and nothing moves yet.
+        assert_eq!(rig.deal(&sit), Step::Moved(Movement::Sit));
+        assert_eq!(rig.calls(), [Call::LookFor(chair())]);
+        assert!(!rig.commands.take_manual());
+        // Described 3 m away: the avatar sits, and the bot goes manual.
+        chair_described(&mut rig, 3.0);
+        rig.commands.described(chair(), Some(&mut rig.grid), rig.now);
+        assert_eq!(rig.calls(), [Call::Sit(chair())]);
+        assert!(rig.commands.take_manual());
+        // By hand, as the operator's console, the same.
+        let mut rig = Rig::new();
+        rig.deal_from(&cuff(), "@sittp:20=n");
+        assert_eq!(rig.deal_from(&operator(), &sit), Step::Moved(Movement::Sit));
+        assert_eq!(rig.calls(), [Call::LookFor(chair())]);
+    }
+
+    #[test]
+    fn a_followed_sit_waits_for_its_seat_to_be_described() {
+        let mut rig = Rig::new();
+        rig.follow = true;
+        rig.deal_from(&cuff(), "@sittp:20=n");
+        let sit = format!("@sit:{}=force", chair());
+        // Followed sit that waits: looked for, and not held yet.
+        assert_eq!(rig.deal(&sit), Step::Sought(chair()));
+        assert_eq!(rig.deal_from(&operator(), &sit), Step::Sought(chair()));
+        assert_eq!(rig.calls(), [Call::LookFor(chair()), Call::LookFor(chair())]);
+        // Dealt with again once described: within 20 m it is held.
+        chair_described(&mut rig, 3.0);
+        assert_eq!(rig.deal(&sit), Step::HoldSeat(chair()));
+        // Its own `sittp` would not have held it either: nothing to look for.
+        let mut rig = Rig::new();
+        rig.follow = true;
+        rig.deal("@sittp=n");
+        assert_eq!(rig.deal(&sit), Step::HoldSeat(chair()));
+        assert_eq!(rig.calls(), []);
+    }
+
+    #[test]
+    fn a_followed_sit_is_refused_after_the_wait() {
+        let mut rig = Rig::new();
+        rig.follow = true;
+        rig.deal_from(&cuff(), "@sittp=n");
+        let sit = format!("@sit:{}=force", chair());
+        assert_eq!(rig.deal(&sit), Step::Sought(chair()));
+        // Described 10 m away: refused, naming the restriction.
+        chair_described(&mut rig, 10.0);
+        let reason = failed(rig.deal(&sit));
+        assert!(
+            reason.starts_with("sittp, held by Cuff") && reason.contains("10.0 m away"),
+            "{reason}"
+        );
+        // Never described: refused once the scan has had its time.
+        let mut rig = Rig::new();
+        rig.follow = true;
+        rig.deal_from(&cuff(), "@sittp=n");
+        assert_eq!(rig.deal(&sit), Step::Sought(chair()));
+        rig.grid.look = Ok(Look::GaveUp);
+        let reason = failed(rig.deal(&sit));
+        assert!(reason.contains("does not know how far"), "{reason}");
+        // Not in a region: refused as well.
+        rig.grid.offline = true;
+        assert_eq!(failed(rig.deal(&sit)), NOT_CONNECTED);
+    }
+
+    #[test]
+    fn what_an_undescribed_object_may_turn_out_to_be_decides_whether_to_look() {
+        let mut store = Restrictions::default();
+        let collar = Who::Object(Uuid::from_bytes([0xC0; 16]));
+        let unknown = Uuid::from_bytes([0x63; 16]);
+        let check = |store: &Restrictions| {
+            let limits = Limits::new(Some(store), None);
+            (limits.sit_undescribed(Sitting::No), limits.touch_undescribed(unknown))
+        };
+        let looks = |check: &Check| matches!(check, Check::LookFirst(_));
+        let refused = |check: &Check| matches!(check, Check::Refused(_));
+        // Nothing held, or nothing about sitting or touching: no look.
+        assert_eq!(check(&store), (Check::Allowed, Check::Allowed));
+        store.set(collar, "Collar", "sendim", None);
+        store.set(collar, "Collar", "touchworld", Some(&unknown.to_string()));
+        assert_eq!(check(&store), (Check::Allowed, Check::Allowed));
+        // A distance, or what the object is, makes it worth looking.
+        for (behaviour, option) in [
+            ("touchhud", None),
+            ("fartouch", Some("3")),
+            ("touchattachself", None),
+            ("touchworld", None),
+        ] {
+            let mut store = Restrictions::default();
+            store.set(collar, "Collar", behaviour, option);
+            assert!(looks(&check(&store).1), "{behaviour}");
+        }
+        // A `touchthis` may name the root of the prim, and a
+        // `touchattachother` the avatar wearing it.
+        for (behaviour, option) in [
+            ("touchthis", Uuid::from_bytes([1; 16])),
+            ("touchattachother", Uuid::from_bytes([2; 16])),
+        ] {
+            let mut store = Restrictions::default();
+            store.set(collar, "Collar", behaviour, Some(&option.to_string()));
+            assert!(looks(&check(&store).1), "{behaviour}");
+        }
+        store.set(collar, "Collar", "sittp", None);
+        assert!(looks(&check(&store).0));
+        // What refuses whatever the object is refuses at once.
+        store.set(collar, "Collar", "interact", None);
+        let (sit, touch) = check(&store);
+        assert!(refused(&sit) && refused(&touch), "{sit:?} {touch:?}");
     }
 
     #[test]

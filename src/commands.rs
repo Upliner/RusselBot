@@ -11,8 +11,8 @@ use crate::names::Names;
 use crate::perms::{self, Ask, Kind, Owner, Rules};
 use crate::persist::{Location, SitState};
 use crate::reconciler::same_region;
-use crate::rlv::{Limits, Refusal, Restrictions, Sitting, Who};
-use crate::session::{InventoryOffer, Thing, Touch, ATTACH_LIMIT, DETACH_LIMIT, NOT_CONNECTED};
+use crate::rlv::{Check, Limits, Refusal, Restrictions, Sitting, Who};
+use crate::session::{InventoryOffer, Look, Thing, Touch, ATTACH_LIMIT, DETACH_LIMIT, NOT_CONNECTED};
 use crate::udp::messages::{Vector3, MAX_TEXT};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Sender;
@@ -292,6 +292,22 @@ pub trait Grid {
     fn thing(&self, object: Uuid) -> Thing;
     /// The prims of the attachment on the avatar made from `item`.
     fn attachment_prims(&self, item: Uuid) -> Vec<Uuid>;
+    /// Looks for an object the simulator has not described, with the
+    /// object scan. A wait ends in the session's `Described` or
+    /// `NotDescribed`.
+    fn look_for(&mut self, object: Uuid, now: Instant) -> Result<Look, String>;
+    /// Why `object` cannot be touched when the scan did not turn it up.
+    fn unknown_object(&self, object: Uuid) -> String;
+}
+
+/// A command that a restriction refuses for an object the simulator has
+/// not described, waiting for it to be: it is then carried out again from
+/// the start, as whoever gave it.
+struct Looking {
+    object: Uuid,
+    origin: Origin,
+    request: Request,
+    reply: Sender<Response>,
 }
 
 /// An inventory offer that is being accepted: the grid is being asked
@@ -527,6 +543,9 @@ pub struct Commands {
     pending_teleport: Option<(Sender<Response>, Origin)>,
     /// `touch` commands waiting for their object to turn up.
     touches: Vec<(Uuid, Sender<Response>)>,
+    /// `sit` and `touch` commands waiting for their object to be described
+    /// before the restrictions decide them.
+    looking: Vec<Looking>,
     /// Whose command is being carried out.
     origin: Origin,
     /// A command moved the avatar since `take_manual` was last asked.
@@ -595,6 +614,7 @@ impl Commands {
             pending_sit: None,
             pending_teleport: None,
             touches: Vec::new(),
+            looking: Vec::new(),
             origin: Origin::Operator,
             went_manual: false,
             last_tp: None,
@@ -808,8 +828,19 @@ impl Commands {
             }
             SitTarget::Object(object) => object,
         };
-        let allowed = self.limits(&*grid).sit(sitting, grid.thing(object).distance);
-        allowed.map_err(|refusal| self.refused(refusal))?;
+        let check = self.limits(&*grid).sit_on(sitting, &grid.thing(object));
+        match check {
+            Check::Allowed => {}
+            Check::Refused(refusal) => return Err(self.refused(refusal)),
+            Check::LookFirst(why) => match grid.look_for(object, now)? {
+                Look::Waiting => return Ok(self.look(object, Request::Sit(object.to_string()), why, reply)),
+                // Decided by what is known now: too far when it was not found.
+                Look::Known | Look::GaveUp => {
+                    let allowed = self.limits(&*grid).sit(sitting, grid.thing(object).distance);
+                    allowed.map_err(|refusal| self.refused(refusal))?;
+                }
+            },
+        }
         grid.sit(object, now)?;
         self.went_manual = true;
         self.remember_sit(SitState::Object(object));
@@ -907,8 +938,21 @@ impl Commands {
     fn touch<G: Grid>(&mut self, object: &str, reply: &Sender<Response>, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
         let object = Uuid::parse_str(object.trim()).map_err(|_| format!("\"{}\" is not an object's UUID", object.trim()))?;
         let grid = grid.ok_or(NOT_CONNECTED)?;
-        let allowed = self.limits(&*grid).touch(&grid.thing(object));
-        allowed.map_err(|refusal| self.refused(refusal))?;
+        let check = self.limits(&*grid).touch_on(&grid.thing(object));
+        match check {
+            Check::Allowed => {}
+            Check::Refused(refusal) => return Err(self.refused(refusal)),
+            // Not the session's own wait, which would touch the object as
+            // soon as it is described, whatever it turns out to be.
+            Check::LookFirst(why) => match grid.look_for(object, now)? {
+                Look::Waiting => return Ok(self.look(object, Request::Touch(object.to_string()), why, reply)),
+                Look::GaveUp => return Err(grid.unknown_object(object)),
+                Look::Known => {
+                    let allowed = self.limits(&*grid).touch(&grid.thing(object));
+                    allowed.map_err(|refusal| self.refused(refusal))?;
+                }
+            },
+        }
         match grid.touch(object, now)? {
             Touch::Sent => {
                 crate::info!("control: touched {object}");
@@ -919,6 +963,47 @@ impl Commands {
                 self.touches.push((object, reply.clone()));
                 Ok(Done::Parked)
             }
+        }
+    }
+
+    /// Parks the command that is being carried out until `object` has
+    /// been looked for.
+    fn look(&mut self, object: Uuid, request: Request, why: Option<Refusal>, reply: &Sender<Response>) -> Done {
+        let tag = self.origin.tag();
+        let why = why.map(|refusal| format!(": {}", refusal.short())).unwrap_or_default();
+        crate::info!("{tag}: {}: looking for {object} first{why}", request.name());
+        self.looking.push(Looking {
+            object,
+            origin: self.origin,
+            request,
+            reply: reply.clone(),
+        });
+        Done::Parked
+    }
+
+    /// The simulator has described `object`: the commands that waited for
+    /// it are carried out again, by the restrictions in force now.
+    pub fn described<G: Grid>(&mut self, object: Uuid, grid: Option<&mut G>, now: Instant) {
+        self.look_again(object, grid, now);
+    }
+
+    /// The time to look for `object` has passed, or the region or the
+    /// session is gone: the commands that waited for it are carried out
+    /// again, and refused as for an object that is not known.
+    pub fn not_described<G: Grid>(&mut self, object: Uuid, grid: Option<&mut G>, now: Instant) {
+        self.look_again(object, grid, now);
+    }
+
+    fn look_again<G: Grid>(&mut self, object: Uuid, mut grid: Option<&mut G>, now: Instant) {
+        let (found, looking) = std::mem::take(&mut self.looking)
+            .into_iter()
+            .partition(|looking| looking.object == object);
+        self.looking = looking;
+        for Looking {
+            origin, request, reply, ..
+        } in found
+        {
+            self.handle_from(origin, request, reply, grid.as_deref_mut(), now);
         }
     }
 
@@ -1748,6 +1833,14 @@ impl Commands {
         for (_, reply) in std::mem::take(&mut self.touches) {
             refuse(CONTROL, "touch", &reply, "the session was lost".to_string());
         }
+        for looking in std::mem::take(&mut self.looking) {
+            refuse(
+                looking.origin.tag(),
+                looking.request.name(),
+                &looking.reply,
+                "the session was lost".to_string(),
+            );
+        }
         self.fail_jobs("the session was lost");
         for attach in std::mem::take(&mut self.attaching) {
             refuse(CONTROL, attach.command, &attach.reply, "the session was lost".to_string());
@@ -2508,6 +2601,8 @@ pub(crate) mod tests {
         /// An accepted inventory offer: whom it is answered to, whether an
         /// object gave, the transaction and the folder.
         AcceptInventory(Uuid, bool, Uuid, Uuid),
+        /// A look for an object the simulator has not described.
+        LookFor(Uuid),
     }
 
     pub(crate) struct FakeGrid {
@@ -2536,6 +2631,8 @@ pub(crate) mod tests {
         pub(crate) sitting: Sitting,
         /// What the simulator has described, object by object.
         pub(crate) things: Vec<(Uuid, Thing)>,
+        /// What `look_for` answers for an object not in `things`.
+        pub(crate) look: Result<Look, String>,
     }
 
     impl Default for FakeGrid {
@@ -2556,6 +2653,7 @@ pub(crate) mod tests {
                 rlv_off: false,
                 sitting: Sitting::No,
                 things: Vec::new(),
+                look: Ok(Look::Waiting),
             }
         }
     }
@@ -2704,6 +2802,17 @@ pub(crate) mod tests {
         }
         fn attachment_prims(&self, item: Uuid) -> Vec<Uuid> {
             self.worn.iter().filter(|(_, of)| *of == item).map(|(prim, _)| *prim).collect()
+        }
+        fn look_for(&mut self, object: Uuid, _: Instant) -> Result<Look, String> {
+            self.check()?;
+            self.calls.push(Call::LookFor(object));
+            match self.things.iter().any(|(id, _)| *id == object) {
+                true => Ok(Look::Known),
+                false => self.look.clone(),
+            }
+        }
+        fn unknown_object(&self, object: Uuid) -> String {
+            format!("object {object} is not known to the bot")
         }
     }
 
@@ -5645,16 +5754,17 @@ pub(crate) mod tests {
         rig.hold(&["interact"]);
         held_back(&rig.command(sit(chair)), "interact");
         // From afar: 10 m is too far, 1 m is not, and an object of unknown
-        // place counts as too far.
+        // place counts as too far once the scan has had its time.
         rig.lift_all();
         rig.hold(&["sittp"]);
         rig.described(chair, Placement::InWorld, 10.0);
         rig.described(stool, Placement::InWorld, 1.0);
         held_back(&rig.command(sit(chair)), "sittp");
         not_answered(&rig.command(sit(stool)));
+        rig.grid.look = Ok(Look::GaveUp);
         let reason = held_back(&rig.command(sit(bench)), "sittp");
         assert!(reason.contains("does not know how far"), "{reason}");
-        assert_eq!(rig.calls(), [Call::Sit(stool)]);
+        assert_eq!(rig.calls(), [Call::Sit(stool), Call::LookFor(bench)]);
         assert_eq!(rig.commands.last_sit(), Some(SitState::Object(stool)));
     }
 
@@ -5719,12 +5829,185 @@ pub(crate) mod tests {
         rig.hold(&["interact"]);
         held_back(&rig.command(touch(lever)), "interact");
         rig.calls();
-        // An object the simulator has not described is looked for as before
-        // when nothing in force could concern it.
+        // An object the simulator has not described is touched as before,
+        // with the session's own wait, when no row of the table is held.
         rig.lift_all();
-        rig.hold(&["touchhud"]);
+        rig.hold(&["sittp", "touchme"]);
         rig.grid.touch = Ok(Touch::Waiting);
-        not_answered(&rig.command(touch(Uuid::from_bytes([0x63; 16]))));
+        let unknown = Uuid::from_bytes([0x63; 16]);
+        let answer = rig.command(touch(unknown));
+        not_answered(&answer);
+        assert_eq!(rig.calls(), [Call::Touch(unknown)]);
+        rig.commands.touched(unknown);
+        assert_eq!(answer.try_recv(), Ok(Response::Ok(None)));
+        // Under `interact` nothing it may turn out to be is touched: refused
+        // at once, without looking.
+        rig.hold(&["interact"]);
+        held_back(&rig.command(touch(unknown)), "interact");
+        assert_eq!(rig.calls(), []);
+    }
+
+    // --------------------------------------- objects the bot does not know
+
+    /// The answer when the bot has not described an object to the fake grid.
+    fn not_known(answer: &Receiver<Response>, object: Uuid) {
+        assert_eq!(error(answer), format!("object {object} is not known to the bot"));
+    }
+
+    impl Rig {
+        /// The simulator has described `object` now, as the session reports.
+        fn now_described(&mut self, object: Uuid, placement: Placement, distance: f32) {
+            self.described(object, placement, distance);
+            self.commands.described(object, Some(&mut self.grid), self.now);
+        }
+
+        /// The time to look for `object` has passed.
+        fn never_described(&mut self, object: Uuid) {
+            self.grid.look = Ok(Look::GaveUp);
+            self.commands.not_described(object, Some(&mut self.grid), self.now);
+        }
+    }
+
+    #[test]
+    fn a_sit_waits_for_its_seat_under_sittp() {
+        let chair = Uuid::from_bytes([0x61; 16]);
+        let sit = Request::Sit(chair.to_string());
+        let mut rig = Rig::new();
+        rig.hold(&["sittp:20"]);
+        // Sit that waits for its seat: looked for, nothing sent, not manual.
+        let answer = rig.command(sit.clone());
+        not_answered(&answer);
+        assert_eq!(rig.calls(), [Call::LookFor(chair)]);
+        assert!(!rig.commands.take_manual());
+        assert_eq!(rig.commands.last_sit(), None);
+        // Described 3 m away: the sit goes out, and is answered as without the wait.
+        rig.now_described(chair, Placement::InWorld, 3.0);
+        assert_eq!(rig.calls(), [Call::Sit(chair)]);
+        assert!(rig.commands.take_manual());
+        assert_eq!(rig.commands.last_sit(), Some(SitState::Object(chair)));
+        not_answered(&answer);
+        rig.commands.seated(chair);
+        assert!(matches!(answer.try_recv(), Ok(Response::Ok(_))));
+        // Something else described is nobody's business.
+        rig.commands.described(Uuid::from_bytes([0x69; 16]), Some(&mut rig.grid), rig.now);
+        assert_eq!(rig.calls(), []);
+    }
+
+    #[test]
+    fn a_seat_that_turns_out_too_far_is_refused_with_its_distance() {
+        let chair = Uuid::from_bytes([0x61; 16]);
+        let mut rig = Rig::new();
+        rig.hold(&["sittp"]);
+        let answer = rig.command(Request::Sit(chair.to_string()));
+        not_answered(&answer);
+        rig.calls();
+        rig.now_described(chair, Placement::InWorld, 10.0);
+        let reason = held_back(&answer, "sittp");
+        assert!(reason.contains("10.0 m away"), "{reason}");
+        assert_eq!(rig.calls(), []);
+        assert!(!rig.commands.take_manual(), "a refused command does not go manual");
+    }
+
+    #[test]
+    fn a_seat_never_described_is_refused_and_later_ones_at_once() {
+        let ghost = Uuid::from_bytes([0x61; 16]);
+        let sit = Request::Sit(ghost.to_string());
+        let mut rig = Rig::new();
+        rig.hold(&["sittp"]);
+        let answer = rig.command(sit.clone());
+        not_answered(&answer);
+        rig.calls();
+        rig.never_described(ghost);
+        let reason = held_back(&answer, "sittp");
+        assert!(reason.contains("does not know how far"), "{reason}");
+        // After the scan has had its time: refused at once.
+        let reason = held_back(&rig.command(sit), "sittp");
+        assert!(reason.contains("does not know how far"), "{reason}");
+        // Asked again at the deadline, which is how the bot learns that the
+        // scan gave up, and once more for the second command.
+        assert_eq!(rig.calls(), [Call::LookFor(ghost), Call::LookFor(ghost)]);
+        assert!(!rig.commands.take_manual());
+    }
+
+    #[test]
+    fn without_a_restriction_that_needs_it_nothing_is_looked_for() {
+        let chair = Uuid::from_bytes([0x61; 16]);
+        let mut rig = Rig::new();
+        // No restriction, no wait.
+        not_answered(&rig.command(Request::Sit(chair.to_string())));
+        assert_eq!(rig.calls(), [Call::Sit(chair)]);
+        rig.commands.seated(chair);
+        // A restriction that refuses whatever the distance: refused at once.
+        rig.hold(&["sit", "sittp"]);
+        held_back(&rig.command(Request::Sit(chair.to_string())), "sit");
+        assert_eq!(rig.calls(), []);
+        // The exempt command never waits for a restriction's sake.
+        not_answered(&rig.exempt(Request::Sit(chair.to_string())));
+        assert_eq!(rig.calls(), [Call::Sit(chair)]);
+    }
+
+    #[test]
+    fn a_wait_ends_with_the_region_or_the_session() {
+        let (chair, door) = (Uuid::from_bytes([0x61; 16]), Uuid::from_bytes([0x62; 16]));
+        let mut rig = Rig::new();
+        rig.hold(&["sittp", "touchworld"]);
+        // Region left while waiting: looked at again, and not in a region.
+        let answer = rig.command(Request::Sit(chair.to_string()));
+        rig.grid.offline = true;
+        rig.commands.not_described(chair, Some(&mut rig.grid), rig.now);
+        assert_eq!(error(&answer), NOT_CONNECTED);
+        // The session lost: every wait is answered.
+        rig.grid.offline = false;
+        let sit = rig.command(Request::Sit(chair.to_string()));
+        let touch = rig.command(Request::Touch(door.to_string()));
+        rig.commands.session_lost();
+        assert_eq!(error(&sit), "the session was lost");
+        assert_eq!(error(&touch), "the session was lost");
+        rig.commands.described(chair, Some(&mut rig.grid), rig.now);
+        rig.calls();
+        assert_eq!(rig.calls(), []);
+    }
+
+    #[test]
+    fn a_touch_under_a_restriction_looks_first_and_touches_what_it_finds() {
+        let (door, hat, ghost) = (
+            Uuid::from_bytes([0x61; 16]),
+            Uuid::from_bytes([0x62; 16]),
+            Uuid::from_bytes([0x63; 16]),
+        );
+        let touch = |object: Uuid| Request::Touch(object.to_string());
+        let mut rig = Rig::new();
+        rig.hold(&["touchattach"]);
+        // Touch under a restriction: looked for, not touched with the
+        // session's own wait.
+        let answer = rig.command(touch(door));
+        not_answered(&answer);
+        assert_eq!(rig.calls(), [Call::LookFor(door)]);
+        // A door rezzed in the region: touched once it is described.
+        rig.now_described(door, Placement::InWorld, 3.0);
+        assert_eq!(answer.try_recv(), Ok(Response::Ok(None)));
+        assert_eq!(rig.calls(), [Call::Touch(door)]);
+        // Another's attachment: refused once described.
+        let answer = rig.command(touch(hat));
+        rig.calls();
+        rig.now_described(hat, Placement::WornBy(jane()), 2.0);
+        held_back(&answer, "touchattach");
+        assert_eq!(rig.calls(), []);
+        // Never described: refused as an unknown object is.
+        let answer = rig.command(touch(ghost));
+        rig.never_described(ghost);
+        not_known(&answer, ghost);
+        // And at once after the scan has had its time.
+        not_known(&rig.command(touch(ghost)), ghost);
+        assert_eq!(rig.calls(), [Call::LookFor(ghost), Call::LookFor(ghost), Call::LookFor(ghost)]);
+        // `fartouch` wants a distance, which only a description gives.
+        rig.lift_all();
+        rig.hold(&["fartouch"]);
+        rig.grid.look = Ok(Look::Waiting);
+        let far = Uuid::from_bytes([0x64; 16]);
+        let answer = rig.command(touch(far));
+        rig.now_described(far, Placement::InWorld, 6.0);
+        held_back(&answer, "fartouch");
     }
 
     fn cuff() -> Item {
