@@ -269,18 +269,19 @@ config describes it like this:
 * Without `sit` the bot does not sit the avatar.
 
 Once the avatar is there (logged in, and seated when `sit` names an
-object), `persist` decides whether the bot holds a placement from then on,
-and which:
+object), the bot carries out the rest of its [startup script](#startup-script),
+and a `persist` command in it decides whether the bot holds a placement
+from then on, and which:
 
-* Without `persist`, or with `persist = "off"`: none. The bot goes to
-  manual mode and leaves the avatar alone; it only keeps it logged in. An
-  avatar that is unseated or moved away stays that way, and after a kick
-  the bot logs in at the avatar's last location.
-* `persist = "cfg"`: `position` and `sit` exactly as the config has them.
-* `persist = "cur"`: the position and the seat the simulator reported at
-  that moment. The position is where the avatar really is, on its seat
-  when it sits, and the seat is the prim the simulator sat it on, which in
-  a linkset may not be the one `sit` names.
+* Without one: none. The bot goes to manual mode and leaves the avatar
+  alone; it only keeps it logged in. An avatar that is unseated or moved
+  away stays that way, and after a kick the bot logs in at the avatar's
+  last location.
+* `persist cfg cfg`: `position` and `sit` exactly as the config has them.
+* `persist` (which is `persist cur cur`): the position and the seat the
+  simulator reported at that moment. The position is where the avatar
+  really is, on its seat when it sits, and the seat is the prim the
+  simulator sat it on, which in a linkset may not be the one `sit` names.
 
 A bot that holds a placement keeps working towards "in the region it
 holds" and "seated as it holds": it logs in there after a kick, teleports
@@ -290,7 +291,7 @@ holds, it does not put the avatar back where it was: it reacts to a change
 of region, and to being unseated from a held object. `rslbot ctl persist`
 sets or changes the held placement while the bot runs, see
 [Holding a place](#holding-a-place). Nothing of it is saved: a restarted
-bot starts from the config again.
+bot starts from the config and its startup script again.
 
 Stop it with Ctrl-C or SIGTERM: it logs out and exits. A second signal exits
 immediately.
@@ -311,12 +312,11 @@ One TOML file; see `russelbot.example.toml`.
 | `user` | yes | `First Last`, or a single word (last name `Resident`) |
 | `password` | one of the two | Plain password |
 | `password_hash` | one of the two | Output of `rslbot hash` |
-| `region` | no, but only with `position` | Region the avatar starts out in; the bot logs in there, and returns there when `persist` says to hold the configured place |
+| `region` | no, but only with `position` | Region the avatar starts out in; the bot logs in there, and returns there when a `persist cfg` says to hold the configured place |
 | `position` | no, but only with `region` | `[x, y, z]` inside the region; pick a spot close to the object to sit on |
 | `start` | no, and only without `region` and `position` | Where the first login puts the avatar: `"home"` (its home location) or `"latest"` (where it was last). Default: `"latest"` |
 | `sit` | no | What to sit on at the start: the UUID of an object, or `"ground"`. Default: the avatar stands, and the bot does not sit it |
 | `object` | no | Deprecated spelling of `sit`, for a UUID only; the bot logs a warning. Not together with `sit` |
-| `persist` | no | What the bot holds once the avatar is at the place above, if anything: `"off"` or `false`, `"cfg"`, `"cur"`, an array, or a table; see below. Default: `"off"` |
 | `log_chat` | no | File that receives local chat, see [Chat and IM logs](#chat-and-im-logs) |
 | `log_im` | no | File that receives instant messages |
 | `fetch_offline_im` | no | `true` to also fetch IMs stored while the avatar was offline. Default: `false` |
@@ -324,12 +324,112 @@ One TOML file; see `russelbot.example.toml`.
 | `requesttp_timeout` | no | Minutes after `requesttp` during which the asked avatar's teleport offer is accepted. Default: `10` |
 | `scan_distance` | no | Metres (1 to 1024) within which objects are learned from the start, for `touch` and `scan`; see [Touching objects](#touching-objects). Default: learn within 32 m when `touch` or `scan` is first used, or when an RLV restriction such as `sittp` needs an object the bot does not know |
 | `restore_attachments` | no | `false` to keep the bot from attaching again, after each login, what the Current Outfit folder lists and the simulator did not bring; see [Attachments](#attachments). Default: `true` |
-| `perms` | no | Two tables, `[perms.autoaccept]` and `[perms.except]`, that say which teleport offers, inventory offers and scripts' permission requests the bot accepts by itself, see [Permission requests](#permission-requests). Default: none |
-| `rlv` | no | `true` to start with RLV on: the bot then reads the `@` commands of scripted objects the avatar owns, see [RLV](#rlv). Default: `false` |
+| `startup` | no, and not with `startup_file` | The [startup script](#startup-script): commands the bot carries out by itself when it starts, one per line. Default: none |
+| `startup_file` | no, and not with `startup` | A file that holds the startup script; a relative path is relative to the working directory |
 | `xmpp` | no | A table, `[xmpp]`, that makes the bot an XMPP component, see [XMPP gateway](#xmpp-gateway). Default: no XMPP connection |
-| `autoreply` | no | A table, `[autoreply]`, with `message` (the text) and `pause` (default `"1h"`): the bot answers avatars' instant messages by itself, see [Autoreplies](#autoreplies). Default: no autoreplies |
+| `persist`, `rlv`, `perms`, `autoreply` | no | Deprecated: what the startup script says with commands, see [Deprecated keys](#deprecated-keys) |
 
-`persist` takes these forms:
+### Startup script
+
+What `rslbot ctl` changes in a running bot is not saved. What the bot is
+to start with goes into the startup script: the same commands, without
+`rslbot ctl` in front, which the bot carries out by itself when it starts.
+
+```toml
+startup = '''
+# Settings: before the first login.
+rlv mode on
+rlv persist follow
+perms autoaccept tp "Jane Doe"
+perms autoaccept anim all
+perms revoke anim 01234567-9abc-defe-dcba-987654321000
+autoreply message Hello, I'm bot. I won't respond to you in next 2 hours
+autoreply pause 2h
+# The rest: once the avatar is in place.
+persist cur cfg
+'''
+```
+
+Write it as a TOML literal string, between `'''` and `'''`: there a
+backslash and a double quote are the script's own, where a string between
+`"""` would want them escaped. Like every key, `startup` has to come
+before the tables (`[xmpp]`) at the end of the file. `startup_file =
+"startup.rsl"` names a file with the same content instead.
+
+* One command per line, any command of the [control socket](#control-socket).
+  An argument with spaces goes in double quotes; inside them `\"` is a
+  double quote and `\\` a backslash. A line end inside double quotes
+  belongs to the argument, so an autoreply text can have several lines.
+  Blank lines and lines that start with `#` are skipped.
+* The **setting commands** at the head of the script are carried out
+  before the first login: `perms`, `autoreply`, and `rlv` other than
+  `rlv cmd`. RLV is then on, and the rules are there, when the avatar
+  arrives. The head ends at the first other command, so put the setting
+  commands first: one further down waits with the rest.
+* **The rest** starts once the avatar is at the place the config describes
+  (logged in, and seated when `sit` names an object; after sitting the bot
+  waits up to 10 seconds to learn where the seat is). Without `persist` in
+  it, the bot is in manual mode from then on, as described under [Run](#run).
+  The commands are carried out in order, one at a time: each after the
+  answer of the one before, so a `sit` after a `tp` is sent when the avatar
+  has arrived.
+* The script is checked before the bot contacts any server. An unknown
+  command, a wrong number of arguments, an unclosed quote, and a setting
+  command at the head that is refused (`perms autoaccept money all`) are
+  config errors: the bot names the line and exits with status 2.
+* A command of the rest that is refused when it is due (`sit` on an object
+  that is not there) stops the script: the commands after it are not
+  carried out, the bot keeps running, and the log says how many were left
+  out. The script does not wait for a lost connection to come back.
+* The script is carried out once. It does not start again after a kick, a
+  region restart or a network outage.
+* If you move the avatar (`tp`, `sit`, `stand`, an accepted teleport
+  offer) or run `persist` or `home` before the avatar is in place, the
+  rest is not carried out, as the bot then no longer goes to that place.
+  The setting commands have been carried out by then. Once the rest has
+  started, your commands do not stop it.
+* The script's commands count as yours: [RLV restrictions](#restrictions)
+  apply to them, and a `tp`, `sit` or `stand` in it puts the bot in manual
+  mode. `quit` at the end makes a bot that logs in, does its commands and
+  leaves.
+
+The log shows each command with the line it starts on, and what came of it:
+
+```
+startup: line 2: rlv mode on
+startup: line 2 answered: rlv: on
+...
+startup: the avatar is in place; carrying out the rest of the startup script
+startup: line 10: persist cur cfg
+startup: line 10 answered: Target/129.33/127.6/26.45 11111111-2222-3333-4444-555555555555
+startup: the script is done
+```
+
+### Deprecated keys
+
+`persist`, `rlv`, `perms` and `autoreply` are the older way to say what
+the startup script says. They still work as they did, and what they set is
+in place before the script's first command; the `persist` setting is
+applied when the avatar is in place, before the rest of the script. For
+each of them a config uses, the bot logs at startup what to write instead:
+
+| Deprecated | In the startup script |
+|---|---|
+| `persist = "cur"`, `persist = "cfg"`, `persist = ["cfg", "cur"]`, and `position` and `sit` under `[persist]` | `persist cur cur`, `persist cfg cfg`, `persist cfg cur`: the same two words, after the setting commands |
+| `persist = "off"`, `persist = false` | Nothing: leave the key out |
+| `rlv = "follow"` under `[persist]` | `rlv persist follow` |
+| `override = ["sit", "tp"]` under `[persist]` | `rlv persist override sit tp` |
+| `rlv = true` | `rlv mode on` |
+| `anim = "all"`, `tp = ["Jane Doe"]` under `[perms.autoaccept]` | `perms autoaccept anim all`, `perms autoaccept tp "Jane Doe"` |
+| `anim = [...]` under `[perms.except]` | `perms revoke anim ...`, after `perms autoaccept anim all` |
+| `[autoreply]` with `message` and `pause` | `autoreply message ...` and `autoreply pause ...` |
+
+`[perms.except]` was meant for kinds whose rule is `"all"`. The table also
+takes an exception for a kind whose rule is a list (one object of an
+avatar that is listed), and no command sets that; the bot says so when a
+config has one.
+
+The deprecated `persist` takes these forms:
 
 | Form | Meaning |
 |---|---|
@@ -385,8 +485,11 @@ Configs written for earlier versions still load, but these things changed:
   object holds takes effect as soon as the new version runs.
 * Inventory offers and scripts' requests for permissions, which the bot
   used to drop unread, are written to the log and wait for
-  `rslbot ctl accept`. Nothing is accepted by itself without a `perms`
-  table.
+  `rslbot ctl accept`. Nothing is accepted by itself without `perms
+  autoaccept` commands in the startup script.
+* `persist`, `rlv`, `[perms]` and `[autoreply]` are deprecated in favour of
+  the [startup script](#startup-script). They still work; the bot logs
+  what to write instead, see [Deprecated keys](#deprecated-keys).
 
 To keep the plain password out of the file:
 
@@ -544,13 +647,13 @@ or `home` command was given, returns to the region and the seat it holds
 whenever it finds the avatar elsewhere. `stand`, `unsit`, `sit`, `tp`,
 `requesttp` and `accept tp` switch that off, and so does a teleport offer
 the bot accepts by itself. From then on the bot is in
-manual mode, as it is without `persist` in the config once the avatar has
-got to the configured place: it stays logged in, and logs in again after a
+manual mode, as it is without a `persist` in the startup script once the
+avatar has got to the configured place: it stays logged in, and logs in again after a
 kick or an outage (at the avatar's last location), but it no longer
 teleports or sits by itself. `persist` and `home` switch holding on, and
 the bot acts at once. `home` is not the avatar's home location: it is the place the bot
 held last. Manual mode ends with the bot process too; a restarted bot
-starts from its config. `sendtp`, `touch`, `scan`, the talking commands and
+starts from its config and startup script. `sendtp`, `touch`, `scan`, the talking commands and
 the inventory commands (`inventory`, `attach`, `wear`, `detach`, `anim`,
 `sound`) leave the mode alone.
 
@@ -561,8 +664,8 @@ With `rlv persist follow` the bot holds the result instead; see
 
 With RLV on, the bot's own steps towards the place it holds are held to
 the RLV restrictions as your commands are: it waits where a restriction
-forbids the teleport or the sit, unless the `[persist]` table's `override`
-says otherwise. See [What the bot does by itself](#what-the-bot-does-by-itself).
+forbids the teleport or the sit, unless `rlv persist override` says
+otherwise. See [What the bot does by itself](#what-the-bot-does-by-itself).
 
 ### Holding a place
 
@@ -624,7 +727,7 @@ What holding means:
   is a persist of its own: it replaces what the bot holds, and `home`
   returns to it.
 * Nothing is saved. A restarted bot starts from its config and the
-  `persist` setting there.
+  `persist` command in its startup script.
 
 In `tp`, a third argument that is a number is `Z`, and anything else starts
 the region's name, which may be several words. A region whose name starts
@@ -1036,8 +1139,8 @@ a viewer that implements the API carries it out. Collars, furniture,
 relays and many games work this way, and most of them first ask for the
 version and do nothing for an avatar that does not answer.
 
-RLV is off unless the config has `rlv = true` or `rslbot ctl rlv mode on`
-was given. While it is off the bot does not read such lines at all, and
+RLV is off unless the [startup script](#startup-script) has `rlv mode on`
+or `rslbot ctl rlv mode on` was given. While it is off the bot does not read such lines at all, and
 nothing below applies. **While it is on, every object the avatar owns,
 worn or rezzed in the region, can make the avatar sit, stand and teleport,
 can take attachments and clothing off it, and can forbid it, the bot and
@@ -1051,7 +1154,10 @@ target/release/rslbot ctl rlv status       # rlv: on / persist: drop / persist o
 target/release/rslbot ctl rlv mode off
 ```
 
-The switch is not saved: a restarted bot starts from its config.
+The switch is not saved: a restarted bot starts from its config, with RLV
+on when the startup script has `rlv mode on`. There it belongs among the
+setting commands at the head, which are carried out before the first
+login: attachments say their restrictions in the first seconds after it.
 
 What the bot implements is a part of the API, and it says so: it reports
 version 0.1.0, far below any viewer's, so that a script that looks at the
@@ -1282,22 +1388,20 @@ collar that holds `tploc`, and the place it is to hold is the region whose
 objects restrict it. The **persist override setting** takes a sort of step
 out of the restrictions for good:
 
-```toml
-[persist]
-override = ["sit", "tp"]
-```
-
 ```sh
 target/release/rslbot ctl rlv persist override tp       # or: sit, sit tp, none
 ```
+
+or, to have it from the start, `rlv persist override sit tp` in the
+[startup script](#startup-script).
 
 | Word | The bot does by itself, whatever is held |
 |---|---|
 | `tp` | Teleport to the place it holds |
 | `sit` | Sit on the seat it holds or on the ground, and stand up when what it holds is `stand` |
 
-It is empty unless the config or the command says otherwise, a value given
-by command is not saved, and `rlv status` shows it as `persist override:`.
+It is empty unless the startup script or a command says otherwise, a value
+given by `rslbot ctl` is not saved, and `rlv status` shows it as `persist override:`.
 It covers the bot's own steps only: your `tp` is still refused under
 `tploc`, and so is a forced `@tpto`. The log names each restriction a step
 went past. Do not confuse it with `rlv mode override`, which exempts one
@@ -1330,8 +1434,9 @@ target/release/rslbot ctl rlv persist follow
 target/release/rslbot ctl rlv persist drop
 ```
 
-or in the config, as `rlv = "follow"` in the `[persist]` table. Like the
-RLV switch, a setting given by command is not saved.
+or, to have it from the start, as `rlv persist follow` in the
+[startup script](#startup-script). Like the RLV switch, a setting given by
+`rslbot ctl` is not saved.
 
 With `drop`, the default, `@sit`, `@sitground`, `@unsit` and `@tpto`
 switch holding off, as the `rslbot ctl` commands they stand for do. The
@@ -1427,27 +1532,26 @@ the rules below would leave waiting, and a seated avatar under `unsit`
 goes nowhere. The rules themselves are not changed by any of it. See
 [Restrictions](#restrictions).
 
-Without a `perms` table in the config the bot accepts nothing by itself,
-except a teleport offer it asked for with `requesttp`. Every request is
-written to the log and waits. The table says what is accepted without you:
+Without `perms` commands the bot accepts nothing by itself, except a
+teleport offer it asked for with `requesttp`. Every request is written to
+the log and waits. `perms autoaccept` and `perms revoke`, in the
+[startup script](#startup-script) or through `rslbot ctl`, say what is
+accepted without you:
 
 ```toml
-[perms.autoaccept]
-tp = ["Jane Doe"]
-inventory = ["Owner Resident", "11111111-2222-3333-4444-555555555555"]
-anim = "all"
-attach = true
-
-[perms.except]
-anim = ["01234567-9abc-defe-dcba-987654321000"]
+startup = '''
+perms autoaccept tp "Jane Doe"
+perms autoaccept inventory "Owner Resident" 11111111-2222-3333-4444-555555555555
+perms autoaccept anim all
+perms revoke anim 01234567-9abc-defe-dcba-987654321000
+perms autoaccept attach all
+'''
 ```
 
-Under `[perms.autoaccept]` a kind is `"all"`, or a list of avatars and
-objects; `true` is another spelling of `"all"` and `false` of an empty
-list. Under `[perms.except]` a kind is a list of avatars and objects that
-are never accepted by themselves, whatever `autoaccept` says: the
-exceptions to `"all"`, or one object of an avatar that is listed. Both are
-TOML tables and have to come after all other keys.
+`perms autoaccept KIND` takes `all`, or avatars and objects, which are
+added to the kind's list. `perms revoke KIND` takes them off the list
+again, `all` for the whole list; for a kind that accepts `all` it names the
+exceptions: avatars and objects that are never accepted by themselves.
 
 An entry is an avatar's name (`"First Last"`, `first.last` or a single
 word) or a UUID:
@@ -1559,26 +1663,28 @@ waiting: tp from John Roe <uuid>
 ```
 
 These commands work whether or not the avatar is connected. Like `rlv
-mode`, they are not saved: a restarted bot starts from its config. A
+mode`, they are not saved: a restarted bot starts from its config and the
+`perms` commands in its startup script. A
 change of the rules does not accept what waits already, and it does not
 take back what a script was granted.
 
 ### Autoreplies
 
-With an `[autoreply]` table in the config the bot answers an avatar that
-sends it an instant message, and then leaves that avatar alone for the
-pause:
+With an autoreply text the bot answers an avatar that sends it an instant
+message, and then leaves that avatar alone for the pause. In the
+[startup script](#startup-script):
 
 ```toml
-[autoreply]
-message = "Hello, I'm bot. I won't respond to you in next 2 hours"
-pause = "2h"
+startup = '''
+autoreply message Hello, I'm bot. I won't respond to you in next 2 hours
+autoreply pause 2h
+'''
 ```
 
-`pause` is a whole number and a unit for each of `d`, `h`, `m` and `s`
+The pause is a whole number and a unit for each of `d`, `h`, `m` and `s`
 that is needed, in that order and without spaces: `90s`, `30m`, `2h`,
-`1h30m`, at most 365 days. `"0"` answers every message. Without `pause` it
-is one hour.
+`1h30m`, at most 365 days. `0` answers every message. Without `autoreply
+pause` it is one hour. A text of several lines goes in double quotes.
 
 * Only instant messages from avatars are answered. Objects, the grid,
   group chats, and messages stored while the avatar was offline get no
@@ -1621,7 +1727,8 @@ avatars in their pause: 2
 
 These commands work whether or not the avatar is connected, no RLV
 restriction refuses them, and they are not saved: a restarted bot starts
-from its config. The pauses are kept across logins until the bot stops.
+from its config and the `autoreply` commands in its startup script. The
+pauses are kept across logins until the bot stops.
 
 ### Exit status and limits
 

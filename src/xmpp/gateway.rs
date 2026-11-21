@@ -353,7 +353,7 @@ impl Gateway {
         let busy = self.waiting.load(Ordering::SeqCst) >= MAX_WAITING;
         let request = match contact {
             Contact::Control => {
-                let args = match command::split(&body) {
+                let args = match crate::control::split(&body) {
                     Ok(args) => args,
                     Err(reason) => return self.refuse(&pending, reason),
                 };

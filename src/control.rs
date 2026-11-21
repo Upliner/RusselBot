@@ -108,7 +108,7 @@ bot accepts by itself: `all`, or the avatars and objects named. An avatar
 stands for its objects too. While everyone is accepted, revoking a WHO
 makes it an exception. `perms status` prints what is accepted for each
 kind, and the requests that wait. These changes are not saved; the config's
-`[perms.autoaccept]` and `[perms.except]` tables are.
+startup script (`startup`) is where the rules a bot starts with are written.
 
 `persist` tells the bot what to hold from now on: it returns to LOCATION
 when the avatar ends up in another region, and keeps it seated as SIT says.
@@ -152,7 +152,8 @@ all of this and the restrictions. `rlv cmd` carries out RLV commands as if
 an object had sent them, such as `rlv cmd @versionnum=5` or
 `rlv cmd @tpto:Blue Lagoon/128/128/25=force`, and prints what became of
 each; its restrictions are its own, apart from every object's, and it is
-refused while RLV is off. None of the switches is saved.
+refused while RLV is off. None of the switches is saved; the config's startup
+script sets them at every start.
 
 `autoreply message` sets the text the bot answers an avatar's instant
 message with, and switches autoreply on. After answering an avatar, or
@@ -160,11 +161,13 @@ after `im` to it, the bot does not answer it again for the pause, which
 `autoreply pause` sets: `90s`, `30m`, `2h`, `1h30m`, or `0` to answer every
 message. `autoreply refresh` forgets every avatar's pause; `autoreply on`
 and `off` switch it on with the text it has and off; `autoreply status`
-prints all of this. None of it is saved; the config's `[autoreply]` table
-is.
+prints all of this. None of it is saved; the config's startup script sets
+it at every start.
 
-The socket address is taken from the environment variable RUSSELBOT_SOCK
-when it is set.";
+The same commands, without `rslbot ctl` in front, are the lines of the
+config's startup script (`startup`), which the bot carries out when it
+starts. The socket address is taken from the environment variable
+RUSSELBOT_SOCK when it is set.";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
@@ -609,6 +612,45 @@ pub fn request_line(args: &[String]) -> String {
         _ => fields.extend(args.iter().cloned()),
     }
     encode_line(&fields.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// The longest command line.
+pub const MAX_COMMAND: usize = 8192;
+
+/// Splits a command line, as the XMPP control contact and the startup
+/// script take it, into arguments at spaces, tabs and line feeds. A
+/// part between double quotes keeps its spaces; inside it `\"` is a double
+/// quote and `\\` a backslash, and every other backslash stays as it is.
+pub fn split(body: &str) -> Result<Vec<String>, String> {
+    if body.len() > MAX_COMMAND {
+        return Err(format!("the command is {} bytes long; the limit is {MAX_COMMAND}", body.len()));
+    }
+    let mut args = Vec::new();
+    let mut current: Option<String> = None;
+    let mut quoted = false;
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                current.get_or_insert_with(String::new);
+            }
+            '\\' if quoted && matches!(chars.peek(), Some('"' | '\\')) => {
+                current.get_or_insert_with(String::new).push(chars.next().expect("peeked"));
+            }
+            ' ' | '\t' | '\n' | '\r' if !quoted => {
+                if let Some(arg) = current.take() {
+                    args.push(arg);
+                }
+            }
+            _ => current.get_or_insert_with(String::new).push(ch),
+        }
+    }
+    if quoted {
+        return Err("the command ends inside double quotes; close the quote with \"".to_string());
+    }
+    args.extend(current);
+    Ok(args)
 }
 
 /// The socket address from the environment: the override if there is one,
@@ -1311,6 +1353,94 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn the_usage_points_at_the_startup_script_for_what_is_not_saved() {
+        let flowed = CTL_USAGE.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Once each for `perms`, `rlv` and `autoreply`, and once for what
+        // the script is.
+        assert_eq!(flowed.matches("startup script").count(), 4, "{flowed}");
+        assert!(flowed.contains("without `rslbot ctl` in front, are the lines of the config's startup script (`startup`)"));
+        // The deprecated tables are no longer where the operator is sent.
+        for table in ["[perms.autoaccept]", "[perms.except]", "[autoreply]", "[persist]"] {
+            assert!(!CTL_USAGE.contains(table), "{table}");
+        }
+        assert!(
+            CTL_USAGE.lines().all(|line| line.len() <= 79),
+            "a usage line is too long for a terminal"
+        );
+    }
+
+    mod command_line {
+        use super::*;
+
+        fn words(list: &[&str]) -> Vec<String> {
+            list.iter().map(|word| word.to_string()).collect()
+        }
+
+        #[test]
+        fn name_with_a_space() {
+            assert_eq!(
+                split("im \"Jane Doe\" see you later").unwrap(),
+                words(&["im", "Jane Doe", "see", "you", "later"])
+            );
+            let line = request_line(&split("im \"Jane Doe\" see you later").unwrap());
+            assert_eq!(
+                Request::decode(line.as_bytes()),
+                Ok(Request::Im {
+                    to: "Jane Doe".into(),
+                    text: "see you later".into()
+                })
+            );
+        }
+
+        #[test]
+        fn quotes_and_backslashes() {
+            assert_eq!(split(r#"say "a \"b\" c\\d""#).unwrap(), words(&["say", r#"a "b" c\d"#]));
+            // Outside quotes, and before anything else, a backslash is itself.
+            assert_eq!(
+                split(r#"attach "Objects/Radio\/TV" left hand"#).unwrap(),
+                words(&["attach", r"Objects/Radio\/TV", "left", "hand"])
+            );
+            assert_eq!(split(r"x a\b").unwrap(), words(&["x", r"a\b"]));
+            assert_eq!(split(r#"x a"b c"d """#).unwrap(), words(&["x", "ab cd", ""]));
+            assert_eq!(split("tp\t128 128\n25  Home ").unwrap(), words(&["tp", "128", "128", "25", "Home"]));
+        }
+
+        #[test]
+        fn a_filter_text_of_two_words_is_one_argument() {
+            let line = request_line(&split("scan 20 --name \"park bench\" -s").unwrap());
+            assert_eq!(
+                Request::decode(line.as_bytes()),
+                Ok(Request::Scan(words(&["20", "--name", "park bench", "-s"])))
+            );
+        }
+
+        #[test]
+        fn unclosed_quote() {
+            let error = split("im \"Jane Doe hi").unwrap_err();
+            assert!(error.contains("quote"), "{error}");
+        }
+
+        #[test]
+        fn empty_body() {
+            assert_eq!(split("").unwrap(), Vec::<String>::new());
+            assert_eq!(split(" \n\t").unwrap(), Vec::<String>::new());
+        }
+
+        #[test]
+        fn too_long() {
+            assert!(split(&"x".repeat(MAX_COMMAND)).is_ok());
+            let error = split(&"x".repeat(MAX_COMMAND + 1)).unwrap_err();
+            assert!(error.contains("8192"), "{error}");
+        }
+
+        #[test]
+        fn words_of_a_message_are_joined_as_ctl_joins_them() {
+            assert_eq!(request_line(&split("say a  b").unwrap()), "say\ta b\n");
+            assert_eq!(request_line(&split("say a  b").unwrap()), request_line(&words(&["say", "a", "b"])));
+        }
+    }
+
     mod socket {
         use super::super::*;
         use super::strings;

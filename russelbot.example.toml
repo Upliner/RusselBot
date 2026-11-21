@@ -16,8 +16,8 @@ password = "secret"
 # Optional: where the avatar starts out: region name and coordinates inside
 # it, always both. The bot logs in there and teleports there when the login
 # lands elsewhere. With a `sit` object, pick coordinates close to it, or the
-# sit may fail. Whether the bot holds the place afterwards is up to `persist`,
-# below.
+# sit may fail. Whether the bot holds the place afterwards is up to a
+# `persist` command in the startup script, below.
 region = "Target"
 position = [128.0, 128.0, 25.0]
 
@@ -30,21 +30,6 @@ position = [128.0, 128.0, 25.0]
 # the bot does not sit the avatar anywhere by itself.
 sit = "00000000-0000-0000-0000-000000000000"
 # sit = "ground"
-
-# Optional: what the bot holds once it has got to the place above (logged in,
-# and seated when `sit` is set). It returns to what it holds after a kick, a
-# region restart or being moved to another region, and sits again when
-# unseated. `rslbot ctl persist` sets or changes it while the bot runs.
-#   "off"  (or false) nothing: the bot goes to the place above once and
-#          leaves the avatar alone from then on. This is the default.
-#   "cfg"  `position` and `sit` exactly as written above; without `position`,
-#          the place the first login arrived at.
-#   "cur"  the position and the seat the simulator reported at that moment.
-# An array gives the position and the seat separately, as does the [persist]
-# table at the end of this file.
-# persist = "cfg"
-#   persist = "cur"
-#   persist = ["cfg", "cur"]
 
 # Optional: record what the avatar hears and is told. Every message is also
 # written to standard error. The files are tab-separated, appended to, and
@@ -80,66 +65,105 @@ sit = "00000000-0000-0000-0000-000000000000"
 # Life); elsewhere this does nothing. On by default; `false` switches it off.
 # restore_attachments = false
 
-# Optional: RLV (the RestrainedLove API). With `true` the bot reads the `@`
-# commands that scripted objects the avatar owns say to their owner, answers
-# their version queries, and carries out forced sits, stands, teleports and
-# detaches. Any such object, worn or rezzed nearby, can then move the avatar
-# and take things off it. Off by default; `rslbot ctl rlv mode on` switches
-# it on while the bot runs.
-# rlv = true
-
-# `persist` as a table. A table has to come after all the keys above.
-#   atstart   Whether the bot holds anything once it has got to the place
-#             above. True when `position` or `sit` is given and false
-#             otherwise; `atstart = true` alone is `persist = "cur"`.
-#   position  "cur" or "cfg", as in the array form. One that is left out is
-#   sit       "cur".
-#   rlv       What a forced RLV sit, stand or teleport does to the place the
-#             bot holds: "drop" (the default) makes it stop holding,
-#             "follow" makes the result the place it holds. It says nothing
-#             about `atstart`. `rslbot ctl rlv persist` changes it while the
-#             bot runs.
-#   override  What the bot does by itself to get back to the place it
-#             holds whatever RLV restrictions say: "tp" its teleports
-#             there, "sit" its sits there, or both in an array. Without it
-#             a restriction such as `@tploc=n` holds the bot where it is,
-#             also after a region restart has put the avatar elsewhere.
-#             It says nothing about `atstart`, and never applies to
-#             commands. `rslbot ctl rlv persist override` changes it while
-#             the bot runs.
-# [persist]
-# atstart = true
-# position = "cur"
-# sit = "cfg"
-# rlv = "follow"
-# override = ["sit", "tp"]
-
-# Which requests the bot accepts by itself; without this it accepts none and
-# every request waits for `rslbot ctl accept KIND`. These are tables too.
-# The kinds of request:
-#   tp         an avatar's teleport offer (the bot goes, and stays there)
-#   inventory  an inventory offer from an avatar or an object
-#   anim       a script asks to animate the avatar
-#   attach     a script asks to attach its object to the avatar
-#   controls   a script asks to take the avatar's controls
-#   camera     a script asks to track or control the camera
-# Under `autoaccept` a kind is "all" (or `true`), or a list of avatar names
-# and UUIDs. An avatar's name or UUID stands for the avatar and for every
-# object it owns; an object's UUID stands for that object. For `inventory`
-# name the owner: an offer does not say which object it came from.
-# Under `except` a kind lists who is never accepted by itself, whatever
-# `autoaccept` says. A script that asks for several things at once is
-# accepted only when all of them are auto-accepted for it.
-# `rslbot ctl perms autoaccept` and `perms revoke` change this while the bot
-# runs.
-# [perms.autoaccept]
-# tp = ["Jane Doe"]
-# inventory = ["Owner Resident", "11111111-2222-3333-4444-555555555555"]
-# anim = "all"
-# attach = true
+# Optional: the startup script: commands the bot carries out by itself when
+# it starts, one per line, written as `rslbot ctl` takes them but without
+# `rslbot ctl` in front. An argument with spaces goes in double quotes, and a
+# line end inside double quotes belongs to the argument. Blank lines and
+# lines that start with `#` are skipped. Everything `rslbot ctl` can do, the
+# script can do; none of what `rslbot ctl` changes is saved, so what the bot
+# is to start with belongs here.
 #
-# [perms.except]
-# anim = ["01234567-9abc-defe-dcba-987654321000"]
+# The setting commands at the head of the script, `perms`, `autoreply` and
+# `rlv` (other than `rlv cmd`), are carried out before the first login. One
+# that is refused is a config error: the bot does not start. Put them first.
+#
+# From the first other command on, the script waits until the avatar is at
+# the place above (logged in, and seated when `sit` is set), and is then
+# carried out in order, each command after the answer of the one before. A
+# command that is refused stops the script there; the bot keeps running.
+# The script runs once, not again after the avatar was kicked and has come
+# back. If `rslbot ctl` moves the avatar or persists a place before the
+# avatar is in place, the rest of the script is not carried out.
+#
+# Write it as a TOML literal string, between ''' and ''': there a backslash
+# and a double quote are the script's own. Like every key, it has to come
+# before the tables at the end of this file.
+#
+#   rlv mode on                 RLV (the RestrainedLove API): the bot reads
+#                               the `@` commands that scripted objects the
+#                               avatar owns say to their owner, answers their
+#                               version queries, and carries out forced sits,
+#                               stands, teleports and detaches. Any such
+#                               object, worn or rezzed nearby, can then move
+#                               the avatar and take things off it.
+#   rlv persist follow          A forced RLV sit, stand or teleport makes its
+#                               result the place the bot holds. Without it
+#                               (`drop`) the bot stops holding.
+#   rlv persist override sit tp What the bot does by itself to get back to
+#                               the place it holds whatever RLV restrictions
+#                               say: its sits there, its teleports there.
+#                               Without it a restriction such as `@tploc=n`
+#                               holds the bot where it is.
+#   perms autoaccept KIND WHO   Which requests the bot accepts by itself;
+#                               without these every request waits for
+#                               `rslbot ctl accept KIND`. KIND is `tp` (an
+#                               avatar's teleport offer), `inventory` (an
+#                               inventory offer), or what a script asks for:
+#                               `anim`, `attach`, `controls`, `camera`. WHO
+#                               is `all`, or avatar names and UUIDs; an
+#                               avatar stands for every object it owns too.
+#   perms revoke KIND WHO       After `perms autoaccept KIND all`: who is
+#                               never accepted by itself.
+#   autoreply message TEXT      The bot answers an avatar that sends it an
+#                               instant message with TEXT, as a viewer's Do
+#                               Not Disturb autoresponse does,
+#   autoreply pause DURATION    and then stays quiet towards that avatar for
+#                               `90s`, `30m`, `2h`, `1h30m` (default 1h), or
+#                               `0` to answer every message.
+#   persist [LOCATION] [SIT]    What the bot holds from then on: it returns
+#                               there after a kick, a region restart or
+#                               being moved to another region, and sits
+#                               again when unseated. Each is `cur` (what the
+#                               simulator reports at that moment; the
+#                               default) or `cfg` (`position` and `sit` as
+#                               written above), or a place and a seat in
+#                               full. Without a `persist` command the bot
+#                               goes to the place above once and leaves the
+#                               avatar alone from then on.
+#
+# startup = '''
+# # Settings: before the first login.
+# rlv mode on
+# rlv persist follow
+# rlv persist override sit tp
+# perms autoaccept tp "Jane Doe"
+# perms autoaccept inventory "Owner Resident" 11111111-2222-3333-4444-555555555555
+# perms autoaccept anim all
+# perms revoke anim 01234567-9abc-defe-dcba-987654321000
+# perms autoaccept attach all
+# autoreply message Hello, I'm bot. I won't respond to you in next 2 hours
+# autoreply pause 2h
+# # The rest: once the avatar is in place.
+# persist cur cfg
+# '''
+
+# The same script in a file of its own, in place of `startup`. A relative
+# path is relative to the working directory.
+# startup_file = "startup.rsl"
+
+# Deprecated: the keys `persist`, `rlv`, `[perms]` and `[autoreply]` are the
+# older way to say what the startup script says. They still work as they
+# did and are applied before the script, and for each of them the bot logs,
+# when it starts, the script commands to write instead:
+#   persist = "cur", "cfg", ["cfg", "cur"]    persist cur cur, persist cfg cfg,
+#     and `position`, `sit` under [persist]     persist cfg cur
+#   `rlv` under [persist]                     rlv persist follow
+#   `override` under [persist]                rlv persist override sit tp
+#   rlv = true                                rlv mode on
+#   [perms.autoaccept]                        perms autoaccept KIND all | WHO...
+#   [perms.except]                            perms revoke KIND WHO...
+#   [autoreply]                               autoreply message TEXT
+#                                             autoreply pause DURATION
 
 # The XMPP (Jabber) gateway: the bot connects to an XMPP server on this host
 # as an external component and owns the domain `component` there. The
@@ -152,26 +176,10 @@ sit = "00000000-0000-0000-0000-000000000000"
 #   Component "russel.sl.example.org"
 #       component_secret = "..."
 # `server` is the server's component port (default 127.0.0.1:5347). The
-# connection is not encrypted, so it must stay on this host. A table too.
+# connection is not encrypted, so it must stay on this host. This is a
+# table: it has to come after all the keys above.
 # [xmpp]
 # component = "russel.sl.example.org"
 # server = "127.0.0.1:5347"
 # secret = "the component_secret of the server"
 # owners = ["me@example.org"]
-
-# Autoreplies: the bot answers an avatar that sends it an instant message
-# with `message`, then stays quiet towards that avatar for `pause`. An
-# instant message the bot sends an avatar on command (`rslbot ctl im`, or
-# an owner's message through the XMPP gateway) starts that avatar's pause
-# too. Objects, group chats and messages stored while the avatar was
-# offline get no answer. The answer goes out the way a viewer's Do Not
-# Disturb autoresponse does, so viewers mark it as automatic and never
-# answer it. `pause` is written as `90s`, `30m`, `2h` or `1h30m` (units d,
-# h, m and s in that order), or `0` to answer every message; it defaults
-# to 1h. While the bot runs, `rslbot ctl autoreply message TEXT`,
-# `autoreply pause DURATION`, `autoreply refresh` (forget every avatar's
-# pause), `autoreply on|off` and `autoreply status` change and show this.
-# A table too.
-# [autoreply]
-# message = "Hello, I'm bot. I won't respond to you in next 2 hours"
-# pause = "2h"

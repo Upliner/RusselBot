@@ -20,6 +20,7 @@ mod reconciler;
 mod rlv;
 mod scan;
 mod session;
+mod startup;
 mod udp {
     pub mod circuit;
     pub mod messages;
@@ -194,6 +195,8 @@ struct Bot {
     /// Since when the config placement has been reached but for the
     /// position of the seat.
     startup_wait: Option<Instant>,
+    /// The startup script, and how far it has got.
+    script: startup::Script,
     /// What inventory commands need of the grid.
     inventory: Inventory,
     /// RLV: whether it is on, and what a forced movement does to `book`.
@@ -472,8 +475,8 @@ impl Bot {
             world: None,
             #[cfg(test)]
             grid: None,
-            // Before the first login, which may take a while.
-            xmpp: config.xmpp.as_ref().map(|xmpp| xmpp::gateway::Gateway::start(xmpp, events.clone())),
+            // Started once the head of the startup script has run.
+            xmpp: None,
             autoreply: match &config.autoreply {
                 Some(auto) => Autoreply::new(Some(auto.message.clone()), auto.pause),
                 None => Autoreply::new(None, autoreply::DEFAULT_PAUSE),
@@ -482,6 +485,7 @@ impl Bot {
             book,
             startup: Some(config.persist),
             startup_wait: None,
+            script: startup::Script::new(config.startup.clone()),
             recorder: Recorder::default(),
             logs,
             name_lookups: names::spawn(events.clone()),
@@ -502,6 +506,102 @@ impl Bot {
             http: caps::http_agent(LOGIN_HTTP_TIMEOUT),
             next_generation: 1,
             stopping: false,
+        }
+    }
+
+    /// Connects the XMPP gateway, when the config has one: before the
+    /// first login, which may take a while, and after the head of the
+    /// startup script.
+    fn start_gateway(&mut self) {
+        let events = self.events.clone();
+        self.xmpp = self.config.xmpp.as_ref().map(|xmpp| xmpp::gateway::Gateway::start(xmpp, events));
+    }
+
+    /// Carries out the setting commands at the head of the startup
+    /// script, before the bot contacts any server. They answer at once.
+    /// One that is refused is a mistake in the config.
+    fn startup_head(&mut self, now: Instant) -> Result<(), startup::ScriptError> {
+        while let Some(line) = self.script.next_head() {
+            info!("startup: line {}: {}", line.number, escape::escape(&line.text));
+            let (reply, answer) = mpsc::channel();
+            // No setting command stops the bot.
+            let _ = self.control(line.request, reply, now);
+            let fail = |reason: String| startup::ScriptError { line: line.number, reason };
+            match answer.try_recv() {
+                Ok(Response::Ok(text)) => Bot::script_answered(line.number, text),
+                Ok(Response::Error(reason)) => return Err(fail(reason)),
+                Err(_) => return Err(fail("the command got no answer".to_string())),
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the answer of a startup script command to the log.
+    fn script_answered(line: usize, answer: Option<String>) {
+        match answer {
+            Some(text) => info!("startup: line {line} answered: {}", text.replace('\n', "; ")),
+            None => info!("startup: line {line} done"),
+        }
+    }
+
+    /// Goes on with the rest of the startup script once the config
+    /// placement has been reached: takes the answer of the command in
+    /// flight, and hands over the next one when there is none. A command
+    /// that is refused ends the script. Returns whether anything happened.
+    fn startup_rest(&mut self) -> Result<bool, i32> {
+        let mut acted = false;
+        loop {
+            if let Some((line, outcome)) = self.script.answered() {
+                acted = true;
+                match outcome {
+                    Ok(answer) => Bot::script_answered(line.number, answer),
+                    Err(reason) => {
+                        let after = match self.script.stop() {
+                            0 => "it was the last command of the startup script".to_string(),
+                            left => format!(
+                                "the startup script stops here: {} after it will not be carried out",
+                                startup::commands(left)
+                            ),
+                        };
+                        info!("startup: line {} refused: {reason}; {after}", line.number);
+                        return Ok(acted);
+                    }
+                }
+            }
+            if self.stopping {
+                // A `quit` of its own, or the operator's.
+                if self.script.running() {
+                    self.script.stop();
+                }
+                return Ok(acted);
+            }
+            let was_running = self.script.running();
+            let Some(line) = self.script.next() else {
+                if was_running && !self.script.running() {
+                    info!("startup: the script is done");
+                }
+                return Ok(acted);
+            };
+            acted = true;
+            info!("startup: line {}: {}", line.number, escape::escape(&line.text));
+            let (reply, answer) = mpsc::channel();
+            let request = line.request.clone();
+            self.script.sent(line, answer);
+            if let Flow::Exit(code) = self.control(request, reply, Instant::now()) {
+                return Err(code);
+            }
+        }
+    }
+
+    /// Gives up the rest of the startup script when it still waits for
+    /// the config placement: the operator, or what moved the avatar, has
+    /// taken over, as with the config's `persist`.
+    fn give_up_script(&mut self, why: &str) {
+        if let Some((first, left)) = self.script.give_up() {
+            info!(
+                "startup: {why}; {} of the startup script, from line {first} on, will not be carried out",
+                startup::commands(left)
+            );
         }
     }
 
@@ -669,6 +769,7 @@ impl Bot {
         let moved = self.commands.take_manual();
         if moved {
             self.startup = None;
+            self.give_up_script("the avatar was moved before it was in place");
             self.follow_seat = false;
             self.seat_sender = None;
             self.set_manual(true);
@@ -716,6 +817,7 @@ impl Bot {
         self.book.commit(placement.clone());
         self.startup = None;
         self.startup_wait = None;
+        self.give_up_script("a placement was persisted before the avatar was in place");
         // What was to follow a forced movement is overtaken by this.
         self.follow_seat = false;
         self.seat_sender = None;
@@ -828,7 +930,9 @@ impl Bot {
         };
         // Until it has been applied, the config's sit state is the held
         // one; for a followed forced sit the held one is what counts.
-        let settled = match startup_due(self.book.held().sit, setting, arrival, self.startup_wait, now) {
+        // The rest of the startup script may ask where the avatar sits.
+        let rest = self.script.waiting();
+        let settled = match startup_due(self.book.held().sit, setting, rest, arrival, self.startup_wait, now) {
             Startup::NotYet => {
                 self.startup_wait = None;
                 return None;
@@ -839,13 +943,27 @@ impl Bot {
             }
             Startup::Now { settled } => settled,
         };
+        self.startup_reached(setting, settled, now);
+        None
+    }
+
+    /// The avatar is where the config, or a followed forced sit, puts it:
+    /// applies `setting`, and lets the rest of the startup script run when
+    /// it waited for this. `settled` is false when the seat's position was
+    /// waited for in vain.
+    fn startup_reached(&mut self, setting: Persist, settled: bool, now: Instant) {
         self.startup = None;
         self.startup_wait = None;
         let for_rlv = std::mem::take(&mut self.follow_seat);
+        // Before anything is persisted: a persist gives up a script that
+        // still waits.
+        if self.script.release() {
+            info!("startup: the avatar is in place; carrying out the rest of the startup script");
+        }
         let Persist::On { position, sit } = setting else {
             info!("the avatar is in place and `persist` is off");
             self.set_manual(true);
-            return None;
+            return;
         };
         if !settled {
             info!(
@@ -870,7 +988,6 @@ impl Bot {
             info!("{what} refused: {reason}");
         }
         self.seat_sender = seat_sender;
-        None
     }
 
     /// The answer to the `status` command.
@@ -1984,8 +2101,9 @@ enum Startup {
 }
 
 /// Whether the config's `persist` is due. `sit` is the config's sit state;
+/// `rest` says that the rest of the startup script waits for this too;
 /// `since` is when the wait for the seat's position began, if it has.
-fn startup_due(sit: SitState, setting: Persist, arrival: Arrival, since: Option<Instant>, now: Instant) -> Startup {
+fn startup_due(sit: SitState, setting: Persist, rest: bool, arrival: Arrival, since: Option<Instant>, now: Instant) -> Startup {
     if !arrival.present || !arrival.in_target_region {
         return Startup::NotYet;
     }
@@ -1997,8 +2115,9 @@ fn startup_due(sit: SitState, setting: Persist, arrival: Arrival, since: Option<
     if !reached {
         return Startup::NotYet;
     }
-    // Only a `cur` location is about where the avatar sits.
-    let wants_position = matches!(setting, Persist::On { position: Source::Cur, .. });
+    // Only a `cur` location is about where the avatar sits, and a script
+    // may ask for one.
+    let wants_position = rest || matches!(setting, Persist::On { position: Source::Cur, .. });
     if wants_position && matches!(sit, SitState::Object(_)) && !arrival.seat_frame_known {
         let deadline = since.unwrap_or(now) + SEAT_POSITION_WAIT;
         if now < deadline {
@@ -2040,10 +2159,18 @@ fn run_bot(config_path: &Path) -> i32 {
         None
     };
     install_signal_handler(events.clone());
-    if config.deprecated_object {
-        info!("{}: `object` is deprecated; write the same value as `sit`", config_path.display());
+    for note in &config.deprecated {
+        info!("{}: {note}", config_path.display());
     }
     let mut bot = Bot::new(config, logs, events);
+    // Still before anything touches the network: a setting command of the
+    // startup script that is refused is a config error.
+    if let Err(e) = bot.startup_head(Instant::now()) {
+        let key = bot.config.startup_key();
+        eprintln!("rslbot: {}: `{key}`: line {}: {}", config_path.display(), e.line, e.reason);
+        return EXIT_CONFIG;
+    }
+    bot.start_gateway();
     let code = run_loop(&mut bot, &incoming);
     bot.flush_messages();
     bot.xmpp_stop();
@@ -2075,6 +2202,12 @@ fn run_loop(bot: &mut Bot, incoming: &Receiver<Event>) -> i32 {
             if pending && bot.startup.is_none() {
                 // What the bot holds may have changed: decide again.
                 continue;
+            }
+            match bot.startup_rest() {
+                // A command of the script may have changed it as well.
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(code) => return code,
             }
         }
         if let Some(session) = &bot.session {
@@ -2388,7 +2521,7 @@ mod tests {
     #[test]
     fn the_config_placement_is_reached_according_to_its_sit() {
         let now = Instant::now();
-        let due = |sit, arrival| startup_due(sit, CFG, arrival, None, now);
+        let due = |sit, arrival| startup_due(sit, CFG, false, arrival, None, now);
         // No seat: being there is enough.
         assert_eq!(due(SitState::Stand, arrived()), Startup::Now { settled: true });
         // An object: seated on it.
@@ -2445,25 +2578,34 @@ mod tests {
             seat_frame_known: true,
             ..seated
         };
-        assert_eq!(startup_due(sit, CUR, known, None, now), Startup::Now { settled: true });
+        assert_eq!(startup_due(sit, CUR, false, known, None, now), Startup::Now { settled: true });
         // Not known: wait, from when the wait began.
-        assert_eq!(startup_due(sit, CUR, seated, None, now), Startup::Wait(now + SEAT_POSITION_WAIT));
-        let later = now + Duration::from_secs(4);
         assert_eq!(
-            startup_due(sit, CUR, seated, Some(now), later),
+            startup_due(sit, CUR, false, seated, None, now),
             Startup::Wait(now + SEAT_POSITION_WAIT)
         );
-        assert_eq!(startup_due(sit, CUR, known, Some(now), later), Startup::Now { settled: true });
+        let later = now + Duration::from_secs(4);
+        assert_eq!(
+            startup_due(sit, CUR, false, seated, Some(now), later),
+            Startup::Wait(now + SEAT_POSITION_WAIT)
+        );
+        assert_eq!(
+            startup_due(sit, CUR, false, known, Some(now), later),
+            Startup::Now { settled: true }
+        );
         // After ten seconds it goes ahead with what it has.
         let late = now + SEAT_POSITION_WAIT;
-        assert_eq!(startup_due(sit, CUR, seated, Some(now), late), Startup::Now { settled: false });
+        assert_eq!(
+            startup_due(sit, CUR, false, seated, Some(now), late),
+            Startup::Now { settled: false }
+        );
         // Only a current location is about the seat's position.
         let seat_only = Persist::On {
             position: Source::Cfg,
             sit: Source::Cur,
         };
         for setting in [CFG, seat_only, Persist::Off] {
-            assert_eq!(startup_due(sit, setting, seated, None, now), Startup::Now { settled: true });
+            assert_eq!(startup_due(sit, setting, false, seated, None, now), Startup::Now { settled: true });
         }
         // And only a seat on an object has one.
         let on_ground = Arrival {
@@ -2471,11 +2613,11 @@ mod tests {
             ..arrived()
         };
         assert_eq!(
-            startup_due(SitState::Ground, CUR, on_ground, None, now),
+            startup_due(SitState::Ground, CUR, false, on_ground, None, now),
             Startup::Now { settled: true }
         );
         assert_eq!(
-            startup_due(SitState::Stand, CUR, arrived(), None, now),
+            startup_due(SitState::Stand, CUR, false, arrived(), None, now),
             Startup::Now { settled: true }
         );
     }
@@ -3263,19 +3405,28 @@ mod tests {
         };
         let held = SitState::Object(bench());
         let now = Instant::now();
-        assert_eq!(startup_due(held, cur, arrived(), None, now), Startup::NotYet);
+        assert_eq!(startup_due(held, cur, false, arrived(), None, now), Startup::NotYet);
         let seated = Arrival {
             seated_on_target: true,
             ..arrived()
         };
-        assert_eq!(startup_due(held, cur, seated, None, now), Startup::Wait(now + SEAT_POSITION_WAIT));
+        assert_eq!(
+            startup_due(held, cur, false, seated, None, now),
+            Startup::Wait(now + SEAT_POSITION_WAIT)
+        );
         let later = now + SEAT_POSITION_WAIT;
-        assert_eq!(startup_due(held, cur, seated, Some(now), later), Startup::Now { settled: false });
+        assert_eq!(
+            startup_due(held, cur, false, seated, Some(now), later),
+            Startup::Now { settled: false }
+        );
         let described = Arrival {
             seat_frame_known: true,
             ..seated
         };
-        assert_eq!(startup_due(held, cur, described, Some(now), now), Startup::Now { settled: true });
+        assert_eq!(
+            startup_due(held, cur, false, described, Some(now), now),
+            Startup::Now { settled: true }
+        );
     }
 
     #[test]
@@ -3411,6 +3562,377 @@ mod tests {
         // All of it is recorded as what it is.
         assert_eq!(bot.recorder.flush_all(Instant::now()).len(), 5);
     }
+    // ------------------------------------------------- startup script
+
+    const JANE_OBJECT: &str = "01234567-9abc-defe-dcba-987654321000";
+
+    /// A bot with `script` as its startup script and `more` after it in
+    /// the config, the head of the script carried out.
+    fn scripted(more: &str, script: &str) -> Bot {
+        let mut bot = bot(full(&format!("startup = '''\n{script}'''\n{more}")));
+        bot.startup_head(Instant::now()).unwrap();
+        bot
+    }
+
+    /// The same on a simulator that takes everything, with the avatar
+    /// where the config puts it: seated on the configured object.
+    fn in_place(more: &str, script: &str) -> Bot {
+        let mut bot = scripted(more, script);
+        bot.grid = Some(commands::tests::FakeGrid::default());
+        bot.world = Some(Box::new(Somewhere(
+            at("Target", 129.33, 127.6, 26.45),
+            persist::Sitting::Object(object()),
+        )));
+        let setting = bot.startup.expect("the config's persist is still to be applied");
+        bot.startup_reached(setting, true, Instant::now());
+        bot
+    }
+
+    /// What the simulator was asked for since the last look.
+    fn asked(bot: &mut Bot) -> Vec<commands::tests::Call> {
+        std::mem::take(&mut bot.grid.as_mut().unwrap().calls)
+    }
+
+    /// Hands the bot a command whose answer may come later.
+    fn send(bot: &mut Bot, line: &str) -> Receiver<Response> {
+        let (reply, answer) = mpsc::channel();
+        let request = Request::decode(line.as_bytes()).unwrap();
+        assert!(matches!(bot.control(request, reply, Instant::now()), Flow::Continue));
+        answer
+    }
+
+    fn said(text: &str) -> commands::tests::Call {
+        commands::tests::Call::Say(0, 1, text.to_string())
+    }
+
+    fn script_is_over(bot: &Bot) -> bool {
+        !bot.script.waiting() && !bot.script.running()
+    }
+
+    #[test]
+    fn the_head_of_the_script_sets_what_the_deprecated_keys_set() {
+        let mut scripted = scripted(
+            "",
+            &format!(
+                "# as the tables below\nrlv mode on\nrlv persist follow\nrlv persist override sit tp\n\
+                 perms autoaccept tp \"Jane Doe\"\nperms autoaccept anim all\nperms revoke anim {JANE_OBJECT}\n\
+                 autoreply message Away\nautoreply pause 2h\n"
+            ),
+        );
+        let mut keyed = bot(full(&format!(
+            "rlv = true\n[persist]\nrlv = \"follow\"\noverride = [\"sit\", \"tp\"]\n\
+             [perms.autoaccept]\ntp = [\"Jane Doe\"]\nanim = \"all\"\n[perms.except]\nanim = [\"{JANE_OBJECT}\"]\n\
+             [autoreply]\nmessage = \"Away\"\npause = \"2h\"\n"
+        )));
+        for status in ["rlv\tstatus", "perms\tstatus", "autoreply\tstatus"] {
+            assert_eq!(ok(&mut scripted, status), ok(&mut keyed, status), "{status}");
+        }
+        assert!(ok(&mut scripted, "rlv\tstatus").starts_with("rlv: on\npersist: follow\npersist override: sit, tp"));
+        // None of it touched the placement, and nothing is left to run.
+        assert!(!scripted.reconciler.is_manual());
+        assert_eq!(scripted.startup, Some(Persist::Off));
+        assert!(script_is_over(&scripted));
+    }
+
+    #[test]
+    fn the_head_comes_after_the_deprecated_keys() {
+        let mut bot = scripted("rlv = true\n", "rlv mode off\n");
+        assert!(ok(&mut bot, "rlv\tstatus").starts_with("rlv: off"));
+        let mut bot = scripted("[autoreply]\nmessage = \"Away\"\npause = \"2h\"\n", "autoreply pause 30m\n");
+        assert_eq!(
+            ok(&mut bot, "autoreply\tstatus"),
+            "autoreply: on\nmessage: Away\npause: 30m\navatars in their pause: 0"
+        );
+    }
+
+    #[test]
+    fn the_head_ends_at_the_first_command_that_is_no_setting() {
+        let mut bot = scripted("", "rlv mode on\nsay hello\nrlv persist follow\n");
+        let status = ok(&mut bot, "rlv\tstatus");
+        assert!(status.starts_with("rlv: on\npersist: drop"), "{status}");
+        assert!(bot.script.waiting());
+        // A script that starts with another command has no head.
+        let mut bot = scripted("", "say hello\nrlv mode on\n");
+        assert!(ok(&mut bot, "rlv\tstatus").starts_with("rlv: off"));
+        assert!(bot.script.waiting());
+    }
+
+    #[test]
+    fn a_setting_command_refused_at_the_head_is_reported_with_its_line() {
+        let head = |script: &str| {
+            let mut bot = bot(full(&format!("startup = '''\n{script}'''\n")));
+            bot.startup_head(Instant::now()).unwrap_err()
+        };
+        let error = head("rlv mode on\nperms autoaccept money all\nsay hello\n");
+        assert_eq!(error.line, 2);
+        assert!(
+            error.reason.contains("`tp`") && error.reason.contains("`camera`"),
+            "{}",
+            error.reason
+        );
+        let error = head("# one\n\nautoreply pause soon\n");
+        assert_eq!(error.line, 3);
+        let error = head("rlv mode override\n");
+        assert!(error.reason.contains("off"), "{}", error.reason);
+        let error = head("autoreply on\n");
+        assert!(error.reason.contains("autoreply message"), "{}", error.reason);
+    }
+
+    #[test]
+    fn a_waiting_script_waits_for_the_seats_position() {
+        let now = Instant::now();
+        let seated = Arrival {
+            seated_on_target: true,
+            ..arrived()
+        };
+        let known = Arrival {
+            seat_frame_known: true,
+            ..seated
+        };
+        let sit = SitState::Object(object());
+        for setting in [CFG, Persist::Off] {
+            // With a rest of the script: as a current location waits.
+            assert_eq!(
+                startup_due(sit, setting, true, seated, None, now),
+                Startup::Wait(now + SEAT_POSITION_WAIT),
+                "{setting:?}"
+            );
+            assert_eq!(
+                startup_due(sit, setting, true, seated, Some(now), now + SEAT_POSITION_WAIT),
+                Startup::Now { settled: false }
+            );
+            assert_eq!(startup_due(sit, setting, true, known, None, now), Startup::Now { settled: true });
+            // Without one: as before.
+            assert_eq!(startup_due(sit, setting, false, seated, None, now), Startup::Now { settled: true });
+        }
+        // Nothing is waited for when the avatar is not to sit on an object,
+        // and nothing is due before the placement is reached.
+        assert_eq!(
+            startup_due(SitState::Stand, Persist::Off, true, arrived(), None, now),
+            Startup::Now { settled: true }
+        );
+        assert_eq!(startup_due(sit, Persist::Off, true, arrived(), None, now), Startup::NotYet);
+    }
+
+    #[test]
+    fn the_rest_starts_when_the_config_placement_is_reached() {
+        let mut bot = scripted("", "rlv mode on\nsay hello\n");
+        bot.grid = Some(commands::tests::FakeGrid::default());
+        // Not before: the avatar is not in place.
+        assert_eq!(bot.startup_rest(), Ok(false));
+        assert!(asked(&mut bot).is_empty());
+        assert!(bot.script.waiting());
+        bot.startup_reached(Persist::Off, true, Instant::now());
+        // Without `persist` the bot goes to manual mode, and the rest runs.
+        assert!(bot.reconciler.is_manual());
+        assert!(bot.script.running());
+        assert_eq!(bot.startup_rest(), Ok(true));
+        assert_eq!(asked(&mut bot), [said("hello")]);
+        assert!(script_is_over(&bot));
+        assert_eq!(bot.startup_rest(), Ok(false));
+    }
+
+    #[test]
+    fn persist_in_the_script_holds_what_the_deprecated_setting_held() {
+        // `persist`: where the avatar is and what it sits on.
+        let mut scripted = in_place("", "persist\n");
+        assert!(scripted.reconciler.is_manual());
+        assert_eq!(scripted.startup_rest(), Ok(true));
+        let mut keyed = in_place("persist = \"cur\"\n", "");
+        assert_eq!(scripted.book.held(), keyed.book.held());
+        assert_eq!(scripted.book.held().location, Some(at("Target", 129.33, 127.6, 26.45)));
+        assert!(!scripted.reconciler.is_manual() && !keyed.reconciler.is_manual());
+        assert_eq!(ok(&mut scripted, "status"), ok(&mut keyed, "status"));
+        // `persist cfg cfg`: the config placement.
+        let mut scripted = in_place("", "persist cfg cfg\n");
+        assert_eq!(scripted.startup_rest(), Ok(true));
+        let mut keyed = in_place("persist = \"cfg\"\n", "");
+        assert_eq!(scripted.book.held(), keyed.book.held());
+        assert_eq!(scripted.book.held().location, Some(at("Target", 128.0, 128.0, 25.0)));
+        assert_eq!(ok(&mut scripted, "status"), ok(&mut keyed, "status"));
+        // Neither asked the simulator for anything.
+        assert!(asked(&mut scripted).is_empty());
+    }
+
+    #[test]
+    fn the_deprecated_persist_is_applied_before_the_rest_runs() {
+        let mut bot = in_place("persist = \"cfg\"\n", "say hello\n");
+        assert!(!bot.reconciler.is_manual());
+        assert_eq!(bot.book.held().location, Some(at("Target", 128.0, 128.0, 25.0)));
+        // Applying it did not give the script up.
+        assert!(bot.script.running());
+        assert_eq!(bot.startup_rest(), Ok(true));
+        assert_eq!(asked(&mut bot), [said("hello")]);
+    }
+
+    #[test]
+    fn the_rest_runs_one_command_at_a_time() {
+        let seat = Uuid::from_bytes([9; 16]);
+        let mut bot = in_place("", &format!("tp 128 128 25 Home\nsit {seat}\nsay hello\n"));
+        assert_eq!(bot.startup_rest(), Ok(true));
+        assert_eq!(
+            asked(&mut bot),
+            [commands::tests::Call::Teleport("Home".to_string(), [128.0, 128.0, 25.0])]
+        );
+        // The sit waits for the teleport's answer.
+        assert_eq!(bot.startup_rest(), Ok(false));
+        assert!(asked(&mut bot).is_empty());
+        bot.commands.arrived("Home");
+        assert_eq!(bot.startup_rest(), Ok(true));
+        assert_eq!(asked(&mut bot), [commands::tests::Call::Sit(seat)]);
+        assert_eq!(bot.startup_rest(), Ok(false));
+        bot.commands.seated(seat);
+        assert_eq!(bot.startup_rest(), Ok(true));
+        assert_eq!(asked(&mut bot), [said("hello")]);
+        assert!(script_is_over(&bot));
+        // The script's commands are the operator's: they moved the avatar.
+        assert!(bot.reconciler.is_manual());
+    }
+
+    #[test]
+    fn a_refused_command_stops_the_script_and_not_the_bot() {
+        let mut bot = in_place("", "sit chair\nsay hello\nsay again\n");
+        assert_eq!(bot.startup_rest(), Ok(true));
+        assert!(asked(&mut bot).is_empty());
+        assert!(script_is_over(&bot));
+        assert_eq!(bot.startup_rest(), Ok(false));
+        assert!(asked(&mut bot).is_empty());
+        // The bot goes on taking commands.
+        assert!(ok(&mut bot, "status").contains("mode: manual"));
+        // A command that fails later stops it as well.
+        let seat = Uuid::from_bytes([9; 16]);
+        let mut bot = in_place("", &format!("sit {seat}\npersist\n"));
+        assert_eq!(bot.startup_rest(), Ok(true));
+        assert!(bot.commands.sit_failed("there is no such object"));
+        assert_eq!(bot.startup_rest(), Ok(true));
+        assert!(script_is_over(&bot));
+        assert!(bot.reconciler.is_manual());
+    }
+
+    #[test]
+    fn a_setting_command_in_the_rest_that_is_refused_stops_the_script_only() {
+        let mut bot = in_place("", "say hello\nautoreply pause soon\nsay again\n");
+        assert_eq!(bot.startup_rest(), Ok(true));
+        assert_eq!(asked(&mut bot), [said("hello")]);
+        assert!(script_is_over(&bot));
+    }
+
+    #[test]
+    fn quit_in_the_script_stops_the_bot() {
+        let mut bot = in_place("", "say done\nquit\nsay never\n");
+        assert_eq!(bot.startup_rest(), Err(EXIT_OK));
+        assert_eq!(asked(&mut bot), [said("done")]);
+        assert!(bot.stopping);
+        // Nothing of the script comes after it: only its answer is taken.
+        assert_eq!(bot.startup_rest(), Ok(true));
+        assert!(script_is_over(&bot));
+        assert_eq!(bot.startup_rest(), Ok(false));
+        assert!(asked(&mut bot).is_empty());
+    }
+
+    #[test]
+    fn the_operator_acting_first_gives_the_rest_up_and_keeps_the_settings() {
+        for line in ["tp\t128\t128\t25\tHome", "persist\tcfg\tcfg", "home"] {
+            let mut bot = scripted("", "rlv mode on\nsay hello\npersist\n");
+            bot.grid = Some(commands::tests::FakeGrid::default());
+            assert!(bot.script.waiting(), "{line}");
+            let _answer = send(&mut bot, line);
+            asked(&mut bot);
+            assert!(script_is_over(&bot), "{line}");
+            assert_eq!(bot.startup, None, "{line}");
+            assert_eq!(bot.startup_rest(), Ok(false), "{line}");
+            assert!(asked(&mut bot).is_empty(), "{line}");
+            assert!(ok(&mut bot, "rlv\tstatus").starts_with("rlv: on"), "{line}");
+        }
+        // A command that moves nothing, or is refused, leaves it waiting.
+        let mut bot = scripted("", "rlv mode on\nsay hello\npersist\n");
+        bot.grid = Some(commands::tests::FakeGrid::default());
+        for line in ["status", "say\thi", "sit\tchair", "persist\tcur\tchair", "rlv\tmode\toff"] {
+            let _answer = send(&mut bot, line);
+            assert!(bot.script.waiting(), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_running_script_is_not_stopped_by_the_operator_or_by_its_own_persist() {
+        let mut bot = in_place("", "tp 128 128 25 Home\npersist cfg cfg\nsay hello\n");
+        assert_eq!(bot.startup_rest(), Ok(true));
+        asked(&mut bot);
+        // The operator's commands while the teleport is on its way.
+        assert!(ok(&mut bot, "status").starts_with("connected"));
+        assert!(matches!(command(&mut bot, "say\thi"), Response::Ok(_)));
+        assert!(matches!(command(&mut bot, "persist\tcfg\tcfg"), Response::Ok(_)));
+        assert_eq!(asked(&mut bot), [said("hi")]);
+        assert!(bot.script.running());
+        assert_eq!(bot.startup_rest(), Ok(false));
+        // The script goes on where it was, through its own persist.
+        bot.commands.arrived("Home");
+        assert_eq!(bot.startup_rest(), Ok(true));
+        assert_eq!(asked(&mut bot), [said("hello")]);
+        assert!(script_is_over(&bot));
+        assert!(!bot.reconciler.is_manual());
+    }
+
+    #[test]
+    fn a_followed_forced_sit_neither_starts_nor_stops_the_script() {
+        // While the script runs.
+        let mut bot = in_place("", "tp 128 128 25 Home\nsay hello\n");
+        assert_eq!(bot.startup_rest(), Ok(true));
+        asked(&mut bot);
+        bot.startup = Some(CUR);
+        bot.follow_seat = true;
+        bot.startup_reached(CUR, true, Instant::now());
+        assert!(bot.script.running());
+        bot.commands.arrived("Home");
+        assert_eq!(bot.startup_rest(), Ok(true));
+        assert_eq!(asked(&mut bot), [said("hello")]);
+        // And when it is done.
+        assert!(script_is_over(&bot));
+        bot.startup = Some(CUR);
+        bot.follow_seat = true;
+        bot.startup_reached(CUR, true, Instant::now());
+        assert!(script_is_over(&bot));
+        assert_eq!(bot.startup_rest(), Ok(false));
+        assert!(asked(&mut bot).is_empty());
+    }
+
+    #[test]
+    fn the_script_is_carried_out_once_in_a_run() {
+        // Done, then the session is lost and the bot logs in again.
+        let mut bot = in_place("", "say hello\n");
+        assert_eq!(bot.startup_rest(), Ok(true));
+        assert_eq!(asked(&mut bot), [said("hello")]);
+        bot.drop_session();
+        assert_eq!(bot.startup, None);
+        assert_eq!(bot.apply_startup(Instant::now()), None);
+        assert_eq!(bot.startup_rest(), Ok(false));
+        assert!(asked(&mut bot).is_empty());
+        assert!(script_is_over(&bot));
+        // Stopped by a session loss in the middle: not taken up again.
+        let mut bot = in_place("", "tp 128 128 25 Home\nsit ground\n");
+        assert_eq!(bot.startup_rest(), Ok(true));
+        asked(&mut bot);
+        bot.drop_session();
+        assert_eq!(bot.startup_rest(), Ok(true));
+        assert!(script_is_over(&bot));
+        assert_eq!(bot.startup_rest(), Ok(false));
+        assert!(asked(&mut bot).is_empty());
+    }
+
+    #[test]
+    fn a_session_lost_before_the_placement_is_reached_keeps_the_rest_waiting() {
+        let mut bot = scripted("", "rlv mode on\nsay hello\n");
+        bot.grid = Some(commands::tests::FakeGrid::default());
+        bot.drop_session();
+        assert!(bot.script.waiting());
+        assert_eq!(bot.startup, Some(Persist::Off));
+        assert_eq!(bot.startup_rest(), Ok(false));
+        // The next login gets the avatar in place.
+        bot.startup_reached(Persist::Off, true, Instant::now());
+        assert_eq!(bot.startup_rest(), Ok(true));
+        assert_eq!(asked(&mut bot), [said("hello")]);
+    }
+
     // ------------------------------------------------------ autoreply
 
     fn answering(more: &str) -> Bot {
@@ -3849,6 +4371,7 @@ mod tests {
                 ));
                 let (events, incoming) = mpsc::channel();
                 let mut bot = Bot::new(config, Logs::open(None, None).ok().unwrap(), events);
+                bot.start_gateway();
                 if grid {
                     bot.grid = Some(FakeGrid::default());
                 }

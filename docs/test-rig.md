@@ -748,3 +748,27 @@ because the bot had not heard `Home` close the connection.
 Not covered on this rig: Second Life; a region that restarts while it
 keeps the avatar's presence; walking or flying across a region border,
 which the bot does not follow.
+
+## Startup script
+
+Run on 2026-11-21 with the debug build, the config of item 1 plus
+`socket = true`, and a `RUSSELBOT_SOCK` of the run's own; `ctl` is
+`rslbot ctl` on that socket. The script is given as `startup = '''...'''`;
+its lines are shown here separated by `;`. The configs of items 209 to 216
+have none of the deprecated keys unless the row says so.
+
+| # | Inject | Expected | Result (2026-11-21, OpenSim feccd9cc53) |
+|---|---|---|---|
+| 209 | Script: `rlv mode on`; `rlv persist follow`; `perms autoaccept tp "Jane Doe"`; `perms autoaccept anim all`; `perms revoke anim <uuid>`; `autoreply message Away from the keyboard`; `autoreply pause 2h`; `persist`; `say in place`. `ctl rlv status`, `ctl perms status` and `ctl autoreply status` 0.3 s after the start | A `startup: line N: ...` and a `startup: line N answered: ...` line for each of the seven setting commands, all before `logging in`; the three answers show the settings while the login is under way | Pass: `rlv: on`, `persist: follow`; `tp: Jane Doe`, `anim: all except <uuid>`; `autoreply: on`, the text, `pause: 2h` |
+| 210 | The same run, after `seated`; then `ctl status` | `startup: the avatar is in place; carrying out the rest of the startup script`, `placement: manual`, `startup: line 10: persist`, `placement: holding` with the seated position and the seat, `startup: line 11: say in place`, `startup: the script is done`; the same placement on the `persist` line, `mode: holding` | Pass: `Target/129.33/128/26.45 <uuid>`, in the second of the sit. A config with `persist = "cur"` in place of the script ended with the same `persist` line (item 65) |
+| 211 | Script: `persist cfg cfg`; and, in its place, `persist = "cfg"` | Both end with `persist: Target/128/128/25 <uuid>` and `mode: holding` | Pass, both; the key also logged `` `persist` is deprecated; write the startup script command `persist cfg cfg` instead `` |
+| 212 | Script: `rlv mode on`; `say first`; `sit <a UUID that is no object>`; `persist`; `say never`. Then `ctl status`, `ctl rlv status` | `say first` is carried out, the sit is refused after 15 s, and the log says that the script stops and two commands are left out; the bot stays connected, in manual mode, with RLV on | Pass: `startup: line 3 refused: the simulator did not confirm the sit within 15 s; the startup script stops here: 2 commands after it will not be carried out` |
+| 213 | `sit` set to a UUID that is no object; script: `rlv mode on`; `say hello`; `persist`. After the first failed sit, `ctl tp 128 128 25 Home`; in another run, `ctl persist cur stand` | The rest is given up with a line that counts the commands; RLV stays on; the bot is where the command put it | Pass: `startup: the avatar was moved before it was in place; 2 commands of the startup script, from line 2 on, will not be carried out`, `region: Home`, `mode: manual`, `rlv: on`. With `persist`: `a placement was persisted before the avatar was in place; 1 command ...` |
+| 214 | `rlv = true` and `persist = "cfg"` with the script `rlv mode off`; `say hello`. `ctl rlv status` 0.3 s after the start | The two deprecation lines, `rlv: on`, then `startup: line 1: rlv mode off` and `rlv: off` before `logging in`; after `seated`, `config: persist cfg cfg` and `placement: holding`, then `startup: line 2: say hello` | Pass, in that order; `rlv: off` from the socket during the login |
+| 215 | Script: `rlv mode on`; `perms autoaccept money all`; `say hello` | Exit status 2, an error naming `startup`, line 2 and the kinds, and no `logging in` line | Pass: ``rslbot: h.toml: `startup`: line 2: `money` is no kind of request; the kinds are `tp`, `inventory`, `anim`, `attach`, `controls` and `camera` `` |
+| 216 | Script: `rlv mode on`; `autoreply message "Away.` / `Back tomorrow."` (one command on two lines); `persist`; `say in place`. When it is done, `kick user Sit Bot` on the console | The autoreply text has two lines; after the kick the bot logs in and sits again, and the log has no further `startup:` line | Pass: ten `startup:` lines before the kick and none after it; `seated` again after the next login, `mode: holding` |
+| 217 | No script: `persist = "cfg"`, `rlv = true` and an `[autoreply]` table, with the build from the commit before this change and with the new one. After `config: persist cfg cfg`: `ctl rlv status`, `ctl autoreply status`, `ctl status`, `kick user Sit Bot`, and `ctl status` once seated again | The same answers and the same log from both, but for three deprecation lines at the start of the new one | Pass: the answers are identical, and the new log has the three lines for `persist`, `rlv` and `autoreply` and is otherwise the old one, except that one `attachment: item ... is on Left Hand` line, which follows the simulator's timing, came before the second `seated` in one run and after it in the other |
+
+Not covered on this rig: a script command that RLV restrictions refuse; a
+`startup_file` (unit tests read one); the XMPP gateway together with a
+script.

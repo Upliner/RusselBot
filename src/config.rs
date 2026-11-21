@@ -1,6 +1,7 @@
 //! The single TOML config file: model, defaults and validation.
 
 use crate::perms::{Entry, Kind, Rule, Rules, KINDS};
+use crate::startup::{self, Line};
 use md5::{Digest, Md5};
 use serde::Deserialize;
 use std::fmt;
@@ -93,8 +94,9 @@ pub struct Config {
     pub place: Place,
     /// Without it the bot seats the avatar only on command.
     pub sit: Option<Sit>,
-    /// The seat came from the old key `object`.
-    pub deprecated_object: bool,
+    /// A note for each deprecated key the config uses: that it is
+    /// deprecated, and what to write instead.
+    pub deprecated: Vec<String>,
     pub persist: Persist,
     /// TSV file for local chat, if any.
     pub log_chat: Option<PathBuf>,
@@ -126,6 +128,22 @@ pub struct Config {
     /// Autoreplies to instant messages, when the config has an
     /// `[autoreply]` table.
     pub autoreply: Option<AutoreplyConfig>,
+    /// The commands of the startup script, from `startup` or from the
+    /// file `startup_file` names.
+    pub startup: Vec<Line>,
+    /// The file the startup script is in, when the config names one.
+    /// `Config::load` reads it; `Config::parse` leaves `startup` empty.
+    pub startup_file: Option<PathBuf>,
+}
+
+impl Config {
+    /// The key the startup script is under, for messages about it.
+    pub fn startup_key(&self) -> &'static str {
+        match self.startup_file {
+            Some(_) => "startup_file",
+            None => "startup",
+        }
+    }
 }
 
 /// The `[autoreply]` table.
@@ -205,6 +223,8 @@ struct Raw {
     perms: Option<toml::Value>,
     xmpp: Option<toml::Value>,
     autoreply: Option<toml::Value>,
+    startup: Option<toml::Value>,
+    startup_file: Option<toml::Value>,
 }
 
 /// Hashes a plain password into the form grids accept: `$1$` + MD5 hex.
@@ -601,10 +621,122 @@ fn persist_table(table: &toml::Table) -> Result<(Persist, RlvPersist, PersistOve
     Ok((setting, rlv, overridden))
 }
 
+/// The startup script under `key`, read into its commands.
+fn script(key: &str, text: &str) -> Result<Vec<Line>, ConfigError> {
+    startup::parse(text).map_err(|e| ConfigError(format!("`{key}`: line {}: {}", e.line, e.reason)))
+}
+
+/// One argument as a startup script takes it: in double quotes when it
+/// has to be.
+fn script_word(text: &str) -> String {
+    let plain = !text.is_empty() && !text.contains([' ', '\t', '\n', '\r', '"']) && !text.starts_with('#');
+    match plain {
+        true => text.to_string(),
+        false => format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\"")),
+    }
+}
+
+/// The note for a deprecated key that the startup script replaces: the
+/// commands to write instead of what the config gives, or that the key
+/// can simply go.
+fn deprecation(key: &str, commands: &[String], more: &str) -> String {
+    let instead = match commands {
+        [] => "the bot does the same without it: leave it out".to_string(),
+        [command] => format!("write the startup script command `{command}` instead (see `startup`)"),
+        commands => format!(
+            "write these startup script commands instead (see `startup`): `{}`",
+            commands.join("`, `")
+        ),
+    };
+    format!("`{key}` is deprecated; {instead}{more}")
+}
+
+/// The note for `persist`: its `rlv` and `override` keys as the setting
+/// commands they are, and what is held at the start as a `persist`
+/// command, which comes after the setting commands.
+fn persist_note(given: &toml::Value, setting: Persist, rlv: RlvPersist, overridden: PersistOverride) -> String {
+    let mut commands = Vec::new();
+    let table = given.as_table();
+    if table.is_some_and(|table| table.contains_key("rlv")) {
+        let word = if rlv == RlvPersist::Follow { "follow" } else { "drop" };
+        commands.push(format!("rlv persist {word}"));
+    }
+    if table.is_some_and(|table| table.contains_key("override")) {
+        commands.push(format!("rlv persist override {}", overridden.words().replace(", ", " ")));
+    }
+    let mut more = "";
+    if let Persist::On { position, sit } = setting {
+        let word = |source| if source == Source::Cur { "cur" } else { "cfg" };
+        commands.push(format!("persist {} {}", word(position), word(sit)));
+        more = "; `persist` goes after the setting commands";
+    }
+    deprecation("persist", &commands, more)
+}
+
+/// The note for `perms`: each kind's rule as `perms autoaccept`, and its
+/// exceptions as `perms revoke`, which only a kind whose rule is `all` has
+/// a command for.
+fn perms_note(rules: &Rules) -> String {
+    let words = |entries: &[Entry]| {
+        entries
+            .iter()
+            .map(|entry| script_word(&entry.to_string()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut commands = Vec::new();
+    let mut lost = Vec::new();
+    for kind in Kind::ALL {
+        let exceptions = rules.exceptions(kind);
+        match rules.rule(kind) {
+            Rule::All => {
+                commands.push(format!("perms autoaccept {kind} all"));
+                if !exceptions.is_empty() {
+                    commands.push(format!("perms revoke {kind} {}", words(exceptions)));
+                }
+            }
+            Rule::List(entries) => {
+                if !entries.is_empty() {
+                    commands.push(format!("perms autoaccept {kind} {}", words(entries)));
+                }
+                if !exceptions.is_empty() {
+                    lost.push(format!("`{kind}`"));
+                }
+            }
+        }
+    }
+    let more = match lost.is_empty() {
+        true => String::new(),
+        false => format!(
+            "; the exceptions for {} cannot be written in the startup script: \
+             `perms revoke` makes an exception only while the kind's rule is `all`",
+            lost.join(", ")
+        ),
+    };
+    deprecation("perms", &commands, &more)
+}
+
+/// The note for `autoreply`: the text, and the pause when the table gives
+/// one.
+fn autoreply_note(given: &toml::Value, auto: &AutoreplyConfig) -> String {
+    let mut commands = vec![format!("autoreply message {}", script_word(&auto.message))];
+    if given.as_table().is_some_and(|table| table.contains_key("pause")) {
+        commands.push(format!("autoreply pause {}", crate::autoreply::format_duration(auto.pause)));
+    }
+    deprecation("autoreply", &commands, "")
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|e| ConfigError(format!("cannot read {}: {e}", path.display())))?;
-        Config::parse(&text).map_err(|e| ConfigError(format!("{}: {e}", path.display())))
+        let mut config = Config::parse(&text).map_err(|e| ConfigError(format!("{}: {e}", path.display())))?;
+        if let Some(file) = &config.startup_file {
+            config.startup = std::fs::read_to_string(file)
+                .map_err(|e| ConfigError(format!("`startup_file`: cannot read {}: {e}", file.display())))
+                .and_then(|text| script("startup_file", &text))
+                .map_err(|e| ConfigError(format!("{}: {e}", path.display())))?;
+        }
+        Ok(config)
     }
 
     pub fn parse(text: &str) -> Result<Config, ConfigError> {
@@ -667,7 +799,10 @@ impl Config {
             },
         };
 
-        let deprecated_object = raw.object.is_some();
+        let mut deprecated = Vec::new();
+        if raw.object.is_some() {
+            deprecated.push("`object` is deprecated; write the same value as `sit`".to_string());
+        }
         let sit = match (raw.sit, raw.object) {
             (Some(_), Some(_)) => return err("`sit` and `object` are both set; use only `sit`"),
             (None, None) => None,
@@ -684,7 +819,11 @@ impl Config {
             )),
         };
 
+        let persist_given = raw.persist.clone();
         let (persist, rlv_persist, persist_override) = persist(raw.persist)?;
+        if let Some(given) = &persist_given {
+            deprecated.push(persist_note(given, persist, rlv_persist, persist_override));
+        }
         let log_chat = log_path(raw.log_chat, "log_chat")?;
         let log_im = log_path(raw.log_im, "log_im")?;
         let fetch_offline_im = flag(raw.fetch_offline_im, "fetch_offline_im")?;
@@ -701,10 +840,31 @@ impl Config {
             Some(_) => return err("`scan_distance` must be a number of metres from 1 to 1024"),
         };
         let restore_attachments = flag_or(raw.restore_attachments, "restore_attachments", true)?;
+        let rlv_given = raw.rlv.is_some();
         let rlv = flag(raw.rlv, "rlv")?;
+        if rlv_given {
+            let commands = if rlv { vec!["rlv mode on".to_string()] } else { Vec::new() };
+            deprecated.push(deprecation("rlv", &commands, ""));
+        }
+        let perms_given = raw.perms.is_some();
         let perms = perms(raw.perms)?;
+        if perms_given {
+            deprecated.push(perms_note(&perms));
+        }
         let xmpp = xmpp(raw.xmpp)?;
+        let autoreply_given = raw.autoreply.clone();
         let autoreply = autoreply(raw.autoreply)?;
+        if let (Some(given), Some(auto)) = (&autoreply_given, &autoreply) {
+            deprecated.push(autoreply_note(given, auto));
+        }
+        let (startup, startup_file) = match (raw.startup, raw.startup_file) {
+            (Some(_), Some(_)) => return err("`startup` and `startup_file` are both set; use only one"),
+            (None, None) => (Vec::new(), None),
+            (Some(toml::Value::String(text)), None) => (script("startup", &text)?, None),
+            (Some(_), None) => return err("`startup` must be a string holding the startup script, one command per line"),
+            (None, Some(toml::Value::String(path))) if !path.is_empty() => (Vec::new(), Some(PathBuf::from(path))),
+            (None, Some(_)) => return err("`startup_file` must be a non-empty file path"),
+        };
 
         Ok(Config {
             login_url,
@@ -713,7 +873,7 @@ impl Config {
             password_hash,
             place,
             sit,
-            deprecated_object,
+            deprecated,
             persist,
             log_chat,
             log_im,
@@ -728,6 +888,8 @@ impl Config {
             perms,
             xmpp,
             autoreply,
+            startup,
+            startup_file,
         })
     }
 }
@@ -763,7 +925,7 @@ mod tests {
             }
         );
         assert_eq!(cfg.sit, Some(Sit::Object(Uuid::parse_str(OBJECT).unwrap())));
-        assert!(!cfg.deprecated_object);
+        assert!(cfg.deprecated.is_empty());
     }
 
     /// `base()` without the lines of the given keys.
@@ -778,7 +940,7 @@ mod tests {
     #[test]
     fn account_alone_is_a_config() {
         let cfg = Config::parse(&without(&["region", "position", "sit"])).unwrap();
-        assert_eq!((cfg.place, cfg.sit, cfg.deprecated_object), (Place::Latest, None, false));
+        assert_eq!((cfg.place, cfg.sit, cfg.deprecated.is_empty()), (Place::Latest, None, true));
     }
 
     #[test]
@@ -828,11 +990,11 @@ mod tests {
     #[test]
     fn object_is_the_old_spelling_of_sit() {
         let old = Config::parse(&base().replace("sit = ", "object = ")).unwrap();
-        assert!(old.deprecated_object);
+        assert_eq!(old.deprecated, ["`object` is deprecated; write the same value as `sit`"]);
         let new = Config::parse(&base()).unwrap();
         assert_eq!(
             Config {
-                deprecated_object: false,
+                deprecated: Vec::new(),
                 ..old
             },
             new
@@ -1201,37 +1363,58 @@ mod tests {
             }
         );
         assert_eq!(cfg.sit, Some(Sit::Object(Uuid::nil())));
-        assert!(!cfg.deprecated_object);
+        assert!(cfg.deprecated.is_empty());
         assert_eq!(cfg.persist, Persist::Off);
         assert!(!cfg.rlv);
         assert_eq!(cfg.rlv_persist, RlvPersist::Drop);
+        assert!(cfg.startup.is_empty() && cfg.startup_file.is_none());
     }
 
     #[test]
-    fn example_file_is_valid_with_its_persist_table_enabled() {
+    fn example_file_is_valid_with_its_startup_script_enabled() {
         let text = include_str!("../russelbot.example.toml");
-        let mut enabled = text.to_string();
-        for line in [
-            "# [persist]",
-            "# atstart = true",
-            "# position = \"cur\"",
-            "# sit = \"cfg\"",
-            "# rlv = \"follow\"",
-            "# rlv = true",
-        ] {
-            assert_eq!(text.matches(&format!("\n{line}\n")).count(), 1, "{line} is not once in the example");
-            enabled = enabled.replace(&format!("\n{line}\n"), &format!("\n{}\n", &line[2..]));
-        }
+        // The block from `# startup = '''` to `# '''`, without its `# `.
+        let start = text.find("\n# startup = '''\n").expect("the example has a startup script");
+        let end = start + text[start + 1..].find("\n# '''\n").expect("the script ends") + "\n# '''\n".len();
+        let block: Vec<&str> = text[start..=end]
+            .lines()
+            .map(|line| line.strip_prefix("# ").unwrap_or(line))
+            .collect();
+        let enabled = format!("{}{}\n{}", &text[..start], block.join("\n"), &text[end + 1..]);
         let cfg = Config::parse(&enabled).unwrap();
+        let commands: Vec<&str> = cfg.startup.iter().map(|line| line.text.as_str()).collect();
         assert_eq!(
-            cfg.persist,
-            Persist::On {
-                position: Source::Cur,
-                sit: Source::Cfg
-            }
+            commands,
+            [
+                "rlv mode on",
+                "rlv persist follow",
+                "rlv persist override sit tp",
+                "perms autoaccept tp \"Jane Doe\"",
+                "perms autoaccept inventory \"Owner Resident\" 11111111-2222-3333-4444-555555555555",
+                "perms autoaccept anim all",
+                "perms revoke anim 01234567-9abc-defe-dcba-987654321000",
+                "perms autoaccept attach all",
+                "autoreply message Hello, I'm bot. I won't respond to you in next 2 hours",
+                "autoreply pause 2h",
+                "persist cur cfg",
+            ]
         );
-        assert!(cfg.rlv);
-        assert_eq!(cfg.rlv_persist, RlvPersist::Follow);
+        // The setting commands are first, as the example says they should be.
+        let (last, settings) = cfg.startup.split_last().unwrap();
+        assert!(settings.iter().all(|line| startup::is_setting(&line.request)));
+        assert!(!startup::is_setting(&last.request));
+        // Nothing in the example is deprecated, with or without the script.
+        assert!(cfg.deprecated.is_empty());
+        assert_eq!((cfg.persist, cfg.rlv, cfg.autoreply), (Persist::Off, false, None));
+        // The script in a file instead.
+        let file = "# startup_file = \"startup.rsl\"";
+        assert_eq!(text.matches(&format!("\n{file}\n")).count(), 1, "{file} is not once in the example");
+        let cfg = Config::parse(&text.replace(&format!("\n{file}\n"), &format!("\n{}\n", &file[2..]))).unwrap();
+        assert_eq!(cfg.startup_file, Some(PathBuf::from("startup.rsl")));
+        assert_eq!(
+            rejected(&enabled.replace(file, &file[2..])),
+            "`startup` and `startup_file` are both set; use only one"
+        );
     }
 
     fn perms_of(tables: &str) -> Rules {
@@ -1329,51 +1512,6 @@ mod tests {
         let both = rejected("[perms.autoaccept]\nanim = [\"Jane Doe\"]\n[perms.except]\nanim = [\"jane.doe\"]\n");
         assert!(both.contains("`perms.autoaccept.anim` and `perms.except.anim`"), "{both}");
         assert!(both.contains("\"Jane Doe\""), "{both}");
-    }
-
-    #[test]
-    fn example_file_is_valid_with_its_perms_tables_enabled() {
-        let text = include_str!("../russelbot.example.toml");
-        let mut enabled = text.to_string();
-        for line in [
-            "# [perms.autoaccept]",
-            "# tp = [\"Jane Doe\"]",
-            "# inventory = [\"Owner Resident\", \"11111111-2222-3333-4444-555555555555\"]",
-            "# anim = \"all\"",
-            "# attach = true",
-            "# [perms.except]",
-            "# anim = [\"01234567-9abc-defe-dcba-987654321000\"]",
-        ] {
-            assert_eq!(text.matches(&format!("\n{line}\n")).count(), 1, "{line} is not once in the example");
-            enabled = enabled.replace(&format!("\n{line}\n"), &format!("\n{}\n", &line[2..]));
-        }
-        let rules = Config::parse(&enabled).unwrap().perms;
-        assert_eq!(*rules.rule(Kind::Tp), Rule::List(vec![entry("Jane Doe")]));
-        assert_eq!(
-            *rules.rule(Kind::Inventory),
-            Rule::List(vec![entry("Owner Resident"), entry(OBJECT)])
-        );
-        assert_eq!(*rules.rule(Kind::Anim), Rule::All);
-        assert_eq!(*rules.rule(Kind::Attach), Rule::All);
-        assert_eq!(rules.exceptions(Kind::Anim), [entry("01234567-9abc-defe-dcba-987654321000")]);
-    }
-
-    #[test]
-    fn example_file_is_valid_with_its_autoreply_table_enabled() {
-        let text = include_str!("../russelbot.example.toml");
-        let mut enabled = text.to_string();
-        for line in [
-            "# [autoreply]",
-            "# message = \"Hello, I'm bot. I won't respond to you in next 2 hours\"",
-            "# pause = \"2h\"",
-        ] {
-            assert_eq!(text.matches(&format!("\n{line}\n")).count(), 1, "{line} is not once in the example");
-            enabled = enabled.replace(&format!("\n{line}\n"), &format!("\n{}\n", &line[2..]));
-        }
-        let autoreply = Config::parse(&enabled).unwrap().autoreply.unwrap();
-        assert_eq!(autoreply.message, "Hello, I'm bot. I won't respond to you in next 2 hours");
-        assert_eq!(autoreply.pause, Duration::from_secs(2 * 3600));
-        assert_eq!(Config::parse(text).unwrap().autoreply, None);
     }
 
     fn autoreply_table(lines: &str) -> String {
@@ -1591,19 +1729,293 @@ mod tests {
             assert!(text.contains(&commented), "{key} is not in the example");
             enabled = enabled.replace(&commented, &format!("{key} = "));
         }
-        let persist = "# persist = \"cfg\"";
-        assert!(text.contains(persist), "persist is not in the example");
-        enabled = enabled.replace(persist, "persist = \"cfg\"");
         let cfg = Config::parse(&enabled).unwrap();
-        assert_eq!(
-            cfg.persist,
-            Persist::On {
-                position: Source::Cfg,
-                sit: Source::Cfg
-            }
-        );
         assert_eq!(cfg.log_chat, Some(PathBuf::from("chat.tsv")));
         assert_eq!(cfg.log_im, Some(PathBuf::from("im.tsv")));
         assert!(cfg.fetch_offline_im);
+    }
+
+    // ------------------------------------------------- startup script
+
+    fn script_texts(cfg: &Config) -> Vec<(usize, &str)> {
+        cfg.startup.iter().map(|line| (line.number, line.text.as_str())).collect()
+    }
+
+    #[test]
+    fn startup_is_a_script_of_command_lines() {
+        let cfg = Config::parse(&format!(
+            "{}startup = '''\n# settings\nrlv mode on\nperms autoaccept tp \"Jane Doe\"\n\npersist cur cfg\n'''\n",
+            base()
+        ))
+        .unwrap();
+        assert_eq!(
+            script_texts(&cfg),
+            [(2, "rlv mode on"), (3, "perms autoaccept tp \"Jane Doe\""), (5, "persist cur cfg")]
+        );
+        assert_eq!((cfg.startup_key(), &cfg.startup_file), ("startup", &None));
+        assert!(cfg.deprecated.is_empty());
+        // Without the keys there is no script, and an empty one is none.
+        assert!(Config::parse(&base()).unwrap().startup.is_empty());
+        assert!(Config::parse(&format!("{}startup = \"\"\n", base())).unwrap().startup.is_empty());
+    }
+
+    #[test]
+    fn startup_and_startup_file_exclude_each_other() {
+        let msg = rejected(&format!("{}startup = \"rlv mode on\"\nstartup_file = \"startup.rsl\"\n", base()));
+        assert!(msg.contains("`startup`") && msg.contains("`startup_file`"), "{msg}");
+    }
+
+    #[test]
+    fn startup_keys_of_the_wrong_type_are_rejected() {
+        let msg = rejected(&format!("{}startup = [\"rlv mode on\"]\n", base()));
+        assert!(msg.contains("`startup` must be a string"), "{msg}");
+        for bad in ["\"\"", "true", "[\"startup.rsl\"]"] {
+            let msg = rejected(&format!("{}startup_file = {bad}\n", base()));
+            assert!(msg.contains("`startup_file` must be a non-empty file path"), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_script_that_is_not_in_its_form_is_rejected_with_its_line() {
+        let with = |script: &str| rejected(&format!("{}startup = '''\n{script}'''\n", base()));
+        let msg = with("rlv mode on\nsay hi\nteleport 128 128 25\n");
+        assert!(msg.contains("`startup`: line 3: unknown command `teleport`"), "{msg}");
+        let msg = with("sit\n");
+        assert!(msg.contains("`startup`: line 1: `sit` takes 1 argument"), "{msg}");
+        let msg = with("\nrlv mode loud\n");
+        assert!(msg.contains("`startup`: line 2: `rlv mode` takes"), "{msg}");
+        let msg = with("say one\nim \"Jane Doe hi\nsay two\n");
+        assert!(msg.contains("`startup`: line 2:") && msg.contains("quote"), "{msg}");
+        let msg = with("help\n");
+        assert!(msg.contains("line 1: unknown command `help`"), "{msg}");
+        // What only the bot can judge is not judged here.
+        assert!(Config::parse(&format!("{}startup = \"sit chair\\nautoreply pause soon\"\n", base())).is_ok());
+    }
+
+    /// A config file and, beside it, the file its `startup_file` names.
+    struct Files {
+        dir: PathBuf,
+    }
+
+    impl Files {
+        fn new(name: &str) -> Files {
+            let dir = std::env::temp_dir().join(format!("russelbot-config-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Files { dir }
+        }
+
+        fn script(&self) -> PathBuf {
+            self.dir.join("startup.rsl")
+        }
+
+        /// Loads `base()` with `startup_file` naming the script file.
+        fn load(&self) -> Result<Config, ConfigError> {
+            let config = self.dir.join("russelbot.toml");
+            std::fs::write(&config, format!("{}startup_file = '{}'\n", base(), self.script().display())).unwrap();
+            Config::load(&config)
+        }
+    }
+
+    impl Drop for Files {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn a_script_file_holds_what_startup_would() {
+        const SCRIPT: &str = "# settings\nrlv mode on\n\npersist\n";
+        let files = Files::new("file");
+        std::fs::write(files.script(), SCRIPT).unwrap();
+        let from_file = files.load().unwrap();
+        let inline = Config::parse(&format!("{}startup = '''{SCRIPT}'''\n", base())).unwrap();
+        assert_eq!(script_texts(&from_file), [(2, "rlv mode on"), (4, "persist")]);
+        assert_eq!(from_file.startup_key(), "startup_file");
+        // Apart from where the script is, the two configs are the same.
+        assert_eq!(
+            Config {
+                startup_file: None,
+                ..from_file
+            },
+            inline
+        );
+    }
+
+    #[test]
+    fn a_script_file_that_cannot_be_read_is_rejected() {
+        let files = Files::new("missing");
+        let msg = files.load().unwrap_err().0;
+        assert!(msg.contains("russelbot.toml: `startup_file`: cannot read"), "{msg}");
+        assert!(msg.contains("startup.rsl"), "{msg}");
+        // Neither can one that is not text.
+        std::fs::write(files.script(), [b's', b'a', b'y', b' ', 0xff, 0xfe]).unwrap();
+        let msg = files.load().unwrap_err().0;
+        assert!(msg.contains("`startup_file`: cannot read") && msg.contains("UTF-8"), "{msg}");
+    }
+
+    #[test]
+    fn a_script_file_that_is_not_in_its_form_is_rejected_with_its_line() {
+        let files = Files::new("form");
+        std::fs::write(files.script(), "say one\nim \"Jane Doe hi\n").unwrap();
+        let msg = files.load().unwrap_err().0;
+        assert!(msg.contains("`startup_file`: line 2:") && msg.contains("quote"), "{msg}");
+    }
+
+    // --------------------------------------------------- deprecations
+
+    fn notes(more: &str) -> Vec<String> {
+        Config::parse(&format!("{}{more}", base())).unwrap().deprecated
+    }
+
+    #[test]
+    fn a_config_without_deprecated_keys_has_no_notes() {
+        assert_eq!(notes(""), Vec::<String>::new());
+        assert_eq!(
+            notes("socket = true\nstartup = \"rlv mode on\"\n[xmpp]\ncomponent = \"a.b\"\nsecret = \"s\"\nowners = [\"me@b\"]\n"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn deprecated_persist_is_named_with_the_persist_command() {
+        let said = notes("persist = [\"cfg\", \"cur\"]\n");
+        assert_eq!(said.len(), 1);
+        assert!(said[0].starts_with("`persist` is deprecated; "), "{}", said[0]);
+        assert!(said[0].contains("`persist cfg cur`") && said[0].contains("startup"), "{}", said[0]);
+        assert!(notes("persist = \"cur\"\n")[0].contains("`persist cur cur`"));
+        assert!(notes("persist = \"cfg\"\n")[0].contains("`persist cfg cfg`"));
+        assert!(notes("[persist]\nsit = \"cfg\"\n")[0].contains("`persist cur cfg`"));
+        assert!(notes("[persist]\natstart = true\n")[0].contains("`persist cur cur`"));
+    }
+
+    #[test]
+    fn a_persist_that_holds_nothing_can_be_left_out() {
+        for off in [
+            "persist = \"off\"\n",
+            "persist = false\n",
+            "[persist]\n",
+            "[persist]\natstart = false\n",
+        ] {
+            let said = notes(off);
+            assert_eq!(said.len(), 1, "{off}");
+            assert!(
+                said[0].contains("leave it out") && !said[0].contains("`persist "),
+                "{off}: {}",
+                said[0]
+            );
+        }
+    }
+
+    #[test]
+    fn the_persist_tables_rlv_keys_are_named_with_their_commands() {
+        let said = notes("[persist]\noverride = [\"sit\", \"tp\"]\nrlv = \"follow\"\n");
+        assert_eq!(said.len(), 1);
+        assert!(said[0].contains("`rlv persist follow`"), "{}", said[0]);
+        assert!(said[0].contains("`rlv persist override sit tp`"), "{}", said[0]);
+        assert!(!said[0].contains("`persist c"), "{}", said[0]);
+        let said = notes("[persist]\nposition = \"cfg\"\nrlv = \"drop\"\noverride = []\n");
+        assert!(said[0].contains("`rlv persist drop`"), "{}", said[0]);
+        assert!(said[0].contains("`rlv persist override none`"), "{}", said[0]);
+        // The setting commands come first.
+        let (settings, persist) = (said[0].find("`rlv persist").unwrap(), said[0].find("`persist cfg cur`").unwrap());
+        assert!(settings < persist, "{}", said[0]);
+        // Every command named is one the script takes.
+        for command in [
+            "rlv persist follow",
+            "rlv persist override sit tp",
+            "rlv persist override none",
+            "persist cfg cur",
+        ] {
+            assert!(startup::parse(command).is_ok(), "{command}");
+        }
+    }
+
+    #[test]
+    fn deprecated_rlv_is_named_with_rlv_mode_on() {
+        assert_eq!(
+            notes("rlv = true\n"),
+            ["`rlv` is deprecated; write the startup script command `rlv mode on` instead (see `startup`)"]
+        );
+        let said = notes("rlv = false\n");
+        assert!(
+            said[0].starts_with("`rlv` is deprecated") && said[0].contains("leave it out"),
+            "{}",
+            said[0]
+        );
+    }
+
+    #[test]
+    fn deprecated_perms_are_named_with_the_perms_commands() {
+        let said = notes(
+            "[perms.autoaccept]\ntp = [\"Jane Doe\", \"sitbot\"]\nanim = \"all\"\nattach = true\ncontrols = false\n\
+             [perms.except]\nanim = [\"01234567-9abc-defe-dcba-987654321000\", \"John Roe\"]\n",
+        );
+        assert_eq!(said.len(), 1);
+        let said = &said[0];
+        assert!(said.starts_with("`perms` is deprecated; "), "{said}");
+        for command in [
+            "perms autoaccept tp \"Jane Doe\" sitbot",
+            "perms autoaccept anim all",
+            "perms revoke anim 01234567-9abc-defe-dcba-987654321000 \"John Roe\"",
+            "perms autoaccept attach all",
+        ] {
+            assert!(said.contains(&format!("`{command}`")), "{command}: {said}");
+            assert!(startup::parse(command).is_ok(), "{command}");
+        }
+        assert!(!said.contains("controls") && !said.contains("cannot be written"), "{said}");
+        // The exceptions come after the rule they are exceptions of.
+        assert!(
+            said.find("autoaccept anim all").unwrap() < said.find("revoke anim").unwrap(),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn an_exception_under_a_list_rule_is_named_as_having_no_command() {
+        let said = notes(
+            "[perms.autoaccept]\nanim = [\"Jane Doe\"]\n[perms.except]\nanim = [\"01234567-9abc-defe-dcba-987654321000\"]\n\
+             tp = [\"John Roe\"]\n",
+        );
+        assert!(said[0].contains("`perms autoaccept anim \"Jane Doe\"`"), "{}", said[0]);
+        assert!(
+            said[0].contains("the exceptions for `tp`, `anim` cannot be written in the startup script"),
+            "{}",
+            said[0]
+        );
+        assert!(!said[0].replace("`perms revoke` makes", "").contains("perms revoke"), "{}", said[0]);
+    }
+
+    #[test]
+    fn deprecated_autoreply_is_named_with_the_autoreply_commands() {
+        let said = notes("[autoreply]\nmessage = \"Away\"\npause = \"2h\"\n");
+        assert_eq!(said.len(), 1);
+        assert!(said[0].starts_with("`autoreply` is deprecated; "), "{}", said[0]);
+        assert!(
+            said[0].contains("`autoreply message Away`") && said[0].contains("`autoreply pause 2h`"),
+            "{}",
+            said[0]
+        );
+        // Without a pause there is only the text, in quotes when it needs them.
+        let said = notes("[autoreply]\nmessage = \"I am \\\"a bot\\\".  Away\"\n");
+        assert!(!said[0].contains("autoreply pause"), "{}", said[0]);
+        let command = "autoreply message \"I am \\\"a bot\\\".  Away\"";
+        assert!(said[0].contains(&format!("`{command}`")), "{}", said[0]);
+        let script = startup::parse(command).unwrap();
+        assert_eq!(
+            script[0].request,
+            crate::control::Request::Autoreply(crate::control::AutoreplyRequest::Message("I am \"a bot\".  Away".to_string()))
+        );
+    }
+
+    #[test]
+    fn every_deprecated_key_has_its_own_note() {
+        let said = notes("persist = \"cfg\"\nrlv = true\n[perms.autoaccept]\ntp = \"all\"\n[autoreply]\nmessage = \"Away\"\n").join("\n");
+        for key in ["`persist` is", "`rlv` is", "`perms` is", "`autoreply` is"] {
+            assert_eq!(said.matches(key).count(), 1, "{key}: {said}");
+        }
+        let old = Config::parse(&format!("{}rlv = true\n", base()).replace("sit = ", "object = ")).unwrap();
+        assert_eq!(old.deprecated.len(), 2);
+        assert!(old.deprecated[0].starts_with("`object`") && old.deprecated[1].starts_with("`rlv`"));
     }
 }
