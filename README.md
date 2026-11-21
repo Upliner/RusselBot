@@ -36,10 +36,17 @@ too (2026-11-21); nothing of them has been tried on Second Life, where the
 distance decides what the simulator describes at all.
 `scan avatars`, `friends` and `profile`, and the RLV restrictions on the
 two scans, are verified there too (2026-11-22), with profiles read over the
-simulator connection. Not tried yet: anything of them on Second Life, so
-neither the profile service (`AgentProfile`) nor an avatar known by the
-simulator's list of the region's avatars only (OpenSimulator describes
-them all).
+simulator connection. The three commands were tried once on Second Life
+too (2026-11-22, a busy region, the avatar on a platform at 610 m):
+`scan avatars` listed 20 avatars with their names, those nearby at the
+positions the simulator described and those farther away at the list's
+whole metres and steps of 4 m, and eleven on platforms above 1020 m with
+`?` as distance and height; `friends` listed the two friends with their
+names; `profile` printed a stranger's profile with `online: unknown`. That
+profile came through the profile service (`AgentProfile`) as far as can be
+told: its about text was 516 bytes, more than the simulator connection
+carries, and the run was not logged verbosely. The RLV restrictions on the
+scans have not been tried on Second Life.
 The movement, teleport-offer and touch commands have not been tried on
 Second Life yet, and neither has `persist` with the position tracking under
 it: whether Second Life answers the bot's question about a seat, and the
