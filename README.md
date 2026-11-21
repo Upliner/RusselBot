@@ -778,11 +778,13 @@ the avatar leaves the region; a smaller one only shortens the listing.
 On OpenSimulator a distance that reaches towards a neighbouring region (64
 m or more from the middle of a region) makes the simulator count that
 region as in view, and it then keeps the avatar's presence in a region it
-leaves for the one next door. The bot does not keep such presences, and a
-teleport back into that region can cost the session: the bot logs in again
-after about a minute. That is so for `scan_distance` as well, and for
-`scan` only when the distance is widened in the moment the avatar arrives;
-see "Area scan" in `docs/test-rig.md`.
+leaves for the one next door, together with the connection the bot had
+there. The bot keeps that connection up, as a viewer does: it answers the
+region's pings and acknowledges what it sends, without reading it, until
+the region closes the connection, and a teleport back into the region goes
+over it. That is so for `scan_distance` as well; see "Teleports next door"
+in `docs/test-rig.md`. The bot still opens no connection to a region the
+avatar has not been in.
 
 A scan asks the simulator what each object in reach is called and whose it
 is, which it does the way the viewer does: by selecting the object and

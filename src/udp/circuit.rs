@@ -56,6 +56,21 @@ impl Circuit {
         }
     }
 
+    /// Takes the circuit up again after a time in which nothing on it was
+    /// acted on: the avatar is back at a simulator it had left. Our
+    /// numbering carries on, because the simulator's client for the avatar
+    /// drops numbers it has seen, and so do the acks owed. The silence clock
+    /// starts over. So does the duplicate filter: the simulator may have
+    /// replaced that client with a new one, which numbers from 1 again. And
+    /// what still awaited an ack is dropped: it belonged to the stay that
+    /// ended, and a new client would carry out an old request as a new one.
+    pub fn resume(&mut self, now: Instant) {
+        self.last_receive = now;
+        self.seen.clear();
+        self.seen_order.clear();
+        self.unacked.clear();
+    }
+
     /// Frames a message with the next sequence number. Reliable messages are
     /// kept for resending until acknowledged.
     pub fn send(&mut self, message: &Outgoing, reliable: bool, now: Instant) -> Vec<u8> {
@@ -274,6 +289,44 @@ mod tests {
             circuit.receive(&incoming(sequence, true), start);
         }
         assert_eq!(circuit.poll(start + ACK_FLUSH_DELAY).datagrams.len(), 2);
+    }
+
+    #[test]
+    fn a_resumed_circuit_keeps_its_numbering_and_the_acks_it_owes() {
+        let start = Instant::now();
+        let mut circuit = Circuit::new(start);
+        circuit.send(&messages::complete_ping_check(1), false, start);
+        circuit.send(&messages::complete_ping_check(2), false, start);
+        assert!(circuit.receive(&incoming(7, true), start));
+
+        let later = start + secs(300);
+        circuit.resume(later);
+        assert_eq!(circuit.last_receive(), later, "the silence clock starts over");
+        let next = circuit.send(&messages::complete_ping_check(3), false, later);
+        assert_eq!(parse(&next).unwrap().sequence, 3);
+        let poll = circuit.poll(later);
+        let ack = parse(&poll.datagrams[0]).unwrap();
+        assert_eq!(messages::decode(ack.id, &ack.body), Ok(messages::Incoming::PacketAck(vec![7])));
+    }
+
+    #[test]
+    fn a_resumed_circuit_takes_numbers_it_has_seen_and_resends_nothing_old() {
+        let start = Instant::now();
+        let mut circuit = Circuit::new(start);
+        assert!(circuit.receive(&incoming(1, true), start));
+        assert!(!circuit.receive(&incoming(1, true), start));
+        circuit.send(&messages::complete_ping_check(1), true, start);
+        assert_eq!(circuit.unacked_count(), 1);
+
+        circuit.resume(start);
+        // The simulator's new client starts at 1 again.
+        assert!(circuit.receive(&incoming(1, true), start));
+        assert!(!circuit.receive(&incoming(1, true), start));
+        // A request of the stay that ended is not repeated to it.
+        assert_eq!(circuit.unacked_count(), 0);
+        let poll = circuit.poll(start + secs(60));
+        assert!(!poll.exhausted);
+        assert!(poll.datagrams.iter().all(|datagram| !parse(datagram).unwrap().is_reliable()));
     }
 
     #[test]

@@ -67,8 +67,14 @@ const ACCESS_NONEXISTENT: u8 = 255;
 /// network carry that number so stale ones can be told apart.
 pub trait Net {
     /// Opens a UDP circuit to `addr` and starts listening on its event queue.
+    /// All circuits send from one local port. An earlier circuit to the same
+    /// address ends here: what that simulator sends from now on is reported
+    /// under `generation`.
     fn open(&mut self, generation: u64, addr: SocketAddr, seed_capability: &str);
     fn send(&mut self, generation: u64, datagram: &[u8]);
+    /// The avatar has left this circuit's simulator: its event queue is not
+    /// listened to any more, its datagrams still come and go.
+    fn leave(&mut self, generation: u64);
     fn close(&mut self, generation: u64);
 }
 
@@ -381,6 +387,7 @@ fn chat_kind(chat_type: u8) -> String {
 
 struct Sim {
     generation: u64,
+    addr: SocketAddr,
     circuit: Circuit,
     opened_at: Instant,
     region_name: Option<String>,
@@ -444,6 +451,16 @@ struct Sim {
     awaited_detach: Vec<(Uuid, Instant)>,
 }
 
+/// The circuit to a simulator the avatar has teleported out of. Such a
+/// simulator may keep the avatar's presence (a child agent) and with it the
+/// circuit, and then expects the avatar back on it, so it is kept up, with
+/// acks and ping replies and nothing else, until that simulator ends it.
+struct Left {
+    generation: u64,
+    addr: SocketAddr,
+    circuit: Circuit,
+}
+
 enum TeleportPhase {
     /// Waiting for the map to resolve the region name.
     Lookup,
@@ -467,6 +484,8 @@ pub struct Session<N: Net> {
     /// config says; a scan then starts on entering each region.
     scan_distance: Option<f32>,
     sim: Sim,
+    /// The circuits to the simulators the avatar has left, while they last.
+    left: Vec<Left>,
     /// The sit the simulator confirmed since the avatar last stood up: an
     /// answer to our request, or one it made unprompted.
     seat_confirmed: Option<Sat>,
@@ -510,7 +529,8 @@ impl<N: Net> Session<N> {
             agent_name: agent_name.to_string(),
             circuit_code: info.circuit_code,
             scan_distance,
-            sim: Sim::new(0, now),
+            sim: Sim::new(0, info.sim_addr, Circuit::new(now), now),
+            left: Vec::new(),
             seat_confirmed: None,
             own_parent: None,
             seat: None,
@@ -524,7 +544,7 @@ impl<N: Net> Session<N> {
             lost: false,
             events: Vec::new(),
         };
-        session.open_circuit(generation, info.sim_addr, &info.seed_capability, now);
+        session.open_circuit(generation, info.sim_addr, Circuit::new(now), &info.seed_capability, now);
         session
     }
 
@@ -563,17 +583,23 @@ impl<N: Net> Session<N> {
         );
         consider(self.teleport.as_ref().map(|t| t.deadline));
         consider(self.logout_deadline);
+        for left in &self.left {
+            consider(Some(left.circuit.last_receive() + SILENCE_LIMIT));
+            consider(left.circuit.next_deadline());
+        }
         deadline
     }
 
-    fn open_circuit(&mut self, generation: u64, addr: SocketAddr, seed_capability: &str, now: Instant) {
+    /// Makes the simulator at `addr` the avatar's, over `circuit`, and
+    /// returns the one it was. Whatever was in progress there is void.
+    fn open_circuit(&mut self, generation: u64, addr: SocketAddr, circuit: Circuit, seed_capability: &str, now: Instant) -> Sim {
         self.fail_touches();
         self.fail_attaches();
         if self.sim.entered {
             let worn = self.worn_prims();
             self.events.push(SessionEvent::RegionLeft { worn });
         }
-        self.sim = Sim::new(generation, now);
+        let old = std::mem::replace(&mut self.sim, Sim::new(generation, addr, circuit, now));
         self.seat_confirmed = None;
         self.own_parent = None;
         self.seat = None;
@@ -585,6 +611,7 @@ impl<N: Net> Session<N> {
         self.net.open(generation, addr, seed_capability);
         self.send(messages::use_circuit_code(&self.agent, self.circuit_code), true, now);
         self.send(messages::complete_agent_movement(&self.agent, self.circuit_code), true, now);
+        old
     }
 
     fn send(&mut self, message: Outgoing, reliable: bool, now: Instant) {
@@ -599,6 +626,9 @@ impl<N: Net> Session<N> {
             self.fail_touches();
             self.fail_attaches();
             self.net.close(self.sim.generation);
+            for left in self.left.drain(..) {
+                self.net.close(left.generation);
+            }
             // A session that ends while logging out has done what was asked;
             // simulators often drop the event queue before confirming.
             self.events.push(match self.logout_deadline.take() {
@@ -1372,6 +1402,7 @@ impl<N: Net> Session<N> {
         if self.lost {
             return;
         }
+        self.tick_left(now);
         let poll = self.sim.circuit.poll(now);
         for datagram in &poll.datagrams {
             self.net.send(self.sim.generation, datagram);
@@ -1434,8 +1465,11 @@ impl<N: Net> Session<N> {
     // ------------------------------------------------------------- events
 
     pub fn handle_datagram(&mut self, generation: u64, datagram: &[u8], now: Instant) {
-        if self.lost || generation != self.sim.generation {
+        if self.lost {
             return;
+        }
+        if generation != self.sim.generation {
+            return self.handle_left_datagram(generation, datagram, now);
         }
         let packet = match packet::parse(datagram) {
             Ok(packet) => packet,
@@ -1468,13 +1502,103 @@ impl<N: Net> Session<N> {
         }
     }
 
-    /// The avatar now belongs to another simulator: drop this circuit and
-    /// connect there. Whatever was in progress here is void.
+    /// The avatar now belongs to another simulator: connect there, over the
+    /// circuit the bot still has to it when the avatar has been there, and
+    /// keep this one up for as long as its simulator does. Whatever was in
+    /// progress here is void.
     fn hand_over(&mut self, finish: TeleportFinish, now: Instant) {
         crate::debug!("teleport finishing at {}", finish.sim_addr);
-        self.net.close(self.sim.generation);
-        self.open_circuit(self.sim.generation + 1, finish.sim_addr, &finish.seed_capability, now);
+        let here = finish.sim_addr == self.sim.addr;
+        let kept = if here {
+            // Not something a simulator is known to do; its client is the
+            // one this circuit has, so the numbering must go on all the same.
+            Some(std::mem::replace(&mut self.sim.circuit, Circuit::new(now)))
+        } else {
+            let at = self.left.iter().position(|left| left.addr == finish.sim_addr);
+            at.map(|at| self.left.swap_remove(at).circuit)
+        };
+        let circuit = match kept {
+            Some(mut circuit) => {
+                crate::debug!("continuing the circuit to {}", finish.sim_addr);
+                circuit.resume(now);
+                circuit
+            }
+            None => Circuit::new(now),
+        };
+        self.net.leave(self.sim.generation);
+        let generation = self.sim.generation + 1;
+        let old = self.open_circuit(generation, finish.sim_addr, circuit, &finish.seed_capability, now);
         self.sim.region_handle = Some(finish.region_handle);
+        if !here {
+            self.left.push(Left {
+                generation: old.generation,
+                addr: old.addr,
+                circuit: old.circuit,
+            });
+        }
+    }
+
+    /// A datagram from a simulator the avatar has left. It is acknowledged
+    /// and its pings are answered, so that the simulator keeps the circuit
+    /// for the avatar's return; nothing in it is acted on, and nothing it
+    /// does ends the session.
+    fn handle_left_datagram(&mut self, generation: u64, datagram: &[u8], now: Instant) {
+        let Some(at) = self.left.iter().position(|left| left.generation == generation) else {
+            return;
+        };
+        let Ok(packet) = packet::parse(datagram) else {
+            return;
+        };
+        let left = &mut self.left[at];
+        if !left.circuit.receive(&packet, now) {
+            return;
+        }
+        // Whatever else it sends, about its objects and avatars, is not
+        // even decoded.
+        const HEEDED: [packet::MessageId; 5] = [
+            messages::START_PING_CHECK,
+            messages::PACKET_ACK,
+            messages::DISABLE_SIMULATOR,
+            messages::KICK_USER,
+            messages::LOGOUT_REPLY,
+        ];
+        if !HEEDED.contains(&packet.id) {
+            return;
+        }
+        match messages::decode(packet.id, &packet.body) {
+            Ok(Incoming::StartPingCheck { ping_id }) => {
+                let reply = left.circuit.send(&messages::complete_ping_check(ping_id), false, now);
+                self.net.send(generation, &reply);
+            }
+            Ok(Incoming::PacketAck(sequences)) => left.circuit.acknowledged(&sequences),
+            Ok(Incoming::DisableSimulator | Incoming::KickUser { .. } | Incoming::LogoutReply) => {
+                crate::debug!("the simulator at {} closed the circuit the avatar left", left.addr);
+                self.left.swap_remove(at);
+                self.net.close(generation);
+            }
+            _ => {}
+        }
+    }
+
+    /// Flushes acks and resends on the circuits the avatar has left, and
+    /// gives up those whose simulator has gone quiet.
+    fn tick_left(&mut self, now: Instant) {
+        let mut at = 0;
+        while at < self.left.len() {
+            let left = &mut self.left[at];
+            let poll = left.circuit.poll(now);
+            for datagram in &poll.datagrams {
+                self.net.send(left.generation, datagram);
+            }
+            if poll.exhausted || now.duration_since(left.circuit.last_receive()) >= SILENCE_LIMIT {
+                crate::debug!("giving up the circuit to {}, which the avatar left", left.addr);
+                let generation = left.generation;
+                self.left.swap_remove(at);
+                self.net.close(generation);
+            } else {
+                at += 1;
+            }
+        }
     }
 
     fn handle_message(&mut self, message: Incoming, now: Instant) {
@@ -1893,10 +2017,11 @@ impl Sim {
         self.asked.remove(&local_id);
     }
 
-    fn new(generation: u64, now: Instant) -> Sim {
+    fn new(generation: u64, addr: SocketAddr, circuit: Circuit, now: Instant) -> Sim {
         Sim {
             generation,
-            circuit: Circuit::new(now),
+            addr,
+            circuit,
             opened_at: now,
             region_name: None,
             region_handle: None,
@@ -1942,6 +2067,7 @@ mod tests {
     #[derive(Debug, PartialEq)]
     enum Call {
         Open(u64, SocketAddr, String),
+        Leave(u64),
         Close(u64),
     }
 
@@ -1963,6 +2089,9 @@ mod tests {
         }
         fn send(&mut self, generation: u64, datagram: &[u8]) {
             self.0.borrow_mut().sent.push((generation, packet::parse(datagram).unwrap()));
+        }
+        fn leave(&mut self, generation: u64) {
+            self.0.borrow_mut().calls.push(Call::Leave(generation));
         }
         fn close(&mut self, generation: u64) {
             self.0.borrow_mut().calls.push(Call::Close(generation));
@@ -2660,7 +2789,7 @@ mod tests {
         assert_eq!(
             rig.calls(),
             [
-                Call::Close(1),
+                Call::Leave(1),
                 Call::Open(2, "127.0.0.1:9001".parse().unwrap(), "http://127.0.0.1:9001/CAPS/seed2/".into()),
             ]
         );
@@ -2700,8 +2829,9 @@ mod tests {
         rig.enter("Target", HOME_HANDLE);
         rig.events();
 
-        rig.receive_from(1, messages::DISABLE_SIMULATOR, &[], true);
+        rig.receive_from(1, messages::REGION_HANDSHAKE, &wire::region_handshake("Home"), true);
         rig.receive_from(1, messages::KICK_USER, &wire::kick_user("old"), true);
+        rig.receive_from(1, messages::DISABLE_SIMULATOR, &[], true);
         rig.receive_from(1, messages::REGION_HANDSHAKE, &wire::region_handshake("Home"), true);
         rig.session.handle_caps(1, CapsEvent::Gone("old queue closed".into()), rig.now);
         assert_eq!(rig.events(), []);
@@ -2733,6 +2863,312 @@ mod tests {
             &rig.events()[..],
             [SessionEvent::RegionLeft { .. }, SessionEvent::Lost(_)]
         ));
+    }
+
+    // ------------------------------------------ simulators the avatar left
+
+    fn target_addr() -> SocketAddr {
+        "127.0.0.1:9001".parse().unwrap()
+    }
+
+    fn home_addr() -> SocketAddr {
+        "127.0.0.1:9000".parse().unwrap()
+    }
+
+    /// A teleport back to the simulator every `Rig` starts at.
+    fn finish_home() -> CapsEvent {
+        CapsEvent::Event(EqEvent::TeleportFinish(TeleportFinish {
+            sim_addr: home_addr(),
+            seed_capability: "http://127.0.0.1:9000/CAPS/seed3/".to_string(),
+            region_handle: HOME_HANDLE,
+        }))
+    }
+
+    impl Rig {
+        /// A session whose avatar has teleported from "Home" (circuit 1) to
+        /// "Target" (circuit 2) and entered it.
+        fn moved() -> Rig {
+            let mut rig = Rig::entered();
+            rig.session.handle_caps(1, finish(), rig.now);
+            rig.enter("Target", ((1001 * 256) << 32) | (1000 * 256));
+            rig.events();
+            rig.calls();
+            rig
+        }
+
+        /// Everything sent since the last call, with the circuit it went on.
+        fn sent_on(&mut self) -> Vec<(u64, Packet)> {
+            std::mem::take(&mut self.net.0.borrow_mut().sent)
+        }
+
+        /// A second passes in which the avatar's simulator is heard from.
+        fn second(&mut self) {
+            let generation = self.generation();
+            self.receive_from(generation, packet::high(200), &[], false);
+            self.advance(secs(1));
+        }
+
+        fn left(&self) -> Vec<u64> {
+            self.session.left.iter().map(|left| left.generation).collect()
+        }
+    }
+
+    #[test]
+    fn the_circuit_to_a_simulator_the_avatar_left_is_kept_up() {
+        let mut rig = Rig::moved();
+        assert_eq!(rig.left(), [1]);
+        rig.advance(Duration::from_millis(200));
+        rig.sent_on();
+
+        // Its pings are answered on it, numbered after what went before.
+        rig.receive_from(1, messages::START_PING_CHECK, &[42, 0, 0, 0, 0], false);
+        let sent = rig.sent_on();
+        assert_eq!(sent.len(), 1);
+        let (generation, pong) = &sent[0];
+        assert_eq!(
+            (*generation, pong.id, pong.body.as_slice()),
+            (1, messages::COMPLETE_PING_CHECK, &[42u8][..])
+        );
+        assert!(pong.sequence > 4, "the circuit's numbering goes on: {}", pong.sequence);
+
+        // Its reliable packets are acknowledged on it, once, and not read.
+        let chat = wire::chat_from_simulator("Rig Owner", (Uuid::from_bytes([7; 16]), Uuid::nil(), 1), 1, 1, "hello");
+        rig.receive_from(1, messages::CHAT_FROM_SIMULATOR, &chat, true);
+        let heard = rig.sequence;
+        rig.receive_from(1, messages::REGION_HANDSHAKE, &wire::region_handshake("Home"), true);
+        rig.receive_from(1, messages::OBJECT_UPDATE, &wire::object_update(&[(agent_id(), 99)]), true);
+        rig.advance(Duration::from_millis(200));
+        let acks: Vec<(u64, Incoming)> = rig
+            .sent_on()
+            .into_iter()
+            .filter(|(_, p)| p.id == messages::PACKET_ACK)
+            .map(|(generation, p)| (generation, messages::decode(p.id, &p.body).unwrap()))
+            .collect();
+        assert_eq!(acks, [(1, Incoming::PacketAck(vec![heard, heard + 1, heard + 2]))]);
+
+        assert_eq!(rig.events(), []);
+        assert_eq!(rig.calls(), []);
+        assert_eq!(rig.session.region(), Some("Target"));
+        assert_eq!(rig.session.seat(), Seat::Unknown);
+    }
+
+    #[test]
+    fn a_simulator_the_avatar_left_ends_its_circuit_without_ending_the_session() {
+        let endings: [(packet::MessageId, Vec<u8>); 3] = [
+            (messages::DISABLE_SIMULATOR, vec![]),
+            (messages::KICK_USER, wire::kick_user("The simulator is going down.")),
+            (messages::LOGOUT_REPLY, vec![0; 33]),
+        ];
+        for (id, body) in endings {
+            let mut rig = Rig::moved();
+            rig.receive_from(1, id, &body, true);
+            assert_eq!(rig.calls(), [Call::Close(1)], "{}", messages::name(id));
+            assert_eq!(rig.left(), [] as [u64; 0]);
+            assert_eq!(rig.events(), []);
+            assert!(!rig.session.lost);
+
+            // Nothing more is sent there, whatever still comes from it.
+            rig.sent_on();
+            rig.receive_from(1, messages::START_PING_CHECK, &[1, 0, 0, 0, 0], false);
+            rig.advance(secs(1));
+            assert!(rig.sent_on().iter().all(|(generation, _)| *generation == 2));
+        }
+    }
+
+    #[test]
+    fn a_silent_simulator_the_avatar_left_is_given_up_after_sixty_seconds() {
+        let mut rig = Rig::moved();
+        for _ in 0..59 {
+            rig.second();
+        }
+        assert_eq!(rig.calls(), []);
+        rig.second();
+        assert_eq!(rig.calls(), [Call::Close(1)]);
+        assert_eq!(rig.left(), [] as [u64; 0]);
+        for _ in 0..70 {
+            rig.second();
+        }
+        assert_eq!(rig.events(), []);
+        assert!(!rig.session.lost);
+    }
+
+    #[test]
+    fn a_simulator_the_avatar_left_that_stops_acknowledging_is_given_up() {
+        let mut rig = Rig::entered();
+        // The teleport request is still unacknowledged when the avatar goes.
+        rig.session
+            .start_teleport_to(((1001 * 256) << 32) | (1000 * 256), [128.0, 128.0, 25.0], rig.now);
+        rig.session.handle_caps(1, finish(), rig.now);
+        rig.enter("Target", ((1001 * 256) << 32) | (1000 * 256));
+        rig.events();
+        rig.calls();
+        rig.sent_on();
+
+        // The simulator left behind keeps pinging but never acknowledges.
+        let mut resends = 0;
+        for second in 1..=31 {
+            rig.receive_from(1, messages::START_PING_CHECK, &[second, 0, 0, 0, 0], false);
+            rig.second();
+            resends += rig
+                .sent_on()
+                .iter()
+                .filter(|(generation, p)| *generation == 1 && p.id == messages::TELEPORT_LOCATION_REQUEST)
+                .count();
+            if second < 31 {
+                assert_eq!(rig.calls(), [], "after {second} s");
+            }
+        }
+        assert_eq!(resends, 4);
+        assert_eq!(rig.calls(), [Call::Close(1)]);
+        assert_eq!(rig.events(), []);
+        assert!(!rig.session.lost);
+    }
+
+    #[test]
+    fn a_lost_session_closes_the_circuits_the_avatar_left() {
+        let mut rig = Rig::moved();
+        rig.receive(messages::KICK_USER, &wire::kick_user("bye"));
+        assert_eq!(rig.lost_reason(), "kicked: bye");
+        assert_eq!(rig.calls(), [Call::Close(2), Call::Close(1)]);
+        assert_eq!(rig.left(), [] as [u64; 0]);
+    }
+
+    #[test]
+    fn a_teleport_back_continues_the_circuit_the_avatar_left() {
+        let mut rig = Rig::moved();
+        // What the bot knows of "Target" is not carried back to "Home".
+        rig.own_update(4242);
+        rig.events();
+        rig.sent_on();
+        rig.receive_from(1, messages::START_PING_CHECK, &[1, 0, 0, 0, 0], false);
+        let last = rig.sent_on()[0].1.sequence;
+
+        rig.session.handle_caps(2, finish_home(), rig.now);
+        assert_eq!(
+            rig.calls(),
+            [
+                Call::Leave(2),
+                Call::Open(3, home_addr(), "http://127.0.0.1:9000/CAPS/seed3/".into()),
+            ]
+        );
+        let handshake: Vec<_> = rig
+            .sent_on()
+            .iter()
+            .map(|(generation, p)| (*generation, p.id, p.sequence, p.is_reliable()))
+            .collect();
+        assert_eq!(
+            handshake,
+            [
+                (3, messages::USE_CIRCUIT_CODE, last + 1, true),
+                (3, messages::COMPLETE_AGENT_MOVEMENT, last + 2, true)
+            ]
+        );
+        assert_eq!(rig.left(), [2], "the simulator just left, not the one returned to");
+        assert_eq!(rig.events(), [SessionEvent::RegionLeft { worn: vec![] }]);
+        assert_eq!(rig.session.region(), None);
+        assert!(rig.session.sim.objects.is_empty());
+        assert_eq!(rig.session.seat(), Seat::Unknown);
+
+        // What the main loop still holds under the circuit's old number is
+        // dropped: not answered, not acknowledged, not read.
+        rig.receive_from(1, messages::START_PING_CHECK, &[2, 0, 0, 0, 0], false);
+        rig.receive_from(1, messages::REGION_HANDSHAKE, &wire::region_handshake("Stale"), true);
+        let stale = rig.sequence;
+        rig.advance(Duration::from_millis(200));
+        for (_, packet) in rig.sent_on() {
+            match messages::decode(packet.id, &packet.body) {
+                Ok(Incoming::PacketAck(acked)) => assert!(!acked.contains(&stale)),
+                _ => assert_ne!(packet.id, messages::COMPLETE_PING_CHECK),
+            }
+        }
+        assert_eq!(rig.session.region(), None);
+
+        // The handshake completes as on any arrival, and "Target" is now
+        // the simulator whose pings are answered on the side.
+        rig.enter("Home", HOME_HANDLE);
+        assert_eq!(rig.events(), [SessionEvent::RegionEntered("Home".into())]);
+        rig.sent_on();
+        rig.receive_from(2, messages::START_PING_CHECK, &[3, 0, 0, 0, 0], false);
+        let sent = rig.sent_on();
+        assert_eq!(sent.len(), 1);
+        assert_eq!((sent[0].0, sent[0].1.id), (2, messages::COMPLETE_PING_CHECK));
+    }
+
+    #[test]
+    fn a_teleport_back_to_a_simulator_that_closed_its_circuit_starts_a_new_one() {
+        let mut rig = Rig::moved();
+        rig.receive_from(1, messages::DISABLE_SIMULATOR, &[], true);
+        rig.calls();
+        rig.sent_on();
+
+        rig.session.handle_caps(2, finish_home(), rig.now);
+        assert_eq!(
+            rig.calls(),
+            [
+                Call::Leave(2),
+                Call::Open(3, home_addr(), "http://127.0.0.1:9000/CAPS/seed3/".into()),
+            ]
+        );
+        let handshake: Vec<_> = rig
+            .sent_on()
+            .iter()
+            .map(|(generation, p)| (*generation, p.id, p.sequence))
+            .collect();
+        assert_eq!(
+            handshake,
+            [(3, messages::USE_CIRCUIT_CODE, 1), (3, messages::COMPLETE_AGENT_MOVEMENT, 2)]
+        );
+    }
+
+    #[test]
+    fn a_simulator_returned_to_gets_the_handshake_time_of_any_other() {
+        let mut rig = Rig::moved();
+        // "Home" was last heard from 45 seconds ago when the avatar returns.
+        for _ in 0..45 {
+            rig.second();
+        }
+        rig.session.handle_caps(2, finish_home(), rig.now);
+        rig.events();
+        // "Target", now left, keeps pinging; "Home" says nothing at all.
+        for second in 1..=29 {
+            rig.receive_from(2, messages::START_PING_CHECK, &[second, 0, 0, 0, 0], false);
+            rig.advance(secs(1));
+            assert_eq!(rig.events(), [], "after {second} s");
+        }
+        rig.advance(secs(1));
+        assert_eq!(rig.lost_reason(), "simulator handshake timed out");
+    }
+
+    #[test]
+    fn a_teleport_to_the_simulator_the_avatar_is_at_keeps_its_numbering() {
+        let mut rig = Rig::entered();
+        rig.calls();
+        rig.sent_on();
+        rig.receive_from(1, messages::START_PING_CHECK, &[1, 0, 0, 0, 0], false);
+        let last = rig.sent_on()[0].1.sequence;
+
+        rig.session.handle_caps(1, finish_home(), rig.now);
+        assert_eq!(
+            rig.calls(),
+            [
+                Call::Leave(1),
+                Call::Open(2, home_addr(), "http://127.0.0.1:9000/CAPS/seed3/".into()),
+            ]
+        );
+        let handshake: Vec<_> = rig
+            .sent_on()
+            .iter()
+            .map(|(generation, p)| (*generation, p.id, p.sequence))
+            .collect();
+        assert_eq!(
+            handshake,
+            [
+                (2, messages::USE_CIRCUIT_CODE, last + 1),
+                (2, messages::COMPLETE_AGENT_MOVEMENT, last + 2)
+            ]
+        );
+        assert_eq!(rig.left(), [] as [u64; 0]);
+        assert_ne!(home_addr(), target_addr());
     }
 
     // ------------------------------------------------------ chat and IMs

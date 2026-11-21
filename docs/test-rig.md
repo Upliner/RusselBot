@@ -695,22 +695,56 @@ test-rig/rezprim.py Target name="Far lamp" east=90                             #
 | 201 | Rename `<bench>` in a viewer, `ctl scan -n bench`; then `ctl tp 128 128 25 Home`, `ctl home`, `ctl scan` | The old name still; the new one after the round trip | | Pass, renamed with `ObjectName` from a script instead of a viewer |
 | 202 | `scan_distance = 64`, wait a minute, `ctl scan` | Answered within a second or two (only the properties are asked for); with `--verbose`, no `ObjectSelect` before the command | | Pass: asked 11 s after the login, answered in the second the properties were asked for |
 
-Found on this run, and the same with the bot as it was before `scan` (built
-from the commit before, `scan_distance = 64`, `ctl tp 128 128 25 Home`, 20
-seconds, `ctl home`): a session is lost on the way back. With a draw
-distance of 64 m or more in the middle of a region, this OpenSimulator
-counts the neighbouring region as in view (it adds 64 m to the draw
-distance) and keeps the avatar's presence in the region it left as a child
-agent. The bot drops that circuit when it leaves, and comes back from
-another UDP port; the simulator then closes the avatar's client in that
-region (`Reusing existing child scene presence`, `Close has been called`),
-the handshake times out after 30 s, and the bot logs in again. Without
-`scan_distance` the same happened once, when `scan 96` was given in the
-second the avatar arrived in `Home`; a `scan` that widens the distance
-later in a stay did not cause it, and after it the avatar's next region
-starts at 32 m again.
+Found on this run, and the same with the bot as it was before `scan`: with
+`scan_distance = 64`, a teleport back into the region next door lost the
+session. That is fixed since; see "Teleports next door" below.
 
 Not covered on this rig: Second Life, where the distance decides what the
 simulator describes at all; a region with more objects than fit one
 `ObjectSelect`; the 30 second limit; an owner the name service does not
 know and objects owned by a group (unit tests only).
+
+## Teleports next door
+
+Run on 2026-11-21 with the debug build and `--verbose`, the config of item
+1 plus `persist = "cfg"` and `socket = true`, and a `RUSSELBOT_SOCK` of the
+run's own; `ctl` is `rslbot ctl` on that socket. `Home` and `Target` are
+neighbours, and the avatar is moved between their middles.
+
+With a draw distance of 64 m or more there, this OpenSimulator counts the
+neighbouring region as in view (it adds 64 m to the draw distance) and
+keeps the avatar's presence in the region it leaves as a child agent,
+together with the client and the UDP address the bot had there. A bot that
+came back from another port (`Handling UseCircuitCode request ... from IP
+127.0.0.1:<new port>`) had that presence closed under it (`Close has been
+called for Sit Bot attached to scene Target`, then an exception in
+`HandleUseCircuitCode`) and lost the session: `event queue reports no such
+session` or `simulator handshake timed out`, a login refused as "already
+logged in", and about a minute offline. The bot now sends on one UDP port
+for the whole session, keeps the connection to a region it left alive
+until the simulator closes it, and returns over it.
+
+A round trip is `ctl tp 128 128 25 Home`, 20 seconds, `ctl home`, then
+waiting for `seated on`.
+
+| # | Inject | Expected | Result (2026-11-21, OpenSim feccd9cc53) |
+|---|---|---|---|
+| 203 | `scan_distance = 64`: three round trips in a row | Each ends `seated`; one login in the whole log and no `session lost`; at each return the simulator logs `Reusing existing child scene presence for Sit Bot ... in Target` and neither `Handling UseCircuitCode request` for `Target` nor `Close has been called ... scene Target` | Pass, three of three. `Home` closes its own presence when the avatar is back in `Target` (`Close has been called ... scene Home`; the bot logs `the simulator at 127.0.0.1:9000 closed the circuit the avatar left`), and the next trip opens a new connection to it from the same port |
+| 204 | `scan_distance = 128`: three round trips in a row | As 203 | Pass, three of three. At this distance both regions keep the presence: `Reusing existing child scene presence` at every arrival from the second on, one `Handling UseCircuitCode request` for `Home` in the whole run and no `Close has been called`; the bot logs `continuing the circuit to 127.0.0.1:9000` and `...:9001` |
+| 205 | `scan_distance = 64`: `ctl tp 128 128 25 Home`, five minutes, `ctl home` | The simulator logs no `No packets received from child agent`; the return is as in 203 | Pass: the bot answered the pings of `Target` for the five minutes and was seated one second after `home` |
+| 206 | `ctl status` and `ctl scan` after a return of 203 | `region: Target`, `seat: target`, `seat name: Seat`; the scan lists the objects by the seat | Pass. The owner's name came out as `?` in every line, and did so with the bot built from the commit before as well, without any teleport: the simulator had been started for this run and `Rig Owner` had not logged in since |
+| 207 | Item 9 with `scan_distance = 64`: `teleport user Sit Bot Home/128/128/25` on the console while the bot holds its seat | `connected, in region "Home" (not the target region)`, a teleport back without a new login, `seated` | Pass: back in `Target` and seated 5 s later. This is the return that lost the session before |
+| 208 | Items 44, 45 and 51 again, without `scan_distance` | As recorded there | Pass, all three. At 32 m neither region keeps the presence: each closes it once the avatar has arrived next door, as before |
+
+Tried with builds that were not kept, to see what the simulator needs
+(`scan_distance = 64`, one round trip): with one UDP port but packet
+numbers starting again at 1, the simulator took the return for old packets
+(`Received a duplicate (not marked as resend) of packet #2, type
+CompleteAgentMovement`) and the session was lost; with the old connection's
+numbering carried on but the connection left unanswered while the avatar
+was away, the first round trip passed and the second lost the session,
+because the bot had not heard `Home` close the connection.
+
+Not covered on this rig: Second Life; a region that restarts while it
+keeps the avatar's presence; walking or flying across a region border,
+which the bot does not follow.
