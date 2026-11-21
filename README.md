@@ -34,6 +34,12 @@ and `ctl im` by avatar name was checked by hand on Second Life on 2026-11-19.
 The `scan` command and the `seat name` line of `status` are verified there
 too (2026-11-21); nothing of them has been tried on Second Life, where the
 distance decides what the simulator describes at all.
+`scan avatars`, `friends` and `profile`, and the RLV restrictions on the
+two scans, are verified there too (2026-11-22), with profiles read over the
+simulator connection. Not tried yet: anything of them on Second Life, so
+neither the profile service (`AgentProfile`) nor an avatar known by the
+simulator's list of the region's avatars only (OpenSimulator describes
+them all).
 The movement, teleport-offer and touch commands have not been tried on
 Second Life yet, and neither has `persist` with the position tracking under
 it: whether Second Life answers the bot's question about a seat, and the
@@ -574,6 +580,9 @@ target/release/rslbot ctl stand
 target/release/rslbot ctl tp 128 128 25 Blue Lagoon
 target/release/rslbot ctl status
 target/release/rslbot ctl scan 20 -n bench          # what is around, by name
+target/release/rslbot ctl scan avatars chat         # who hears local chat
+target/release/rslbot ctl friends                   # the friends, and who is online
+target/release/rslbot ctl profile "Jane Doe"        # who an avatar is
 target/release/rslbot ctl persist                   # stay here, like this
 target/release/rslbot ctl home
 target/release/rslbot ctl inventory "Bot gear"      # what the avatar owns there
@@ -597,7 +606,10 @@ target/release/rslbot ctl rlv cmd @versionnum=5     # an RLV command, by hand
 | `accepttp [AVATAR]` | The older name of `accept tp [AVATAR]`; deprecated |
 | `sendtp AVATAR [MESSAGE...]` | Offer the avatar a teleport to the bot |
 | `touch UUID` | Click that object once |
-| `scan [DISTANCE] [FILTER...]` | List the objects around the avatar with their UUID, distance, owner and name. See [Scanning for objects](#scanning-for-objects) |
+| `scan [objects] [DISTANCE] [FILTER...]` | List the objects around the avatar with their UUID, distance, owner and name. `DISTANCE` is metres, or `shout` (100), `chat` (20) or `whisper` (10). See [Scanning for objects](#scanning-for-objects) |
+| `scan avatars [DISTANCE]` | List the other avatars in the region, or those within `DISTANCE`, with their UUID, distance, position and names. See [Scanning for avatars](#scanning-for-avatars) |
+| `friends` | List the avatar's friends with their UUID, whether they are online, and their names. See [Friends](#friends) |
+| `profile AVATAR` | Print an avatar's profile. See [Profiles](#profiles) |
 | `inventory [-a] [-n] [FOLDER]` | List the avatar's inventory: everything, or what is under `FOLDER`. See [Inventory](#inventory) |
 | `attach ITEM [BODY PART...]` | Attach an object from the inventory, to the named attachment point or else to the one it was last on. See [Attachments](#attachments) |
 | `wear ITEM` | For an object, the same as `attach ITEM`. For clothing or a body part, put it on; only where the grid makes the avatar's appearance. See [Clothing](#clothing) |
@@ -653,7 +665,7 @@ kick or an outage (at the avatar's last location), but it no longer
 teleports or sits by itself. `persist` and `home` switch holding on, and
 the bot acts at once. `home` is not the avatar's home location: it is the place the bot
 held last. Manual mode ends with the bot process too; a restarted bot
-starts from its config and startup script. `sendtp`, `touch`, `scan`, the talking commands and
+starts from its config and startup script. `sendtp`, `touch`, `scan`, `friends`, `profile`, the talking commands and
 the inventory commands (`inventory`, `attach`, `wear`, `detach`, `anim`,
 `sound`) leave the mode alone.
 
@@ -830,8 +842,10 @@ rslbot ctl scan 96 -o "Jane Doe"    # Jane Doe's objects within 96 m
 rslbot ctl scan -a -c -o <uuid>     # an avatar's or a group's, worn ones and child prims too
 ```
 
-`scan [DISTANCE] [FILTER...]` lists the objects around the avatar the way a
-viewer's area search does, nearest first, one line each:
+`scan [objects] [DISTANCE] [FILTER...]` lists the objects around the avatar
+the way a viewer's area search does, nearest first, one line each. The word
+`objects` changes nothing: `scan objects 20 -n bench` is `scan 20 -n bench`
+(and `scan avatars` is [another command](#scanning-for-avatars)).
 
 ```
 0c1b2f6e-...   3.2   scripted,touch   7d9a41c0-...   Jane Doe   Park Bench   Sit here
@@ -874,9 +888,11 @@ meet all the filters.
 The distance is measured from the avatar to the object's root prim; a
 child prim counts as being where its root is, and what an avatar wears as
 being where that avatar is. Without `DISTANCE` the listing reaches as far
-as the bot looks for objects: `scan_distance`, or 32 m. A larger
-`DISTANCE`, up to 1024, makes the bot look that far from then on, until
-the avatar leaves the region; a smaller one only shortens the listing.
+as the bot looks for objects: `scan_distance`, or 32 m. `DISTANCE` is a
+number of metres from 1 to 1024, or one of the words `shout`, `chat` and
+`whisper`, in lower case, for 100, 20 and 10 metres. A larger `DISTANCE`
+makes the bot look that far from then on, until the avatar leaves the
+region; a smaller one only shortens the listing.
 
 On OpenSimulator a distance that reaches towards a neighbouring region (64
 m or more from the middle of a region) makes the simulator count that
@@ -908,7 +924,162 @@ the avatar leaves the region fails.
 it marks only the child prim that holds the script, the root prim's line
 lacks the flag: add `-c` when an object you expect is missing.
 
-`scan` moves nothing and is not held to [RLV](#rlv) restrictions.
+`scan` moves nothing. While [RLV](#rlv) is on, it is held to what limits
+a viewer's area search and sight, and to nothing else:
+
+* Under `shownames`, `shownames_sec` or `shownametags` the owner's UUID and
+  name are `?` for an object of an avatar those restrictions hide; an
+  exception (`shownames:UUID`, `shownametags:UUID`) shows that avatar, and
+  the bot's own avatar and groups are always shown. `-o` is refused while
+  any of the three is held, whoever it names.
+* `camdrawmax:DISTANCE` is a fog the avatar cannot see through: nothing
+  farther away is listed, the bot does not look farther for objects on
+  account of a larger `DISTANCE`, and the operator log says the scan was cut
+  to that distance by `camdrawmax`. The smallest held counts, and none while
+  a `camdrawalphamax` below 0.99 is held (the largest such counts), which
+  makes the fog thin enough to see through.
+
+Under an [override](#override) a `scan` is listed as with no restriction
+kept, and uses the override up like any other command.
+
+### Scanning for avatars
+
+```sh
+rslbot ctl scan avatars             # everyone in the region
+rslbot ctl scan avatars chat        # who hears local chat: within 20 m
+rslbot ctl scan avatars 50          # within 50 m
+```
+
+`scan avatars [DISTANCE]` lists the other avatars in the avatar's region,
+nearest first, one line each:
+
+```
+7d9a41c0-...   3.2   103,100,25   Jane Doe   JD
+```
+
+The five fields are separated by tabs, and there is no header line: the
+avatar's UUID, its distance from the bot's avatar in metres, its position
+in the region as `X,Y,Z` in whole metres, its name (`First Last`) and its
+display name. A tab, line feed, carriage return or backslash in a name is
+written as `\t`, `\n`, `\r` and `\\`. Without `DISTANCE` everyone in the
+region is listed, however far; with it (metres, or `shout`, `chat` or
+`whisper` as for `scan`) only those known to be within it. Avatars in
+neighbouring regions are not listed.
+
+The bot asks the simulator nothing for this: it uses what the simulator
+tells every viewer unasked, so `scan avatars` does not start the object
+scan or widen it, and the only traffic is the name lookups. An avatar the
+simulator has described to the bot is where the simulator says, and a
+seated one where its seat is; Second Life describes what is within the
+distance the bot looks for objects (`scan_distance`, or 32 m), and
+OpenSimulator every avatar in the region. Every other avatar is where the
+simulator's list of the region's avatars puts it, as a viewer's minimap
+does: in whole metres, and in steps of 4 m in height. That list cannot hold
+a height above about 1020 m: such an avatar is listed with `?` as its
+distance and its height, and is left out when a `DISTANCE` is given. So is
+one at a height of 0 to 4 m that is not described, which is rare. A name
+the name service does not give is `?`.
+
+On OpenSimulator the list holds at most 60 avatars, and regions larger
+than 256 m (var regions) do not fit its coordinates; as OpenSimulator
+describes every avatar in the region, neither limit shows in the listing.
+
+The answer comes once the simulator has sent its list since the avatar
+entered the region, which it does every few seconds, and the names are
+there: at once for a second `scan avatars`. It comes after 10 seconds at
+the latest, with what is known by then. A `scan avatars` that waits when
+the avatar leaves the region fails.
+
+`scan avatars` moves nothing. While [RLV](#rlv) is on, it is held to what
+limits a viewer's radar and minimap:
+
+* Under `shownames`, `shownames_sec` or `shownametags` an avatar those
+  restrictions hide has a line with its distance and position, and `?` as
+  its UUID, name and display name; the bot does not ask the name service
+  about it. An exception (`shownames:UUID`, `shownametags:UUID`) shows that
+  avatar.
+* `shownearby` refuses `scan avatars`.
+* `showminimap` makes every position `?`; distances, the order and
+  `DISTANCE` are as without it.
+
+`camdrawmax` does not cut `scan avatars`. Under an [override](#override) it
+lists as with no restriction kept, and uses the override up.
+
+### Friends
+
+```sh
+rslbot ctl friends
+```
+
+`friends` lists the avatar's friends, one line each, online ones first,
+then by name:
+
+```
+11111111-2222-3333-4444-555555555555	online	Jane Doe	JD
+22222222-3333-4444-5555-666666666666	online	John Roe	John Roe
+33333333-4444-5555-6666-777777777777	offline	Ann Poe	Annie
+44444444-5555-6666-7777-888888888888	?	Zed Low	Zed
+```
+
+The four fields are separated by tabs: the friend's UUID, its status, its
+name and its display name, `?` for a name the name service does not give.
+The status is `online` or `offline`, or `?` for a friend that does not let
+the avatar see whether it is online (it has not given the right to see
+it).
+
+The list is the one the grid gives at login, kept up to date while the bot
+runs: from the simulator's notices that friends come online and go
+offline, from a friend ending the friendship, and from an avatar
+accepting a friendship the avatar offered from a viewer. The bot itself
+never offers, accepts or ends a friendship, and leaves offers made to the
+avatar unanswered. Right after a login a friend that is online may show as
+`offline` for a moment, until the simulator's notice has come. The names
+are looked up at the first `friends`, which with many friends can take
+until its 10-second limit; what is missing then is `?`, and the next
+`friends` has it. `friends` is not held to RLV restrictions and does not
+use up an [override](#override).
+
+### Profiles
+
+```sh
+rslbot ctl profile "Jane Doe"
+rslbot ctl profile 11111111-2222-3333-4444-555555555555
+```
+
+`profile AVATAR` prints the profile of an avatar given as for `im`:
+
+```
+id: 11111111-2222-3333-4444-555555555555
+name: Jane Doe
+display name: JD
+online: yes
+friend: yes
+born: 2010-03-14
+partner: 22222222-3333-4444-5555-666666666666
+about: Builder.
+first life: Not telling.
+```
+
+`id`, `online` and `friend` are always there. `name` and `display name`
+are left out when the name service does not give them, `born` when the
+grid does not tell it, `partner` when there is none, `about` and `first
+life` when they are empty. A line feed in a text is written as `\n`, as
+in the listings. `born` is `YYYY-MM-DD`, or as the grid wrote it when it
+is not a day.
+
+`online` is `yes` when the grid says the avatar is online, and otherwise
+`no` for a [friend](#friends) that lets the avatar see whether it is
+online, and `unknown` for everyone else: the grid answers for an avatar
+that hides its status as it does for one that is offline.
+
+The grid is asked anew for every `profile`: through its profile service
+where the simulator offers one (Second Life), and otherwise on the
+simulator connection (OpenSimulator). The answer comes within 10 seconds
+of the avatar being found, or the command fails naming the avatar. An
+avatar the grid does not know fails at once where there is a profile
+service, and after the 10 seconds otherwise. `profile` is not held to RLV
+restrictions, `shownames` included, and does not use up an
+[override](#override).
 
 ### Inventory
 
@@ -1289,6 +1460,10 @@ These restrictions have an effect:
 | `addoutfit`, `addoutfit:KIND`, `remoutfit`, `remoutfit:KIND` | No clothing, or none of that kind, can be put on, or taken off |
 | `acceptpermission`, `denypermission` | A script's request to attach or to take controls is granted by itself, or dropped, whatever the `perms` rules say |
 | `showinv` | `inventory` is refused; items can still be named in other commands |
+| `shownames`, `shownames_sec`, `shownametags` | [`scan avatars`](#scanning-for-avatars) writes `?` for the UUID and names of the avatars they hide, and [`scan`](#scanning-for-objects) for such an owner; `scan -o` is refused. `shownames:UUID` and `shownametags:UUID` are exceptions, each to its own restriction |
+| `shownearby` | `scan avatars` is refused |
+| `showminimap` | `scan avatars` writes `?` for every position |
+| `camdrawmax:DISTANCE`, `camdrawalphamax:ALPHA` | `scan` lists nothing farther than the smallest `camdrawmax`, unless the largest `camdrawalphamax` held is below 0.99 |
 | `permissive` | Every restriction counts only the exceptions of its own holder, as the `_sec` ones always do |
 
 A few notes on these. An exception counts whoever holds it, except against
@@ -1322,11 +1497,12 @@ where a viewer would tell them.
 All other restrictions of the API are kept and reported, and have no
 effect: `rlv status` marks them `(no effect)`. They are about what a viewer
 shows its user, or about things the bot does not do: `recvchat`,
-`recvemote` and their variants, `showloc`, `shownames`, the map, hovertext
-and camera restrictions, `fly`, `edit`, `rez`, `share`, `sendgesture`,
+`recvemote` and their variants, `showloc`, the world map, hovertext
+and the other camera restrictions, `fly`, `edit`, `rez`, `share`, `sendgesture`,
 `tplm`, `standtp`, `defaultwear`, `setgroup`, `setdebug`, `setenv`, and
 everything about the shared `#RLV` folder. Apart from what `recvim` hides,
-the message log and `status` are yours and are never censored. A restriction the API does not have,
+the message log, `status`, `friends` and `profile` are yours and are never
+censored; the name restrictions hide names from the two scans only. A restriction the API does not have,
 and `@notify`, are not kept and are noted in the log as not supported.
 
 Two things a viewer does for restrictions the bot does not: it does not
@@ -1351,8 +1527,10 @@ target/release/rslbot ctl stand              # carried out, whatever is held
 `rlv mode override` exempts your next command from every restriction. RLV
 is on again the moment that command arrives, whatever becomes of it: a
 command that fails for a reason of its own, or that no restriction
-concerns, uses the override up as well. Only `status`, `scan`, `perms`,
-`quit` and the `rlv` commands never do. For `requesttp` the exemption includes
+concerns, uses the override up as well. Only `status`, `perms`,
+`friends`, `profile`, `quit` and the `rlv` commands never do. (`scan`
+used to be among them; now that restrictions apply to it, it uses the
+override up like any other command.) For `requesttp` the exemption includes
 accepting the one offer that answers it; for `persist` and `home` it
 includes the bot's own way to the place they name, until the avatar is
 there for the first time.

@@ -3,7 +3,9 @@
 //! seat tracking. All I/O goes through `Net`, so the logic is testable with
 //! a fake clock and a recording network.
 
+use crate::avatars::Seen;
 use crate::caps::{CapsEvent, EqEvent, InventoryUrls, TeleportFinish};
+use crate::friends::Friends;
 use crate::login::SessionInfo;
 use crate::persist::{Location, Sitting, World};
 use crate::reconciler::same_region;
@@ -108,6 +110,9 @@ pub enum SessionEvent {
     /// Where the current simulator answers avatar searches over HTTP, if it
     /// does.
     AvatarSearchUrl(Option<String>),
+    /// Where the current simulator answers for profiles over HTTP, if it
+    /// does.
+    ProfilesUrl(Option<String>),
     /// An avatar offers to teleport the bot's avatar to it; `lure` is what
     /// `accept_teleport` takes.
     TeleportOffer {
@@ -180,6 +185,12 @@ pub enum SessionEvent {
     /// An object the simulator had described is gone: deleted, detached,
     /// or out of what the simulator shows.
     ObjectGone(Uuid),
+    /// The answer to `request_profile`.
+    Profile(crate::profile::Profile),
+    /// A friend ended its friendship with the avatar.
+    FriendshipEnded(Uuid),
+    /// An avatar accepted the avatar's offer of friendship.
+    FriendshipBegun(Uuid),
     /// The avatar has left a region for another. `worn` are the objects
     /// the old simulator had described that were on the avatar, the prims
     /// of its attachments: they come along, everything else stays behind.
@@ -292,6 +303,8 @@ const CHAT_TYPE_STOP_TYPING: u8 = 5;
 const CHAT_NOT_AUDIBLE: i8 = -1;
 const IM_NOTHING_SPECIAL: u8 = messages::IM_PLAIN;
 const IM_FROM_TASK: u8 = 19;
+/// An avatar accepted the avatar's offer of friendship.
+const IM_FRIENDSHIP_ACCEPTED: u8 = 39;
 
 /// The asset type an inventory offer's binary bucket names. An avatar's
 /// offer carries the type and the item's UUID; an object's the type alone,
@@ -449,6 +462,9 @@ struct Sim {
     awaited_attach: Vec<(Uuid, Instant)>,
     /// Items a `detach` is waiting to see gone, with the deadline.
     awaited_detach: Vec<(Uuid, Instant)>,
+    /// The simulator's last list of the avatars in the region, with their
+    /// coarse positions; `None` until the first has come.
+    coarse: Option<Vec<(Uuid, [u8; 3])>>,
 }
 
 /// The circuit to a simulator the avatar has teleported out of. Such a
@@ -504,6 +520,11 @@ pub struct Session<N: Net> {
     logout_deadline: Option<Instant>,
     /// Ask for the IMs stored while offline, once, on entering the first region.
     fetch_offline_im: bool,
+    /// The avatar's friends and who of them is online, for this login.
+    friends: Friends,
+    /// The avatars whose profiles the simulator has been asked for and has
+    /// not answered.
+    profiles_asked: HashSet<Uuid>,
     lost: bool,
     events: Vec<SessionEvent>,
 }
@@ -541,11 +562,20 @@ impl<N: Net> Session<N> {
             teleport: None,
             logout_deadline: None,
             fetch_offline_im,
+            friends: Friends::new(&info.friends),
+            profiles_asked: HashSet::new(),
             lost: false,
             events: Vec::new(),
         };
+        let count = info.friends.len();
+        crate::info!("the grid lists {count} friend{} of the avatar", if count == 1 { "" } else { "s" });
         session.open_circuit(generation, info.sim_addr, Circuit::new(now), &info.seed_capability, now);
         session
+    }
+
+    /// The bot's own avatar.
+    pub fn agent_id(&self) -> Uuid {
+        self.agent.agent_id
     }
 
     /// The generation of the current circuit.
@@ -1098,6 +1128,71 @@ impl<N: Net> Session<N> {
         prims.collect()
     }
 
+    /// Whether the simulator has said who is in the region since the
+    /// avatar entered it.
+    pub fn avatars_known(&self) -> bool {
+        self.sim.coarse.is_some()
+    }
+
+    /// The avatars in the region other than the bot's own: those the
+    /// simulator has described where it said they are (a seated one where
+    /// its seat's root is), the others where its list of the avatars in
+    /// the region puts them.
+    pub fn avatars(&self) -> Vec<Seen> {
+        let sim = &self.sim;
+        let own = self.agent.agent_id;
+        let mut covered = HashSet::from([own]);
+        let mut seen = Vec::new();
+        for (local_id, id) in &sim.local_ids {
+            let avatar = sim.kinds.get(local_id).is_some_and(|kind| kind.0 == messages::PCODE_AVATAR);
+            if !avatar || sim.own_local == Some(*local_id) || covered.contains(id) {
+                continue;
+            }
+            let Some(at) = self.place(*local_id) else {
+                continue;
+            };
+            covered.insert(*id);
+            seen.push(Seen {
+                id: *id,
+                position: [at[0], at[1]],
+                height: Some(at[2]),
+                hidden: false,
+            });
+        }
+        for (id, [x, y, z]) in sim.coarse.iter().flatten() {
+            if id.is_nil() || !covered.insert(*id) {
+                continue;
+            }
+            // Second Life writes 255 for a height above 1020 m, and
+            // OpenSimulator 0 for one above 1024 m.
+            let height = match z {
+                0 | 255 => None,
+                z => Some(f32::from(*z) * 4.0),
+            };
+            seen.push(Seen {
+                id: *id,
+                position: [f32::from(*x), f32::from(*y)],
+                height,
+                hidden: false,
+            });
+        }
+        seen
+    }
+
+    /// The avatar's friends and who of them is online.
+    pub fn friends(&self) -> &Friends {
+        &self.friends
+    }
+
+    /// Asks the simulator for the profile of `avatar`; a
+    /// `SessionEvent::Profile` follows if it answers.
+    pub fn request_profile(&mut self, avatar: Uuid, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::avatar_properties_request(&self.agent, avatar), true, now);
+        self.profiles_asked.insert(avatar);
+        Ok(())
+    }
+
     /// Asks the simulator what the objects with these local ids are
     /// called and whose they are, the way a viewer's area search does: by
     /// selecting them and ending the selection at once. Objects it has
@@ -1498,6 +1593,7 @@ impl<N: Net> Session<N> {
             CapsEvent::Event(EqEvent::Other(name)) => crate::debug!("event queue: ignoring {name}"),
             CapsEvent::DisplayNames(url) => self.events.push(SessionEvent::DisplayNamesUrl(url)),
             CapsEvent::AvatarSearch(url) => self.events.push(SessionEvent::AvatarSearchUrl(url)),
+            CapsEvent::Profiles(url) => self.events.push(SessionEvent::ProfilesUrl(url)),
             CapsEvent::Inventory(urls) => self.events.push(SessionEvent::InventoryUrls(urls)),
         }
     }
@@ -1853,6 +1949,12 @@ impl<N: Net> Session<N> {
                         };
                         return self.events.push(SessionEvent::InventoryOffer(offer));
                     }
+                    IM_FRIENDSHIP_ACCEPTED => {
+                        if self.friends.accepted(from_agent) {
+                            self.events.push(SessionEvent::FriendshipBegun(from_agent));
+                        }
+                        return;
+                    }
                     other => return crate::debug!("ignoring instant message with dialog {other}"),
                 };
                 let sent_at = (offline && timestamp != 0).then_some(timestamp);
@@ -1916,6 +2018,35 @@ impl<N: Net> Session<N> {
                 }
             }
             Incoming::DisableSimulator => self.lose("the simulator closed the connection"),
+            Incoming::AvatarsHere(avatars) => self.sim.coarse = Some(avatars),
+            Incoming::FriendsOnline(ids) => self.friends.online(&ids),
+            Incoming::FriendsOffline(ids) => self.friends.offline(&ids),
+            Incoming::FriendshipEnded(id) => {
+                if self.friends.ended(id) {
+                    self.events.push(SessionEvent::FriendshipEnded(id));
+                }
+            }
+            Incoming::RightsChanged { agent, rights } => {
+                // Rights the avatar grants are no concern of the list.
+                if agent != self.agent.agent_id {
+                    for (_, rights) in rights {
+                        self.friends.rights_changed(agent, rights);
+                    }
+                }
+            }
+            Incoming::AvatarProperties {
+                avatar,
+                partner,
+                about,
+                first_life,
+                born,
+                flags,
+            } => {
+                if self.profiles_asked.remove(&avatar) {
+                    let profile = crate::profile::from_udp(avatar, partner, &about, &first_life, &born, flags);
+                    self.events.push(SessionEvent::Profile(profile));
+                }
+            }
             Incoming::Other => {}
         }
     }
@@ -2050,6 +2181,7 @@ impl Sim {
             attachments: HashMap::new(),
             awaited_attach: Vec::new(),
             awaited_detach: Vec::new(),
+            coarse: None,
         }
     }
 }
@@ -2144,6 +2276,10 @@ mod tests {
         }
 
         fn with(scan_distance: Option<f32>, fetch_offline_im: bool) -> Rig {
+            Rig::with_friends(scan_distance, fetch_offline_im, Vec::new())
+        }
+
+        fn with_friends(scan_distance: Option<f32>, fetch_offline_im: bool, friends: Vec<(Uuid, i32)>) -> Rig {
             let net = FakeNet::default();
             let info = SessionInfo {
                 agent_id: agent_id(),
@@ -2152,6 +2288,7 @@ mod tests {
                 sim_addr: "127.0.0.1:9000".parse().unwrap(),
                 seed_capability: "http://127.0.0.1:9000/CAPS/seed/".to_string(),
                 inventory_root: None,
+                friends,
             };
             let now = Instant::now();
             let session = Session::new(net.clone(), &info, "Sit Bot", scan_distance, fetch_offline_im, 1, now);
@@ -5481,5 +5618,231 @@ mod tests {
         rig.session.ask_properties(&[CHAIR], rig.now);
         assert_eq!(rig.selections(), []);
         assert_eq!(rig.sighting(target()).unwrap().properties, Some(properties(target(), "Park Bench")));
+    }
+
+    // ------------------------------------------------- avatars in the region
+
+    impl Rig {
+        fn coarse(&mut self, generation: u64, avatars: &[(Uuid, [u8; 3])]) {
+            let ids: Vec<Uuid> = avatars.iter().map(|(id, _)| *id).collect();
+            let locations: Vec<[u8; 3]> = avatars.iter().map(|(_, at)| *at).collect();
+            let body = wire::coarse_location_update(&locations, Some(&ids));
+            self.receive_from(generation, messages::COARSE_LOCATION_UPDATE, &body, false);
+        }
+
+        /// What `avatars` says of `id`: east and north, and the height.
+        fn avatar(&self, id: Uuid) -> Option<([f32; 2], Option<f32>)> {
+            let seen = self.session.avatars().into_iter().find(|seen| seen.id == id)?;
+            Some((seen.position, seen.height))
+        }
+
+        /// An avatar's full update.
+        fn avatar_at(&mut self, id: Uuid, local_id: u32, parent: u32, position: Vector3) {
+            let block = wire::Block {
+                data: wire::object_data(position, [0.0; 3], true),
+                ..prim(id, local_id, parent, [0.0; 3])
+            };
+            self.describe(&[block], &[(PCODE_AVATAR, 0)]);
+        }
+    }
+
+    #[test]
+    fn who_is_in_the_region_is_known_once_the_simulator_lists_it() {
+        let mut rig = Rig::entered();
+        assert!(!rig.session.avatars_known());
+        rig.coarse(1, &[(object(0x1A), [10, 20, 5])]);
+        assert!(rig.session.avatars_known());
+        // An empty list is a list.
+        let mut empty = Rig::entered();
+        empty.coarse(1, &[]);
+        assert!(empty.session.avatars_known() && empty.session.avatars().is_empty());
+
+        // Unknown again in the next region.
+        rig.session.handle_caps(1, finish(), rig.now);
+        rig.enter("Target", ((1001 * 256) << 32) | (1000 * 256));
+        assert!(!rig.session.avatars_known());
+        assert_eq!(rig.session.avatars(), []);
+        // What the region left behind sends is not read.
+        rig.coarse(1, &[(object(0x1A), [10, 20, 5])]);
+        assert!(!rig.session.avatars_known());
+        rig.coarse(2, &[(object(0x2B), [30, 40, 6])]);
+        assert_eq!(rig.avatar(object(0x2B)), Some(([30.0, 40.0], Some(24.0))));
+        assert_eq!(rig.avatar(object(0x1A)), None);
+    }
+
+    #[test]
+    fn avatars_are_where_the_simulator_last_said() {
+        let mut rig = Rig::by_a_bench();
+        let (jane, john, ann, zed, ned) = (object(0x1A), object(0x2B), object(0x3C), object(0x4D), object(0x5E));
+        // Jane is described, John sits on the bench.
+        rig.avatar_at(jane, 800, 0, [103.24, 100.0, 25.0]);
+        rig.avatar_at(john, 801, BENCH, [0.0, 0.0, 0.5]);
+        rig.coarse(
+            1,
+            &[
+                (jane, [200, 40, 6]),
+                (john, [103, 100, 6]),
+                (ann, [200, 40, 6]),
+                (zed, [128, 64, 255]),
+                (ned, [128, 64, 0]),
+                (agent_id(), [100, 100, 6]),
+            ],
+        );
+        // A described avatar wins over its entry in the list.
+        assert_eq!(rig.avatar(jane), Some(([103.24, 100.0], Some(25.0))));
+        // A seated one is where its seat's root is.
+        assert_eq!(rig.avatar(john), Some(([103.0, 100.0], Some(25.0))));
+        // One in the list only, in whole metres and steps of 4 m.
+        assert_eq!(rig.avatar(ann), Some(([200.0, 40.0], Some(24.0))));
+        // Heights the list cannot hold.
+        assert_eq!(rig.avatar(zed), Some(([128.0, 64.0], None)));
+        assert_eq!(rig.avatar(ned), Some(([128.0, 64.0], None)));
+        // Never the bot's own, described or listed.
+        rig.own_at(0, [100.0, 100.0, 25.0]);
+        assert_eq!(rig.avatar(agent_id()), None);
+        assert_eq!(rig.session.avatars().len(), 5);
+        assert!(rig.session.avatars().iter().all(|seen| !seen.hidden));
+
+        // Gone from the description: back to the list.
+        rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[800]));
+        assert_eq!(rig.avatar(jane), Some(([200.0, 40.0], Some(24.0))));
+        // A described avatar the list does not name is still there.
+        rig.coarse(1, &[(ann, [200, 40, 6])]);
+        assert_eq!(rig.avatar(john), Some(([103.0, 100.0], Some(25.0))));
+        assert_eq!(rig.avatar(jane), None);
+    }
+
+    #[test]
+    fn a_described_avatar_moves_with_its_updates() {
+        let mut rig = Rig::by_a_bench();
+        let jane = object(0x1A);
+        rig.avatar_at(jane, 800, 0, [103.0, 100.0, 25.0]);
+        rig.terse(800, true, [110.0, 100.0, 2000.0]);
+        assert_eq!(rig.avatar(jane), Some(([110.0, 100.0], Some(2000.0))));
+        // Only the list has been sent: still described.
+        rig.coarse(1, &[(jane, [110, 100, 255])]);
+        assert_eq!(rig.avatar(jane), Some(([110.0, 100.0], Some(2000.0))));
+    }
+
+    // ----------------------------------------------------------- friends
+
+    use crate::friends::{Status, SEE_ONLINE};
+
+    impl Rig {
+        fn friended() -> Rig {
+            let friends = vec![(object(0x1A), SEE_ONLINE), (object(0x2B), 0)];
+            let mut rig = Rig::with_friends(None, false, friends);
+            rig.enter("Home", HOME_HANDLE);
+            rig.events();
+            rig
+        }
+
+        fn status(&self, id: Uuid) -> Option<Status> {
+            self.session.friends().status(id)
+        }
+    }
+
+    #[test]
+    fn friends_come_from_the_login_and_the_notices() {
+        let mut rig = Rig::friended();
+        let (jane, john, stranger) = (object(0x1A), object(0x2B), object(0x99));
+        assert_eq!((rig.status(jane), rig.status(john)), (Some(Status::Offline), Some(Status::Unknown)));
+        rig.receive(messages::ONLINE_NOTIFICATION, &wire::friend_notification(&[jane, john, stranger]));
+        assert_eq!((rig.status(jane), rig.status(john)), (Some(Status::Online), Some(Status::Unknown)));
+        assert!(!rig.session.friends().is_friend(stranger));
+        // A teleport keeps who is online.
+        rig.session.handle_caps(1, finish(), rig.now);
+        rig.enter("Target", ((1001 * 256) << 32) | (1000 * 256));
+        assert_eq!(rig.status(jane), Some(Status::Online));
+        rig.receive(messages::OFFLINE_NOTIFICATION, &wire::friend_notification(&[jane]));
+        assert_eq!(rig.status(jane), Some(Status::Offline));
+        rig.receive(messages::ONLINE_NOTIFICATION, &wire::friend_notification(&[jane]));
+        // A new login starts from its own list.
+        let again = Rig::with_friends(None, false, vec![(jane, SEE_ONLINE)]);
+        assert_eq!((again.status(jane), again.status(john)), (Some(Status::Offline), None));
+        assert_eq!(Rig::new().session.friends().len(), 0);
+    }
+
+    #[test]
+    fn friendships_that_end_or_begin_are_reported() {
+        let mut rig = Rig::friended();
+        let (jane, ann, bob) = (object(0x1A), object(0x3C), object(0x4D));
+        rig.receive(messages::TERMINATE_FRIENDSHIP, &wire::terminate_friendship(jane));
+        assert_eq!(rig.events(), [SessionEvent::FriendshipEnded(jane)]);
+        assert!(!rig.session.friends().is_friend(jane));
+        // Ended again, or by a stranger: nothing to report.
+        rig.receive(messages::TERMINATE_FRIENDSHIP, &wire::terminate_friendship(jane));
+        assert_eq!(rig.events(), []);
+
+        // Ann accepts the avatar's offer.
+        rig.ack_all();
+        rig.sent();
+        let accepted = wire::improved_instant_message(ann, "Ann Poe", 39, object(0x77), None, "accepted");
+        rig.receive(messages::IMPROVED_INSTANT_MESSAGE, &accepted);
+        assert_eq!(rig.events(), [SessionEvent::FriendshipBegun(ann)]);
+        assert_eq!(rig.status(ann), Some(Status::Offline));
+        rig.receive(messages::ONLINE_NOTIFICATION, &wire::friend_notification(&[ann]));
+        assert_eq!(rig.status(ann), Some(Status::Online));
+
+        // Bob's offer is left unanswered.
+        let offer = wire::improved_instant_message(bob, "Bob Poe", 38, object(0x78), None, "Be my friend?");
+        rig.receive(messages::IMPROVED_INSTANT_MESSAGE, &offer);
+        assert_eq!(rig.events(), []);
+        assert!(!rig.session.friends().is_friend(bob));
+        rig.ack_all();
+        assert_eq!(rig.sent(), []);
+    }
+
+    #[test]
+    fn a_friend_changes_what_it_lets_the_avatar_see() {
+        let mut rig = Rig::friended();
+        let (jane, john) = (object(0x1A), object(0x2B));
+        rig.receive(messages::ONLINE_NOTIFICATION, &wire::friend_notification(&[jane, john]));
+        rig.receive(messages::CHANGE_USER_RIGHTS, &wire::change_user_rights(jane, &[(agent_id(), 2)]));
+        assert_eq!(rig.status(jane), Some(Status::Unknown));
+        rig.receive(messages::CHANGE_USER_RIGHTS, &wire::change_user_rights(john, &[(agent_id(), 3)]));
+        assert_eq!(rig.status(john), Some(Status::Online));
+        // What the avatar grants is not what it is granted.
+        let own = wire::change_user_rights(agent_id(), &[(jane, SEE_ONLINE), (john, 0)]);
+        rig.receive(messages::CHANGE_USER_RIGHTS, &own);
+        assert_eq!((rig.status(jane), rig.status(john)), (Some(Status::Unknown), Some(Status::Online)));
+    }
+
+    // ---------------------------------------------------------- profiles
+
+    #[test]
+    fn a_profile_is_asked_for_once_per_call_and_answered_once() {
+        let mut rig = Rig::entered();
+        let (jane, john) = (object(0x1A), object(0x2B));
+        rig.ack_all();
+        rig.sent();
+        rig.session.request_profile(jane, rig.now).unwrap();
+        let sent = rig.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].id, messages::AVATAR_PROPERTIES_REQUEST);
+        assert_eq!(sent[0].body[32..], *jane.as_bytes());
+        // An answer about somebody nobody asked about is dropped.
+        let reply = |avatar| wire::avatar_properties_reply(avatar, Uuid::nil(), "Builder.", "", "3/14/2010", 0x10);
+        rig.receive(messages::AVATAR_PROPERTIES_REPLY, &reply(john));
+        assert_eq!(rig.events(), []);
+        rig.receive(messages::AVATAR_PROPERTIES_REPLY, &reply(jane));
+        let wanted = crate::profile::from_udp(jane, Uuid::nil(), "Builder.", "", "3/14/2010", 0x10);
+        assert_eq!(rig.events(), [SessionEvent::Profile(wanted)]);
+        // Answered once.
+        rig.receive(messages::AVATAR_PROPERTIES_REPLY, &reply(jane));
+        assert_eq!(rig.events(), []);
+        // Not asked while the avatar is in no region.
+        rig.session.start_logout(rig.now);
+        rig.sent();
+        assert_eq!(rig.session.request_profile(jane, rig.now), Err(NOT_CONNECTED.to_string()));
+        assert_eq!(rig.sent_ids(), []);
+    }
+
+    #[test]
+    fn the_profile_service_is_reported() {
+        let mut rig = Rig::entered();
+        let url = Some("http://127.0.0.1:9000/CAPS/profile/".to_string());
+        rig.session.handle_caps(1, CapsEvent::Profiles(url.clone()), rig.now);
+        assert_eq!(rig.events(), [SessionEvent::ProfilesUrl(url)]);
     }
 }

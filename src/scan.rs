@@ -5,7 +5,7 @@
 use crate::escape::escape;
 use crate::names;
 use crate::udp::messages::{Properties, FLAG_PHANTOM, FLAG_PHYSICS, FLAG_SCRIPTED, FLAG_TEMPORARY, FLAG_TOUCH};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 /// The furthest a `scan` reaches, in metres: the limit of `scan_distance`.
@@ -67,6 +67,50 @@ pub struct Query {
     pub children: bool,
 }
 
+/// What a `scan` command is: a scan of the objects around the avatar, or
+/// of the avatars in the region, with the distance to list them within.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Command {
+    Objects(Query),
+    Avatars(Option<f32>),
+}
+
+impl Command {
+    /// Reads the arguments of `scan`: `avatars` first selects the scan of
+    /// avatars, `objects` first is the scan of objects as without it.
+    pub fn parse(args: &[String]) -> Result<Command, String> {
+        match args.first().map(String::as_str) {
+            Some("avatars") => {
+                let rest = &args[1..];
+                if let Some(option) = rest.iter().find(|arg| arg.starts_with('-')) {
+                    return Err(format!("`scan avatars` has no option `{option}`"));
+                }
+                match rest {
+                    [] => Ok(Command::Avatars(None)),
+                    [given] => Ok(Command::Avatars(Some(distance(given)?))),
+                    _ => Err(format!("`scan avatars` takes one distance, not `{}`", rest.join("` and `"))),
+                }
+            }
+            Some("objects") => Query::parse(&args[1..]).map(Command::Objects),
+            _ => Query::parse(args).map(Command::Objects),
+        }
+    }
+}
+
+/// Reads a distance: a number of metres from 1 to 1024, or `shout`,
+/// `chat` or `whisper`, which stand for 100, 20 and 10 metres.
+pub fn distance(given: &str) -> Result<f32, String> {
+    let metres = match given {
+        "shout" => Some(100.0),
+        "chat" => Some(20.0),
+        "whisper" => Some(10.0),
+        number => number.parse::<f32>().ok().filter(|metres| (1.0..=MAX_DISTANCE).contains(metres)),
+    };
+    metres.ok_or_else(|| {
+        format!("the distance is a number of metres from 1 to {MAX_DISTANCE} or `shout`, `chat` or `whisper`, not `{given}`")
+    })
+}
+
 /// The owner of an object and whether that is a group: a group's object
 /// has no owner, or the group as its owner.
 pub fn owner(properties: &Properties) -> (Uuid, bool) {
@@ -105,9 +149,7 @@ impl Query {
             }
         }
         if let Some(given) = distance {
-            let metres = given.parse::<f32>().ok().filter(|metres| (1.0..=MAX_DISTANCE).contains(metres));
-            let bounds = || format!("the distance is a number of metres from 1 to {MAX_DISTANCE}, not `{given}`");
-            query.distance = Some(metres.ok_or_else(bounds)?);
+            query.distance = Some(self::distance(given)?);
         }
         Ok(query)
     }
@@ -191,9 +233,10 @@ fn flag_words(sighting: &Sighting) -> String {
 
 /// The listing of `sightings`: one line each, nearest first, of the UUID,
 /// the distance, the flags, the owner's UUID and name, the name and the
-/// description, separated by tabs, with `?` for what is not known. `None`
-/// when there is nothing to list.
-pub fn listing(mut sightings: Vec<Sighting>, owners: &HashMap<Uuid, Option<String>>) -> Option<String> {
+/// description, separated by tabs, with `?` for what is not known and for
+/// an owner in `hidden`, unless it is a group. `None` when there is
+/// nothing to list.
+pub fn listing(mut sightings: Vec<Sighting>, owners: &HashMap<Uuid, Option<String>>, hidden: &HashSet<Uuid>) -> Option<String> {
     sightings.sort_by(|a, b| a.distance.total_cmp(&b.distance).then(a.object.cmp(&b.object)));
     let lines: Vec<String> = sightings
         .iter()
@@ -205,10 +248,15 @@ pub fn listing(mut sightings: Vec<Sighting>, owners: &HashMap<Uuid, Option<Strin
                     let (id, group) = owner(properties);
                     let named = match owners.get(&id) {
                         _ if group => "(group)".to_string(),
+                        _ if hidden.contains(&id) => unknown(),
                         Some(Some(name)) => escape(name),
                         _ => unknown(),
                     };
-                    [id.to_string(), named, escape(&properties.name), escape(&properties.description)]
+                    let id = match !group && hidden.contains(&id) {
+                        true => unknown(),
+                        false => id.to_string(),
+                    };
+                    [id, named, escape(&properties.name), escape(&properties.description)]
                 }
             };
             let [owner, owner_name, name, description] = known;
@@ -333,6 +381,17 @@ mod tests {
         for example in examples {
             assert!(parse(example).is_ok(), "{example:?}");
         }
+        let commands: [&[&str]; 6] = [
+            &["objects", "chat", "-t"],
+            &["shout"],
+            &["avatars"],
+            &["avatars", "chat"],
+            &["avatars", "50"],
+            &["objects"],
+        ];
+        for example in commands {
+            assert!(Command::parse(&args(example)).is_ok(), "{example:?}");
+        }
     }
 
     #[test]
@@ -360,11 +419,77 @@ mod tests {
     fn the_distance_is_one_number_within_bounds() {
         for given in ["0", "2000", "far", "0.5", "nan", "inf"] {
             let error = parse(&[given]).unwrap_err();
-            assert!(error.contains("from 1 to 1024") && error.contains(given), "{error}");
+            assert!(
+                error.contains("from 1 to 1024 or `shout`, `chat` or `whisper`") && error.contains(given),
+                "{error}"
+            );
         }
         assert_eq!(parse(&["1"]).unwrap().distance, Some(1.0));
         assert_eq!(parse(&["1024"]).unwrap().distance, Some(1024.0));
         assert!(parse(&["10", "20"]).unwrap_err().contains("one distance"));
+    }
+
+    #[test]
+    fn the_distance_may_be_a_word() {
+        assert_eq!(parse(&["chat"]).unwrap().distance, Some(20.0));
+        assert_eq!(parse(&["shout"]).unwrap().distance, Some(100.0));
+        assert_eq!(parse(&["-t", "whisper"]).unwrap(), parse(&["10", "-t"]).unwrap());
+        // A word and a number are two distances.
+        assert!(parse(&["chat", "20"]).unwrap_err().contains("one distance"));
+        // Only in lower case.
+        for given in ["Chat", "far", "SHOUT"] {
+            let error = parse(&[given]).unwrap_err();
+            assert!(error.contains("`shout`, `chat` or `whisper`") && error.contains(given), "{error}");
+        }
+        assert_eq!(distance("whisper"), Ok(10.0));
+        assert_eq!(distance("12.5"), Ok(12.5));
+    }
+
+    fn command(words: &[&str]) -> Result<Command, String> {
+        Command::parse(&args(words))
+    }
+
+    #[test]
+    fn the_word_objects_changes_nothing() {
+        for words in [&[][..], &["20", "-n", "bench"][..], &["-t", "whisper"][..]] {
+            let with: Vec<&str> = std::iter::once("objects").chain(words.iter().copied()).collect();
+            assert_eq!(command(&with), command(words));
+            assert_eq!(command(words), parse(words).map(Command::Objects));
+        }
+        assert_eq!(
+            command(&["objects", "-t", "whisper"]),
+            Ok(Command::Objects(Query {
+                distance: Some(10.0),
+                flags: FLAG_TOUCH,
+                ..Query::default()
+            }))
+        );
+        // Anywhere else it is read as a distance, and refused.
+        let error = command(&["20", "objects"]).unwrap_err();
+        assert!(error.contains("one distance"), "{error}");
+        assert!(command(&["objects", "objects"]).unwrap_err().contains("`objects`"));
+    }
+
+    #[test]
+    fn scan_avatars_takes_one_distance_at_most() {
+        assert_eq!(command(&["avatars"]), Ok(Command::Avatars(None)));
+        assert_eq!(command(&["avatars", "chat"]), Ok(Command::Avatars(Some(20.0))));
+        assert_eq!(command(&["avatars", "12.5"]), Ok(Command::Avatars(Some(12.5))));
+        assert_eq!(command(&["avatars", "shout"]), Ok(Command::Avatars(Some(100.0))));
+        // The object scan's filters are no part of it.
+        assert!(command(&["avatars", "-n", "jane"]).unwrap_err().contains("`-n`"));
+        assert!(command(&["avatars", "-t"]).unwrap_err().contains("`-t`"));
+        for given in ["0", "2000", "near", "Chat"] {
+            let error = command(&["avatars", given]).unwrap_err();
+            assert!(
+                error.contains("from 1 to 1024 or `shout`, `chat` or `whisper`") && error.contains(given),
+                "{error}"
+            );
+        }
+        assert!(command(&["avatars", "chat", "30"]).is_err());
+        assert!(command(&["avatars", "10", "20"]).is_err());
+        // Not the first argument: the object scan's distance, and refused.
+        assert!(command(&["20", "avatars"]).is_err());
     }
 
     #[test]
@@ -505,7 +630,7 @@ mod tests {
             flags: FLAG_SCRIPTED | FLAG_TOUCH,
             ..sighting(1, 3.24, named("Bench", "Sit here"))
         };
-        let line = listing(vec![bench], &owners()).unwrap();
+        let line = listing(vec![bench], &owners(), &HashSet::new()).unwrap();
         assert_eq!(
             line,
             format!("{}\t3.2\tscripted,touch\t{}\tJane Doe\tBench\tSit here", id(1), jane())
@@ -523,7 +648,7 @@ mod tests {
                 }),
                 ..sighting(1, 2.0, None)
             };
-            let line = listing(vec![sign], &owners()).unwrap();
+            let line = listing(vec![sign], &owners(), &HashSet::new()).unwrap();
             // No description: the line ends with the tab after the name.
             assert_eq!(line, format!("{}\t2.0\t-\t{}\t(group)\tSign\t", id(1), club()));
         }
@@ -533,13 +658,13 @@ mod tests {
     fn what_is_not_known_is_a_question_mark() {
         let unanswered = sighting(1, 2.0, None);
         assert_eq!(
-            listing(vec![unanswered], &owners()).unwrap(),
+            listing(vec![unanswered], &owners(), &HashSet::new()).unwrap(),
             format!("{}\t2.0\t-\t?\t?\t?\t?", id(1))
         );
         // The owner is known, the name service does not name it.
         let bench = sighting(1, 2.0, named("Bench", ""));
         for owners in [HashMap::new(), HashMap::from([(jane(), None)])] {
-            let line = listing(vec![bench.clone()], &owners).unwrap();
+            let line = listing(vec![bench.clone()], &owners, &HashSet::new()).unwrap();
             assert_eq!(line, format!("{}\t2.0\t-\t{}\t?\tBench\t", id(1), jane()));
         }
     }
@@ -550,21 +675,51 @@ mod tests {
         let near = sighting(3, 3.0, None);
         let middle = sighting(2, 7.0, None);
         let twin = sighting(4, 7.0, None);
-        let text = listing(vec![far, twin, near, middle], &owners()).unwrap();
+        let text = listing(vec![far, twin, near, middle], &owners(), &HashSet::new()).unwrap();
         let order: Vec<String> = text.lines().map(|line| line.split('\t').next().unwrap().to_string()).collect();
         assert_eq!(order, [id(3), id(2), id(4), id(1)].map(|id| id.to_string()));
-        assert_eq!(listing(Vec::new(), &owners()), None);
+        assert_eq!(listing(Vec::new(), &owners(), &HashSet::new()), None);
     }
 
     #[test]
     fn names_stay_on_their_line_and_in_their_field() {
         let odd = sighting(1, 1.0, named("Tab\there", "two\nlines \\ slash\r"));
-        let line = listing(vec![odd], &owners()).unwrap();
+        let line = listing(vec![odd], &owners(), &HashSet::new()).unwrap();
         assert_eq!(line.lines().count(), 1);
         let fields: Vec<&str> = line.split('\t').collect();
         assert_eq!(fields.len(), 7);
         assert_eq!(fields[5], "Tab\\there");
         assert_eq!(fields[6], "two\\nlines \\\\ slash\\r");
+    }
+
+    #[test]
+    fn hidden_owners_are_question_marks() {
+        let bench = sighting(1, 3.24, named("Bench", "Sit here"));
+        let hidden = HashSet::from([jane()]);
+        assert_eq!(
+            listing(vec![bench.clone()], &owners(), &hidden).unwrap(),
+            format!("{}\t3.2\t-\t?\t?\tBench\tSit here", id(1))
+        );
+        // Another owner is shown, and so is a group.
+        let johns = Sighting {
+            properties: Some(Properties {
+                owner: id(0x2B),
+                ..named("Lamp", "").unwrap()
+            }),
+            ..sighting(2, 1.0, None)
+        };
+        let sign = Sighting {
+            properties: Some(Properties {
+                owner: Uuid::nil(),
+                group: jane(),
+                ..named("Sign", "").unwrap()
+            }),
+            ..sighting(3, 2.0, None)
+        };
+        let text = listing(vec![johns, sign], &owners(), &hidden).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].contains(&format!("\t{}\tJohn Roe\tLamp", id(0x2B))), "{}", lines[0]);
+        assert!(lines[1].contains(&format!("\t{}\t(group)\tSign", jane())), "{}", lines[1]);
     }
 
     #[test]

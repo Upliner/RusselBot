@@ -45,7 +45,10 @@ Usage: rslbot ctl say MESSAGE...
        rslbot ctl accepttp [AVATAR]
        rslbot ctl sendtp AVATAR [MESSAGE...]
        rslbot ctl touch UUID
-       rslbot ctl scan [DISTANCE] [FILTER...]
+       rslbot ctl scan [objects] [DISTANCE] [FILTER...]
+       rslbot ctl scan avatars [DISTANCE]
+       rslbot ctl friends
+       rslbot ctl profile AVATAR
        rslbot ctl inventory [-a] [-n] [FOLDER]
        rslbot ctl attach ITEM [BODY PART...]
        rslbot ctl wear ITEM
@@ -81,17 +84,24 @@ REGION stays in the current region, and without Z keeps the current height.
 a teleport to the bot. `touch` clicks an object. `status` shows where the
 avatar is and what it sits on; `quit` logs out and stops the bot.
 
-`scan` lists the objects within DISTANCE metres of the avatar, nearest
-first: one line each with the UUID, the distance, flags, the owner's UUID
-and name, the name and the description, separated by tabs, with `?` for
-what the simulator has not told. Without DISTANCE it lists as far as the
-bot looks for objects; a larger one makes it look that far until the avatar
-leaves the region. FILTERs: `-n TEXT` (`--name`) and `-d TEXT` (`--desc`)
-for a part of the name or the description; `-o WHO` (`--owner`) for the
-objects of an AVATAR or of a group given by its UUID; `-s` (`--scripted`),
-`-t` (`--touch`), `-p` (`--physical`), `--temporary` and `--phantom` for
-prims the simulator flags so; `-a` (`--attachments`) to list what avatars
-wear as well, and `-c` (`--children`) the child prims of linksets.
+`scan` (or `scan objects`) lists the objects within DISTANCE metres of the
+avatar, nearest first: one line each with the UUID, the distance, flags,
+the owner's UUID and name, the name and the description, separated by
+tabs, with `?` for what the simulator has not told. DISTANCE is a number of
+metres or `shout` (100), `chat` (20) or `whisper` (10). Without DISTANCE it
+lists as far as the bot looks for objects; a larger one makes it look that
+far until the avatar leaves the region. FILTERs: `-n TEXT` (`--name`) and
+`-d TEXT` (`--desc`) for a part of the name or the description; `-o WHO`
+(`--owner`) for the objects of an AVATAR or of a group given by its UUID;
+`-s` (`--scripted`), `-t` (`--touch`), `-p` (`--physical`), `--temporary`
+and `--phantom` for prims the simulator flags so; `-a` (`--attachments`) to
+list what avatars wear as well, and `-c` (`--children`) the child prims of
+linksets. `scan avatars` lists the other avatars in the region, or those
+within DISTANCE: UUID, distance, position, name and display name.
+
+`friends` lists the avatar's friends: UUID, `online`, `offline` or `?` (a
+friend that does not show it), name and display name. `profile` prints the
+profile of AVATAR as `name: value` lines.
 
 `accept` accepts a request that waits because the bot did not accept it by
 itself. KIND is what was asked: `tp` (a teleport offer), `inventory` (an
@@ -202,8 +212,12 @@ pub enum Request {
     },
     /// A UUID, still to be read.
     Touch(String),
-    /// `[DISTANCE] [FILTER...]`, still to be read.
+    /// `[objects] [DISTANCE] [FILTER...]` or `avatars [DISTANCE]`, still
+    /// to be read.
     Scan(Vec<String>),
+    Friends,
+    /// An avatar, still to be read.
+    Profile(String),
     /// `[-a] [-n] [folder]`, still to be read.
     Inventory(Vec<String>),
     /// An inventory item and, when given, the words of a body part.
@@ -255,6 +269,8 @@ impl Request {
             Request::SendTp { .. } => "sendtp",
             Request::Touch(_) => "touch",
             Request::Scan(_) => "scan",
+            Request::Friends => "friends",
+            Request::Profile(_) => "profile",
             Request::Persist { .. } => "persist",
             Request::Home => "home",
             Request::Status => "status",
@@ -467,6 +483,11 @@ impl Request {
                 Ok(Request::Touch(fields.remove(0)))
             }
             "scan" => Ok(Request::Scan(fields)),
+            "friends" => arguments(0).map(|()| Request::Friends),
+            "profile" => {
+                at_least(1)?;
+                Ok(Request::Profile(fields.join(" ")))
+            }
             "inventory" => Ok(Request::Inventory(fields)),
             "attach" => {
                 at_least(1)?;
@@ -1008,7 +1029,34 @@ mod tests {
             "scan	20	--name	park bench	-a
 "
         );
-        assert!(CTL_USAGE.contains("rslbot ctl scan [DISTANCE] [FILTER...]"));
+        assert!(CTL_USAGE.contains("rslbot ctl scan [objects] [DISTANCE] [FILTER...]"));
+        assert!(CTL_USAGE.contains("rslbot ctl scan avatars [DISTANCE]"));
+        assert_eq!(
+            Request::decode(b"scan\tavatars\tchat"),
+            Ok(Request::Scan(strings(&["avatars", "chat"])))
+        );
+    }
+
+    #[test]
+    fn friends_takes_no_arguments() {
+        assert_eq!(Request::decode(b"friends"), Ok(Request::Friends));
+        assert_eq!(Request::Friends.name(), "friends");
+        let error = Request::decode(b"friends\tonline").unwrap_err();
+        assert!(error.contains("`friends` takes no arguments"), "{error}");
+        assert!(CTL_USAGE.contains("rslbot ctl friends\n"));
+    }
+
+    #[test]
+    fn profile_takes_an_avatar() {
+        let text = |s: &str| s.to_string();
+        assert_eq!(Request::decode(b"profile\tJane\tDoe"), Ok(Request::Profile(text("Jane Doe"))));
+        assert_eq!(Request::decode(b"profile\tJane Doe"), Ok(Request::Profile(text("Jane Doe"))));
+        assert_eq!(Request::decode(b"profile\tjane.doe"), Ok(Request::Profile(text("jane.doe"))));
+        assert_eq!(Request::Profile(text("x")).name(), "profile");
+        assert!(Request::decode(b"profile")
+            .unwrap_err()
+            .contains("`profile` takes at least 1 argument"));
+        assert!(CTL_USAGE.contains("rslbot ctl profile AVATAR"));
     }
 
     #[test]

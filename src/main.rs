@@ -2,12 +2,14 @@
 //! to a target region, sits it on a target object and keeps it there.
 
 mod autoreply;
+mod avatars;
 mod backoff;
 mod caps;
 mod commands;
 mod config;
 mod control;
 mod escape;
+mod friends;
 mod inventory;
 mod log;
 mod login;
@@ -16,6 +18,7 @@ mod names;
 mod net;
 mod perms;
 mod persist;
+mod profile;
 mod reconciler;
 mod rlv;
 mod scan;
@@ -184,9 +187,8 @@ struct Bot {
     names_url: Option<Option<String>>,
     /// Commands from the control socket.
     commands: Commands,
-    avatar_searches: Sender<Search>,
-    /// The current simulator's avatar search service, if it has one.
-    search_url: Option<String>,
+    /// The avatar search and profile services.
+    lookups: Lookups,
     /// The placement the bot holds, and what `persist` remembers.
     book: Book,
     /// The config's `persist`, until it has been applied or the operator
@@ -252,13 +254,23 @@ struct Inventory {
     generation: Option<u64>,
 }
 
-/// The session as commands see it. A simulator with an avatar search
-/// service is asked there, as viewers do; the older simulator message is
-/// for the ones without.
+/// The workers that ask the grid about avatars over HTTP, and where the
+/// current simulator answers.
+struct Lookups {
+    avatar_searches: Sender<Search>,
+    /// The current simulator's avatar search service, if it has one.
+    search_url: Option<String>,
+    profiles: Sender<profile::Fetch>,
+    /// The current simulator's profile service, if it has one.
+    profile_url: Option<String>,
+}
+
+/// The session as commands see it. A simulator with an avatar search or
+/// profile service is asked there, as viewers do; the older simulator
+/// messages are for the ones without.
 struct Live<'a> {
     session: &'a mut Session<RealNet>,
-    search_url: Option<&'a str>,
-    avatar_searches: &'a Sender<Search>,
+    lookups: &'a Lookups,
     inventory: &'a Inventory,
     rlv: &'a Rlv,
 }
@@ -276,6 +288,35 @@ fn sitting(session: &Session<RealNet>) -> Sitting {
 impl Grid for Live<'_> {
     fn reach(&mut self, distance: Option<f32>, now: Instant) -> Result<f32, String> {
         self.session.reach(distance, now)
+    }
+    fn present(&self) -> Result<(), String> {
+        self.session.present()
+    }
+    fn own_id(&self) -> Uuid {
+        self.session.agent_id()
+    }
+    fn avatars(&self) -> Vec<avatars::Seen> {
+        self.session.avatars()
+    }
+    fn avatars_known(&self) -> bool {
+        self.session.avatars_known()
+    }
+    fn friends(&self) -> &friends::Friends {
+        self.session.friends()
+    }
+    fn ask_profile(&mut self, avatar: Uuid, now: Instant) -> Result<(), String> {
+        let Some(url) = &self.lookups.profile_url else {
+            return self.session.request_profile(avatar, now);
+        };
+        self.session.present()?;
+        let fetch = profile::Fetch {
+            url: url.clone(),
+            id: avatar,
+        };
+        self.lookups
+            .profiles
+            .send(fetch)
+            .map_err(|_| "the profile service is not running".to_string())
     }
     fn sightings(&self) -> Vec<scan::Sighting> {
         self.session.sightings()
@@ -311,7 +352,7 @@ impl Grid for Live<'_> {
         self.session.instant_message(to, text, now)
     }
     fn find_avatar(&mut self, query: Uuid, name: &str, now: Instant) -> Result<(), String> {
-        let Some(url) = self.search_url else {
+        let Some(url) = &self.lookups.search_url else {
             return self.session.find_avatar(query, name, now);
         };
         self.session.present()?;
@@ -320,7 +361,8 @@ impl Grid for Live<'_> {
             query,
             name: name.to_string(),
         };
-        self.avatar_searches
+        self.lookups
+            .avatar_searches
             .send(search)
             .map_err(|_| "the avatar search is not running".to_string())
     }
@@ -431,18 +473,11 @@ impl Grid for Live<'_> {
 }
 
 /// The session, if there is one, for commands to act on.
-fn live<'a>(
-    session: &'a mut Option<Session<RealNet>>,
-    search_url: &'a Option<String>,
-    avatar_searches: &'a Sender<Search>,
-    inventory: &'a Inventory,
-    rlv: &'a Rlv,
-) -> Option<Live<'a>> {
+fn live<'a>(session: &'a mut Option<Session<RealNet>>, lookups: &'a Lookups, inventory: &'a Inventory, rlv: &'a Rlv) -> Option<Live<'a>> {
     let session = session.as_mut()?;
     Some(Live {
         session,
-        search_url: search_url.as_deref(),
-        avatar_searches,
+        lookups,
         inventory,
         rlv,
     })
@@ -491,8 +526,12 @@ impl Bot {
             name_lookups: names::spawn(events.clone()),
             names_url: None,
             commands,
-            avatar_searches: names::spawn_search(events.clone()),
-            search_url: None,
+            lookups: Lookups {
+                avatar_searches: names::spawn_search(events.clone()),
+                search_url: None,
+                profiles: profile::spawn(events.clone()),
+                profile_url: None,
+            },
             inventory: Inventory {
                 jobs: inventory::spawn(events.clone()),
                 urls: None,
@@ -658,7 +697,8 @@ impl Bot {
             self.next_generation = session.generation() + 1;
         }
         self.names_url = None;
-        self.search_url = None;
+        self.lookups.search_url = None;
+        self.lookups.profile_url = None;
         self.inventory.urls = None;
         self.inventory.generation = None;
         self.commands.session_lost();
@@ -676,26 +716,14 @@ impl Bot {
     /// Reads the Current Outfit folder when it is time to compare it with
     /// what is attached (see `Commands::entered_region`).
     fn restore_attachments(&mut self, now: Instant) {
-        let mut live = live(
-            &mut self.session,
-            &self.search_url,
-            &self.avatar_searches,
-            &self.inventory,
-            &self.rlv,
-        );
+        let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
         self.commands.restore_due(live.as_mut(), now);
     }
 
     /// Decides the requests that waited too long for the grid to say who
     /// is behind them (see `Commands::requests_due`).
     fn decide_requests(&mut self, now: Instant) {
-        let mut live = live(
-            &mut self.session,
-            &self.search_url,
-            &self.avatar_searches,
-            &self.inventory,
-            &self.rlv,
-        );
+        let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
         self.commands.requests_due(live.as_mut(), now);
         self.follow_commands();
     }
@@ -707,13 +735,7 @@ impl Bot {
         if let Some(grid) = self.grid.as_mut() {
             return self.commands.scans_due(Some(grid), now);
         }
-        let mut live = live(
-            &mut self.session,
-            &self.search_url,
-            &self.avatar_searches,
-            &self.inventory,
-            &self.rlv,
-        );
+        let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
         self.commands.scans_due(live.as_mut(), now);
     }
 
@@ -741,13 +763,7 @@ impl Bot {
             self.follow_commands();
             return;
         }
-        let mut live = live(
-            &mut self.session,
-            &self.search_url,
-            &self.avatar_searches,
-            &self.inventory,
-            &self.rlv,
-        );
+        let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
         for sent in self.commands.avatars_found(query, avatars, live.as_mut(), now) {
             self.record_sent(sent, now);
         }
@@ -1006,12 +1022,19 @@ impl Bot {
 
     /// Carries out a command from the control socket.
     fn control(&mut self, request: Request, reply: Sender<Response>, now: Instant) -> Flow {
-        // While RLV is in override, the next command but these six is
+        // While RLV is in override, the next command but these seven is
         // exempt from the restrictions, and RLV is on again with it. No
-        // restriction applies to a `scan`, so it has no use for one.
+        // restriction applies to `friends` and `profile`, so they have no
+        // use for one; `scan` is held to some, and uses it up.
         let never = matches!(
             request,
-            Request::Rlv(_) | Request::Status | Request::Perms(_) | Request::Autoreply(_) | Request::Scan(_) | Request::Quit
+            Request::Rlv(_)
+                | Request::Status
+                | Request::Perms(_)
+                | Request::Autoreply(_)
+                | Request::Friends
+                | Request::Profile(_)
+                | Request::Quit
         );
         let exempt = !never && self.rlv.take_override(request.name());
         match request {
@@ -1078,13 +1101,7 @@ impl Bot {
                     self.follow_commands();
                     return Flow::Continue;
                 }
-                let mut live = live(
-                    &mut self.session,
-                    &self.search_url,
-                    &self.avatar_searches,
-                    &self.inventory,
-                    &self.rlv,
-                );
+                let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
                 if let Some(sent) = self.commands.handle_from(origin, request, reply, live.as_mut(), now) {
                     self.record_sent(sent, now);
                 }
@@ -1191,13 +1208,7 @@ impl Bot {
         let follows = self.rlv.follows();
         let was_manual = self.reconciler.is_manual();
         let step = {
-            let mut live = live(
-                &mut self.session,
-                &self.search_url,
-                &self.avatar_searches,
-                &self.inventory,
-                &self.rlv,
-            );
+            let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
             rlv::deal(command, issuer, follows, &mut self.commands, live.as_mut(), now)
         };
         match step {
@@ -1224,13 +1235,7 @@ impl Bot {
     /// restrictions in force now.
     fn looked_for(&mut self, object: Uuid, described: bool, now: Instant) {
         {
-            let mut live = live(
-                &mut self.session,
-                &self.search_url,
-                &self.avatar_searches,
-                &self.inventory,
-                &self.rlv,
-            );
+            let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
             match described {
                 true => self.commands.described(object, live.as_mut(), now),
                 false => self.commands.not_described(object, live.as_mut(), now),
@@ -1448,26 +1453,14 @@ impl Bot {
     /// The grid named these avatars and does not know those: the message
     /// log and the requests that waited for a name go on.
     fn names_resolved(&mut self, found: Vec<(Uuid, names::Names)>, missing: Vec<Uuid>, now: Instant) {
-        let mut live = live(
-            &mut self.session,
-            &self.search_url,
-            &self.avatar_searches,
-            &self.inventory,
-            &self.rlv,
-        );
+        let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
         self.commands.names_resolved(&found, &missing, live.as_mut(), now);
         self.recorder.names_resolved(found, missing, now);
     }
 
     /// A name lookup came to nothing.
     fn names_failed(&mut self, ids: &[Uuid], now: Instant) {
-        let mut live = live(
-            &mut self.session,
-            &self.search_url,
-            &self.avatar_searches,
-            &self.inventory,
-            &self.rlv,
-        );
+        let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
         self.commands.names_failed(ids, live.as_mut(), now);
         self.recorder.lookup_failed(ids);
     }
@@ -1619,25 +1612,13 @@ impl Bot {
                 self.after_forced(after, "the teleport failed", now);
             }
             SessionEvent::TeleportOffer { from, name, lure } => {
-                let mut live = live(
-                    &mut self.session,
-                    &self.search_url,
-                    &self.avatar_searches,
-                    &self.inventory,
-                    &self.rlv,
-                );
+                let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
                 self.commands.teleport_offer(from, &name, lure, live.as_mut(), now);
                 // One accepted by rule moves the avatar as a command does.
                 self.follow_commands();
             }
             SessionEvent::InventoryOffer(offer) => {
-                let mut live = live(
-                    &mut self.session,
-                    &self.search_url,
-                    &self.avatar_searches,
-                    &self.inventory,
-                    &self.rlv,
-                );
+                let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
                 self.commands.inventory_offer(offer, live.as_mut(), now);
             }
             SessionEvent::PermissionRequest {
@@ -1647,34 +1628,16 @@ impl Bot {
                 owner_name,
                 permissions,
             } => {
-                let mut live = live(
-                    &mut self.session,
-                    &self.search_url,
-                    &self.avatar_searches,
-                    &self.inventory,
-                    &self.rlv,
-                );
+                let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
                 self.commands
                     .permission_request(object, item, &object_name, &owner_name, permissions, live.as_mut(), now);
             }
             SessionEvent::ObjectOwner { object, owner, group } => {
-                let mut live = live(
-                    &mut self.session,
-                    &self.search_url,
-                    &self.avatar_searches,
-                    &self.inventory,
-                    &self.rlv,
-                );
+                let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
                 self.commands.object_owner(object, owner, group, live.as_mut(), now);
             }
             SessionEvent::TeleportRequested { from, name, text } => {
-                let mut live = live(
-                    &mut self.session,
-                    &self.search_url,
-                    &self.avatar_searches,
-                    &self.inventory,
-                    &self.rlv,
-                );
+                let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
                 self.commands.teleport_requested(from, &name, &text, live.as_mut(), now);
             }
             SessionEvent::Touched(object) => self.commands.touched(object),
@@ -1703,25 +1666,13 @@ impl Bot {
                 self.inventory.urls = Some(urls);
             }
             SessionEvent::Attached { item, point } => {
-                let mut live = live(
-                    &mut self.session,
-                    &self.search_url,
-                    &self.avatar_searches,
-                    &self.inventory,
-                    &self.rlv,
-                );
+                let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
                 if !self.commands.attached(item, point, live.as_mut(), now) {
                     info!("attachment: item {item} is on {}", inventory::point_name(point));
                 }
             }
             SessionEvent::Detached { item, point } => {
-                let mut live = live(
-                    &mut self.session,
-                    &self.search_url,
-                    &self.avatar_searches,
-                    &self.inventory,
-                    &self.rlv,
-                );
+                let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
                 if !self.commands.detached(item, live.as_mut(), now) {
                     info!("attachment: item {item} is gone from {}", inventory::point_name(point));
                 }
@@ -1749,9 +1700,18 @@ impl Bot {
                 if url.is_none() {
                     debug!("the simulator has no avatar search service");
                 }
-                self.search_url = url;
+                self.lookups.search_url = url;
             }
             SessionEvent::AvatarsFound { query, avatars } => self.avatars_found(query, &avatars, now),
+            SessionEvent::ProfilesUrl(url) => {
+                if url.is_none() {
+                    debug!("the simulator has no profile service");
+                }
+                self.lookups.profile_url = url;
+            }
+            SessionEvent::Profile(profile) => self.commands.profile_received(profile),
+            SessionEvent::FriendshipEnded(id) => info!("{id} ended the friendship with the avatar"),
+            SessionEvent::FriendshipBegun(id) => info!("{id} accepted the avatar's offer of friendship"),
             SessionEvent::LoggedOut => {
                 info!("logged out");
                 return Flow::Exit(EXIT_OK);
@@ -1949,17 +1909,13 @@ impl Bot {
             (Event::Caps { generation, event }, Some(session)) => session.handle_caps(generation, event, now),
             (Event::Names { found, missing }, _) => self.names_resolved(found, missing, now),
             (Event::NamesFailed(ids), _) => self.names_failed(&ids, now),
+            (Event::Profile { result: Ok(profile), .. }, _) => self.commands.profile_received(profile),
+            (Event::Profile { id, result: Err(reason) }, _) => self.commands.profile_failed(id, &reason),
             // An answer about another simulator's inventory service is of
             // no use: the commands that asked were told so.
             (Event::Inventory { generation, .. }, Some(session)) if generation != session.generation() => {}
             (Event::Inventory { id, result, .. }, _) => {
-                let mut live = live(
-                    &mut self.session,
-                    &self.search_url,
-                    &self.avatar_searches,
-                    &self.inventory,
-                    &self.rlv,
-                );
+                let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
                 self.commands.inventory_answer(id, result, live.as_mut(), now);
             }
             // Left over from a session that is already gone.
@@ -3021,16 +2977,187 @@ mod tests {
             "{line}"
         );
 
-        // It did not use up the override, and neither does one that is
-        // refused.
+        // It was the command the override let through, as any other is.
+        assert!(ok(&mut bot, "rlv\tstatus").starts_with("rlv: on\n"));
         assert!(refused(&mut bot, "scan\t-x").contains("`-x`"));
-        assert!(ok(&mut bot, "rlv\tstatus").starts_with("rlv: override\n"));
         // Nor did it move the avatar or change what the bot holds.
         assert!(!bot.reconciler.is_manual());
         assert_eq!(bot.book.held().to_string(), held);
         assert!(ok(&mut bot, "status").ends_with("mode: holding"));
         let calls = &bot.grid.as_ref().unwrap().calls;
         assert_eq!(calls[..], [commands::tests::Call::Reach(Some(20.0))]);
+    }
+
+    /// A bot with RLV on and a grid where Jane stands 5 metres from the
+    /// avatar and a sign of a group 3 metres away, the collar holding
+    /// `held` there.
+    fn among_others(held: &[&str]) -> Bot {
+        let mut bot = bot(full("rlv = true\n"));
+        let sign = Uuid::from_bytes([0x51; 16]);
+        let mut grid = commands::tests::FakeGrid {
+            position: Some([100.0, 100.0, 25.0]),
+            avatars: vec![avatars::Seen {
+                id: Uuid::from_bytes([1; 16]),
+                position: [105.0, 100.0],
+                height: Some(25.0),
+                hidden: false,
+            }],
+            friends: friends::Friends::new(&[(Uuid::from_bytes([1; 16]), friends::SEE_ONLINE)]),
+            ..commands::tests::FakeGrid::default()
+        };
+        grid.sightings = vec![scan::Sighting {
+            object: sign,
+            local_id: 700,
+            distance: 3.0,
+            flags: 0,
+            attachment: false,
+            child: false,
+            properties: Some(udp::messages::Properties {
+                object: sign,
+                owner: Uuid::from_bytes([1; 16]),
+                group: Uuid::nil(),
+                name: "Sign".to_string(),
+                description: String::new(),
+            }),
+        }];
+        let collar = rlv::Who::Object(Uuid::from_bytes([0xC0; 16]));
+        for text in held {
+            let (behaviour, option) = match text.split_once(':') {
+                Some((behaviour, option)) => (behaviour, Some(option)),
+                None => (*text, None),
+            };
+            grid.kept.set(collar, "Collar", behaviour, option);
+        }
+        bot.grid = Some(grid);
+        bot
+    }
+
+    /// Carries out `line` and answers it after the waits it has: the text,
+    /// or why it failed.
+    fn waited(bot: &mut Bot, line: &str) -> Result<Option<String>, String> {
+        let (reply, answer) = mpsc::channel();
+        let request = Request::decode(line.as_bytes()).unwrap();
+        assert!(matches!(bot.control(request, reply, Instant::now()), Flow::Continue));
+        if let Ok(response) = answer.try_recv() {
+            return match response {
+                Response::Ok(text) => Ok(text),
+                Response::Error(reason) => Err(reason),
+            };
+        }
+        // The profiles asked for come at once; names are never given.
+        let calls = std::mem::take(&mut bot.grid.as_mut().unwrap().calls);
+        for call in calls {
+            if let commands::tests::Call::Profile(id) = call {
+                let profile = profile::Profile {
+                    id,
+                    ..profile::tests::full()
+                };
+                bot.commands.profile_received(profile);
+            }
+        }
+        let later = Instant::now() + commands::SCAN_LIMIT + Duration::from_secs(1);
+        bot.scan_objects(later);
+        match answer.try_recv() {
+            Ok(Response::Ok(text)) => Ok(text),
+            Ok(Response::Error(reason)) => Err(reason),
+            Err(e) => panic!("{line}: no answer: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_avatars_reads_only() {
+        let mut bot = among_others(&[]);
+        bot.grid.as_mut().unwrap().sitting = Sitting::Object;
+        let held = bot.book.held().to_string();
+        let listed = waited(&mut bot, "scan\tavatars").unwrap().unwrap();
+        assert!(
+            listed.starts_with(&format!("{}\t5.0\t105,100,25\t", Uuid::from_bytes([1; 16]))),
+            "{listed}"
+        );
+        assert!(!bot.reconciler.is_manual());
+        assert_eq!(bot.book.held().to_string(), held);
+        assert!(ok(&mut bot, "status").ends_with("mode: holding"));
+        // No sit, no teleport, no object scan: nothing asked of the grid.
+        assert_eq!(bot.grid.as_ref().unwrap().calls, []);
+    }
+
+    #[test]
+    fn a_scan_under_an_override_is_held_to_nothing_and_uses_it_up() {
+        // Restrictions on scans.
+        let mut bot = among_others(&["shownames", "camdrawmax:10"]);
+        let grid = bot.grid.as_mut().unwrap();
+        let far = scan::Sighting {
+            distance: 20.0,
+            ..grid.sightings[0].clone()
+        };
+        grid.sightings.push(far);
+        ok(&mut bot, "rlv\tmode\toverride");
+        let listed = waited(&mut bot, "scan").unwrap().unwrap();
+        // The owner, and out to the object scan's distance.
+        assert!(listed.contains(&format!("\t{}\t?\tSign\t", Uuid::from_bytes([1; 16]))), "{listed}");
+        assert_eq!(listed.lines().count(), 2);
+        assert!(ok(&mut bot, "rlv\tstatus").starts_with("rlv: on\n"));
+        // The next one is held to them.
+        let listed = waited(&mut bot, "scan").unwrap().unwrap();
+        assert!(listed.contains("\t?\t?\tSign\t"), "{listed}");
+        assert_eq!(listed.lines().count(), 1);
+        // None on scans: used up all the same.
+        let mut bot = among_others(&["sendchat"]);
+        ok(&mut bot, "rlv\tmode\toverride");
+        waited(&mut bot, "scan").unwrap();
+        assert!(ok(&mut bot, "rlv\tstatus").starts_with("rlv: on\n"));
+    }
+
+    #[test]
+    fn scan_avatars_under_an_override_lets_one_through() {
+        let mut bot = among_others(&["shownearby", "shownames"]);
+        ok(&mut bot, "rlv\tmode\toverride");
+        let listed = waited(&mut bot, "scan\tavatars").unwrap().unwrap();
+        assert!(listed.starts_with(&Uuid::from_bytes([1; 16]).to_string()), "{listed}");
+        assert!(ok(&mut bot, "rlv\tstatus").starts_with("rlv: on\n"));
+        // Only one.
+        let reason = waited(&mut bot, "scan\tavatars").unwrap_err();
+        assert!(reason.contains("shownearby") && reason.contains("rlv mode override"), "{reason}");
+    }
+
+    #[test]
+    fn friends_and_profile_leave_an_override_alone() {
+        let mut bot = among_others(&["shownames", "shownearby", "showminimap"]);
+        ok(&mut bot, "rlv\tmode\toverride");
+        let listed = waited(&mut bot, "friends").unwrap().unwrap();
+        assert_eq!(listed, format!("{}\toffline\t?\t?", Uuid::from_bytes([1; 16])));
+        let profile = waited(&mut bot, &format!("profile\t{}", Uuid::from_bytes([1; 16])))
+            .unwrap()
+            .unwrap();
+        assert!(
+            profile.starts_with(&format!("id: {}\nonline: yes\nfriend: yes\n", Uuid::from_bytes([1; 16]))),
+            "{profile}"
+        );
+        assert!(ok(&mut bot, "rlv\tstatus").starts_with("rlv: override\n"));
+        assert!(ok(&mut bot, "status").ends_with("mode: holding"));
+        assert!(!bot.reconciler.is_manual());
+    }
+
+    #[test]
+    fn restrictions_on_scans_change_nothing_else() {
+        let mut bot = bot(full("rlv = true\n"));
+        let status = ok(&mut bot, "status");
+        ok(&mut bot, "rlv\tcmd\t@shownames=n,shownearby=n,showminimap=n");
+        assert_eq!(ok(&mut bot, "status"), status);
+        let jane = Uuid::from_bytes([2; 16]);
+        let said = session::Message {
+            kind: "say".to_string(),
+            source: session::Source::Avatar {
+                id: jane,
+                name: "Jane Doe".to_string(),
+            },
+            sent_at: None,
+            text: "hello".to_string(),
+        };
+        hear(&mut bot, SessionEvent::Chat(said));
+        let records = bot.recorder.flush_all(Instant::now());
+        assert_eq!(records.len(), 1);
+        assert_eq!((records[0].avatar_name.as_str(), records[0].avatar_uuid), ("Jane Doe", Some(jane)));
     }
 
     #[test]
@@ -4407,7 +4534,7 @@ mod tests {
                 self.next()
             }
 
-            fn from_owner(&mut self, to: &str, body: &str) -> Flow {
+            fn owner_sends(&mut self, to: &str, body: &str) -> Flow {
                 self.from(&format!("{OWNER}/phone"), to, body)
             }
 
@@ -4547,25 +4674,25 @@ mod tests {
         #[test]
         fn commands_are_answered_as_the_control_socket_answers_them() {
             let mut rig = Rig::connected(false);
-            rig.from_owner(DOMAIN, "status");
+            rig.owner_sends(DOMAIN, "status");
             assert_eq!(answer(&mut rig), rig.bot.status());
-            rig.from_owner(DOMAIN, "sit ground");
+            rig.owner_sends(DOMAIN, "sit ground");
             let reason = refused(&mut rig.bot, "sit\tground");
             assert_eq!(answer(&mut rig), format!("error: {reason}"));
-            rig.from_owner(DOMAIN, "im \"Jane Doe hi");
+            rig.owner_sends(DOMAIN, "im \"Jane Doe hi");
             let unclosed = answer(&mut rig);
             assert!(unclosed.starts_with("error: ") && unclosed.contains("quote"), "{unclosed}");
-            rig.from_owner(DOMAIN, "dance");
+            rig.owner_sends(DOMAIN, "dance");
             assert!(answer(&mut rig).starts_with("error: "));
-            rig.from_owner(DOMAIN, "");
+            rig.owner_sends(DOMAIN, "");
             assert!(answer(&mut rig).contains("help"));
-            rig.from_owner(DOMAIN, "help");
+            rig.owner_sends(DOMAIN, "help");
             assert!(answer(&mut rig).contains("\nim AVATAR MESSAGE...\n"));
-            rig.from_owner(DOMAIN, &"x".repeat(8193));
+            rig.owner_sends(DOMAIN, &"x".repeat(8193));
             assert!(answer(&mut rig).contains("8192"));
-            rig.from_owner(DOMAIN, "autoreply message back soon");
+            rig.owner_sends(DOMAIN, "autoreply message back soon");
             assert_eq!(answer(&mut rig), "autoreply: on, message: back soon");
-            rig.from_owner(DOMAIN, "autoreply off");
+            rig.owner_sends(DOMAIN, "autoreply off");
             assert_eq!(answer(&mut rig), "autoreply: off");
         }
 
@@ -4573,7 +4700,7 @@ mod tests {
         fn owners_messages_become_commands_ims_and_chat() {
             let mut rig = Rig::connected(true);
             // Name with a space: the answer comes once the name is found.
-            rig.from_owner(DOMAIN, "im \"Jane Doe\" see you later");
+            rig.owner_sends(DOMAIN, "im \"Jane Doe\" see you later");
             let query = rig.lookup();
             rig.bot.avatars_found(query, &[(jane(), "Jane Doe".into())], Instant::now());
             assert_eq!(rig.calls(), [Call::Im(jane(), "see you later".into())]);
@@ -4601,12 +4728,12 @@ mod tests {
             assert_eq!(rig.quiet(), "");
 
             // Reply to an avatar: the address stands for the UUID now.
-            rig.from_owner(&format!("jane.doe@{DOMAIN}"), "see you");
+            rig.owner_sends(&format!("jane.doe@{DOMAIN}"), "see you");
             assert_eq!(rig.calls(), [Call::Im(jane(), "see you".into())]);
             assert_eq!(rig.quiet(), "");
 
             // Unknown name.
-            rig.from_owner(&format!("no.body@{DOMAIN}"), "hi");
+            rig.owner_sends(&format!("no.body@{DOMAIN}"), "hi");
             let query = rig.lookup();
             rig.bot.avatars_found(query, &[], Instant::now());
             rig.next();
@@ -4622,7 +4749,7 @@ mod tests {
             assert_eq!(rig.calls(), []);
 
             // Reply to an object.
-            rig.from_owner(&format!("obj-{}@{DOMAIN}", collar()), "hi");
+            rig.owner_sends(&format!("obj-{}@{DOMAIN}", collar()), "hi");
             assert!(rig.fake.expect("</message>").contains("<feature-not-implemented "));
             assert_eq!(rig.calls(), []);
 
@@ -4635,9 +4762,9 @@ mod tests {
             assert_eq!(rig.quiet(), "");
 
             // Owner speaks in local chat, with the chat-bar forms.
-            rig.from_owner(&format!("local@{DOMAIN}"), "hello everyone");
-            rig.from_owner(&format!("local@{DOMAIN}"), "/shout come here");
-            rig.from_owner(&format!("local@{DOMAIN}"), "/7 open");
+            rig.owner_sends(&format!("local@{DOMAIN}"), "hello everyone");
+            rig.owner_sends(&format!("local@{DOMAIN}"), "/shout come here");
+            rig.owner_sends(&format!("local@{DOMAIN}"), "/7 open");
             assert_eq!(
                 rig.calls(),
                 [
@@ -4649,7 +4776,7 @@ mod tests {
             assert_eq!(rig.quiet(), "");
 
             // Too long.
-            rig.from_owner(&format!("local@{DOMAIN}"), &"x".repeat(2000));
+            rig.owner_sends(&format!("local@{DOMAIN}"), &"x".repeat(2000));
             assert!(rig.fake.expect("</message>").contains("<not-acceptable "));
             assert_eq!(rig.calls(), []);
         }
@@ -4660,9 +4787,9 @@ mod tests {
             rig.bot.names_resolved(vec![janes_names()], vec![], Instant::now());
             rig.heard(Channel::Im, from_jane("im", "hello"), vec![janes_names()]);
             rig.fake.expect("</message>");
-            rig.from_owner(DOMAIN, "tp 128 128 25 Home");
+            rig.owner_sends(DOMAIN, "tp 128 128 25 Home");
             assert!(matches!(&rig.calls()[..], [Call::Teleport(region, _)] if region == "Home"));
-            rig.from_owner(&format!("jane.doe@{DOMAIN}"), "hi");
+            rig.owner_sends(&format!("jane.doe@{DOMAIN}"), "hi");
             assert_eq!(rig.calls(), [Call::Im(jane(), "hi".into())]);
             assert_eq!(rig.quiet(), "", "no answer to the teleport yet");
             rig.bot.commands.arrived("Home");
@@ -4674,11 +4801,11 @@ mod tests {
         fn a_seventeenth_waiting_command_is_answered_as_busy() {
             let mut rig = Rig::connected(true);
             for n in 0..16 {
-                rig.from_owner(DOMAIN, &format!("im \"Name{n} Doe\" hi"));
+                rig.owner_sends(DOMAIN, &format!("im \"Name{n} Doe\" hi"));
                 rig.lookup();
             }
             assert_eq!(rig.bot.xmpp.as_ref().unwrap().waiting(), 16);
-            rig.from_owner(DOMAIN, "im \"Name16 Doe\" hi");
+            rig.owner_sends(DOMAIN, "im \"Name16 Doe\" hi");
             assert!(answer(&mut rig).starts_with("error: the bot is busy"));
             assert_eq!(rig.calls(), []);
         }
@@ -4794,7 +4921,7 @@ mod tests {
         #[test]
         fn quit_is_answered_before_the_addresses_go_offline() {
             let mut rig = Rig::connected(false);
-            assert!(matches!(rig.from_owner(DOMAIN, "quit"), Flow::Exit(EXIT_OK)));
+            assert!(matches!(rig.owner_sends(DOMAIN, "quit"), Flow::Exit(EXIT_OK)));
             // As the main loop would before it ends.
             rig.bot.xmpp_presence();
             rig.bot.flush_messages();

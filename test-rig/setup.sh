@@ -60,8 +60,10 @@ fi
 bin=$sim/bin
 if [ ! -f "$bin/OpenSim.ini" ]; then
     # Standalone architecture is already the uncommented default in the
-    # example; add a default estate so the first start asks no questions.
+    # example; add a default estate so the first start asks no questions,
+    # and the profile service, without which nothing answers for profiles.
     sed -e 's|^ *; DefaultEstateName = .*|    DefaultEstateName = Rig Estate|' \
+        -e 's|^ *;; ProfileServiceURL = |  ProfileServiceURL = |' \
         -e 's|^ *; DefaultEstateOwnerName = .*|    DefaultEstateOwnerName = Rig Owner|' \
         -e 's|^ *; DefaultEstateOwnerUUID = .*|    DefaultEstateOwnerUUID = 7e570000-0000-4000-8000-0000000000aa|' \
         -e 's|^ *; DefaultEstateOwnerEMail = .*|    DefaultEstateOwnerEMail = owner@example.com|' \
@@ -69,8 +71,10 @@ if [ ! -f "$bin/OpenSim.ini" ]; then
         "$bin/OpenSim.ini.example" > "$bin/OpenSim.ini"
 fi
 if [ ! -f "$bin/config-include/StandaloneCommon.ini" ]; then
-    # Logins that cannot be placed where they ask go to "Home".
+    # Logins that cannot be placed where they ask go to "Home"; the local
+    # profile service is on (the first `Enabled = false` is its section's).
     sed -e 's|^ *Region_Welcome_Area = .*|    Region_Home = "DefaultRegion, FallbackRegion"|' \
+        -e '/^\[UserProfilesService\]/,/^ *Enabled/s|Enabled = false|Enabled = true|' \
         "$bin/config-include/StandaloneCommon.ini.example" > "$bin/config-include/StandaloneCommon.ini"
 fi
 cp "$rig/config/Regions.ini" "$bin/Regions/Regions.ini"

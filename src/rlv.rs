@@ -257,6 +257,13 @@ const ENFORCED: &[&str] = &[
     "acceptpermission",
     "denypermission",
     "showinv",
+    "shownames",
+    "shownames_sec",
+    "shownametags",
+    "shownearby",
+    "showminimap",
+    "camdrawmax",
+    "camdrawalphamax",
     "permissive",
 ];
 
@@ -275,9 +282,7 @@ const KEPT: &[&str] = &[
     "camdistmin",
     "setcam_avdistmin",
     "camdrawmin",
-    "camdrawmax",
     "camdrawalphamin",
-    "camdrawalphamax",
     "camdrawcolor",
     "camunlock",
     "setcam_unlock",
@@ -317,12 +322,7 @@ const KEPT: &[&str] = &[
     "attachthis_except",
     "attachallthis_except",
     "showworldmap",
-    "showminimap",
     "showloc",
-    "shownames",
-    "shownames_sec",
-    "shownametags",
-    "shownearby",
     "showhovertextall",
     "showhovertext",
     "showhovertexthud",
@@ -996,6 +996,49 @@ impl<'a> Limits<'a> {
 
     pub fn inventory(&self) -> Result<(), Refusal> {
         Limits::ok(self.in_force("showinv"))
+    }
+
+    /// Whether who `avatar` is is hidden from the scans: `shownames` or
+    /// `shownametags` is in force against it, each with its own
+    /// exceptions. The bot's own avatar is the caller's to leave out.
+    pub fn hides(&self, avatar: Uuid) -> bool {
+        let avatar = Target::Id(avatar);
+        self.against("shownames", avatar).is_some() || self.against("shownametags", avatar).is_some()
+    }
+
+    /// A restriction that hides names at all: `scan -o` is refused under it.
+    pub fn names_hidden(&self) -> Option<Refusal> {
+        ["shownames", "shownames_sec", "shownametags"]
+            .iter()
+            .find_map(|behaviour| self.in_force(behaviour))
+    }
+
+    /// `scan avatars`: the list of the avatars nearby.
+    pub fn nearby(&self) -> Result<(), Refusal> {
+        Limits::ok(self.in_force("shownearby"))
+    }
+
+    /// Whether `showminimap` hides where avatars are.
+    pub fn minimap(&self) -> bool {
+        self.in_force("showminimap").is_some()
+    }
+
+    /// How far the avatar sees, in metres: the smallest distance of the
+    /// `camdrawmax` restrictions, while the fog is opaque, which a largest
+    /// `camdrawalphamax` below 0.99 undoes. `None` for no limit.
+    pub fn vision(&self) -> Option<f32> {
+        let values = |behaviour: &'static str| {
+            self.holders()
+                .flat_map(|holder| &holder.rules)
+                .filter(move |rule| rule.behaviour == behaviour)
+                .filter_map(|rule| rule.option.as_deref()?.trim().parse::<f32>().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+        };
+        let limit = values("camdrawmax").reduce(f32::min)?;
+        match values("camdrawalphamax").reduce(f32::max) {
+            Some(alpha) if alpha < 0.99 => None,
+            _ => Some(limit),
+        }
     }
 
     /// Touching `thing`.
@@ -2562,7 +2605,7 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), count, "a behaviour is listed twice");
-        assert_eq!((ENFORCED.len(), KEPT.len()), (49, 68));
+        assert_eq!((ENFORCED.len(), KEPT.len()), (56, 61));
         for behaviour in [
             "sendchat",
             "unsit",
@@ -3686,5 +3729,116 @@ mod tests {
         // What nothing forbids is not "let through".
         assert_eq!(own_step(Limits::none(), Sitting::No, teleport, both), Verdict::Go);
         assert_eq!((teleport.sort(), seat.sort(), OwnStep::Stand.sort()), ("tp", "sit", "sit"));
+    }
+
+    #[test]
+    fn the_vision_limit() {
+        // The smallest of two.
+        let mut store = holding(&[(holder(COLLAR), "camdrawmax:25"), (holder(CUFF), "camdrawmax:10")]);
+        assert_eq!(limits(&store).vision(), Some(10.0));
+        assert!(store.lift(holder(CUFF), "camdrawmax", Some("10")));
+        assert_eq!(limits(&store).vision(), Some(25.0));
+        // Thin fog lets the avatar see.
+        let mut store = holding(&[(holder(CUFF), "camdrawmax:10"), (holder(CUFF), "camdrawalphamax:0.5")]);
+        assert_eq!(limits(&store).vision(), None);
+        // Unless a thick one is held too.
+        hold(&mut store, holder(COLLAR), "camdrawalphamax:1");
+        assert_eq!(limits(&store).vision(), Some(10.0));
+        // Without a distance, no limit.
+        for text in ["camdrawmax", "camdrawmax:far"] {
+            assert_eq!(limits(&collared(&[text])).vision(), None, "{text}");
+        }
+        // Other camera restrictions change nothing.
+        assert_eq!(limits(&collared(&["camdrawmin:5", "camdrawalphamin:0.2"])).vision(), None);
+        assert_eq!(Limits::none().vision(), None);
+    }
+
+    #[test]
+    fn avatars_hidden_from_the_scans() {
+        let (jane, john) = (id(1), id(2));
+        let store = collared(&["shownames"]);
+        assert!(limits(&store).hides(jane) && limits(&store).hides(john));
+        assert_eq!(limits(&store).names_hidden().unwrap().rule, "shownames");
+        assert_eq!(limits(&collared(&["shownametags"])).names_hidden().unwrap().rule, "shownametags");
+        assert!(limits(&collared(&["shownametags"])).hides(jane));
+        // An exception shows that avatar, and `-o` stays refused.
+        let excepted = format!("shownames:{jane}");
+        let store = collared(&["shownames", &excepted]);
+        assert!(!limits(&store).hides(jane) && limits(&store).hides(john));
+        assert!(limits(&store).names_hidden().is_some());
+        // An exception of one restriction does not except from the other.
+        let store = collared(&["shownames", "shownametags", &excepted]);
+        assert!(limits(&store).hides(jane));
+        // The secure form needs its holder's own exception.
+        let mut store = holding(&[(holder(COLLAR), "shownames_sec"), (holder(CUFF), &excepted)]);
+        assert!(limits(&store).hides(jane));
+        assert_eq!(limits(&store).names_hidden().unwrap().rule, "shownames_sec");
+        hold(&mut store, holder(COLLAR), &excepted);
+        assert!(!limits(&store).hides(jane));
+        // Nothing hides without RLV, or for an exempt command.
+        for free in [Limits::new(None, None), Limits::none()] {
+            assert!(!free.hides(jane) && free.names_hidden().is_none());
+            assert!(free.nearby().is_ok() && !free.minimap() && free.vision().is_none());
+        }
+    }
+
+    #[test]
+    fn the_nearby_list_and_the_minimap() {
+        let store = collared(&["shownearby"]);
+        assert_eq!(rule(limits(&store).nearby()), "shownearby");
+        assert!(!limits(&store).minimap() && !limits(&store).hides(id(1)));
+        let store = collared(&["showminimap"]);
+        assert!(limits(&store).minimap() && limits(&store).nearby().is_ok());
+    }
+
+    #[test]
+    fn restrictions_on_the_scans_have_an_effect() {
+        let store = collared(&[
+            "shownames",
+            "shownames_sec",
+            "shownametags",
+            "shownearby",
+            "showminimap",
+            "camdrawmax:10",
+            "camdrawalphamax:1",
+            "camdrawmin:1",
+            "showloc",
+        ]);
+        let lines = store.lines();
+        let effectless: Vec<&String> = lines.iter().filter(|line| line.ends_with("(no effect)")).collect();
+        let collar = id(COLLAR);
+        assert_eq!(
+            effectless,
+            [
+                &format!("Collar <{collar}>: camdrawmin:1 (no effect)"),
+                &format!("Collar <{collar}>: showloc (no effect)")
+            ]
+        );
+        for behaviour in [
+            "shownames",
+            "shownames_sec",
+            "shownametags",
+            "shownearby",
+            "showminimap",
+            "camdrawmax",
+            "camdrawalphamax",
+        ] {
+            assert_eq!(effect(behaviour), Some(Effect::Enforced), "{behaviour}");
+        }
+    }
+
+    #[test]
+    fn the_readme_lists_the_restrictions_with_an_effect() {
+        let readme = include_str!("../README.md");
+        let start = readme.find("These restrictions have an effect:").unwrap();
+        let end = start + readme[start..].find("A few notes on these.").unwrap();
+        let table = &readme[start..end];
+        let named = |behaviour: &str| table.contains(&format!("`{behaviour}`")) || table.contains(&format!("`{behaviour}:"));
+        for behaviour in ENFORCED {
+            assert!(named(behaviour), "{behaviour} is not in the README's table");
+        }
+        for behaviour in KEPT {
+            assert!(!named(behaviour), "{behaviour} is in the README's table");
+        }
     }
 }

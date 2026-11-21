@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 const EVENT_QUEUE: &str = "EventQueueGet";
 const DISPLAY_NAMES: &str = "GetDisplayNames";
 const AVATAR_SEARCH: &str = "AvatarPickerSearch";
+const AGENT_PROFILE: &str = "AgentProfile";
 const FETCH_DESCENDENTS: &str = "FetchInventoryDescendents2";
 const FETCH_ITEMS: &str = "FetchInventory2";
 const INVENTORY_API: &str = "InventoryAPIv3";
@@ -56,8 +57,11 @@ pub enum CapsEvent {
     /// The simulator's avatar search URL, or that it has none. Sent once,
     /// after `DisplayNames`.
     AvatarSearch(Option<String>),
+    /// The simulator's profile service URL, or that it has none. Sent once,
+    /// after `AvatarSearch`.
+    Profiles(Option<String>),
     /// The simulator's inventory services, as far as it has them. Sent
-    /// once, after `AvatarSearch`.
+    /// once, after `Profiles`.
     Inventory(InventoryUrls),
 }
 
@@ -89,6 +93,7 @@ pub struct Seed {
     pub event_queue: String,
     pub display_names: Option<String>,
     pub avatar_search: Option<String>,
+    pub profiles: Option<String>,
     pub inventory: InventoryUrls,
 }
 
@@ -97,6 +102,7 @@ pub fn seed_request() -> String {
         EVENT_QUEUE,
         DISPLAY_NAMES,
         AVATAR_SEARCH,
+        AGENT_PROFILE,
         FETCH_DESCENDENTS,
         FETCH_ITEMS,
         INVENTORY_API,
@@ -114,6 +120,7 @@ pub fn parse_seed_reply(body: &str) -> Result<Seed, String> {
             event_queue,
             display_names: url(DISPLAY_NAMES),
             avatar_search: url(AVATAR_SEARCH),
+            profiles: url(AGENT_PROFILE),
             inventory: InventoryUrls {
                 descendents: url(FETCH_DESCENDENTS),
                 items: url(FETCH_ITEMS),
@@ -244,6 +251,7 @@ pub fn run(seed_capability: &str, stop: &AtomicBool, mut emit: impl FnMut(CapsEv
                     let found = [
                         CapsEvent::DisplayNames(seed.display_names),
                         CapsEvent::AvatarSearch(seed.avatar_search),
+                        CapsEvent::Profiles(seed.profiles),
                         CapsEvent::Inventory(seed.inventory),
                     ];
                     for event in found {
@@ -324,7 +332,7 @@ mod tests {
     fn seed_request_asks_for_the_event_queue() {
         assert!(seed_request().ends_with(
             "<llsd><array><string>EventQueueGet</string><string>GetDisplayNames</string>\
-             <string>AvatarPickerSearch</string><string>FetchInventoryDescendents2</string>\
+             <string>AvatarPickerSearch</string><string>AgentProfile</string><string>FetchInventoryDescendents2</string>\
              <string>FetchInventory2</string><string>InventoryAPIv3</string>\
              <string>UpdateAvatarAppearance</string></array></llsd>"
         ));
@@ -386,6 +394,19 @@ mod tests {
         assert_eq!(seed.display_names.as_deref(), Some("http://127.0.0.1:9000/CAPS/names/"));
         assert!(parse_seed_reply("<llsd><map></map></llsd>").is_err());
         assert!(parse_seed_reply("oops").is_err());
+    }
+
+    #[test]
+    fn seed_reply_may_carry_the_profile_service() {
+        let bare = "<llsd><map><key>EventQueueGet</key>\
+                    <string>http://127.0.0.1:9000/CAPS/EQG/abc/</string></map></llsd>";
+        assert_eq!(parse_seed_reply(bare).unwrap().profiles, None);
+        let with = |url: &str| bare.replace("</map>", &format!("<key>AgentProfile</key><string>{url}</string></map>"));
+        let seed = parse_seed_reply(&with("https://example.com/cap/profile")).unwrap();
+        assert_eq!(seed.profiles.as_deref(), Some("https://example.com/cap/profile"));
+        // An empty URL is none.
+        assert_eq!(parse_seed_reply(&with("")).unwrap().profiles, None);
+        assert!(seed_request().contains("<string>AgentProfile</string>"));
     }
 
     #[test]

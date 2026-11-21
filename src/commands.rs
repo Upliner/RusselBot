@@ -4,12 +4,15 @@
 //! inventory, and the ones waiting for a lookup, for the inventory or for
 //! the simulator to say how they ended.
 
+use crate::avatars::{self, Seen};
 use crate::config::DEFAULT_REQUESTTP_TIMEOUT;
 use crate::control::{PermsRequest, Request, Response};
+use crate::friends::Friends;
 use crate::inventory::{self, Clothes, Entry, Failed, Item, ListArgs, Outcome, Removal, What};
 use crate::names::Names;
 use crate::perms::{self, Ask, Kind, Owner, Rules};
 use crate::persist::{Location, SitState};
+use crate::profile::{self, Profile};
 use crate::reconciler::same_region;
 use crate::rlv::{Check, Limits, Refusal, Restrictions, Sitting, Who};
 use crate::scan::{self, Query, Sighting};
@@ -311,6 +314,20 @@ pub trait Grid {
     fn ask_properties(&mut self, local_ids: &[u32], now: Instant);
     /// When the objects around the avatar count as all described.
     fn settled_at(&self) -> Instant;
+    /// Whether the avatar is in a region and not on its way out of it.
+    fn present(&self) -> Result<(), String>;
+    /// The bot's own avatar.
+    fn own_id(&self) -> Uuid;
+    /// The other avatars in the region, as far as the simulator has told.
+    fn avatars(&self) -> Vec<Seen>;
+    /// Whether the simulator has said who is in the region since the
+    /// avatar entered it.
+    fn avatars_known(&self) -> bool;
+    /// The avatar's friends and who of them is online.
+    fn friends(&self) -> &Friends;
+    /// Asks the grid for the profile of `avatar`; the answer comes as
+    /// `Commands::profile_received` or `profile_failed`.
+    fn ask_profile(&mut self, avatar: Uuid, now: Instant) -> Result<(), String>;
 }
 
 /// A `scan` command waiting for the simulator to describe and name the
@@ -319,10 +336,43 @@ struct Scanning {
     query: Query,
     /// How far it lists, in metres.
     distance: f32,
+    /// The vision limit it was cut to, when it was.
+    cut: Option<f32>,
+    /// Whose command it is: the restrictions it is held to at answer time.
+    origin: Origin,
     /// Its arguments, for the operator log.
     args: String,
     reply: Sender<Response>,
     /// When it is answered with what is known.
+    deadline: Instant,
+}
+
+/// A `scan avatars` command waiting for the simulator's list of the
+/// avatars in the region and for their names.
+struct AvatarScan {
+    /// How far it lists, in metres; everyone in the region when left out.
+    distance: Option<f32>,
+    /// Its arguments, for the operator log.
+    args: String,
+    origin: Origin,
+    reply: Sender<Response>,
+    /// When it is answered with what is known.
+    deadline: Instant,
+}
+
+/// A `friends` command waiting for its friends' names.
+struct FriendsWait {
+    reply: Sender<Response>,
+    deadline: Instant,
+}
+
+/// A `profile` command waiting for the grid's answer and the names.
+struct ProfileWait {
+    id: Uuid,
+    /// The name it was resolved by, if it was.
+    name: String,
+    profile: Option<Profile>,
+    reply: Sender<Response>,
     deadline: Instant,
 }
 
@@ -483,6 +533,7 @@ enum After {
     Im(String),
     RequestTp(String),
     SendTp(String),
+    Profile,
 }
 
 impl After {
@@ -491,6 +542,7 @@ impl After {
             After::Im(_) => "im",
             After::RequestTp(_) => "requesttp",
             After::SendTp(_) => "sendtp",
+            After::Profile => "profile",
         }
     }
 }
@@ -583,10 +635,17 @@ pub struct Commands {
     /// looked at.
     scanning: Vec<Scanning>,
     scan_poll: Option<Instant>,
-    /// The names of the owners of scanned objects: `None` for one the
-    /// name service did not name. Kept from scan to scan when known.
-    owners: HashMap<Uuid, Option<String>>,
-    /// The owners whose names the name service has been or will be asked.
+    /// `scan avatars`, `friends` and `profile` commands waiting; looked at
+    /// with the scans.
+    avatar_scans: Vec<AvatarScan>,
+    friend_lists: Vec<FriendsWait>,
+    profiles: Vec<ProfileWait>,
+    /// The names of the avatars the listings name: owners of scanned
+    /// objects, avatars in the region, friends, profiles. `None` for one
+    /// the name service did not name. Kept from listing to listing when
+    /// known.
+    owners: HashMap<Uuid, Option<Names>>,
+    /// The avatars whose names the name service has been or will be asked.
     owner_lookups: HashSet<Uuid>,
     /// Whose command is being carried out.
     origin: Origin,
@@ -659,6 +718,9 @@ impl Commands {
             looking: Vec::new(),
             scanning: Vec::new(),
             scan_poll: None,
+            avatar_scans: Vec::new(),
+            friend_lists: Vec::new(),
+            profiles: Vec::new(),
             owners: HashMap::new(),
             owner_lookups: HashSet::new(),
             origin: Origin::Operator,
@@ -746,6 +808,8 @@ impl Commands {
             }
             Request::Touch(object) => self.touch(&object, &reply, grid, now),
             Request::Scan(args) => self.scan(&args, &reply, grid, now),
+            Request::Friends => self.friends(&reply, grid, now),
+            Request::Profile(avatar) => self.with_avatar(&avatar, After::Profile, &reply, grid, now),
             Request::Persist { .. } | Request::Home | Request::Status | Request::Rlv(_) | Request::Autoreply(_) | Request::Quit => {
                 Err("not a command for the grid".to_string())
             }
@@ -1016,17 +1080,88 @@ impl Commands {
     /// `scan`: lists the objects around the avatar once the simulator
     /// has described and named them (see `scans_due`).
     fn scan<G: Grid>(&mut self, args: &[String], reply: &Sender<Response>, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
-        let query = Query::parse(args)?;
-        let distance = grid.ok_or(NOT_CONNECTED)?.reach(query.distance, now)?;
+        let query = match scan::Command::parse(args)? {
+            scan::Command::Objects(query) => query,
+            scan::Command::Avatars(distance) => return self.scan_avatars(distance, args, reply, grid, now),
+        };
+        let grid = grid.ok_or(NOT_CONNECTED)?;
+        let limits = self.limits(&*grid);
+        if let (Some(_), Some(refusal)) = (&query.owner, limits.names_hidden()) {
+            return Err(self.refused(refusal));
+        }
+        // The object scan reaches no further than the avatar sees.
+        let vision = limits.vision();
+        let asked = match (query.distance, vision) {
+            (Some(distance), Some(vision)) => Some(distance.min(vision)),
+            (distance, _) => distance,
+        };
+        let reach = grid.reach(asked, now)?;
+        let cut = vision.filter(|vision| query.distance.unwrap_or(reach) > *vision);
         self.scanning.push(Scanning {
             query,
-            distance,
+            distance: cut.map_or(reach, |vision| reach.min(vision)),
+            cut,
+            origin: self.origin,
             args: args.join(" "),
             reply: reply.clone(),
             deadline: now + SCAN_LIMIT,
         });
         self.scan_poll = Some(now);
         Ok(Done::Parked)
+    }
+
+    /// `scan avatars`: lists the avatars in the region once the simulator
+    /// has said who is there and they are named (see `scans_due`). It asks
+    /// the simulator nothing.
+    fn scan_avatars<G: Grid>(
+        &mut self,
+        distance: Option<f32>,
+        args: &[String],
+        reply: &Sender<Response>,
+        grid: Option<&mut G>,
+        now: Instant,
+    ) -> Result<Done, String> {
+        let grid = grid.ok_or(NOT_CONNECTED)?;
+        grid.present()?;
+        self.limits(&*grid).nearby().map_err(|refusal| self.refused(refusal))?;
+        self.avatar_scans.push(AvatarScan {
+            distance,
+            args: args.join(" "),
+            origin: self.origin,
+            reply: reply.clone(),
+            deadline: now + LOOKUP_LIMIT,
+        });
+        self.scan_poll = Some(now);
+        Ok(Done::Parked)
+    }
+
+    /// `friends`: lists the avatar's friends once they are named.
+    fn friends<G: Grid>(&mut self, reply: &Sender<Response>, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
+        grid.ok_or(NOT_CONNECTED)?.present()?;
+        self.friend_lists.push(FriendsWait {
+            reply: reply.clone(),
+            deadline: now + LOOKUP_LIMIT,
+        });
+        self.scan_poll = Some(now);
+        Ok(Done::Parked)
+    }
+
+    /// Whether the name of `id` is known, or known to be unknown; if not,
+    /// it is asked for, once.
+    fn named(&mut self, id: Uuid) -> bool {
+        if self.owners.contains_key(&id) {
+            return true;
+        }
+        if self.owner_lookups.insert(id) {
+            self.wanted_names.push(id);
+        }
+        false
+    }
+
+    /// The owners' legacy names, as the object scan takes them.
+    fn legacy_names(&self) -> HashMap<Uuid, Option<String>> {
+        let legacy = |names: &Option<Names>| names.as_ref().map(|names| names.legacy.clone());
+        self.owners.iter().map(|(id, names)| (*id, legacy(names))).collect()
     }
 
     /// Looks at the `scan` commands that wait: asks the simulator for the
@@ -1043,17 +1178,20 @@ impl Commands {
         }
         let sightings = grid.sightings();
         let settled = now >= grid.settled_at();
+        let own = grid.own_id();
         for scan in std::mem::take(&mut self.scanning) {
             let reachable: Vec<&Sighting> = sightings.iter().filter(|s| scan.query.reachable(s, scan.distance)).collect();
             let unnamed: Vec<u32> = reachable.iter().filter(|s| s.properties.is_none()).map(|s| s.local_id).collect();
             grid.ask_properties(&unnamed, now);
+            let limits = scan.origin.limits(grid.restrictions());
+            let hides = |owner: &Uuid| *owner != own && limits.hides(*owner);
             let mut nameless = 0;
+            let mut hidden = HashSet::new();
             for owner in reachable.iter().filter_map(|s| scan.query.owner_wanted(s)) {
-                if !self.owners.contains_key(&owner) {
+                if hides(&owner) {
+                    hidden.insert(owner);
+                } else if !self.named(owner) {
                     nameless += 1;
-                    if self.owner_lookups.insert(owner) {
-                        self.wanted_names.push(owner);
-                    }
                 }
             }
             let complete = settled && unnamed.is_empty() && nameless == 0;
@@ -1061,11 +1199,11 @@ impl Commands {
                 self.scanning.push(scan);
                 continue;
             }
-            let listed: Vec<Sighting> = reachable
-                .into_iter()
-                .filter(|s| scan.query.matches(s, &self.owners))
-                .cloned()
-                .collect();
+            // Owners the name filter left out may be hidden too.
+            let owned = reachable.iter().filter_map(|s| s.properties.as_ref()).map(scan::owner);
+            hidden.extend(owned.filter(|(owner, group)| !group && hides(owner)).map(|(owner, _)| owner));
+            let legacy = self.legacy_names();
+            let listed: Vec<Sighting> = reachable.into_iter().filter(|s| scan.query.matches(s, &legacy)).cloned().collect();
             let count = listed.len();
             let short = match complete {
                 true => String::new(),
@@ -1080,14 +1218,27 @@ impl Commands {
             } else {
                 format!(" {}", scan.args)
             };
-            crate::info!("{CONTROL}: scan{given}: {count} listed within {} m{short}", scan.distance);
+            let cut = match scan.cut {
+                Some(vision) => format!(", cut to {vision} m by camdrawmax"),
+                None => String::new(),
+            };
+            self.tell(format!(
+                "{}: scan{given}: {count} listed within {} m{cut}{short}",
+                scan.origin.tag(),
+                scan.distance
+            ));
             // The client may have gone away; the scan is done either way.
-            let _ = scan.reply.send(Response::Ok(scan::listing(listed, &self.owners)));
+            let _ = scan.reply.send(Response::Ok(scan::listing(listed, &legacy, &hidden)));
         }
-        self.scan_poll = (!self.scanning.is_empty()).then(|| now + SCAN_POLL);
-        if self.scanning.is_empty() {
-            // An owner the name service did not name is asked for again
-            // by the next scan.
+        self.avatar_scans_due(grid, now);
+        self.friends_due(grid, now);
+        self.profiles_due(grid, now);
+        let waiting =
+            !self.scanning.is_empty() || !self.avatar_scans.is_empty() || !self.friend_lists.is_empty() || !self.profiles.is_empty();
+        self.scan_poll = waiting.then(|| now + SCAN_POLL);
+        if !waiting {
+            // An avatar the name service did not name is asked for again
+            // by the next listing.
             self.owners.retain(|_, name| name.is_some());
             if self.owners.len() > MAX_OWNER_NAMES {
                 self.owners.clear();
@@ -1095,19 +1246,160 @@ impl Commands {
         }
     }
 
+    /// Answers the `scan avatars` commands whose list and names are there,
+    /// or whose time is up.
+    fn avatar_scans_due<G: Grid>(&mut self, grid: &mut G, now: Instant) {
+        if self.avatar_scans.is_empty() {
+            return;
+        }
+        let Some(from) = grid.position() else {
+            return self.fail_avatar_scans(NOT_CONNECTED);
+        };
+        let known = grid.avatars_known();
+        let everyone = grid.avatars();
+        for scan in std::mem::take(&mut self.avatar_scans) {
+            let limits = scan.origin.limits(grid.restrictions());
+            let mut listed: Vec<Seen> = everyone
+                .iter()
+                .filter(|seen| scan.distance.is_none_or(|distance| seen.within(from, distance)))
+                .cloned()
+                .collect();
+            let mut nameless = 0;
+            for seen in &mut listed {
+                seen.hidden = limits.hides(seen.id);
+                if !seen.hidden && !self.named(seen.id) {
+                    nameless += 1;
+                }
+            }
+            let complete = known && nameless == 0;
+            if !complete && now < scan.deadline {
+                self.avatar_scans.push(scan);
+                continue;
+            }
+            let given = match scan.args.is_empty() {
+                true => String::new(),
+                false => format!(" {}", scan.args),
+            };
+            let short = match complete {
+                true => String::new(),
+                false if !known => format!("; the simulator did not list the region's avatars in {} s", LOOKUP_LIMIT.as_secs()),
+                false => format!("; {nameless} without a name after {} s", LOOKUP_LIMIT.as_secs()),
+            };
+            self.tell(format!("{}: scan{given}: {} listed{short}", scan.origin.tag(), listed.len()));
+            let text = avatars::listing(&listed, from, &self.owners, limits.minimap());
+            let _ = scan.reply.send(Response::Ok(text));
+        }
+    }
+
+    /// Answers the `friends` commands whose friends are all named, or
+    /// whose time is up.
+    fn friends_due<G: Grid>(&mut self, grid: &mut G, now: Instant) {
+        if self.friend_lists.is_empty() {
+            return;
+        }
+        let friends = grid.friends().clone();
+        let mut nameless = 0;
+        for id in friends.ids() {
+            if !self.named(id) {
+                nameless += 1;
+            }
+        }
+        for wait in std::mem::take(&mut self.friend_lists) {
+            if nameless > 0 && now < wait.deadline {
+                self.friend_lists.push(wait);
+                continue;
+            }
+            let short = match nameless {
+                0 => String::new(),
+                _ => format!("; {nameless} without a name after {} s", LOOKUP_LIMIT.as_secs()),
+            };
+            self.tell(format!(
+                "{CONTROL}: friends: {} listed, {} online{short}",
+                friends.len(),
+                friends.online_count()
+            ));
+            let _ = wait.reply.send(Response::Ok(friends.listing(&self.owners)));
+        }
+    }
+
+    /// Answers the `profile` commands whose profile has come and whose
+    /// names are known, and those whose time is up.
+    fn profiles_due<G: Grid>(&mut self, grid: &mut G, now: Instant) {
+        for wait in std::mem::take(&mut self.profiles) {
+            let named = self.owners.contains_key(&wait.id);
+            let late = now >= wait.deadline;
+            let who = match self.owners.get(&wait.id) {
+                Some(Some(names)) => whom(wait.id, &names.legacy),
+                _ => whom(wait.id, &wait.name),
+            };
+            match &wait.profile {
+                Some(profile) if named || late => {
+                    let names = self.owners.get(&wait.id).and_then(Option::as_ref);
+                    let friends = grid.friends();
+                    let text = profile::text(profile, names, friends.is_friend(wait.id), friends.sees_online(wait.id));
+                    self.tell(format!("{CONTROL}: profile of {who}"));
+                    let _ = wait.reply.send(Response::Ok(Some(text)));
+                }
+                None if late => {
+                    let reason = format!(
+                        "the grid did not answer for the profile of {who} within {} s",
+                        LOOKUP_LIMIT.as_secs()
+                    );
+                    refuse(CONTROL, "profile", &wait.reply, reason);
+                }
+                _ => self.profiles.push(wait),
+            }
+        }
+    }
+
+    /// The grid answered for a profile.
+    pub fn profile_received(&mut self, profile: Profile) {
+        for wait in self
+            .profiles
+            .iter_mut()
+            .filter(|wait| wait.id == profile.id && wait.profile.is_none())
+        {
+            wait.profile = Some(profile.clone());
+        }
+    }
+
+    /// The grid's profile service could not answer for `id`.
+    pub fn profile_failed(&mut self, id: Uuid, reason: &str) {
+        let (failed, waiting) = std::mem::take(&mut self.profiles)
+            .into_iter()
+            .partition(|wait| wait.id == id && wait.profile.is_none());
+        self.profiles = waiting;
+        for wait in failed {
+            refuse(CONTROL, "profile", &wait.reply, reason.to_string());
+        }
+    }
+
+    /// Answers the `scan avatars` commands that wait with an error.
+    fn fail_avatar_scans(&mut self, reason: &str) {
+        for scan in std::mem::take(&mut self.avatar_scans) {
+            refuse(scan.origin.tag(), "scan", &scan.reply, reason.to_string());
+        }
+    }
+
     /// Answers the `scan` commands that wait with an error.
     fn fail_scans(&mut self, reason: &str) {
         for scan in std::mem::take(&mut self.scanning) {
-            refuse(CONTROL, "scan", &scan.reply, reason.to_string());
+            refuse(scan.origin.tag(), "scan", &scan.reply, reason.to_string());
         }
-        self.scan_poll = None;
+        self.fail_avatar_scans(reason);
+        for wait in std::mem::take(&mut self.profiles) {
+            refuse(CONTROL, "profile", &wait.reply, reason.to_string());
+        }
+        if self.friend_lists.is_empty() {
+            self.scan_poll = None;
+        }
     }
 
-    /// The name service answered for an owner of scanned objects, with a
-    /// name or without one.
-    fn owner_named(&mut self, id: Uuid, name: Option<&str>) {
+    /// The name service answered for an avatar a listing named, with
+    /// names or without.
+    fn owner_named(&mut self, id: Uuid, names: Option<&Names>) {
         if self.owner_lookups.remove(&id) {
-            self.owners.insert(id, name.map(str::to_string));
+            self.owners.insert(id, names.cloned());
         }
     }
 
@@ -1818,11 +2110,11 @@ impl Commands {
         let recipient = parse_recipient(to)?;
         let grid = grid.ok_or(NOT_CONNECTED)?;
         let name = match recipient {
-            Recipient::Id(id) => return self.act(grid, id, String::new(), then, now),
+            Recipient::Id(id) => return self.act(grid, id, String::new(), then, reply, now),
             Recipient::Name(name) => name,
         };
         if let Some((id, proper)) = self.known.get(&name).cloned() {
-            return self.act(grid, id, proper, then, now);
+            return self.act(grid, id, proper, then, reply, now);
         }
         let query = match self.waiting.iter().find(|w| w.name == name) {
             Some(same) => same.query,
@@ -1848,7 +2140,15 @@ impl Commands {
     }
 
     /// What a command does once its avatar is known to be `id`.
-    fn act<G: Grid>(&mut self, grid: &mut G, id: Uuid, name: String, then: After, now: Instant) -> Result<Done, String> {
+    fn act<G: Grid>(
+        &mut self,
+        grid: &mut G,
+        id: Uuid,
+        name: String,
+        then: After,
+        reply: &Sender<Response>,
+        now: Instant,
+    ) -> Result<Done, String> {
         let who = whom(id, &name);
         match then {
             After::Im(text) => {
@@ -1873,6 +2173,19 @@ impl Commands {
                 grid.offer_teleport(id, &message, now)?;
                 crate::info!("control: offered {who} a teleport");
                 Ok(Done::Answer(Some(format!("offered {who} a teleport"))))
+            }
+            After::Profile => {
+                grid.ask_profile(id, now)?;
+                self.named(id);
+                self.profiles.push(ProfileWait {
+                    id,
+                    name,
+                    profile: None,
+                    reply: reply.clone(),
+                    deadline: now + LOOKUP_LIMIT,
+                });
+                self.scan_poll = Some(now);
+                Ok(Done::Parked)
             }
         }
     }
@@ -1906,7 +2219,7 @@ impl Commands {
                 (Some(_), None) => Err(NOT_CONNECTED.to_string()),
                 (Some((id, proper)), Some(grid)) => {
                     self.known.insert(name, (*id, proper.clone()));
-                    self.act(grid, *id, proper.clone(), then, now)
+                    self.act(grid, *id, proper.clone(), then, &reply, now)
                 }
             };
             self.origin = Origin::Operator;
@@ -1990,6 +2303,10 @@ impl Commands {
         }
         self.fail_jobs("the session was lost");
         self.fail_scans("the session was lost");
+        for wait in std::mem::take(&mut self.friend_lists) {
+            refuse(CONTROL, "friends", &wait.reply, "the session was lost".to_string());
+        }
+        self.scan_poll = None;
         self.owner_lookups.clear();
         for attach in std::mem::take(&mut self.attaching) {
             refuse(CONTROL, attach.command, &attach.reply, "the session was lost".to_string());
@@ -2516,7 +2833,7 @@ impl Commands {
     /// without a name.
     pub fn names_resolved<G: Grid>(&mut self, found: &[(Uuid, Names)], missing: &[Uuid], mut grid: Option<&mut G>, now: Instant) {
         for (id, names) in found {
-            self.owner_named(*id, Some(&names.legacy));
+            self.owner_named(*id, Some(names));
             let learn = |sender: &mut perms::Sender| {
                 if let perms::Sender::Object {
                     owner: Owner::Avatar { name, .. },
@@ -2761,6 +3078,8 @@ pub(crate) mod tests {
         Reach(Option<f32>),
         /// A question about the properties of these objects.
         Properties(Vec<u32>),
+        /// A question about the profile of this avatar.
+        Profile(Uuid),
     }
 
     pub(crate) struct FakeGrid {
@@ -2798,6 +3117,13 @@ pub(crate) mod tests {
         /// When the surroundings count as all described; long ago when
         /// left out.
         pub(crate) settled_at: Option<Instant>,
+        /// The bot's own avatar.
+        pub(crate) own: Uuid,
+        /// The other avatars in the region.
+        pub(crate) avatars: Vec<Seen>,
+        /// The simulator has said who is in the region.
+        pub(crate) avatars_known: bool,
+        pub(crate) friends: Friends,
     }
 
     impl Default for FakeGrid {
@@ -2822,6 +3148,10 @@ pub(crate) mod tests {
                 reach: 32.0,
                 sightings: Vec::new(),
                 settled_at: None,
+                own: Uuid::from_bytes([0xB0; 16]),
+                avatars: Vec::new(),
+                avatars_known: true,
+                friends: Friends::default(),
             }
         }
     }
@@ -2862,6 +3192,26 @@ pub(crate) mod tests {
         }
         fn settled_at(&self) -> Instant {
             self.settled_at.unwrap_or_else(|| Instant::now() - Duration::from_secs(60))
+        }
+        fn present(&self) -> Result<(), String> {
+            self.check()
+        }
+        fn own_id(&self) -> Uuid {
+            self.own
+        }
+        fn avatars(&self) -> Vec<Seen> {
+            self.avatars.clone()
+        }
+        fn avatars_known(&self) -> bool {
+            self.avatars_known
+        }
+        fn friends(&self) -> &Friends {
+            &self.friends
+        }
+        fn ask_profile(&mut self, avatar: Uuid, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::Profile(avatar));
+            Ok(())
         }
         fn say(&mut self, channel: i32, chat_type: u8, text: &str, _: Instant) -> Result<(), String> {
             self.check()?;
@@ -6868,5 +7218,785 @@ pub(crate) mod tests {
         assert_eq!(rig.calls(), [Call::Reach(Some(96.0))]);
         assert!(!rig.commands.take_manual());
         assert_eq!((rig.commands.last_tp(), rig.commands.last_sit()), (None, None));
+    }
+
+    // ----------------------------------------------------- scan avatars
+
+    fn ann() -> Uuid {
+        Uuid::from_bytes([0x3C; 16])
+    }
+
+    /// An avatar at this place in the region; `None` for an unknown height.
+    fn avatar(id: Uuid, x: f32, y: f32, z: Option<f32>) -> Seen {
+        Seen {
+            id,
+            position: [x, y],
+            height: z,
+            hidden: false,
+        }
+    }
+
+    /// The fields of every line of a listing.
+    fn lines(answer: &Receiver<Response>) -> Vec<Vec<String>> {
+        match answer.try_recv() {
+            Ok(Response::Ok(Some(text))) => text.lines().map(|line| line.split('\t').map(str::to_string).collect()).collect(),
+            Ok(Response::Ok(None)) => Vec::new(),
+            other => panic!("expected a listing, got {other:?}"),
+        }
+    }
+
+    impl Rig {
+        /// Standing at 100, 100, 25 with Jane 5 metres east, John 15
+        /// metres north and Ann 180 metres away, known by the list only.
+        fn among_avatars() -> Rig {
+            let mut rig = Rig::new();
+            rig.grid.position = Some([100.0, 100.0, 25.0]);
+            rig.grid.avatars = vec![
+                avatar(ann(), 280.0, 100.0, Some(24.0)),
+                avatar(jane(), 105.0, 100.0, Some(25.0)),
+                avatar(john(), 100.0, 115.0, Some(25.0)),
+            ];
+            rig
+        }
+
+        /// The name service names Jane, John and Ann: as asked, or as
+        /// known from an earlier listing.
+        fn name_all(&mut self) {
+            let named = [
+                names_of(jane(), "Jane Doe"),
+                names_of(john(), "John Roe"),
+                names_of(ann(), "Ann Poe"),
+            ];
+            self.named_by_the_grid(&named, &[]);
+            for (id, names) in named {
+                self.commands.owners.insert(id, Some(names));
+            }
+        }
+
+        fn lookups(&mut self) -> Vec<Uuid> {
+            let mut wanted = self.commands.take_name_lookups();
+            wanted.sort();
+            wanted
+        }
+    }
+
+    #[test]
+    fn scan_avatars_lists_everyone_in_the_region_once_named() {
+        let mut rig = Rig::among_avatars();
+        let answer = rig.scan_for(&["avatars"]);
+        assert!(answer.try_recv().is_err());
+        rig.look();
+        assert_eq!(rig.lookups(), [jane(), john(), ann()]);
+        assert!(answer.try_recv().is_err(), "it waits for the names");
+        rig.name_all();
+        rig.now += SCAN_POLL;
+        rig.look();
+        let listed = lines(&answer);
+        assert_eq!(
+            listed[0],
+            [
+                jane().to_string(),
+                "5.0".into(),
+                "105,100,25".into(),
+                "Jane Doe".into(),
+                "Jane Doe".into()
+            ]
+        );
+        assert_eq!(listed[1][..3], [john().to_string(), "15.0".into(), "100,115,25".into()]);
+        assert_eq!(listed[2][..3], [ann().to_string(), "180.0".into(), "280,100,24".into()]);
+        assert_eq!(rig.told(), ["control: scan avatars: 3 listed"]);
+        // Nothing asked of the simulator, no object scan.
+        assert_eq!(rig.calls(), []);
+        assert_eq!(rig.grid.reach, 32.0);
+        assert_eq!(rig.commands.next_deadline(), None);
+
+        // The second is answered at once and asks nobody.
+        let again = rig.scan_for(&["avatars", "shout"]);
+        rig.look();
+        assert_eq!(lines(&again).len(), 2);
+        assert_eq!(rig.lookups(), Vec::<Uuid>::new());
+        assert_eq!(rig.told(), ["control: scan avatars shout: 2 listed"]);
+        assert_eq!(rig.calls(), []);
+    }
+
+    #[test]
+    fn scan_avatars_names_only_who_it_lists() {
+        let mut rig = Rig::among_avatars();
+        let answer = rig.scan_for(&["avatars", "chat"]);
+        rig.look();
+        assert_eq!(rig.lookups(), [jane(), john()]);
+        rig.named_by_the_grid(&[names_of(jane(), "Jane Doe"), names_of(john(), "John Roe")], &[]);
+        rig.now += SCAN_POLL;
+        rig.look();
+        let ids: Vec<String> = lines(&answer).into_iter().map(|line| line[0].clone()).collect();
+        assert_eq!(ids, [jane().to_string(), john().to_string()]);
+        assert_eq!(rig.told(), ["control: scan avatars chat: 2 listed"]);
+        // Alone, or nobody within the distance: nothing.
+        let nobody = rig.scan_for(&["avatars", "1"]);
+        rig.look();
+        assert_eq!(nobody.try_recv(), Ok(Response::Ok(None)));
+        // No command, no lookups.
+        rig.look();
+        assert_eq!(rig.lookups(), Vec::<Uuid>::new());
+    }
+
+    #[test]
+    fn scan_avatars_leaves_out_unknown_distances_when_given_one() {
+        let mut rig = Rig::among_avatars();
+        rig.grid.avatars.push(avatar(object_id(7), 128.0, 64.0, None));
+        rig.name_all();
+        let everyone = rig.scan_for(&["avatars"]);
+        let within = rig.scan_for(&["avatars", "1024"]);
+        rig.look();
+        rig.named_by_the_grid(&[], &[object_id(7)]);
+        rig.now += SCAN_POLL;
+        rig.look();
+        let listed = lines(&everyone);
+        assert_eq!(listed.len(), 4);
+        assert_eq!(
+            listed[3],
+            [object_id(7).to_string(), "?".into(), "128,64,?".into(), "?".into(), "?".into()]
+        );
+        assert_eq!(lines(&within).len(), 3);
+    }
+
+    fn object_id(n: u8) -> Uuid {
+        Uuid::from_bytes([n; 16])
+    }
+
+    #[test]
+    fn scan_avatars_waits_for_the_simulators_list() {
+        let mut rig = Rig::among_avatars();
+        rig.name_all();
+        rig.grid.avatars_known = false;
+        let answer = rig.scan_for(&["avatars"]);
+        rig.look();
+        assert!(answer.try_recv().is_err());
+        rig.grid.avatars_known = true;
+        rig.now += SCAN_POLL;
+        rig.look();
+        assert_eq!(lines(&answer).len(), 3);
+
+        // A list that does not come: what was described, at the deadline.
+        rig.grid.avatars_known = false;
+        rig.grid.avatars.truncate(2);
+        let answer = rig.scan_for(&["avatars"]);
+        rig.told();
+        rig.now += LOOKUP_LIMIT - SCAN_POLL;
+        rig.look();
+        assert!(answer.try_recv().is_err());
+        rig.now += SCAN_POLL;
+        rig.look();
+        assert_eq!(lines(&answer).len(), 2);
+        assert_eq!(
+            rig.told(),
+            ["control: scan avatars: 2 listed; the simulator did not list the region's avatars in 10 s"]
+        );
+    }
+
+    #[test]
+    fn scan_avatars_lists_without_names_the_service_does_not_give() {
+        let mut rig = Rig::among_avatars();
+        rig.grid.avatars.truncate(2);
+        let answer = rig.scan_for(&["avatars"]);
+        rig.look();
+        assert_eq!(rig.lookups().len(), 2);
+        rig.now += LOOKUP_LIMIT;
+        rig.look();
+        let listed = lines(&answer);
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|line| line[3] == "?" && line[4] == "?"));
+        assert_eq!(rig.told(), ["control: scan avatars: 2 listed; 2 without a name after 10 s"]);
+    }
+
+    #[test]
+    fn scan_avatars_needs_the_avatar_in_a_region() {
+        let mut rig = Rig::among_avatars();
+        let (reply, answer) = mpsc::channel();
+        rig.commands
+            .handle(Request::Scan(vec!["avatars".into()]), reply, None::<&mut FakeGrid>, rig.now);
+        assert_eq!(error(&answer), NOT_CONNECTED);
+        rig.grid.offline = true;
+        assert_eq!(error(&rig.scan_for(&["avatars"])), NOT_CONNECTED);
+        rig.grid.offline = false;
+
+        let answer = rig.scan_for(&["avatars"]);
+        rig.look();
+        rig.commands.simulator_changed();
+        assert_eq!(error(&answer), "the avatar left the region");
+        let answer = rig.scan_for(&["avatars"]);
+        rig.commands.session_lost();
+        assert_eq!(error(&answer), "the session was lost");
+        assert_eq!(rig.commands.next_deadline(), None);
+        assert_eq!(rig.calls(), []);
+    }
+
+    #[test]
+    fn scan_avatars_refuses_what_is_no_distance() {
+        let mut rig = Rig::among_avatars();
+        assert!(error(&rig.scan_for(&["avatars", "-n", "jane"])).contains("`-n`"));
+        for given in ["0", "2000", "near"] {
+            let reason = error(&rig.scan_for(&["avatars", given]));
+            assert!(reason.contains("from 1 to 1024 or `shout`, `chat` or `whisper`"), "{reason}");
+        }
+        assert!(rig.scan_for(&["avatars", "chat", "30"]).try_recv().is_ok());
+        assert_eq!(rig.commands.next_deadline(), None);
+        assert_eq!(rig.calls(), []);
+    }
+
+    #[test]
+    fn the_word_objects_scans_objects() {
+        let mut rig = Rig::among_objects();
+        let plain = rig.scan_for(&["20"]);
+        let worded = rig.scan_for(&["objects", "20"]);
+        let chat = rig.scan_for(&["objects", "chat"]);
+        rig.look();
+        assert_eq!(listed(&plain), ["Bench", "Lamp"]);
+        assert_eq!(listed(&worded), ["Bench", "Lamp"]);
+        assert_eq!(listed(&chat), ["Bench", "Lamp"]);
+        assert_eq!(
+            rig.calls(),
+            [Call::Reach(Some(20.0)), Call::Reach(Some(20.0)), Call::Reach(Some(20.0))]
+        );
+        assert!(error(&rig.scan_for(&["20", "objects"])).contains("one distance"));
+        let whisper = rig.scan_for(&["whisper"]);
+        let five = rig.scan_for(&["5"]);
+        rig.look();
+        // The lamp is 10 m away: within a whisper.
+        assert_eq!(listed(&whisper), ["Bench", "Lamp"]);
+        assert_eq!(listed(&five), ["Bench"]);
+    }
+
+    // --------------------------------------- scan avatars under restrictions
+
+    #[test]
+    fn scan_avatars_hides_who_restrictions_hide() {
+        let mut rig = Rig::among_avatars();
+        rig.hold(&["shownames"]);
+        let answer = rig.scan_for(&["avatars", "chat"]);
+        rig.look();
+        // Nobody is asked about, and the lines keep their place.
+        assert_eq!(rig.lookups(), Vec::<Uuid>::new());
+        assert_eq!(
+            lines(&answer),
+            [vec!["?", "5.0", "105,100,25", "?", "?"], vec!["?", "15.0", "100,115,25", "?", "?"]]
+        );
+        // An exception shows Jane.
+        rig.hold(&[&format!("shownames:{}", jane())]);
+        rig.name_all();
+        let answer = rig.scan_for(&["avatars", "chat"]);
+        rig.look();
+        let listed = lines(&answer);
+        assert_eq!(
+            listed[0][..4],
+            [jane().to_string(), "5.0".into(), "105,100,25".into(), "Jane Doe".into()]
+        );
+        assert_eq!(listed[1][0], "?");
+        // The name tags restriction has its own exceptions.
+        rig.hold(&["shownametags"]);
+        let answer = rig.scan_for(&["avatars", "chat"]);
+        rig.look();
+        assert!(lines(&answer).iter().all(|line| line[0] == "?"));
+        // RLV off: all of them.
+        rig.grid.rlv_off = true;
+        let answer = rig.scan_for(&["avatars"]);
+        rig.look();
+        assert!(lines(&answer).iter().all(|line| line[0] != "?" && line[3] != "?"));
+    }
+
+    #[test]
+    fn scan_avatars_under_the_minimap_restriction() {
+        let mut rig = Rig::among_avatars();
+        rig.name_all();
+        rig.hold(&["showminimap"]);
+        let answer = rig.scan_for(&["avatars", "chat"]);
+        rig.look();
+        let listed = lines(&answer);
+        assert_eq!(
+            listed[0],
+            [jane().to_string(), "5.0".into(), "?".into(), "Jane Doe".into(), "Jane Doe".into()]
+        );
+        assert_eq!(listed.len(), 2);
+        rig.hold(&["shownames"]);
+        let answer = rig.scan_for(&["avatars", "whisper"]);
+        rig.look();
+        assert_eq!(lines(&answer), [vec!["?", "5.0", "?", "?", "?"]]);
+    }
+
+    #[test]
+    fn scan_avatars_is_refused_under_the_nearby_restriction() {
+        let mut rig = Rig::among_avatars();
+        rig.hold(&["shownearby"]);
+        let reason = held_back(&rig.scan_for(&["avatars", "chat"]), "shownearby");
+        assert!(reason.contains("Collar"), "{reason}");
+        assert_eq!(rig.commands.next_deadline(), None);
+        // Objects are still scanned, with their owners.
+        let mut rig = Rig::among_objects();
+        rig.hold(&["shownearby"]);
+        let answer = rig.scan_for(&[]);
+        rig.look();
+        assert_eq!(listed(&answer), ["Bench", "Lamp"]);
+    }
+
+    #[test]
+    fn scan_avatars_ignores_restrictions_that_are_not_about_avatars() {
+        let mut rig = Rig::among_avatars();
+        rig.name_all();
+        rig.hold(&["camdrawmax:10", "showloc", "sendim"]);
+        let answer = rig.scan_for(&["avatars", "shout"]);
+        rig.look();
+        let listed = lines(&answer);
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|line| line[0] != "?" && line[2] != "?"));
+    }
+
+    #[test]
+    fn an_exempt_scan_avatars_is_held_to_nothing_while_it_waits() {
+        let mut rig = Rig::among_avatars();
+        rig.hold(&["shownearby", "shownames", "showminimap"]);
+        let (reply, answer) = mpsc::channel();
+        let request = Request::Scan(vec!["avatars".into(), "chat".into()]);
+        rig.commands
+            .handle_from(Origin::Exempt, request, reply, Some(&mut rig.grid), rig.now);
+        rig.look();
+        assert_eq!(rig.lookups(), [jane(), john()]);
+        rig.name_all();
+        rig.now += SCAN_POLL;
+        rig.look();
+        let listed = lines(&answer);
+        assert_eq!(
+            listed[0],
+            [
+                jane().to_string(),
+                "5.0".into(),
+                "105,100,25".into(),
+                "Jane Doe".into(),
+                "Jane Doe".into()
+            ]
+        );
+    }
+
+    // --------------------------------------- scan objects under restrictions
+
+    #[test]
+    fn scan_hides_owners_restrictions_hide() {
+        let mut rig = Rig::among_objects();
+        rig.hold(&["shownames"]);
+        let answer = rig.scan_for(&[]);
+        rig.look();
+        let fields = lines(&answer);
+        assert_eq!(
+            fields[0],
+            [
+                object_id(1).to_string(),
+                "3.0".into(),
+                "-".into(),
+                "?".into(),
+                "?".into(),
+                "Bench".into(),
+                String::new()
+            ]
+        );
+        assert_eq!(fields[1][3..6], ["?".to_string(), "?".into(), "Lamp".into()]);
+        // An exception shows Jane's.
+        rig.hold(&[&format!("shownames:{}", jane())]);
+        let answer = rig.scan_for(&[]);
+        rig.look();
+        let fields = lines(&answer);
+        assert_eq!(fields[0][3..5], [jane().to_string(), "Jane Doe".into()]);
+        assert_eq!(fields[1][3..5], ["?".to_string(), "?".into()]);
+        // Other filters work as without the restriction.
+        let answer = rig.scan_for(&["20", "-n", "bench"]);
+        rig.look();
+        assert_eq!(listed(&answer), ["Bench"]);
+    }
+
+    #[test]
+    fn scan_names_no_hidden_owner() {
+        let mut rig = Rig::new();
+        rig.grid.sightings = vec![seen(1, 3.0, Some(("Bench", jane()))), seen(2, 4.0, Some(("Radio", rig.grid.own)))];
+        let sign = Sighting {
+            properties: Some(Properties {
+                object: object_id(3),
+                owner: Uuid::nil(),
+                group: object_id(0x6C),
+                name: "Sign".to_string(),
+                description: String::new(),
+            }),
+            ..seen(3, 5.0, None)
+        };
+        rig.grid.sightings.push(sign);
+        rig.hold(&["shownametags"]);
+        let answer = rig.scan_for(&[]);
+        rig.look();
+        // Only the bot's own avatar is asked about.
+        assert_eq!(rig.lookups(), [rig.grid.own]);
+        rig.named_by_the_grid(&[names_of(rig.grid.own, "Sit Bot")], &[]);
+        rig.now += SCAN_POLL;
+        rig.look();
+        let listed = lines(&answer);
+        assert_eq!(listed[0][3..6], ["?".to_string(), "?".into(), "Bench".into()]);
+        assert_eq!(listed[1][3..6], [rig.grid.own.to_string(), "Sit Bot".into(), "Radio".into()]);
+        assert_eq!(listed[2][3..6], [object_id(0x6C).to_string(), "(group)".into(), "Sign".into()]);
+    }
+
+    #[test]
+    fn scan_by_owner_is_refused_while_names_are_hidden() {
+        let mut rig = Rig::among_objects();
+        rig.hold(&["shownames", &format!("shownames:{}", jane())]);
+        let reason = held_back(&rig.scan_for(&["-o", "Jane Doe"]), "shownames");
+        assert!(reason.contains("Collar"), "{reason}");
+        held_back(&rig.scan_for(&["-o", &jane().to_string()]), "shownames");
+        assert_eq!(rig.calls(), []);
+        assert_eq!(rig.commands.next_deadline(), None);
+    }
+
+    #[test]
+    fn scan_reaches_no_further_than_the_avatar_sees() {
+        let mut rig = Rig::new();
+        rig.grid.sightings = vec![
+            seen(1, 3.0, Some(("Bench", jane()))),
+            seen(2, 20.0, Some(("Lamp", jane()))),
+            seen(3, 45.0, Some(("Tower", jane()))),
+        ];
+        rig.named_by_the_grid(&[], &[]);
+        rig.commands.owners.insert(jane(), Some(names_of(jane(), "Jane Doe").1));
+        rig.hold(&["camdrawmax:10"]);
+        let answer = rig.scan_for(&[]);
+        rig.look();
+        assert_eq!(listed(&answer), ["Bench"]);
+        assert_eq!(rig.calls(), [Call::Reach(None)]);
+        assert_eq!(rig.told(), ["control: scan: 1 listed within 10 m, cut to 10 m by camdrawmax"]);
+        // Further than the limit: no wider than it.
+        let answer = rig.scan_for(&["96"]);
+        rig.look();
+        assert_eq!(listed(&answer), ["Bench"]);
+        assert_eq!(rig.calls(), [Call::Reach(Some(10.0))]);
+        assert_eq!(rig.grid.reach, 32.0);
+        assert_eq!(rig.told(), ["control: scan 96: 1 listed within 10 m, cut to 10 m by camdrawmax"]);
+        // Within the limit: as asked.
+        let answer = rig.scan_for(&["5"]);
+        rig.look();
+        assert_eq!(listed(&answer), ["Bench"]);
+        assert_eq!(rig.told(), ["control: scan 5: 1 listed within 5 m"]);
+        rig.calls();
+        // A limit beyond the object scan widens it as far.
+        rig.lift_all();
+        rig.hold(&["camdrawmax:50"]);
+        let answer = rig.scan_for(&["96"]);
+        rig.look();
+        assert_eq!(listed(&answer), ["Bench", "Lamp", "Tower"]);
+        assert_eq!(rig.calls(), [Call::Reach(Some(50.0))]);
+        assert_eq!(rig.grid.reach, 50.0);
+        // Thin fog: no limit.
+        rig.hold(&["camdrawalphamax:0.5"]);
+        let answer = rig.scan_for(&["20"]);
+        rig.look();
+        assert_eq!(listed(&answer), ["Bench", "Lamp"]);
+        rig.told();
+        // Avatars are not cut.
+        let mut rig = Rig::among_avatars();
+        rig.name_all();
+        rig.hold(&["camdrawmax:10"]);
+        let answer = rig.scan_for(&["avatars", "shout"]);
+        rig.look();
+        assert_eq!(lines(&answer).len(), 2);
+    }
+
+    #[test]
+    fn scan_under_a_tiny_vision_limit_lists_what_the_avatar_wears() {
+        let mut rig = Rig::new();
+        let radio = Sighting {
+            attachment: true,
+            ..seen(4, 0.0, Some(("Radio", rig.grid.own)))
+        };
+        rig.grid.sightings = vec![radio, seen(1, 3.0, Some(("Bench", jane())))];
+        rig.commands.owners.insert(rig.grid.own, Some(names_of(rig.grid.own, "Sit Bot").1));
+        rig.hold(&["camdrawmax:0.5"]);
+        let answer = rig.scan_for(&["-a"]);
+        rig.look();
+        let listed = lines(&answer);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0][1..3], ["0.0".to_string(), "attachment".into()]);
+    }
+
+    // ------------------------------------------------------------ friends
+
+    use crate::friends::SEE_ONLINE;
+
+    impl Rig {
+        fn friends_of(list: &[(Uuid, i32)], online: &[Uuid]) -> Rig {
+            let mut rig = Rig::new();
+            rig.grid.friends = Friends::new(list);
+            rig.grid.friends.online(online);
+            rig
+        }
+
+        fn friends(&mut self) -> Receiver<Response> {
+            self.run(Request::Friends).0
+        }
+    }
+
+    #[test]
+    fn friends_lists_the_friends_once_named() {
+        let mut rig = Rig::friends_of(&[(jane(), SEE_ONLINE), (john(), SEE_ONLINE), (ann(), 0)], &[john()]);
+        let answer = rig.friends();
+        assert!(answer.try_recv().is_err());
+        rig.look();
+        assert_eq!(rig.lookups(), [jane(), john(), ann()]);
+        rig.name_all();
+        rig.now += SCAN_POLL;
+        rig.look();
+        let listed = lines(&answer);
+        let statuses: Vec<(&str, &str)> = listed.iter().map(|line| (line[1].as_str(), line[2].as_str())).collect();
+        assert_eq!(statuses, [("online", "John Roe"), ("offline", "Jane Doe"), ("?", "Ann Poe")]);
+        assert_eq!(rig.told(), ["control: friends: 3 listed, 1 online"]);
+        assert_eq!(rig.calls(), []);
+        // The second asks nobody and is answered at once.
+        let again = rig.friends();
+        rig.look();
+        assert_eq!(lines(&again).len(), 3);
+        assert_eq!(rig.lookups(), Vec::<Uuid>::new());
+        assert_eq!(rig.commands.next_deadline(), None);
+    }
+
+    #[test]
+    fn friends_without_friends_prints_nothing() {
+        let mut rig = Rig::new();
+        let answer = rig.friends();
+        rig.look();
+        assert_eq!(answer.try_recv(), Ok(Response::Ok(None)));
+        assert_eq!(rig.told(), ["control: friends: 0 listed, 0 online"]);
+    }
+
+    #[test]
+    fn friends_lists_many_and_waits_ten_seconds_at_most() {
+        let ids: Vec<(Uuid, i32)> = (0..120u128).map(|n| (Uuid::from_u128(n + 1000), SEE_ONLINE)).collect();
+        let mut rig = Rig::friends_of(&ids, &[]);
+        let answer = rig.friends();
+        rig.look();
+        assert_eq!(rig.lookups().len(), 120);
+        rig.now += LOOKUP_LIMIT - SCAN_POLL;
+        rig.look();
+        assert!(answer.try_recv().is_err());
+        rig.now += SCAN_POLL;
+        rig.look();
+        let listed = lines(&answer);
+        assert_eq!(listed.len(), 120);
+        assert!(listed.iter().all(|line| line[2] == "?" && line[3] == "?"));
+        assert_eq!(
+            rig.told(),
+            ["control: friends: 120 listed, 0 online; 120 without a name after 10 s"]
+        );
+    }
+
+    #[test]
+    fn friends_needs_the_avatar_in_a_region() {
+        let mut rig = Rig::friends_of(&[(jane(), SEE_ONLINE)], &[]);
+        let (reply, answer) = mpsc::channel();
+        rig.commands.handle(Request::Friends, reply, None::<&mut FakeGrid>, rig.now);
+        assert_eq!(error(&answer), NOT_CONNECTED);
+        rig.grid.offline = true;
+        assert_eq!(error(&rig.friends()), NOT_CONNECTED);
+        assert_eq!(rig.commands.next_deadline(), None);
+        assert_eq!(rig.commands.take_name_lookups(), Vec::<Uuid>::new());
+        // One that waits fails with the session, not with a teleport.
+        rig.grid.offline = false;
+        let answer = rig.friends();
+        rig.look();
+        rig.commands.simulator_changed();
+        assert!(answer.try_recv().is_err());
+        rig.commands.session_lost();
+        assert_eq!(error(&answer), "the session was lost");
+        assert_eq!(rig.commands.next_deadline(), None);
+    }
+
+    #[test]
+    fn friends_and_profile_are_held_to_no_restriction() {
+        let mut rig = Rig::friends_of(&[(jane(), SEE_ONLINE)], &[jane()]);
+        rig.hold(&["shownames", "shownearby", "showminimap", "shownametags"]);
+        rig.name_all();
+        let answer = rig.friends();
+        rig.look();
+        assert_eq!(
+            lines(&answer)[0],
+            [jane().to_string(), "online".into(), "Jane Doe".into(), "Jane Doe".into()]
+        );
+        let answer = rig.profile(&jane().to_string());
+        rig.commands.profile_received(janes_profile(true));
+        rig.look();
+        assert!(text(&answer).contains("\nname: Jane Doe\n"));
+    }
+
+    // ------------------------------------------------------------ profile
+
+    fn janes_profile(online: bool) -> Profile {
+        Profile {
+            online,
+            ..profile::tests::full()
+        }
+        .with_id(jane())
+    }
+
+    impl Profile {
+        fn with_id(self, id: Uuid) -> Profile {
+            Profile { id, ..self }
+        }
+    }
+
+    fn text(answer: &Receiver<Response>) -> String {
+        match answer.try_recv() {
+            Ok(Response::Ok(Some(text))) => text,
+            other => panic!("expected a text, got {other:?}"),
+        }
+    }
+
+    impl Rig {
+        fn profile(&mut self, avatar: &str) -> Receiver<Response> {
+            self.run(Request::Profile(avatar.to_string())).0
+        }
+    }
+
+    #[test]
+    fn profile_by_name_resolves_the_name_first() {
+        let mut rig = Rig::friends_of(&[(jane(), SEE_ONLINE)], &[jane()]);
+        let answer = rig.profile("Jane Doe");
+        let query = rig.lookup("jane doe");
+        rig.found(query, &jane_found());
+        assert_eq!(rig.calls(), [Call::Profile(jane())]);
+        rig.look();
+        assert_eq!(rig.lookups(), [jane()]);
+        rig.commands.profile_received(janes_profile(true));
+        rig.look();
+        assert!(answer.try_recv().is_err(), "it waits for the names");
+        rig.named_by_the_grid(
+            &[(
+                jane(),
+                Names {
+                    legacy: "Jane Doe".into(),
+                    display: "JD".into(),
+                },
+            )],
+            &[],
+        );
+        rig.now += SCAN_POLL;
+        rig.look();
+        let answered = text(&answer);
+        assert_eq!(
+            answered.lines().collect::<Vec<_>>()[..5],
+            [
+                format!("id: {}", jane()).as_str(),
+                "name: Jane Doe",
+                "display name: JD",
+                "online: yes",
+                "friend: yes"
+            ]
+        );
+        assert!(answered.contains("\nborn: 2010-03-14\n"));
+        assert_eq!(rig.told(), [format!("control: profile of Jane Doe <{}>", jane())]);
+        assert_eq!(rig.commands.next_deadline(), None);
+        // Asked again every time; the resolved name is kept.
+        let again = rig.profile("jane.doe");
+        assert_eq!(rig.calls(), [Call::Profile(jane())]);
+        rig.commands.profile_received(janes_profile(false));
+        rig.look();
+        assert!(text(&again).contains("\nonline: no\n"));
+    }
+
+    #[test]
+    fn profile_by_uuid_searches_for_no_name() {
+        let mut rig = Rig::new();
+        let answer = rig.profile(&jane().to_string());
+        assert_eq!(rig.calls(), [Call::Profile(jane())]);
+        rig.commands.profile_received(janes_profile(false));
+        rig.name_all();
+        rig.look();
+        let text = text(&answer);
+        assert!(text.contains("\nonline: unknown\nfriend: no\n"), "{text}");
+        assert_eq!(rig.told(), [format!("control: profile of Jane Doe <{}>", jane())]);
+    }
+
+    #[test]
+    fn profile_of_nobody_is_refused() {
+        let mut rig = Rig::new();
+        let answer = rig.profile("Nobody Here");
+        let query = rig.lookup("nobody here");
+        rig.found(query, &[]);
+        assert!(error(&answer).contains("\"Nobody Here\""));
+        assert_eq!(rig.calls(), []);
+        // The grid does not know the UUID.
+        let answer = rig.profile(&jane().to_string());
+        rig.calls();
+        rig.commands.profile_failed(jane(), &format!("the grid knows no avatar {}", jane()));
+        assert!(error(&answer).contains(&jane().to_string()));
+        rig.look();
+        assert_eq!(rig.commands.next_deadline(), None);
+    }
+
+    #[test]
+    fn profile_waits_ten_seconds_for_the_grid() {
+        let mut rig = Rig::new();
+        let answer = rig.profile(&jane().to_string());
+        rig.now += LOOKUP_LIMIT - SCAN_POLL;
+        rig.look();
+        assert!(answer.try_recv().is_err());
+        rig.now += SCAN_POLL;
+        rig.look();
+        let reason = error(&answer);
+        assert!(
+            reason.contains(&jane().to_string()) && reason.contains("did not answer"),
+            "{reason}"
+        );
+
+        // The profile without the names the service never gives.
+        let answer = rig.profile(&jane().to_string());
+        rig.commands.profile_received(janes_profile(true));
+        rig.look();
+        assert!(answer.try_recv().is_err());
+        rig.now += LOOKUP_LIMIT;
+        rig.look();
+        let text = text(&answer);
+        assert!(!text.contains("name:"), "{text}");
+        assert!(text.starts_with(&format!("id: {}\nonline: yes\nfriend: no\n", jane())), "{text}");
+    }
+
+    #[test]
+    fn profile_needs_the_avatar_in_a_region() {
+        let mut rig = Rig::new();
+        let (reply, answer) = mpsc::channel();
+        rig.commands
+            .handle(Request::Profile("Jane Doe".into()), reply, None::<&mut FakeGrid>, rig.now);
+        assert_eq!(error(&answer), NOT_CONNECTED);
+        rig.grid.offline = true;
+        assert_eq!(error(&rig.profile("Jane Doe")), NOT_CONNECTED);
+        assert_eq!(error(&rig.profile(&jane().to_string())), NOT_CONNECTED);
+        assert_eq!(rig.calls(), []);
+        rig.grid.offline = false;
+        let answer = rig.profile(&jane().to_string());
+        rig.commands.simulator_changed();
+        assert_eq!(error(&answer), "the avatar left the region");
+        let answer = rig.profile(&jane().to_string());
+        rig.commands.session_lost();
+        assert_eq!(error(&answer), "the session was lost");
+        assert_eq!(rig.commands.next_deadline(), None);
+    }
+
+    #[test]
+    fn profile_online_status_comes_from_the_grid_and_the_friends() {
+        let mut rig = Rig::friends_of(&[(jane(), SEE_ONLINE)], &[]);
+        rig.name_all();
+        let status = |rig: &mut Rig, id: Uuid, online: bool| -> String {
+            let answer = rig.profile(&id.to_string());
+            rig.commands.profile_received(janes_profile(online).with_id(id));
+            rig.look();
+            let text = text(&answer);
+            text.lines().find(|line| line.starts_with("online: ")).unwrap().to_string()
+        };
+        assert_eq!(status(&mut rig, jane(), true), "online: yes");
+        assert_eq!(status(&mut rig, jane(), false), "online: no");
+        assert_eq!(status(&mut rig, john(), true), "online: yes");
+        assert_eq!(status(&mut rig, john(), false), "online: unknown");
+        rig.grid.friends.rights_changed(jane(), 0);
+        assert_eq!(status(&mut rig, jane(), false), "online: unknown");
     }
 }

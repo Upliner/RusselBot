@@ -12,6 +12,9 @@ const MAX_REDIRECTS: usize = 5;
 /// The login option that asks for the inventory's root folder, and the
 /// reply's key for it.
 const INVENTORY_ROOT: &str = "inventory-root";
+/// The login option that asks for the avatar's friends, and the reply's key
+/// for them.
+const BUDDY_LIST: &str = "buddy-list";
 
 /// Where the login asks the grid to place the avatar.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -34,6 +37,9 @@ pub struct SessionInfo {
     pub seed_capability: String,
     /// The folder at the top of My Inventory, when the grid says.
     pub inventory_root: Option<Uuid>,
+    /// The avatar's friends, each with the rights it grants the avatar
+    /// (`buddy_rights_has`).
+    pub friends: Vec<(Uuid, i32)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,9 +105,9 @@ pub fn request_xml(cfg: &Config, start: Start, held: Option<&Location>) -> Strin
             ("id0", Value::Str(md5_hex(&format!("rslbot-id0:{identity}")))),
             ("agree_to_tos", Value::Bool(true)),
             ("read_critical", Value::Bool(true)),
-            // The one optional part of the reply the bot has a use for: the
-            // id of the folder at the top of My Inventory.
-            ("options", Value::Array(vec![str(INVENTORY_ROOT)])),
+            // The optional parts of the reply the bot has a use for: the id
+            // of the folder at the top of My Inventory, and the friends.
+            ("options", Value::Array(vec![str(INVENTORY_ROOT), str(BUDDY_LIST)])),
         ],
     )
 }
@@ -136,6 +142,7 @@ fn parse_reply(body: &str) -> Result<Reply, String> {
                 sim_addr: SocketAddr::new(ip, port),
                 seed_capability,
                 inventory_root: inventory_root(&reply),
+                friends: friends(&reply),
             }))
         }
         "indeterminate" => match reply.str_field("next_url") {
@@ -154,6 +161,22 @@ fn parse_reply(body: &str) -> Result<Reply, String> {
 fn inventory_root(reply: &Value) -> Option<Uuid> {
     let root = reply.get(INVENTORY_ROOT)?.as_array()?.first()?.get("folder_id")?.as_uuid()?;
     (!root.is_nil()).then_some(root)
+}
+
+/// The friends: `buddy-list` is an array of structs with `buddy_id`,
+/// `buddy_rights_has` and `buddy_rights_given` (llstartup.cpp; OpenSim's
+/// LLLoginResponse writes the same). An entry without a readable id is
+/// left out; rights that cannot be read are none.
+fn friends(reply: &Value) -> Vec<(Uuid, i32)> {
+    let Some(list) = reply.get(BUDDY_LIST).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let entry = |buddy: &Value| {
+        let id = buddy.get("buddy_id")?.as_uuid().filter(|id| !id.is_nil())?;
+        let rights = buddy.get("buddy_rights_has").and_then(Value::as_i64).unwrap_or(0);
+        Some((id, rights as i32))
+    };
+    list.iter().filter_map(entry).collect()
 }
 
 fn classify(failure: Failure) -> Outcome {
@@ -288,8 +311,12 @@ mod tests {
         assert_eq!(value("channel"), "<string>RusselBot</string>");
         assert_eq!(value("agree_to_tos"), "<boolean>1</boolean>");
         assert!(!xml.contains("secret"));
-        // The inventory's root folder is the only option asked for.
+        // The inventory's root folder and the friends are the options asked for.
         assert_eq!(value("options"), "<array><data><value><string>inventory-root</string>");
+        assert!(xml.contains(
+            "<array><data><value><string>inventory-root</string></value>\
+             <value><string>buddy-list</string></value></data></array>"
+        ));
         assert_eq!(xml.matches("<name>options</name>").count(), 1);
     }
 
@@ -328,6 +355,59 @@ mod tests {
             &format!("{}</struct></value></param>", member("inventory-root", &nil)),
         );
         assert!(matches!(outcome(reply), Outcome::Success(info) if info.inventory_root.is_none()));
+    }
+
+    fn with_buddies(list: &str) -> String {
+        success_reply().replace(
+            "</struct></value></param>",
+            &format!("{}</struct></value></param>", member("buddy-list", list)),
+        )
+    }
+
+    fn buddy(id: &str, has: &str) -> String {
+        format!(
+            "<value><struct>{}{}{}</struct></value>",
+            member("buddy_id", &format!("<string>{id}</string>")),
+            member("buddy_rights_has", has),
+            member("buddy_rights_given", "<int>1</int>"),
+        )
+    }
+
+    #[test]
+    fn reply_may_carry_the_friends() {
+        let (jane, john) = ("11111111-0000-0000-0000-000000000001", "22222222-0000-0000-0000-000000000002");
+        let list = format!(
+            "<array><data>{}{}</data></array>",
+            buddy(jane, "<int>3</int>"),
+            buddy(john, "<int>0</int>")
+        );
+        let Outcome::Success(info) = outcome(with_buddies(&list)) else {
+            panic!("not a success")
+        };
+        let ids = |info: &SessionInfo| {
+            info.friends
+                .iter()
+                .map(|(id, rights)| (id.to_string(), *rights))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&info), [(jane.to_string(), 3), (john.to_string(), 0)]);
+        // Without the list, or with an empty one, no friends.
+        let Outcome::Success(info) = outcome(success_reply()) else {
+            panic!("not a success")
+        };
+        assert!(info.friends.is_empty());
+        // A malformed entry is skipped and the login still succeeds.
+        let bad = format!(
+            "<array><data>{}{}<value><string>junk</string></value>{}</data></array>",
+            buddy("not-a-uuid", "<int>1</int>"),
+            buddy(jane, "<string>x</string>"),
+            buddy(john, "<int>1</int>")
+        );
+        let Outcome::Success(info) = outcome(with_buddies(&bad)) else {
+            panic!("not a success")
+        };
+        assert_eq!(ids(&info), [(jane.to_string(), 0), (john.to_string(), 1)]);
+        assert!(matches!(outcome(with_buddies("<string>none</string>")), Outcome::Success(info) if info.friends.is_empty()));
     }
 
     #[test]
@@ -392,6 +472,8 @@ mod tests {
             info.inventory_root.map(|id| id.to_string()).as_deref(),
             Some("fa500bdc-8933-4110-af3e-6d10c1f63ae4")
         );
+        // Its list of friends is empty.
+        assert!(info.friends.is_empty());
     }
 
     #[test]

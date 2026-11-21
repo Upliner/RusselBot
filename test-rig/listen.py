@@ -11,12 +11,13 @@ what is attached to it, which animations it plays and which sounds it
 triggers. Stands in for watching with a viewer. Start it while the bot is
 seated in Target, then use `rslbot ctl`.
 
-Usage: listen.py [SECONDS] [prim] [offer=N] [im=T1,T2,...]   (default: 30 seconds)
+Usage: listen.py [SECONDS] [prim] [offer=N] [im=T1,T2,...] [at=X,Y,Z]   (default: 30 seconds)
 
   prim      rez a box near the bot with the library script DefaultWithTouch,
             which says "Touched." when clicked, and print its UUID; the box
             goes to the trash at the end
   offer=N   after N seconds, offer the bot a teleport it did not ask for
+  at=X,Y,Z  log in at that place in Target instead of 124, 128, 25
   im=T,...  T seconds after listening starts, send the bot the instant
             message "hello <T>", for each T given
 
@@ -39,6 +40,7 @@ ARGS = sys.argv[1:]
 SECONDS = float(next((a for a in ARGS if a.replace(".", "").isdigit()), 30.0))
 PRIM = "prim" in ARGS
 OFFER_AFTER = next((float(a[6:]) for a in ARGS if a.startswith("offer=")), None)
+AT = next((a[3:].split(",") for a in ARGS if a.startswith("at=")), ["124", "128", "25"])
 IM_AT = sorted(float(t) for a in ARGS if a.startswith("im=") for t in a[3:].split(",") if t)
 BOT = uuid.UUID("7e570000-0000-4000-8000-0000000000b0")
 # SIT_GROUND and SIT_GROUND_CONSTRAINED, from OpenSim's avataranimations.xml.
@@ -54,7 +56,7 @@ def member(n, v):
 body = ("<?xml version=\"1.0\"?><methodCall><methodName>login_to_simulator</methodName><params><param><value><struct>"
         + member("first", FIRST) + member("last", LAST)
         + member("passwd", "$1$" + hashlib.md5(PASSWORD.encode()).hexdigest())
-        + member("start", "uri:Target&amp;124&amp;128&amp;25") + member("channel", "rig-listener") + member("version", "0.1")
+        + member("start", "uri:Target&amp;%s&amp;%s&amp;%s" % tuple(AT)) + member("channel", "rig-listener") + member("version", "0.1")
         + member("platform", "Lnx") + member("mac", "0" * 32) + member("id0", "0" * 32)
         + "<member><name>agree_to_tos</name><value><boolean>1</boolean></value></member>"
         + "<member><name>options</name><value><array><data></data></array></value></member>"

@@ -772,3 +772,55 @@ have none of the deprecated keys unless the row says so.
 Not covered on this rig: a script command that RLV restrictions refuse; a
 `startup_file` (unit tests read one); the XMPP gateway together with a
 script.
+
+## Avatars, friends and profiles
+
+Run on 2026-11-22 with the debug build and `--verbose`: `scan avatars`,
+`friends`, `profile` and the RLV restrictions on the two scans. The config
+is the account, `region = "Target"`, `position = [128.0, 128.0, 25.0]` and
+`socket = true`, with a `RUSSELBOT_SOCK` of the run's own; `ctl` is
+`rslbot ctl` on that socket. The bot stands at 128, 128, 26. The objects
+are those the area scan rezzed. The second avatar is `Rig Owner`, through
+`listen.py SECONDS at=X,Y,Z`, which logs in at that place in `Target`.
+
+Profiles need the simulator's profile service: `setup.sh` turns it on
+(`ProfileServiceURL` under `[UserProfiles]` in `OpenSim.ini`, `Enabled =
+true` under `[UserProfilesService]` in `StandaloneCommon.ini`). A rig set
+up before that answers no profile: its `[UserProfiles]` section, present
+but without a URL, switches both of OpenSimulator's profile modules off.
+Set the two by hand there.
+
+`test-rig/friend.py` makes and changes the friendship between `Sit Bot`
+and `Rig Owner`: `make` (with the bot offline) has the first offer and the
+second accept, `end` ends it, `hide` and `show` take away and give back the
+bot's right to see `Rig Owner` online.
+
+| # | Inject | Expected | Result (2026-11-22, OpenSim feccd9cc53) |
+|---|---|---|---|
+| 218 | `friend.py make` | `Sit Bot`'s next login lists `Rig Owner` in `buddy-list`; the bot logs `the grid lists 1 friend of the avatar` | Pass, both |
+| 219 | Alone in the region: `ctl scan avatars`; `ctl friends`; `ctl profile "Rig Owner"` | Nothing, status 0; one line `offline`; the profile with `online: no` and `friend: yes`, over UDP (`the simulator has no profile service`) | Pass. The names were `?` in both, and the profile had no `name` lines: right after a simulator start this OpenSimulator names nobody who has not logged in since (as in item 206) |
+| 220 | `listen.py 600 at=131,128,25`; `ctl scan avatars` twice; `ctl friends` | One line: UUID, `3.0`, `131,128,26`, `Rig Owner`, `Rig Owner`; the second within a second; `online` | Pass: 0.26 s, then 0.01 s |
+| 221 | `ctl scan avatars whisper`, `chat`, `shout`, `50`, `2` | Listed by the first four, not by `2` | Pass |
+| 222 | `ctl profile "Rig Owner"`; `ctl profile <its UUID>` | `id`, `name`, `display name`, `online: yes`, `friend: yes`, `born` as `YYYY-MM-DD`; one `AvatarPropertiesRequest` each; no `name` search for the UUID | Pass: `born: 2026-11-21`; three requests for the three `profile` commands of the run, nothing else |
+| 223 | `ctl profile Nobody Here` | Status 1 naming `Nobody Here`, no profile asked | Pass |
+| 224 | `scan avatars` in items 219 to 221 | With `--verbose`, no `scanning for objects`, no `ObjectSelect`, no raised distance; only the circuit's own messages sent | Pass |
+| 225 | Stop `listen.py`; `ctl friends`; `ctl scan avatars` | `offline` once the simulator's notice is in; the avatar gone from `scan avatars` with the next list | Pass: `OfflineNotification` when it logged out; `scan avatars` still listed it a moment from the list, by the next list (within 5 s) not |
+| 226 | `listen.py 240 at=200,40,25`; `ctl scan avatars`, `shout`, `100`, `120`, `chat` | One line about 114 m away at `200,40,`*height*; listed by the bare scan and `120` only | Pass: `113.7`, `200,40,25`. OpenSimulator describes every avatar of the region to every agent (`SendOtherAgentsAvatarFullToMe`), so the position is the exact one, not the list's; also with `ObjectsCullingByDistance = true`, tried for item 233 |
+| 227 | `ctl rlv mode on`, `rlv cmd @shownames=n`; `ctl scan avatars`; `ctl scan`; `ctl scan -o "Rig Owner"` | `?`, distance, position, `?`, `?`; the objects with `?` as owner UUID and name; `-o` refused naming `shownames` | Pass, all three |
+| 228 | `rlv cmd @shownames:<Rig Owner>=add`; `ctl scan avatars`; `ctl scan 3`; `ctl scan -o "Rig Owner"` | `Rig Owner` in full in both scans; `-o` still refused | Pass |
+| 229 | `rlv cmd @clear`, `@shownearby=n`, `ctl scan avatars chat`; `@clear`, `@showminimap=n`, `ctl scan avatars` | Refused naming `shownearby`; then `?` as the position, distance and names kept | Pass, both |
+| 230 | `ctl scan objects`; `ctl scan` | The same lines | Pass: the five objects of the area scan |
+| 231 | `rlv cmd @camdrawmax:5=n`; `ctl scan`; `ctl scan 96`; `ctl scan avatars`; `rlv cmd @camdrawalphamax:0.5=n`; `ctl scan` | Nothing beyond 5 m and `cut to 5 m by camdrawmax` in the log, for both; no raised distance; `scan avatars` lists `Rig Owner` at 113.7; then the five objects again | Pass, all of it |
+| 232 | `rlv cmd @shownearby=n,shownames=n`, `ctl rlv mode override`, `ctl scan avatars`, `ctl rlv status`, `ctl scan avatars` | Listed in full; `rlv: on`; refused naming `shownearby` | Pass |
+| 233 | `ObjectsCullingByDistance = true` in `OpenSim.ini`; `listen.py at=200,40,25`; start the bot and give `ctl scan avatars` the moment it logs `connected` | The command waits for the simulator's list of the region's avatars and lists `Rig Owner` | Pass: answered after 1.76 s, the first `CoarseLocationUpdate` having come 2 s after the arrival (52 bytes: both avatars with their ids). `Rig Owner` had dropped to the ground, `200,40,1`, a height the list cannot hold below 4 m; listed exactly, being described all the same (see 226) |
+| 234 | `friend.py hide`; `ctl friends`; `friend.py show`; `ctl friends` | `?`; `offline` | Pass, each after one `ChangeUserRights` |
+| 235 | `ctl profile "Rig Owner"` right after item 234's `hide`, with `Rig Owner` just logged out | What the simulator says | `online: yes`: this OpenSimulator answers from its friends cache, which still had `Rig Owner` online, and does not apply the right it took away. A minute later, after `show`, `online: no` |
+| 236 | `friend.py end`; `ctl friends`; `ctl profile "Rig Owner"` | Nothing; `<uuid> ended the friendship with the avatar` in the log; `friend: no` | Pass. The profile said `online: yes` again for the moment after `friend.py` logged out, as in 235 |
+
+The rig was left without the friendship, as it was before (item 236).
+
+Not covered on this rig: an avatar known by the simulator's list only
+(OpenSimulator describes every avatar in the region), and so the list's
+heights, its 60-avatar limit and var regions; the `AgentProfile` service,
+which OpenSimulator does not have; a friendship accepted while the bot
+runs, and friends online when the bot logs in; Second Life.

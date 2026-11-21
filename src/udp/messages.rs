@@ -58,6 +58,13 @@ pub const OBJECT_PROPERTIES: MessageId = medium(9);
 pub const PACKET_ACK: MessageId = 0xFFFF_FFFB;
 /// Sent by the bot to play a sound, and by simulators when one plays.
 pub const SOUND_TRIGGER: MessageId = high(29);
+pub const COARSE_LOCATION_UPDATE: MessageId = medium(6);
+pub const AVATAR_PROPERTIES_REQUEST: MessageId = low(169);
+pub const AVATAR_PROPERTIES_REPLY: MessageId = low(171);
+pub const TERMINATE_FRIENDSHIP: MessageId = low(300);
+pub const CHANGE_USER_RIGHTS: MessageId = low(321);
+pub const ONLINE_NOTIFICATION: MessageId = low(322);
+pub const OFFLINE_NOTIFICATION: MessageId = low(323);
 
 // Messages a real simulator sends that the bot ignores; listed so verbose
 // logging can name them.
@@ -67,7 +74,6 @@ pub const IMPROVED_TERSE_OBJECT_UPDATE: MessageId = high(15);
 pub const KILL_OBJECT: MessageId = high(16);
 pub const AVATAR_ANIMATION: MessageId = high(20);
 pub const CAMERA_CONSTRAINT: MessageId = high(22);
-pub const COARSE_LOCATION_UPDATE: MessageId = medium(6);
 pub const ATTACHED_SOUND: MessageId = medium(13);
 pub const VIEWER_EFFECT: MessageId = medium(17);
 pub const HEALTH_MESSAGE: MessageId = low(138);
@@ -77,7 +83,6 @@ pub const AVATAR_APPEARANCE: MessageId = low(158);
 pub const SCRIPT_CONTROL_CHANGE: MessageId = low(189);
 pub const SCRIPT_DIALOG: MessageId = low(190);
 pub const PARCEL_OVERLAY: MessageId = low(196);
-pub const ONLINE_NOTIFICATION: MessageId = low(322);
 pub const AGENT_DATA_UPDATE: MessageId = low(387);
 
 pub type Vector3 = [f32; 3];
@@ -152,6 +157,11 @@ pub fn name(id: MessageId) -> String {
         SCRIPT_DIALOG => "ScriptDialog",
         PARCEL_OVERLAY => "ParcelOverlay",
         ONLINE_NOTIFICATION => "OnlineNotification",
+        OFFLINE_NOTIFICATION => "OfflineNotification",
+        TERMINATE_FRIENDSHIP => "TerminateFriendship",
+        CHANGE_USER_RIGHTS => "ChangeUserRights",
+        AVATAR_PROPERTIES_REQUEST => "AvatarPropertiesRequest",
+        AVATAR_PROPERTIES_REPLY => "AvatarPropertiesReply",
         AGENT_DATA_UPDATE => "AgentDataUpdate",
         0..=0xFE => return format!("High {id}"),
         0xFF00..=0xFFFE => return format!("Medium {}", id & 0xFF),
@@ -469,6 +479,12 @@ pub fn request_object_properties_family(agent: &Agent, object: Uuid) -> Outgoing
 /// the avatars whose names match `name`.
 pub fn avatar_picker_request(agent: &Agent, query: Uuid, name: &str) -> Outgoing {
     Writer::agent(agent).uuid(query).text1(name).finish(AVATAR_PICKER_REQUEST, false)
+}
+
+/// AvatarPropertiesRequest, Low 169: AvatarID. Asks for the profile of
+/// `avatar`; answered with AvatarPropertiesReply.
+pub fn avatar_properties_request(agent: &Agent, avatar: Uuid) -> Outgoing {
+    Writer::agent(agent).uuid(avatar).finish(AVATAR_PROPERTIES_REQUEST, false)
 }
 
 /// StartLure, Low 70: LureType U8, Message Variable 1, then the avatars
@@ -946,6 +962,32 @@ pub enum Incoming {
         query: Uuid,
         avatars: Vec<(Uuid, String)>,
     },
+    /// The avatars in the region as the simulator lists them for the
+    /// minimap: id and position, `x` and `y` in whole metres, `z` in steps
+    /// of 4 metres.
+    AvatarsHere(Vec<(Uuid, [u8; 3])>),
+    /// Friends that came online.
+    FriendsOnline(Vec<Uuid>),
+    /// Friends that went offline.
+    FriendsOffline(Vec<Uuid>),
+    /// The avatar that ended its friendship with the agent.
+    FriendshipEnded(Uuid),
+    /// Rights between friends changed. When `agent` is another avatar, it
+    /// is the friend that changed what it grants the agent; when it is the
+    /// agent, the rights are the ones the agent grants.
+    RightsChanged {
+        agent: Uuid,
+        rights: Vec<(Uuid, i32)>,
+    },
+    /// An avatar's profile, in answer to AvatarPropertiesRequest.
+    AvatarProperties {
+        avatar: Uuid,
+        partner: Uuid,
+        about: String,
+        first_life: String,
+        born: String,
+        flags: u32,
+    },
     LogoutReply,
     DisableSimulator,
     /// A message the bot has no use for.
@@ -1249,6 +1291,69 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
                 avatars.push((id, format!("{first} {last}").trim().to_string()));
             }
             Incoming::AvatarPickerReply { query, avatars }
+        }
+        // CoarseLocationUpdate, Medium 6: Location Variable { X U8, Y U8,
+        // Z U8 }, Index { You S16, Prey S16 }, AgentData Variable { AgentID }.
+        // The two lists pair by index; older simulators leave the ids out,
+        // and a list without them names nobody.
+        COARSE_LOCATION_UPDATE => {
+            let count = r.u8()?;
+            let locations = (0..count).map(|_| r.array::<3>()).collect::<Decoded<Vec<_>>>()?;
+            r.skip(2 + 2)?;
+            let ids = match r.0.is_empty() {
+                true => Vec::new(),
+                false => {
+                    let count = r.u8()?;
+                    (0..count).map(|_| r.uuid()).collect::<Decoded<Vec<_>>>()?
+                }
+            };
+            Incoming::AvatarsHere(ids.into_iter().zip(locations).collect())
+        }
+        // OnlineNotification, Low 322, and OfflineNotification, Low 323:
+        // AgentBlock Variable { AgentID }.
+        ONLINE_NOTIFICATION | OFFLINE_NOTIFICATION => {
+            let count = r.u8()?;
+            let ids = (0..count).map(|_| r.uuid()).collect::<Decoded<Vec<_>>>()?;
+            match id {
+                ONLINE_NOTIFICATION => Incoming::FriendsOnline(ids),
+                _ => Incoming::FriendsOffline(ids),
+            }
+        }
+        // TerminateFriendship, Low 300: AgentID, SessionID, ExBlock { OtherID }.
+        TERMINATE_FRIENDSHIP => {
+            r.skip(32)?;
+            Incoming::FriendshipEnded(r.uuid()?)
+        }
+        // ChangeUserRights, Low 321: AgentID, Rights Variable
+        // { AgentRelated, RelatedRights S32 }.
+        CHANGE_USER_RIGHTS => {
+            let agent = r.uuid()?;
+            let count = r.u8()?;
+            let rights = (0..count).map(|_| Ok((r.uuid()?, r.u32()? as i32))).collect::<Decoded<Vec<_>>>()?;
+            Incoming::RightsChanged { agent, rights }
+        }
+        // AvatarPropertiesReply, Low 171, Zerocoded: AgentID, AvatarID,
+        // ImageID, FLImageID, PartnerID, AboutText Variable 2, FLAboutText
+        // Variable 1, BornOn Variable 1, ProfileURL Variable 1,
+        // CharterMember Variable 1, Flags U32.
+        AVATAR_PROPERTIES_REPLY => {
+            r.skip(16)?;
+            let avatar = r.uuid()?;
+            r.skip(32)?; // ImageID, FLImageID
+            let partner = r.uuid()?;
+            let about = text(r.variable2()?);
+            let first_life = text(r.variable1()?);
+            let born = text(r.variable1()?);
+            r.variable1()?; // ProfileURL
+            r.variable1()?; // CharterMember
+            Incoming::AvatarProperties {
+                avatar,
+                partner,
+                about,
+                first_life,
+                born,
+                flags: r.u32()?,
+            }
         }
         LOGOUT_REPLY => Incoming::LogoutReply,
         DISABLE_SIMULATOR => Incoming::DisableSimulator,
@@ -1607,6 +1712,64 @@ pub mod testing {
             body.push(index as u8 * 16); // TextureID
             body.extend(vec![0x7E; index * 16]);
         }
+        body
+    }
+
+    /// A CoarseLocationUpdate; `ids` may be fewer than `locations`, and
+    /// `None` leaves the AgentData block out as older simulators do.
+    pub fn coarse_location_update(locations: &[[u8; 3]], ids: Option<&[Uuid]>) -> Vec<u8> {
+        let mut body = vec![locations.len() as u8];
+        for location in locations {
+            body.extend(location);
+        }
+        body.extend((-1i16).to_le_bytes()); // You
+        body.extend((-1i16).to_le_bytes()); // Prey
+        if let Some(ids) = ids {
+            body.push(ids.len() as u8);
+            for id in ids {
+                body.extend(id.as_bytes());
+            }
+        }
+        body
+    }
+
+    /// An OnlineNotification or OfflineNotification body.
+    pub fn friend_notification(ids: &[Uuid]) -> Vec<u8> {
+        let mut body = vec![ids.len() as u8];
+        for id in ids {
+            body.extend(id.as_bytes());
+        }
+        body
+    }
+
+    pub fn terminate_friendship(other: Uuid) -> Vec<u8> {
+        let mut body = vec![0x5A; 32]; // AgentID, SessionID
+        body.extend(other.as_bytes());
+        body
+    }
+
+    pub fn change_user_rights(agent: Uuid, rights: &[(Uuid, i32)]) -> Vec<u8> {
+        let mut body = agent.as_bytes().to_vec();
+        body.push(rights.len() as u8);
+        for (related, value) in rights {
+            body.extend(related.as_bytes());
+            body.extend(value.to_le_bytes());
+        }
+        body
+    }
+
+    /// An AvatarPropertiesReply body, before zerocoding.
+    pub fn avatar_properties_reply(avatar: Uuid, partner: Uuid, about: &str, first_life: &str, born: &str, flags: u32) -> Vec<u8> {
+        let mut body = vec![0xA1; 16]; // AgentID
+        body.extend(avatar.as_bytes());
+        body.extend([0x1E; 32]); // ImageID, FLImageID
+        body.extend(partner.as_bytes());
+        body.extend(string2(about));
+        body.extend(string1(first_life));
+        body.extend(string1(born));
+        body.extend(string1("http://example.com/profile")); // ProfileURL
+        body.extend([1, 3]); // CharterMember
+        body.extend(flags.to_le_bytes());
         body
     }
 
@@ -2255,6 +2418,90 @@ mod tests {
         assert_eq!(decode(low(28), &body[..body.len() - 1]), Err(DecodeError));
         let none = avatar_picker_reply(query, &[]);
         assert_eq!(decode(low(28), &none), Ok(Incoming::AvatarPickerReply { query, avatars: vec![] }));
+    }
+
+    #[test]
+    fn decodes_coarse_location_update() {
+        let ids = [Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16])];
+        let locations = [[200, 40, 6], [10, 20, 255], [0, 255, 0]];
+        let body = coarse_location_update(&locations, Some(&ids));
+        let wanted: Vec<(Uuid, [u8; 3])> = ids.into_iter().zip(locations).collect();
+        assert_eq!(decode(medium(6), &body), Ok(Incoming::AvatarsHere(wanted.clone())));
+        // Without the ids, nobody; with fewer ids, as many as there are.
+        let bare = coarse_location_update(&locations, None);
+        assert_eq!(decode(medium(6), &bare), Ok(Incoming::AvatarsHere(vec![])));
+        let short = coarse_location_update(&locations, Some(&ids[..2]));
+        assert_eq!(decode(medium(6), &short), Ok(Incoming::AvatarsHere(wanted[..2].to_vec())));
+        for cut in [1, 5, 16] {
+            assert_eq!(decode(medium(6), &body[..body.len() - cut]), Err(DecodeError));
+        }
+        assert_eq!(decode(medium(6), &[]), Err(DecodeError));
+    }
+
+    #[test]
+    fn decodes_online_and_offline_notifications() {
+        let ids = [Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16])];
+        let body = friend_notification(&ids);
+        assert_eq!(decode(low(322), &body), Ok(Incoming::FriendsOnline(ids.to_vec())));
+        assert_eq!(decode(low(323), &body), Ok(Incoming::FriendsOffline(ids.to_vec())));
+        assert_eq!(decode(low(323), &body[..body.len() - 1]), Err(DecodeError));
+        assert_eq!(
+            (name(low(322)), name(low(323))),
+            ("OnlineNotification".into(), "OfflineNotification".into())
+        );
+    }
+
+    #[test]
+    fn decodes_terminate_friendship() {
+        let jane = Uuid::from_bytes([0x1A; 16]);
+        let body = terminate_friendship(jane);
+        assert_eq!(body.len(), 48);
+        assert_eq!(decode(low(300), &body), Ok(Incoming::FriendshipEnded(jane)));
+        assert_eq!(decode(low(300), &body[..47]), Err(DecodeError));
+        assert_eq!(name(low(300)), "TerminateFriendship");
+    }
+
+    #[test]
+    fn decodes_change_user_rights() {
+        let (jane, bot) = (Uuid::from_bytes([0x1A; 16]), Uuid::from_bytes([0xA1; 16]));
+        let body = change_user_rights(jane, &[(bot, 1), (jane, -2)]);
+        assert_eq!(body.len(), 16 + 1 + 2 * 20);
+        assert_eq!(
+            decode(low(321), &body),
+            Ok(Incoming::RightsChanged {
+                agent: jane,
+                rights: vec![(bot, 1), (jane, -2)],
+            })
+        );
+        assert_eq!(decode(low(321), &body[..body.len() - 1]), Err(DecodeError));
+        assert_eq!(name(low(321)), "ChangeUserRights");
+    }
+
+    #[test]
+    fn encodes_avatar_properties_request() {
+        let msg = avatar_properties_request(&agent(), Uuid::from_bytes([0x1A; 16]));
+        assert_eq!((msg.id, msg.zerocoded), (low(169), false));
+        assert_eq!(msg.body, [agent_prefix(), vec![0x1A; 16]].concat());
+    }
+
+    #[test]
+    fn decodes_avatar_properties_reply() {
+        let jane = Uuid::from_bytes([0x1A; 16]);
+        let about = "x".repeat(600);
+        let body = avatar_properties_reply(jane, Uuid::nil(), &about, "", "3/14/2010", 0x10 | 0x01);
+        assert_eq!(
+            decode(low(171), &body),
+            Ok(Incoming::AvatarProperties {
+                avatar: jane,
+                partner: Uuid::nil(),
+                about,
+                first_life: String::new(),
+                born: "3/14/2010".to_string(),
+                flags: 0x11,
+            })
+        );
+        assert_eq!(decode(low(171), &body[..body.len() - 1]), Err(DecodeError));
+        assert_eq!(name(low(171)), "AvatarPropertiesReply");
     }
 
     #[test]

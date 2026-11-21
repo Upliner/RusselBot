@@ -48,6 +48,11 @@ pub enum Event {
         query: Uuid,
         reason: String,
     },
+    /// The answer of the profile service about an avatar.
+    Profile {
+        id: Uuid,
+        result: Result<crate::profile::Profile, String>,
+    },
     /// What became of an inventory job.
     Inventory {
         id: u64,
