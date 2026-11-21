@@ -20,7 +20,7 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `start` | no, and only without `region` and `position` | Where a login places the avatar while the bot holds no location: `"home"` for the avatar's home location, `"latest"` for the location it was last at. Defaults to `"latest"` |
 | `sit` | no | Sit state of the config placement: the UUID of an object, or the word `ground`. When absent the config placement's sit state is `stand` and the bot does not seat the avatar at startup |
 | `object` | no | Deprecated spelling of `sit`, accepting a UUID only |
-| `persist` | no | What the bot holds once it has reached the config placement after startup (see `placement-persist`), and in its table form also what a forced RLV movement does to the held placement and which of the bot's own steps RLV restrictions do not hold back (see `rlv-commands`); the forms are given below. Defaults to `"off"` |
+| `persist` | no | Deprecated in favour of the startup script, as said below. What the bot holds once it has reached the config placement after startup (see `placement-persist`), and in its table form also what a forced RLV movement does to the held placement and which of the bot's own steps RLV restrictions do not hold back (see `rlv-commands`); the forms are given below. Defaults to `"off"` |
 | `log_chat` | no | Path of the TSV file that receives local chat; no chat file is written when absent |
 | `log_im` | no | Path of the TSV file that receives instant messages; no IM file is written when absent |
 | `fetch_offline_im` | no | Boolean; when true the bot fetches instant messages stored while the avatar was offline. Defaults to false |
@@ -28,10 +28,12 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `requesttp_timeout` | no | Number of minutes, greater than zero, during which the bot accepts a teleport offer from an avatar it has asked with `requesttp`. Defaults to 10 |
 | `scan_distance` | no | Number of metres, from 1 to 1024. When present the bot learns the objects within that distance from the moment it enters a region, for the `touch` command. When absent it learns them only when `touch` is first used, within 32 metres |
 | `restore_attachments` | no | Boolean; when true the bot attaches again, after each login, the objects the avatar's Current Outfit folder lists and the simulator did not bring (see `avatar-outfit`, "Restoring attachments after a login"). Defaults to true |
-| `rlv` | no | Boolean; when true the bot starts with RLV on and reads the RLV commands of the objects the avatar owns (see `rlv-commands`). Defaults to false |
-| `perms` | no | Table saying which requests the bot accepts by itself (see `permission-requests`); its form is given below. Without it the bot accepts none by itself |
+| `rlv` | no | Deprecated in favour of the startup script. Boolean; when true the bot starts with RLV on and reads the RLV commands of the objects the avatar owns (see `rlv-commands`). Defaults to false |
+| `perms` | no | Deprecated in favour of the startup script. Table saying which requests the bot accepts by itself (see `permission-requests`); its form is given below. Without it the bot accepts none by itself |
 | `xmpp` | no | Table that switches on the XMPP gateway (see `xmpp-gateway`); its form is given below. Without it the bot makes no XMPP connection |
-| `autoreply` | no | Table that switches on autoreplies to instant messages (see `im-autoreply`); its form is given below. Without it the bot starts with autoreply off and no autoreply text |
+| `autoreply` | no | Deprecated in favour of the startup script. Table that switches on autoreplies to instant messages (see `im-autoreply`); its form is given below. Without it the bot starts with autoreply off and no autoreply text |
+| `startup` | no, and not together with `startup_file` | The startup script, a string of one or more lines: commands the bot carries out by itself when it starts (see `startup-script`) |
+| `startup_file` | no, and not together with `startup` | Path of a file that holds the startup script |
 
 `persist` SHALL be accepted in these forms:
 
@@ -65,7 +67,22 @@ In the table form, `atstart` is a boolean that says whether the bot holds anythi
 
 A duration SHALL be a string of one or more groups, each a whole number followed by one of the units `s` (seconds), `m` (minutes), `h` (hours) and `d` (days), written without spaces, such as `"90s"`, `"30m"`, `"2h"` or `"1h30m"`, or the string `"0"`. A unit SHALL appear at most once, and the units SHALL be in the order `d`, `h`, `m`, `s`. The duration is the sum of the groups and SHALL be at most 365 days. A config with an `autoreply` table SHALL start the bot with autoreply on.
 
-A relative `log_chat` or `log_im` path SHALL be taken relative to the directory the bot was started in. A config that uses `object` SHALL behave exactly as the same config with that value under `sit`, and the bot SHALL write a line to standard error at startup that names `object` as deprecated and `sit` as its replacement.
+A relative `log_chat`, `log_im` or `startup_file` path SHALL be taken relative to the directory the bot was started in. A config that uses `object` SHALL behave exactly as the same config with that value under `sit`, and the bot SHALL write a line to standard error at startup that names `object` as deprecated and `sit` as its replacement.
+
+The keys `persist`, `rlv`, `perms` and `autoreply` are deprecated in favour of the startup script. A config that uses them SHALL behave as this requirement says, and what they set SHALL be in place before the first command of the startup script is carried out: the bot starts with what `rlv`, `perms`, `autoreply` and the `[persist]` keys `rlv` and `override` give, and it applies the `persist` setting before the rest of the script starts (see `startup-script`, "The rest waits for the config placement"). For each of these four keys the config contains, the bot SHALL write a line to standard error at startup that names the key as deprecated and the startup script commands that replace what the config gives for it:
+
+| Deprecated | Commands in the startup script |
+|---|---|
+| `persist` as `"cur"`, `"cfg"` or an array, and the `[persist]` keys `atstart`, `position` and `sit` | `persist <location> <sit state>` with the same words `cur` and `cfg`, after the setting commands |
+| `persist = "off"` or `persist = false` | None: the key is left out |
+| `rlv` in the `[persist]` table | `rlv persist follow` or `rlv persist drop` |
+| `override` in the `[persist]` table | `rlv persist override` with `sit`, `tp` or both |
+| `rlv = true` | `rlv mode on` |
+| A kind under `[perms.autoaccept]` | `perms autoaccept <kind> all`, or `perms autoaccept <kind>` with the entries |
+| A kind under `[perms.except]` | `perms revoke <kind>` with the entries, after `perms autoaccept <kind> all` |
+| `[autoreply]` | `autoreply message` with the text and, when the table has a `pause`, `autoreply pause` with it |
+
+An exception under `[perms.except]` for a kind whose rule is not `all` has no command; when the config has one, the line for `perms` SHALL say that it cannot be written in the startup script.
 
 #### Scenario: Minimal config for Second Life
 - **WHEN** the config contains only `user` and `password_hash`
@@ -243,8 +260,44 @@ A relative `log_chat` or `log_im` path SHALL be taken relative to the directory 
 - **WHEN** the config has no `autoreply` key
 - **THEN** the bot starts with autoreply off and answers no instant message by itself
 
+#### Scenario: Startup script in the config
+- **WHEN** the config contains `startup` with the lines `rlv mode on` and `persist`
+- **THEN** the bot starts with RLV on and, once the config placement is reached, holds where the avatar is, as `startup-script` describes
+
+#### Scenario: Startup script in a file
+- **WHEN** the config contains `startup_file = "startup.rsl"` and the directory the bot was started in has that file
+- **THEN** the bot carries out the commands in that file as it would the same text under `startup`
+
+#### Scenario: No startup script
+- **WHEN** the config has neither `startup` nor `startup_file`
+- **THEN** the bot starts and carries out no startup script
+
+#### Scenario: Deprecated key named in the log
+- **WHEN** the config contains `rlv = true`
+- **THEN** the bot starts with RLV on, and its log names `rlv` as deprecated in favour of the startup script command `rlv mode on`
+
+#### Scenario: Deprecated persist named in the log
+- **WHEN** the config contains `persist = ["cfg", "cur"]`
+- **THEN** the bot holds the configured position and the seat the simulator reported, and its log names `persist` as deprecated in favour of the startup script command `persist cfg cur`
+
+#### Scenario: No deprecated key
+- **WHEN** the config has none of `object`, `persist`, `rlv`, `perms` and `autoreply`
+- **THEN** the bot's log has no line about a deprecated key
+
+#### Scenario: Deprecated key and a script
+- **WHEN** the config contains `rlv = true` and `startup` with the line `rlv mode off`
+- **THEN** RLV is off when the bot logs in
+
+#### Scenario: Deprecated persist and a script
+- **WHEN** the config contains `region`, `position`, `sit`, `persist = "cfg"` and `startup` with the line `say hello`
+- **THEN** once the avatar is seated the bot holds the config placement, and the avatar then says `hello`
+
+#### Scenario: Exception that no command gives
+- **WHEN** the config has `anim = ["Jane Doe"]` under `[perms.autoaccept]` and `anim = ["01234567-9abc-defe-dcba-987654321000"]` under `[perms.except]`
+- **THEN** the bot starts with that rule and that exception, and the line that names `perms` as deprecated says that the exception for `anim` cannot be written in the startup script
+
 ### Requirement: Config validation before any network activity
-The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `atstart`, `position`, `sit`, `rlv` and `override`, with a `position` or `sit` other than `"cur"` and `"cfg"`, with an `atstart` that is not a boolean, with an `rlv` other than `"drop"` and `"follow"`, with an `override` that is neither `"sit"`, `"tp"` nor an array of these two strings, or with `atstart = false` together with `position` or `sit`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, a `restore_attachments` that is not a boolean, an `rlv` that is not a boolean, a `perms` that is not in its form (a value that is not a table, a key other than `autoaccept` and `except`, an `autoaccept` or `except` that is not a table, a key in either that is not a kind of request, a value under `autoaccept` that is neither `"all"`, a boolean nor an array of strings, a value under `except` that is not an array of strings, an entry that is neither a UUID nor a name of one or two words, the entry `"all"` inside an array, or one entry both in a kind's `autoaccept` array and in its `except` array), an `xmpp` that is not in its form (a value that is not a table, a key other than `component`, `server`, `secret` and `owners`, a missing `component`, `secret` or `owners`, a `component` that is not a domain name or that holds `@` or `/`, a `server` that is not `host:port` with a port from 1 to 65535 or whose host is neither `localhost` nor a loopback address, a `secret` that is not a non-empty string, an `owners` that is not a non-empty array of strings, or an owner that is not a bare address `user@domain`), an `autoreply` that is not in its form (a value that is not a table, a key other than `message` and `pause`, a missing `message`, a `message` that is not a string, is blank or is longer than 1023 bytes, or a `pause` that is not a string in the duration form or is longer than 365 days), and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything.
+The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `atstart`, `position`, `sit`, `rlv` and `override`, with a `position` or `sit` other than `"cur"` and `"cfg"`, with an `atstart` that is not a boolean, with an `rlv` other than `"drop"` and `"follow"`, with an `override` that is neither `"sit"`, `"tp"` nor an array of these two strings, or with `atstart = false` together with `position` or `sit`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, a `restore_attachments` that is not a boolean, an `rlv` that is not a boolean, a `perms` that is not in its form (a value that is not a table, a key other than `autoaccept` and `except`, an `autoaccept` or `except` that is not a table, a key in either that is not a kind of request, a value under `autoaccept` that is neither `"all"`, a boolean nor an array of strings, a value under `except` that is not an array of strings, an entry that is neither a UUID nor a name of one or two words, the entry `"all"` inside an array, or one entry both in a kind's `autoaccept` array and in its `except` array), an `xmpp` that is not in its form (a value that is not a table, a key other than `component`, `server`, `secret` and `owners`, a missing `component`, `secret` or `owners`, a `component` that is not a domain name or that holds `@` or `/`, a `server` that is not `host:port` with a port from 1 to 65535 or whose host is neither `localhost` nor a loopback address, a `secret` that is not a non-empty string, an `owners` that is not a non-empty array of strings, or an owner that is not a bare address `user@domain`), an `autoreply` that is not in its form (a value that is not a table, a key other than `message` and `pause`, a missing `message`, a `message` that is not a string, is blank or is longer than 1023 bytes, or a `pause` that is not a string in the duration form or is longer than 365 days), both `startup` and `startup_file`, a `startup` that is not a string, a `startup_file` that is not a non-empty string, a `startup_file` file that cannot be read or is not valid UTF-8, a startup script that is not in its form (see `startup-script`: a command that ends inside double quotes, that is longer than 8192 bytes, whose name the control socket does not know, or that has a number or form of arguments for which the control socket refuses it without looking at the bot's state), a setting command at the head of the startup script that is refused when it is carried out (see `startup-script`, "Setting commands run before the first login"), and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything. For a startup script the message SHALL name `startup` or `startup_file`, whichever the config has, and the line the offending command starts on. A command of the startup script that is in its form and is no setting command at the head SHALL NOT be judged before it is due: when it is refused then, the bot keeps running, as `startup-script` says.
 
 #### Scenario: Both password forms given
 - **WHEN** the config contains both `password` and `password_hash`
@@ -397,6 +450,38 @@ The bot SHALL validate the whole config before contacting any server. It SHALL r
 #### Scenario: Blank autoreply text
 - **WHEN** the `[autoreply]` table contains `message = "  "`
 - **THEN** the bot prints an error naming `autoreply.message` and exits with status 2
+
+#### Scenario: Both startup keys
+- **WHEN** the config contains both `startup` and `startup_file`
+- **THEN** the bot prints an error naming both keys and exits with status 2
+
+#### Scenario: Startup of the wrong type
+- **WHEN** the config contains `startup = ["rlv mode on"]` or `startup_file = ""`
+- **THEN** the bot prints an error naming that key and exits with status 2
+
+#### Scenario: Startup file missing
+- **WHEN** `startup_file` names a file that does not exist
+- **THEN** the bot prints an error naming `startup_file`, the path and the reason, and exits with status 2 without contacting the login server
+
+#### Scenario: Unknown command in the script
+- **WHEN** the third line of `startup` is `teleport 128 128 25`
+- **THEN** the bot prints an error naming `startup`, line 3 and the unknown command `teleport`, and exits with status 2
+
+#### Scenario: Wrong number of arguments in the script
+- **WHEN** a line of `startup` is `sit` or `rlv mode loud`
+- **THEN** the bot prints an error naming `startup`, that line and what the command takes, and exits with status 2
+
+#### Scenario: Unclosed quote in the script
+- **WHEN** line 2 of the file `startup_file` names is `im "Jane Doe hi` and no later line has a double quote
+- **THEN** the bot prints an error naming `startup_file`, line 2 and the quote, and exits with status 2
+
+#### Scenario: Setting command refused
+- **WHEN** `startup` starts with `rlv mode on` and has `perms autoaccept money all` as its second line
+- **THEN** the bot prints an error naming `startup`, line 2 and the kinds there are, and exits with status 2 without contacting any server
+
+#### Scenario: Command that is judged when it is due
+- **WHEN** `startup` is the two lines `say hello` and `autoreply pause soon`
+- **THEN** the bot starts and logs in; the refusal of `autoreply pause soon` is in the operator log once the avatar has said `hello`
 
 ### Requirement: Password hash subcommand
 The bot SHALL provide a `hash` subcommand that reads a password from standard input and prints the corresponding hash on standard output as `$1$` followed by the 32 lowercase hexadecimal digits of the MD5 digest of the password. The password SHALL NOT be accepted as a command-line argument. When standard input is a terminal the password SHALL NOT be echoed. A trailing line ending SHALL NOT be part of the hashed password. An empty password SHALL be rejected with a non-zero exit status.
