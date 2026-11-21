@@ -106,6 +106,15 @@ mod tests {
     }
 
     #[test]
+    fn a_filter_text_of_two_words_is_one_argument() {
+        let line = request_line(&split("scan 20 --name \"park bench\" -s").unwrap());
+        assert_eq!(
+            Request::decode(line.as_bytes()),
+            Ok(Request::Scan(words(&["20", "--name", "park bench", "-s"])))
+        );
+    }
+
+    #[test]
     fn unclosed_quote() {
         let error = split("im \"Jane Doe hi").unwrap_err();
         assert!(error.contains("quote"), "{error}");

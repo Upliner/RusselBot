@@ -20,6 +20,8 @@ pub const AVATAR_PICKER_REQUEST: MessageId = low(26);
 pub const AVATAR_PICKER_REPLY: MessageId = low(28);
 pub const START_LURE: MessageId = low(70);
 pub const TELEPORT_LURE_REQUEST: MessageId = low(71);
+pub const OBJECT_SELECT: MessageId = low(110);
+pub const OBJECT_DESELECT: MessageId = low(111);
 pub const OBJECT_GRAB: MessageId = low(117);
 pub const OBJECT_DEGRAB: MessageId = low(119);
 pub const REQUEST_MULTIPLE_OBJECTS: MessageId = medium(3);
@@ -52,6 +54,7 @@ pub const SCRIPT_ANSWER_YES: MessageId = low(132);
 pub const SCRIPT_QUESTION: MessageId = low(188);
 pub const REQUEST_OBJECT_PROPERTIES_FAMILY: MessageId = medium(5);
 pub const OBJECT_PROPERTIES_FAMILY: MessageId = medium(10);
+pub const OBJECT_PROPERTIES: MessageId = medium(9);
 pub const PACKET_ACK: MessageId = 0xFFFF_FFFB;
 /// Sent by the bot to play a sound, and by simulators when one plays.
 pub const SOUND_TRIGGER: MessageId = high(29);
@@ -94,6 +97,9 @@ pub fn name(id: MessageId) -> String {
         SCRIPT_QUESTION => "ScriptQuestion",
         REQUEST_OBJECT_PROPERTIES_FAMILY => "RequestObjectPropertiesFamily",
         OBJECT_PROPERTIES_FAMILY => "ObjectPropertiesFamily",
+        OBJECT_PROPERTIES => "ObjectProperties",
+        OBJECT_SELECT => "ObjectSelect",
+        OBJECT_DESELECT => "ObjectDeselect",
         USE_CIRCUIT_CODE => "UseCircuitCode",
         AVATAR_PICKER_REQUEST => "AvatarPickerRequest",
         AVATAR_PICKER_REPLY => "AvatarPickerReply",
@@ -514,6 +520,31 @@ pub fn request_multiple_objects(agent: &Agent, local_ids: &[u32]) -> Outgoing {
     writer.finish(REQUEST_MULTIPLE_OBJECTS, true)
 }
 
+/// The most objects one ObjectSelect or ObjectDeselect names: the block
+/// count is one byte.
+pub const SELECT_BATCH: usize = 255;
+
+fn local_ids(agent: &Agent, local_ids: &[u32]) -> Writer {
+    let mut writer = Writer::agent(agent).u8(local_ids.len() as u8);
+    for id in local_ids {
+        writer = writer.u32(*id);
+    }
+    writer
+}
+
+/// ObjectSelect, Low 110, Zerocoded: ObjectData Variable { ObjectLocalID
+/// U32 }. The simulator answers with the ObjectProperties of each object.
+/// At most 255 ids fit in one message.
+pub fn object_select(agent: &Agent, ids: &[u32]) -> Outgoing {
+    local_ids(agent, ids).finish(OBJECT_SELECT, true)
+}
+
+/// ObjectDeselect, Low 111, Zerocoded: ObjectData Variable { ObjectLocalID
+/// U32 }. Ends the selection an ObjectSelect made.
+pub fn object_deselect(agent: &Agent, ids: &[u32]) -> Outgoing {
+    local_ids(agent, ids).finish(OBJECT_DESELECT, true)
+}
+
 /// RezSingleAttachmentFromInv's AttachmentPt: do not take off what is on
 /// the point already (ATTACHMENT_ADD, indra_constants.h:194).
 pub const ATTACHMENT_ADD: u8 = 0x80;
@@ -729,6 +760,34 @@ pub struct ObjectParent {
     /// The inventory item an attachment was made from: the name-value
     /// `AttachItemID` of its root prim.
     pub attach_item: Option<Uuid>,
+    /// What kind of object it is: `PCODE_PRIM`, `PCODE_AVATAR`, a tree...
+    pub pcode: u8,
+    /// `UpdateFlags`: the `FLAG_` bits among others.
+    pub flags: u32,
+}
+
+/// PCode of a prim (LL_PCODE_VOLUME, llprimitive.h).
+pub const PCODE_PRIM: u8 = 9;
+/// PCode of an avatar (LL_PCODE_LEGACY_AVATAR).
+pub const PCODE_AVATAR: u8 = 47;
+
+// The bits of an object's UpdateFlags the bot reads (object_flags.h).
+pub const FLAG_PHYSICS: u32 = 1 << 0;
+pub const FLAG_SCRIPTED: u32 = 1 << 6;
+pub const FLAG_TOUCH: u32 = 1 << 7;
+pub const FLAG_PHANTOM: u32 = 1 << 10;
+pub const FLAG_TEMPORARY: u32 = 1 << 29;
+
+/// What the simulator says of an object in answer to a selection or to
+/// RequestObjectPropertiesFamily.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Properties {
+    pub object: Uuid,
+    /// The owning avatar; nil, or the group, for a group's object.
+    pub owner: Uuid,
+    pub group: Uuid,
+    pub name: String,
+    pub description: String,
 }
 
 impl ObjectParent {
@@ -760,6 +819,10 @@ pub struct CompressedObject {
     /// Set when the update names the inventory item the object was
     /// attached from; missing also when its optional fields do not read.
     pub attachment: Option<Worn>,
+    /// What kind of object it is; zero when the update is too short to say.
+    pub pcode: u8,
+    /// `UpdateFlags`: the `FLAG_` bits among others.
+    pub flags: u32,
 }
 
 /// The attachment point in an object's `State`: the two nibbles swapped
@@ -871,7 +934,12 @@ pub enum Incoming {
         object: Uuid,
         owner: Uuid,
         group: Uuid,
+        /// Its name and description; missing when the answer ends early.
+        named: Option<(String, String)>,
     },
+    /// What objects are called and whose they are, in answer to a
+    /// selection.
+    ObjectProperties(Vec<Properties>),
     /// The answer to an avatar search: the avatars found, as id and
     /// `First Last`.
     AvatarPickerReply {
@@ -968,9 +1036,10 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
             let count = r.u8()?;
             let mut objects = Vec::with_capacity(usize::from(count));
             for _ in 0..count {
-                r.skip(4)?;
+                let flags = r.u32()?;
                 let mut data = Reader(r.variable2()?);
                 let (full_id, local_id) = (data.uuid()?, data.u32()?);
+                let pcode = data.0.first().copied().unwrap_or(0);
                 // Whatever is too short to hold them describes the object
                 // all the same.
                 let mut parent_id = None;
@@ -987,6 +1056,8 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
                     transform,
                     parent_id,
                     attachment,
+                    pcode,
+                    flags,
                 });
             }
             Incoming::ObjectsCompressed(objects)
@@ -1120,11 +1191,50 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
         // OwnerID, GroupID, then masks, sale data, names.
         OBJECT_PROPERTIES_FAMILY => {
             r.skip(4)?;
+            let (object, owner, group) = (r.uuid()?, r.uuid()?, r.uuid()?);
+            // BaseMask .. NextOwnerMask, OwnershipCost S32, SaleType U8,
+            // SalePrice S32, Category U32, LastOwnerID, then Name and
+            // Description, both Variable 1.
+            let mut named = || {
+                r.skip(5 * 4 + 4 + 1 + 4 + 4 + 16)?;
+                Ok::<_, DecodeError>((text(r.variable1()?), text(r.variable1()?)))
+            };
             Incoming::ObjectPropertiesFamily {
-                object: r.uuid()?,
-                owner: r.uuid()?,
-                group: r.uuid()?,
+                object,
+                owner,
+                group,
+                named: named().ok(),
             }
+        }
+        // ObjectProperties, Medium 9: ObjectData Variable { ObjectID,
+        // CreatorID, OwnerID, GroupID, CreationDate U64, BaseMask ..
+        // NextOwnerMask (five U32), OwnershipCost S32, SaleType U8,
+        // SalePrice S32, AggregatePerms U8, AggregatePermTextures U8,
+        // AggregatePermTexturesOwner U8, Category U32, InventorySerial
+        // S16, ItemID, FolderID, FromTaskID, LastOwnerID, then Name,
+        // Description, TouchName, SitName and TextureID, each Variable 1 }
+        // (message_template.msg:3709).
+        OBJECT_PROPERTIES => {
+            let count = r.u8()?;
+            let mut objects = Vec::with_capacity(usize::from(count));
+            for _ in 0..count {
+                let object = r.uuid()?;
+                r.skip(16)?; // CreatorID
+                let (owner, group) = (r.uuid()?, r.uuid()?);
+                r.skip(8 + 5 * 4 + 4 + 1 + 4 + 3 + 4 + 2 + 4 * 16)?;
+                let (name, description) = (text(r.variable1()?), text(r.variable1()?));
+                for _ in 0..3 {
+                    r.variable1()?; // TouchName, SitName, TextureID
+                }
+                objects.push(Properties {
+                    object,
+                    owner,
+                    group,
+                    name,
+                    description,
+                });
+            }
+            Incoming::ObjectProperties(objects)
         }
         // AvatarPickerReply, Low 28: AgentID, QueryID, then Data Variable
         // { AvatarID, FirstName Variable 1, LastName Variable 1 }.
@@ -1265,10 +1375,12 @@ fn decode_object_update(r: &mut Reader) -> Decoded<Vec<ObjectParent>> {
         let local_id = r.u32()?;
         let state = r.u8()?;
         let full_id = r.uuid()?;
-        r.skip(4 + 1 + 1 + 1 + 12)?; // CRC, PCode, Material, ClickAction, Scale
+        r.skip(4)?; // CRC
+        let pcode = r.u8()?;
+        r.skip(1 + 1 + 12)?; // Material, ClickAction, Scale
         let transform = transform_from_motion(r.variable1()?); // ObjectData
         let parent_id = r.u32()?;
-        r.skip(4)?; // UpdateFlags
+        let flags = r.u32()?; // UpdateFlags
         r.skip(23)?; // PathCurve .. ProfileHollow
         r.variable2()?; // TextureEntry
         r.variable1()?; // TextureAnim
@@ -1288,6 +1400,8 @@ fn decode_object_update(r: &mut Reader) -> Decoded<Vec<ObjectParent>> {
             transform,
             state,
             attach_item,
+            pcode,
+            flags,
         });
     }
     Ok(objects)
@@ -1463,13 +1577,36 @@ pub mod testing {
     }
 
     pub fn object_properties_family(object: Uuid, owner: Uuid, group: Uuid) -> Vec<u8> {
+        object_properties_family_named(object, owner, group, "Dance Ball", "")
+    }
+
+    pub fn object_properties_family_named(object: Uuid, owner: Uuid, group: Uuid, name: &str, description: &str) -> Vec<u8> {
         let mut body = vec![0; 4]; // RequestFlags
         for id in [object, owner, group] {
             body.extend(id.as_bytes());
         }
-        body.extend([0; 5 * 4 + 4 + 1 + 4 + 4 + 16]); // masks .. LastOwnerID
-        body.extend(string1("Dance Ball"));
-        body.extend(string1(""));
+        body.extend([0x3C; 5 * 4 + 4 + 1 + 4 + 4 + 16]); // masks .. LastOwnerID
+        body.extend(string1(name));
+        body.extend(string1(description));
+        body
+    }
+
+    /// An ObjectProperties with one block for each of `objects`.
+    pub fn object_properties(objects: &[Properties]) -> Vec<u8> {
+        let mut body = vec![objects.len() as u8];
+        for (index, object) in objects.iter().enumerate() {
+            body.extend(object.object.as_bytes());
+            body.extend([0xC1; 16]); // CreatorID
+            body.extend(object.owner.as_bytes());
+            body.extend(object.group.as_bytes());
+            body.extend([0x3C; 8 + 5 * 4 + 4 + 1 + 4 + 3 + 4 + 2 + 4 * 16]); // CreationDate .. LastOwnerID
+            body.extend(string1(&object.name));
+            body.extend(string1(&object.description));
+            body.extend(string1("Touch")); // TouchName
+            body.extend(string1("")); // SitName
+            body.push(index as u8 * 16); // TextureID
+            body.extend(vec![0x7E; index * 16]);
+        }
         body
     }
 
@@ -1524,11 +1661,12 @@ pub mod testing {
         let mut body = vec![0; 8 + 2];
         body.push(objects.len() as u8);
         for (full_id, local_id, position, rotation) in objects {
-            body.extend([0xEF; 4]); // UpdateFlags
+            body.extend([0; 4]); // UpdateFlags
             body.extend(80u16.to_le_bytes());
             body.extend(full_id.as_bytes());
             body.extend(local_id.to_le_bytes());
-            body.extend([0x99; 1 + 1 + 4 + 1 + 1 + 12]); // PCode .. Scale
+            body.push(PCODE_PRIM);
+            body.extend([0x99; 1 + 4 + 1 + 1 + 12]); // State .. Scale
             body.extend(vector(*position));
             body.extend(vector(*rotation));
             body.extend([0x99; 16]); // what follows
@@ -1542,11 +1680,12 @@ pub mod testing {
         let mut body = vec![0; 8 + 2];
         body.push(objects.len() as u8);
         for (full_id, local_id) in objects {
-            body.extend([0xEF; 4]); // UpdateFlags
+            body.extend([0; 4]); // UpdateFlags
             body.extend(50u16.to_le_bytes());
             body.extend(full_id.as_bytes());
             body.extend(local_id.to_le_bytes());
-            body.extend([0x99; 30]); // PCode and what follows
+            body.push(PCODE_PRIM);
+            body.extend([0x99; 29]); // what follows
         }
         body
     }
@@ -1597,6 +1736,8 @@ pub mod testing {
     /// The optional fields of a compressed update.
     #[derive(Default)]
     pub struct Compressed {
+        /// The PCode; a prim's when left out.
+        pub pcode: Option<u8>,
         pub state: u8,
         pub angular_velocity: bool,
         pub parent_id: Option<u32>,
@@ -1638,7 +1779,7 @@ pub mod testing {
     pub fn compressed_data(full_id: Uuid, local_id: u32, fields: &Compressed) -> Vec<u8> {
         let mut data = full_id.as_bytes().to_vec();
         data.extend(local_id.to_le_bytes());
-        data.push(9); // PCode
+        data.push(fields.pcode.unwrap_or(PCODE_PRIM));
         data.push(fields.state);
         data.extend([0x99; 4 + 1 + 1 + 12]); // CRC, Material, ClickAction, Scale
         data.extend(vector([1.0, 2.0, 3.0]));
@@ -1692,12 +1833,20 @@ pub mod testing {
         data
     }
 
-    /// An ObjectUpdateCompressed made of `compressed_data` blocks.
+    /// An ObjectUpdateCompressed made of `compressed_data` blocks, without
+    /// UpdateFlags.
     pub fn object_update_compressed_blocks(blocks: &[Vec<u8>]) -> Vec<u8> {
+        let flagged: Vec<(u32, Vec<u8>)> = blocks.iter().map(|data| (0, data.clone())).collect();
+        object_update_compressed_flagged(&flagged)
+    }
+
+    /// An ObjectUpdateCompressed made of `compressed_data` blocks, each
+    /// with its UpdateFlags.
+    pub fn object_update_compressed_flagged(blocks: &[(u32, Vec<u8>)]) -> Vec<u8> {
         let mut body = vec![0; 8 + 2];
         body.push(blocks.len() as u8);
-        for data in blocks {
-            body.extend([0xEF; 4]); // UpdateFlags
+        for (flags, data) in blocks {
+            body.extend(flags.to_le_bytes()); // UpdateFlags
             body.extend((data.len() as u16).to_le_bytes());
             body.extend(data);
         }
@@ -1732,9 +1881,16 @@ pub mod testing {
         object_blocks(&blocks)
     }
 
-    /// Variable fields get assorted lengths so a wrong skip misaligns the
-    /// next block.
+    /// An ObjectUpdate of prims without UpdateFlags.
     pub fn object_blocks(objects: &[Block]) -> Vec<u8> {
+        object_blocks_of(objects, &[])
+    }
+
+    /// An ObjectUpdate whose blocks have the PCode and UpdateFlags `kinds`
+    /// gives for their place; a block past its end is a prim without
+    /// flags. Variable fields get assorted lengths so a wrong skip
+    /// misaligns the next block.
+    pub fn object_blocks_of(objects: &[Block], kinds: &[(u8, u32)]) -> Vec<u8> {
         let mut body = vec![0; 8 + 2];
         body.push(objects.len() as u8);
         for (
@@ -1754,14 +1910,17 @@ pub mod testing {
                 Some((point, names)) => (point.rotate_left(4), [names.as_bytes(), &[0]].concat()),
                 None => (0, vec![0x33; pad * 20]),
             };
+            let (pcode, flags) = kinds.get(index).copied().unwrap_or((PCODE_PRIM, 0));
             body.extend(local_id.to_le_bytes()); // ID
             body.push(state);
             body.extend(full_id.as_bytes());
-            body.extend([0xAB; 4 + 1 + 1 + 1 + 12]);
+            body.extend([0xAB; 4]); // CRC
+            body.push(pcode);
+            body.extend([0xAB; 1 + 1 + 12]); // Material, ClickAction, Scale
             body.push(data.len() as u8); // ObjectData
             body.extend(data);
             body.extend(parent_id.to_le_bytes());
-            body.extend([0xEF; 4]); // UpdateFlags
+            body.extend(flags.to_le_bytes()); // UpdateFlags
             body.extend([0x11; 23]); // PathCurve .. ProfileHollow
             body.extend((pad as u16 * 7).to_le_bytes()); // TextureEntry
             body.extend(vec![0x22; pad * 7]);
@@ -2055,6 +2214,8 @@ mod tests {
             transform: None,
             parent_id: None,
             attachment: None,
+            pcode: PCODE_PRIM,
+            flags: 0,
         };
         assert_eq!(
             decode(high(13), &body),
@@ -2334,9 +2495,106 @@ mod tests {
         let body = object_properties_family(object, owner, group);
         assert_eq!(
             decode(medium(10), &body),
-            Ok(Incoming::ObjectPropertiesFamily { object, owner, group })
+            Ok(Incoming::ObjectPropertiesFamily {
+                object,
+                owner,
+                group,
+                named: Some(("Dance Ball".to_string(), String::new())),
+            })
         );
         assert_eq!(decode(medium(10), &body[..40]), Err(DecodeError));
+
+        let body = object_properties_family_named(object, owner, group, "Park Bench", "Sit here");
+        assert_eq!(
+            decode(medium(10), &body),
+            Ok(Incoming::ObjectPropertiesFamily {
+                object,
+                owner,
+                group,
+                named: Some(("Park Bench".to_string(), "Sit here".to_string())),
+            })
+        );
+        // An answer that ends after the ids still says whose the object is.
+        assert_eq!(
+            decode(medium(10), &body[..4 + 3 * 16 + 10]),
+            Ok(Incoming::ObjectPropertiesFamily {
+                object,
+                owner,
+                group,
+                named: None,
+            })
+        );
+    }
+
+    #[test]
+    fn decodes_object_properties() {
+        let bench = Properties {
+            object: Uuid::from_bytes([1; 16]),
+            owner: Uuid::from_bytes([2; 16]),
+            group: Uuid::from_bytes([3; 16]),
+            name: "Park Bench".to_string(),
+            description: "Sit here".to_string(),
+        };
+        let lamp = Properties {
+            object: Uuid::from_bytes([4; 16]),
+            owner: Uuid::nil(),
+            group: Uuid::from_bytes([5; 16]),
+            name: "Lamp".to_string(),
+            description: String::new(),
+        };
+        let body = object_properties(&[bench.clone(), lamp.clone()]);
+        assert_eq!(decode(medium(9), &body), Ok(Incoming::ObjectProperties(vec![bench, lamp])));
+        assert_eq!(decode(medium(9), &body[..body.len() - 1]), Err(DecodeError));
+        assert_eq!(decode(medium(9), &[0]), Ok(Incoming::ObjectProperties(vec![])));
+    }
+
+    #[test]
+    fn encodes_a_selection_and_its_end() {
+        let msg = object_select(&agent(), &[7, 0x0102]);
+        assert_eq!((msg.id, msg.zerocoded), (low(110), true));
+        assert_eq!(msg.body, [agent_prefix(), vec![2, 7, 0, 0, 0, 2, 1, 0, 0]].concat());
+        let msg = object_deselect(&agent(), &[7]);
+        assert_eq!((msg.id, msg.zerocoded), (low(111), true));
+        assert_eq!(msg.body, [agent_prefix(), vec![1, 7, 0, 0, 0]].concat());
+
+        let ids: Vec<u32> = (1..=SELECT_BATCH as u32).collect();
+        let msg = object_select(&agent(), &ids);
+        assert_eq!(msg.body.len(), 32 + 1 + 255 * 4);
+        assert_eq!(msg.body[32], 255);
+        assert_eq!(msg.body[msg.body.len() - 4..], [255, 0, 0, 0]);
+    }
+
+    #[test]
+    fn object_updates_say_what_kind_of_object_and_its_flags() {
+        let (bench, jane) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]));
+        let block = |full_id, local_id| Block {
+            full_id,
+            local_id,
+            parent_id: 0,
+            data: vec![0xCD; 32],
+            worn: None,
+        };
+        let kinds = [(PCODE_PRIM, FLAG_SCRIPTED | FLAG_TOUCH), (PCODE_AVATAR, 0)];
+        let body = object_blocks_of(&[block(bench, 100), block(jane, 101)], &kinds);
+        let Ok(Incoming::ObjectUpdate(objects)) = decode(high(12), &body) else {
+            panic!("not an object update");
+        };
+        let read: Vec<(u8, u32)> = objects.iter().map(|object| (object.pcode, object.flags)).collect();
+        assert_eq!(read, kinds);
+
+        let avatar = Compressed {
+            pcode: Some(PCODE_AVATAR),
+            ..Compressed::default()
+        };
+        let blocks = [
+            (FLAG_PHYSICS | FLAG_TEMPORARY, compressed_data(bench, 100, &Compressed::default())),
+            (0, compressed_data(jane, 101, &avatar)),
+        ];
+        let Ok(Incoming::ObjectsCompressed(objects)) = decode(high(13), &object_update_compressed_flagged(&blocks)) else {
+            panic!("not a compressed update");
+        };
+        let read: Vec<(u8, u32)> = objects.iter().map(|object| (object.pcode, object.flags)).collect();
+        assert_eq!(read, [(PCODE_PRIM, FLAG_PHYSICS | FLAG_TEMPORARY), (PCODE_AVATAR, 0)]);
     }
 
     #[test]
@@ -2397,7 +2655,9 @@ mod tests {
                     parent_id: 0,
                     transform: None,
                     state: 0,
-                    attach_item: None
+                    attach_item: None,
+                    pcode: PCODE_PRIM,
+                    flags: 0,
                 },
                 ObjectParent {
                     full_id: ids[1],
@@ -2405,7 +2665,9 @@ mod tests {
                     parent_id: 4242,
                     transform: None,
                     state: 0,
-                    attach_item: None
+                    attach_item: None,
+                    pcode: PCODE_PRIM,
+                    flags: 0,
                 },
                 ObjectParent {
                     full_id: ids[2],
@@ -2413,7 +2675,9 @@ mod tests {
                     parent_id: 77,
                     transform: None,
                     state: 0,
-                    attach_item: None
+                    attach_item: None,
+                    pcode: PCODE_PRIM,
+                    flags: 0,
                 },
             ]))
         );

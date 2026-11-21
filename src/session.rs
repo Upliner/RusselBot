@@ -7,8 +7,9 @@ use crate::caps::{CapsEvent, EqEvent, InventoryUrls, TeleportFinish};
 use crate::login::SessionInfo;
 use crate::persist::{Location, Sitting, World};
 use crate::reconciler::same_region;
+use crate::scan::Sighting;
 use crate::udp::circuit::Circuit;
-use crate::udp::messages::{self, Agent, AttachItem, Incoming, Outgoing, Transform, Vector3};
+use crate::udp::messages::{self, Agent, AttachItem, Incoming, Outgoing, Properties, Transform, Vector3};
 use crate::udp::packet;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -43,6 +44,17 @@ const REQUEST_BATCH: usize = 255;
 /// with these values the update arrives within a second of sitting or
 /// standing.
 const THROTTLES: [f32; 7] = [20_000.0, 0.0, 0.0, 0.0, 30_000.0, 0.0, 10_000.0];
+/// The same while a scan runs in the region: the task channel is widened,
+/// as it then carries the descriptions and properties of the objects
+/// around, which at the rate above take minutes in a busy place. A viewer
+/// asks for more than this at its default bandwidth.
+const SCAN_THROTTLES: [f32; 7] = [20_000.0, 0.0, 0.0, 0.0, 300_000.0, 0.0, 10_000.0];
+/// How long the simulator has to have described nothing new for the
+/// objects around the avatar to count as all described.
+pub const SCAN_QUIET: Duration = Duration::from_secs(3);
+/// How long the simulator is given to answer for an object's properties
+/// before it is asked again.
+const PROPERTIES_RETRY: Duration = Duration::from_secs(10);
 /// A short draw distance keeps the simulator from streaming the whole scene.
 pub const DRAW_DISTANCE: f32 = 32.0;
 /// Why the session will not send a message for the operator right now.
@@ -395,10 +407,29 @@ struct Sim {
     /// Where each described object is, as last reported: in the region,
     /// or relative to its parent when it has one.
     places: HashMap<u32, Vector3>,
+    /// What kind of object each described object is, and its flags: the
+    /// PCode and UpdateFlags of the last update that described it.
+    kinds: HashMap<u32, (u8, u32)>,
+    /// When the simulator last described an object the bot did not know.
+    last_new: Option<Instant>,
     /// Objects mentioned as cached, which the bot would have to ask about.
     undescribed: HashSet<u32>,
     /// When the bot started asking about them, if it has.
     scan_started: Option<Instant>,
+    /// The largest distance a `scan` command named in this region, when
+    /// that is more than the configured one, and when it was last raised.
+    reach: Option<f32>,
+    raised_at: Option<Instant>,
+    /// What the simulator has said of the objects a `scan` asked about:
+    /// what they are called and whose they are.
+    properties: HashMap<u32, Properties>,
+    /// When the simulator was asked for the properties of each object it
+    /// has not answered for.
+    asked: HashMap<u32, Instant>,
+    /// The root prim of the seat whose name has been asked for since the
+    /// avatar last became seated, and what the simulator said of it.
+    seat_asked: Option<u32>,
+    seat_named: Option<(u32, Properties)>,
     /// Touches waiting for their object to be described, with their deadline.
     wanted: Vec<(Uuid, Instant)>,
     /// Objects `look_for` waits to see described, with their deadline.
@@ -682,8 +713,12 @@ impl<N: Net> Session<N> {
         self.ground
     }
 
+    /// How far around the avatar the simulator is asked to describe
+    /// objects: what the config says, or what a `scan` command has raised
+    /// it to in this region.
     fn draw_distance(&self) -> f32 {
-        self.scan_distance.unwrap_or(DRAW_DISTANCE)
+        let configured = self.scan_distance.unwrap_or(DRAW_DISTANCE);
+        self.sim.reach.map_or(configured, |reach| reach.max(configured))
     }
 
     /// Teleports to `position` in `region`. Ends in `RegionEntered` (another
@@ -831,6 +866,7 @@ impl<N: Net> Session<N> {
         }
         self.sim.scan_started = Some(now);
         crate::info!("scanning for objects within {} m", self.draw_distance());
+        self.send(messages::agent_throttle(&self.agent, self.circuit_code, SCAN_THROTTLES), true, now);
         let ids: Vec<u32> = self.sim.undescribed.drain().collect();
         self.request_objects(&ids, now);
     }
@@ -847,16 +883,24 @@ impl<N: Net> Session<N> {
     }
 
     /// The simulator described an object.
-    fn learn(&mut self, object: Uuid, local_id: u32, now: Instant) {
+    fn learn(&mut self, object: Uuid, local_id: u32, kind: (u8, u32), now: Instant) {
         let sim = &mut self.sim;
         sim.undescribed.remove(&local_id);
         if sim.objects.len() < MAX_OBJECTS || sim.objects.contains_key(&object) {
-            if let Some(old) = sim.objects.insert(object, local_id).filter(|old| *old != local_id) {
-                sim.local_ids.remove(&old);
-                sim.parents.remove(&old);
-                sim.places.remove(&old);
+            // The simulator may have given the number to another object
+            // without saying the first is gone: what was known under it,
+            // its name among it, was the first one's.
+            if let Some(before) = sim.local_ids.get(&local_id).copied().filter(|before| *before != object) {
+                sim.objects.remove(&before);
+                sim.forget(local_id);
+            }
+            match sim.objects.insert(object, local_id) {
+                Some(old) if old != local_id => sim.forget(old),
+                Some(_) => {}
+                None => sim.last_new = Some(now),
             }
             sim.local_ids.insert(local_id, object);
+            sim.kinds.insert(local_id, kind);
         }
         if sim.wanted.iter().any(|(wanted, _)| *wanted == object) {
             sim.wanted.retain(|(wanted, _)| *wanted != object);
@@ -941,6 +985,139 @@ impl<N: Net> Session<N> {
         if self.present().is_ok() {
             self.start_scan(now);
         }
+    }
+
+    /// Makes ready for a `scan` command that reaches `distance` metres,
+    /// or as far as the scan in this region does: starts that scan if it
+    /// has not started, and has the simulator describe objects further
+    /// away than before when `distance` is more than it was asked for.
+    /// That lasts until the avatar leaves the region. Returns how far the
+    /// command reaches.
+    pub fn reach(&mut self, distance: Option<f32>, now: Instant) -> Result<f32, String> {
+        self.present()?;
+        self.start_scan(now);
+        let Some(distance) = distance else {
+            return Ok(self.draw_distance());
+        };
+        if distance > self.draw_distance() {
+            self.sim.reach = Some(distance);
+            self.sim.raised_at = Some(now);
+            crate::info!("scan distance raised to {distance} m");
+            // The simulator is told now, not with the next update.
+            self.sim.next_agent_update = now + AGENT_UPDATE_INTERVAL;
+            let camera = self.sim.position.unwrap_or_default();
+            self.send(messages::agent_update(&self.agent, camera, distance, 0), false, now);
+        }
+        Ok(distance)
+    }
+
+    /// When the objects around the avatar count as all described: once
+    /// the simulator has described nothing new for `SCAN_QUIET`, counted
+    /// from the start of the scan and from the last raise of its distance
+    /// at the earliest.
+    pub fn settled_at(&self) -> Instant {
+        let sim = &self.sim;
+        let last = [sim.scan_started, sim.raised_at, sim.last_new].into_iter().flatten().max();
+        last.unwrap_or(sim.opened_at) + SCAN_QUIET
+    }
+
+    /// Whether the object with this local id is an avatar: the simulator
+    /// described it as one, or it is the bot's own.
+    fn is_avatar(&self, local_id: u32) -> bool {
+        self.sim.own_local == Some(local_id) || self.sim.kinds.get(&local_id).is_some_and(|kind| kind.0 == messages::PCODE_AVATAR)
+    }
+
+    /// What the simulator has said the object with this local id is
+    /// called and whose it is: in answer to a `scan`, or about the seat.
+    fn known(&self, local_id: u32) -> Option<&Properties> {
+        let seat = self.sim.seat_named.as_ref().filter(|(seat, _)| *seat == local_id);
+        self.sim.properties.get(&local_id).or(seat.map(|(_, properties)| properties))
+    }
+
+    /// Every prim the simulator has described whose place is known, with
+    /// how far it is from the avatar: a child prim counts as being where
+    /// its linkset's root is, and what an avatar wears as being where
+    /// that avatar is. No avatars, trees or grass.
+    pub fn sightings(&self) -> Vec<Sighting> {
+        let sim = &self.sim;
+        let Some(avatar) = sim.position else {
+            return Vec::new();
+        };
+        let prims = sim.local_ids.iter().filter_map(|(local_id, object)| {
+            let (pcode, flags) = *sim.kinds.get(local_id)?;
+            if pcode != messages::PCODE_PRIM || self.is_avatar(*local_id) {
+                return None;
+            }
+            let lineage = self.lineage(*local_id);
+            let wearer = lineage.iter().skip(1).find(|above| self.is_avatar(**above));
+            let at = match wearer {
+                Some(wearer) if sim.own_local == Some(*wearer) => avatar,
+                // An avatar that sits is where its seat is.
+                _ => *sim.places.get(lineage.last()?)?,
+            };
+            Some(Sighting {
+                object: *object,
+                local_id: *local_id,
+                distance: [0, 1, 2].map(|i| (at[i] - avatar[i]).powi(2)).iter().sum::<f32>().sqrt(),
+                flags,
+                attachment: wearer.is_some(),
+                child: lineage.get(1).is_some_and(|parent| !self.is_avatar(*parent)),
+                properties: self.known(*local_id).cloned(),
+            })
+        });
+        prims.collect()
+    }
+
+    /// Asks the simulator what the objects with these local ids are
+    /// called and whose they are, the way a viewer's area search does: by
+    /// selecting them and ending the selection at once. Objects it has
+    /// answered for, and those asked about less than 10 seconds ago, are
+    /// left out.
+    pub fn ask_properties(&mut self, local_ids: &[u32], now: Instant) {
+        if self.present().is_err() {
+            return;
+        }
+        let sim = &self.sim;
+        let waiting = |id: &u32| sim.asked.get(id).is_some_and(|at| now.duration_since(*at) < PROPERTIES_RETRY);
+        let mut due: Vec<u32> = local_ids
+            .iter()
+            .copied()
+            .filter(|id| sim.local_ids.contains_key(id) && self.known(*id).is_none() && !waiting(id))
+            .collect();
+        due.sort_unstable();
+        due.dedup();
+        for batch in due.chunks(messages::SELECT_BATCH) {
+            self.send(messages::object_select(&self.agent, batch), true, now);
+            self.send(messages::object_deselect(&self.agent, batch), true, now);
+        }
+        for id in due {
+            self.sim.asked.insert(id, now);
+        }
+    }
+
+    /// The name of the object the avatar sits on: that of the root prim
+    /// of its linkset, once the simulator has told it.
+    pub fn seat_name(&self) -> Option<&str> {
+        let seat = self.own_parent.filter(|parent| *parent != 0)?;
+        self.known(seat).map(|properties| properties.name.as_str())
+    }
+
+    /// Asks the simulator for the name of the object the avatar sits on,
+    /// once per sit and as soon as that object's root prim is described.
+    /// Without selecting it: a seat the avatar owns may be a vehicle on
+    /// the move, which a selection would hold up.
+    fn ask_seat_name(&mut self, now: Instant) {
+        let Some(seat) = self.own_parent.filter(|parent| *parent != 0) else {
+            return;
+        };
+        if self.sim.seat_asked == Some(seat) || self.sim.properties.contains_key(&seat) {
+            return;
+        }
+        let Some(object) = self.sim.local_ids.get(&seat).copied() else {
+            return;
+        };
+        self.sim.seat_asked = Some(seat);
+        self.send(messages::request_object_properties_family(&self.agent, object), true, now);
     }
 
     /// Whether the simulator has described `object` in this region.
@@ -1358,7 +1535,7 @@ impl<N: Net> Session<N> {
             Incoming::ObjectUpdate(objects) => {
                 let own_id = self.agent.agent_id;
                 for object in &objects {
-                    self.learn(object.full_id, object.local_id, now);
+                    self.learn(object.full_id, object.local_id, (object.pcode, object.flags), now);
                     if self.sim.local_ids.contains_key(&object.local_id) {
                         self.sim.parents.insert(object.local_id, object.parent_id);
                     }
@@ -1391,6 +1568,8 @@ impl<N: Net> Session<N> {
                         // kept.
                         self.sim.seat_frame = None;
                         self.sim.own_offset = None;
+                        self.sim.seat_asked = None;
+                        self.sim.seat_named = None;
                         if object.parent_id != 0 {
                             self.request_objects(&[object.parent_id], now);
                         }
@@ -1405,10 +1584,11 @@ impl<N: Net> Session<N> {
                     self.update_seat();
                 }
                 self.report_sought();
+                self.ask_seat_name(now);
             }
             Incoming::ObjectsCompressed(objects) => {
                 for object in objects {
-                    self.learn(object.full_id, object.local_id, now);
+                    self.learn(object.full_id, object.local_id, (object.pcode, object.flags), now);
                     if let Some(parent) = object.parent_id.filter(|_| self.sim.local_ids.contains_key(&object.local_id)) {
                         self.sim.parents.insert(object.local_id, parent);
                     }
@@ -1420,6 +1600,7 @@ impl<N: Net> Session<N> {
                     }
                 }
                 self.report_sought();
+                self.ask_seat_name(now);
             }
             Incoming::ObjectsMoved(objects) => {
                 for (local_id, trasform) in objects {
@@ -1438,9 +1619,8 @@ impl<N: Net> Session<N> {
             Incoming::ObjectsKilled(local_ids) => {
                 for local_id in local_ids {
                     self.sim.undescribed.remove(&local_id);
-                    self.sim.parents.remove(&local_id);
-                    self.sim.places.remove(&local_id);
-                    let gone = self.sim.local_ids.remove(&local_id);
+                    let gone = self.sim.local_ids.get(&local_id).copied();
+                    self.sim.forget(local_id);
                     if let Some(object) = gone {
                         self.sim.objects.remove(&object);
                     }
@@ -1576,8 +1756,33 @@ impl<N: Net> Session<N> {
                 owner_name,
                 permissions: questions,
             }),
-            Incoming::ObjectPropertiesFamily { object, owner, group } => {
+            Incoming::ObjectPropertiesFamily {
+                object,
+                owner,
+                group,
+                named,
+            } => {
                 self.events.push(SessionEvent::ObjectOwner { object, owner, group });
+                // The answer about the seat, when it is one.
+                let seat = self.sim.seat_asked.filter(|seat| self.sim.local_ids.get(seat) == Some(&object));
+                if let (Some(seat), Some((name, description))) = (seat, named) {
+                    let properties = Properties {
+                        object,
+                        owner,
+                        group,
+                        name,
+                        description,
+                    };
+                    self.sim.seat_named = Some((seat, properties));
+                }
+            }
+            Incoming::ObjectProperties(objects) => {
+                for properties in objects {
+                    if let Some(local_id) = self.sim.objects.get(&properties.object).copied() {
+                        self.sim.asked.remove(&local_id);
+                        self.sim.properties.insert(local_id, properties);
+                    }
+                }
             }
             Incoming::LogoutReply => {
                 if self.logout_deadline.take().is_some() {
@@ -1678,6 +1883,16 @@ impl<N: Net> World for Session<N> {
 }
 
 impl Sim {
+    /// Drops what is known of the object with this region-local id.
+    fn forget(&mut self, local_id: u32) {
+        self.local_ids.remove(&local_id);
+        self.parents.remove(&local_id);
+        self.places.remove(&local_id);
+        self.kinds.remove(&local_id);
+        self.properties.remove(&local_id);
+        self.asked.remove(&local_id);
+    }
+
     fn new(generation: u64, now: Instant) -> Sim {
         Sim {
             generation,
@@ -1695,8 +1910,16 @@ impl Sim {
             local_ids: HashMap::new(),
             parents: HashMap::new(),
             places: HashMap::new(),
+            kinds: HashMap::new(),
+            last_new: None,
             undescribed: HashSet::new(),
             scan_started: None,
+            reach: None,
+            raised_at: None,
+            properties: HashMap::new(),
+            asked: HashMap::new(),
+            seat_asked: None,
+            seat_named: None,
             wanted: Vec::new(),
             sought: Vec::new(),
             attachments: HashMap::new(),
@@ -3530,6 +3753,10 @@ mod tests {
     fn touch_gives_up_when_the_scan_does_not_find_the_object() {
         let mut rig = Rig::entered();
         assert_eq!(rig.session.touch(object(3), rig.now), Ok(Touch::Waiting));
+        // Nothing to ask about yet: the scan starts with its wider
+        // throttle alone.
+        assert_eq!(rig.sent_ids(), [messages::AGENT_THROTTLE]);
+        rig.ack_all();
         assert!(rig.session.next_deadline() <= rig.now + TOUCH_WAIT);
         rig.advance(secs(9));
         assert_eq!(rig.events(), []);
@@ -3550,7 +3777,11 @@ mod tests {
         );
         rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[500]));
         assert_eq!(rig.session.touch(object(2), rig.now), Ok(Touch::Waiting));
-        assert_eq!(rig.sent_ids(), [], "nothing to press, and nothing left to ask about");
+        assert_eq!(
+            rig.sent_ids(),
+            [messages::AGENT_THROTTLE],
+            "nothing to press, and nothing left to ask about"
+        );
     }
 
     #[test]
@@ -4298,5 +4529,521 @@ mod tests {
         // A second start changes nothing.
         rig.session.scan(rig.now);
         assert_eq!(requests(&rig.sent()), Vec::<Vec<u8>>::new());
+    }
+
+    // ------------------------------------------------------ the area scan
+
+    use crate::udp::messages::{FLAG_SCRIPTED, FLAG_TOUCH, PCODE_AVATAR, PCODE_PRIM};
+
+    /// A full update's block for a prim at `position`: in the region, or
+    /// on its parent when it has one.
+    fn prim(full_id: Uuid, local_id: u32, parent_id: u32, position: Vector3) -> wire::Block {
+        wire::Block {
+            full_id,
+            local_id,
+            parent_id,
+            data: wire::object_data(position, [0.0; 3], false),
+            worn: None,
+        }
+    }
+
+    fn properties(object: Uuid, name: &str) -> Properties {
+        Properties {
+            object,
+            owner: Uuid::from_bytes([0x1A; 16]),
+            group: Uuid::nil(),
+            name: name.to_string(),
+            description: "Sit here".to_string(),
+        }
+    }
+
+    const BENCH: u32 = 700;
+
+    fn bench() -> Uuid {
+        object(0x70)
+    }
+
+    impl Rig {
+        /// Standing at 100, 100, 25 with a bench 3 metres away.
+        fn by_a_bench() -> Rig {
+            let mut rig = Rig::entered();
+            rig.own_at(0, [100.0, 100.0, 25.0]);
+            rig.describe(&[prim(bench(), BENCH, 0, [103.0, 100.0, 25.0])], &[]);
+            rig.events();
+            rig.ack_all();
+            rig.sent();
+            rig
+        }
+
+        fn describe(&mut self, blocks: &[wire::Block], kinds: &[(u8, u32)]) {
+            self.receive(messages::OBJECT_UPDATE, &wire::object_blocks_of(blocks, kinds));
+        }
+
+        fn sighting(&self, object: Uuid) -> Option<Sighting> {
+            self.session.sightings().into_iter().find(|sighting| sighting.object == object)
+        }
+
+        /// The selections made and ended since the last call, as the
+        /// message and the local ids it names.
+        fn selections(&mut self) -> Vec<(packet::MessageId, Vec<u32>)> {
+            let select = |p: &Packet| p.id == messages::OBJECT_SELECT || p.id == messages::OBJECT_DESELECT;
+            let ids = |body: &[u8]| -> Vec<u32> {
+                assert_eq!(usize::from(body[32]) * 4, body.len() - 33);
+                body[33..].chunks(4).map(|id| u32::from_le_bytes(id.try_into().unwrap())).collect()
+            };
+            self.sent().iter().filter(|p| select(p)).map(|p| (p.id, ids(&p.body))).collect()
+        }
+
+        fn named(&mut self, objects: &[Properties]) {
+            self.receive(messages::OBJECT_PROPERTIES, &wire::object_properties(objects));
+        }
+
+        /// The owner requests sent since the last call, as the objects
+        /// they are about.
+        fn family_requests(&mut self) -> Vec<Uuid> {
+            let family = |p: &&Packet| p.id == messages::REQUEST_OBJECT_PROPERTIES_FAMILY;
+            let sent = self.sent();
+            sent.iter()
+                .filter(family)
+                .map(|p| Uuid::from_slice(&p.body[36..52]).unwrap())
+                .collect()
+        }
+
+        /// Time passes without the simulator going silent or the circuit
+        /// sending anything again.
+        fn wait(&mut self, by: Duration) {
+            self.ack_all();
+            self.advance(by);
+            self.ack_all();
+        }
+    }
+
+    #[test]
+    fn a_later_update_changes_an_objects_flags() {
+        let mut rig = Rig::by_a_bench();
+        assert_eq!(rig.sighting(bench()).unwrap().flags, 0);
+        rig.describe(
+            &[prim(bench(), BENCH, 0, [103.0, 100.0, 25.0])],
+            &[(PCODE_PRIM, FLAG_SCRIPTED | FLAG_TOUCH)],
+        );
+        assert_eq!(rig.sighting(bench()).unwrap().flags, FLAG_SCRIPTED | FLAG_TOUCH);
+    }
+
+    #[test]
+    fn a_killed_object_takes_what_was_known_of_it_along() {
+        let mut rig = Rig::by_a_bench();
+        rig.session.reach(None, rig.now).unwrap();
+        rig.session.ask_properties(&[BENCH], rig.now);
+        rig.named(&[properties(bench(), "Bench")]);
+        assert_eq!(rig.sighting(bench()).unwrap().properties, Some(properties(bench(), "Bench")));
+        rig.receive(messages::KILL_OBJECT, &wire::kill_object(&[BENCH]));
+        assert_eq!(rig.session.sightings(), []);
+        // The simulator may give the number to another object.
+        rig.describe(&[prim(object(0x71), BENCH, 0, [101.0, 100.0, 25.0])], &[]);
+        let lamp = rig.sighting(object(0x71)).unwrap();
+        assert_eq!((lamp.properties, lamp.flags), (None, 0));
+        rig.sent();
+        rig.session.ask_properties(&[BENCH], rig.now);
+        assert_eq!(rig.selections().len(), 2, "asked about anew");
+    }
+
+    #[test]
+    fn a_number_given_to_another_object_does_not_keep_the_first_ones_name() {
+        let mut rig = Rig::by_a_bench();
+        rig.session.reach(None, rig.now).unwrap();
+        rig.session.ask_properties(&[BENCH], rig.now);
+        rig.named(&[properties(bench(), "Bench")]);
+        // No KillObject in between.
+        let lamp = object(0x71);
+        rig.describe(&[prim(lamp, BENCH, 0, [101.0, 100.0, 25.0])], &[]);
+        assert_eq!(rig.sighting(bench()), None);
+        assert_eq!(rig.sighting(lamp).unwrap().properties, None);
+        assert!(!rig.session.knows(bench()) && rig.session.knows(lamp));
+    }
+
+    #[test]
+    fn a_scan_command_raises_the_distance_until_the_region_is_left() {
+        let mut rig = Rig::entered();
+        rig.sent_all();
+        assert_eq!(rig.session.reach(Some(96.0), rig.now), Ok(96.0));
+        // The simulator is told at once, and the scan starts.
+        let sent = rig.sent_all();
+        let update = sent.iter().find(|p| p.id == messages::AGENT_UPDATE).expect("an update at once");
+        assert_eq!(update_fields(update), (96.0, 0));
+        assert!(sent.iter().any(|p| p.id == messages::AGENT_THROTTLE));
+        rig.wait(secs(2));
+        let updates: Vec<Packet> = rig.sent_all().into_iter().filter(|p| p.id == messages::AGENT_UPDATE).collect();
+        assert!(!updates.is_empty() && updates.iter().all(|p| update_fields(p) == (96.0, 0)));
+
+        // A shorter scan shortens its own listing only.
+        assert_eq!(rig.session.reach(Some(10.0), rig.now), Ok(10.0));
+        assert_eq!(rig.session.reach(None, rig.now), Ok(96.0));
+        rig.wait(secs(2));
+        assert!(rig
+            .sent_all()
+            .iter()
+            .filter(|p| p.id == messages::AGENT_UPDATE)
+            .all(|p| update_fields(p) == (96.0, 0)));
+        assert!(rig.session.unknown_object(object(9)).contains("96 m"));
+
+        // The next region starts over.
+        rig.session.handle_caps(rig.generation(), finish(), rig.now);
+        rig.enter("Elsewhere", HOME_HANDLE + 256);
+        rig.wait(secs(2));
+        let updates: Vec<Packet> = rig.sent_all().into_iter().filter(|p| p.id == messages::AGENT_UPDATE).collect();
+        assert!(!updates.is_empty() && updates.iter().all(|p| update_fields(p) == (32.0, 0)));
+        assert_eq!(rig.session.reach(None, rig.now), Ok(32.0));
+    }
+
+    #[test]
+    fn a_scan_command_does_not_lower_the_configured_distance() {
+        let mut rig = Rig::with(Some(64.0), false);
+        rig.enter("Home", HOME_HANDLE);
+        assert_eq!(rig.session.reach(Some(10.0), rig.now), Ok(10.0));
+        assert_eq!(rig.session.reach(None, rig.now), Ok(64.0));
+        rig.wait(secs(2));
+        assert!(rig
+            .sent_all()
+            .iter()
+            .filter(|p| p.id == messages::AGENT_UPDATE)
+            .all(|p| update_fields(p) == (64.0, 0)));
+        assert_eq!(rig.session.reach(Some(128.0), rig.now), Ok(128.0));
+        assert_eq!(rig.session.reach(None, rig.now), Ok(128.0));
+    }
+
+    #[test]
+    fn a_scan_command_needs_the_avatar_in_a_region() {
+        let mut rig = Rig::new();
+        rig.sent_all();
+        assert_eq!(rig.session.reach(Some(96.0), rig.now), Err(NOT_CONNECTED.to_string()));
+        rig.session.ask_properties(&[BENCH], rig.now);
+        assert_eq!(rig.sent_all().len(), 0);
+
+        let mut rig = Rig::by_a_bench();
+        start_teleport(&mut rig);
+        rig.sent_all();
+        assert_eq!(rig.session.reach(None, rig.now), Err(NOT_CONNECTED.to_string()));
+        rig.session.ask_properties(&[BENCH], rig.now);
+        assert_eq!(rig.sent_all().len(), 0);
+    }
+
+    #[test]
+    fn the_task_throttle_is_widened_while_a_scan_runs() {
+        let throttles = |packets: &[Packet]| -> Vec<Vec<u8>> {
+            let throttle = |p: &&Packet| p.id == messages::AGENT_THROTTLE;
+            packets.iter().filter(throttle).map(|p| p.body.clone()).collect()
+        };
+        let mut rig = Rig::by_a_bench();
+        let agent = rig.agent();
+        let (base, wide) = (
+            messages::agent_throttle(&agent, 77, THROTTLES).body,
+            messages::agent_throttle(&agent, 77, SCAN_THROTTLES).body,
+        );
+        assert_ne!(base, wide);
+        rig.session.reach(None, rig.now).unwrap();
+        assert_eq!(throttles(&rig.sent()), vec![wide.clone()]);
+        // Once per scan.
+        rig.session.reach(Some(96.0), rig.now).unwrap();
+        assert_eq!(rig.session.touch(object(9), rig.now), Ok(Touch::Waiting));
+        assert_eq!(throttles(&rig.sent()), Vec::<Vec<u8>>::new());
+
+        // The next simulator gets the narrow one again.
+        rig.session.handle_caps(rig.generation(), finish(), rig.now);
+        rig.sent();
+        rig.receive(messages::REGION_HANDSHAKE, &wire::region_handshake("Elsewhere"));
+        let body = wire::agent_movement_complete(&agent, [10.0, 20.0, 30.0], HOME_HANDLE + 256);
+        rig.receive(messages::AGENT_MOVEMENT_COMPLETE, &body);
+        assert_eq!(throttles(&rig.sent()), vec![base.clone()]);
+
+        // With a configured distance the scan starts with the region.
+        let mut rig = Rig::with(Some(64.0), false);
+        rig.sent();
+        rig.receive(messages::REGION_HANDSHAKE, &wire::region_handshake("Home"));
+        let body = wire::agent_movement_complete(&agent, [10.0, 20.0, 30.0], HOME_HANDLE);
+        rig.receive(messages::AGENT_MOVEMENT_COMPLETE, &body);
+        assert_eq!(throttles(&rig.sent()), [base, wide]);
+    }
+
+    #[test]
+    fn properties_are_asked_for_by_selecting_and_only_once() {
+        let mut rig = Rig::by_a_bench();
+        let lamp = object(0x71);
+        rig.describe(&[prim(lamp, 701, 0, [100.0, 110.0, 25.0])], &[]);
+        rig.session.reach(None, rig.now).unwrap();
+        rig.sent();
+
+        // Twice the bench, and a number the simulator never described.
+        rig.session.ask_properties(&[701, BENCH, BENCH, 999], rig.now);
+        let (select, deselect) = (messages::OBJECT_SELECT, messages::OBJECT_DESELECT);
+        assert_eq!(rig.selections(), [(select, vec![BENCH, 701]), (deselect, vec![BENCH, 701])]);
+        // A second scan right away shares the request.
+        rig.session.ask_properties(&[BENCH, 701], rig.now);
+        assert_eq!(rig.selections(), []);
+
+        rig.named(&[properties(bench(), "Bench")]);
+        assert_eq!(rig.sighting(bench()).unwrap().properties, Some(properties(bench(), "Bench")));
+        assert_eq!(rig.sighting(lamp).unwrap().properties, None);
+        rig.wait(secs(9));
+        rig.sent();
+        rig.session.ask_properties(&[BENCH, 701], rig.now);
+        assert_eq!(rig.selections(), []);
+        // An answer that did not come in 10 seconds is asked for again;
+        // one that came, never.
+        rig.wait(secs(1));
+        rig.sent();
+        rig.session.ask_properties(&[BENCH, 701], rig.now);
+        assert_eq!(rig.selections(), [(select, vec![701]), (deselect, vec![701])]);
+        rig.named(&[properties(lamp, "Lamp")]);
+        rig.wait(secs(30));
+        rig.sent();
+        rig.session.ask_properties(&[BENCH, 701], rig.now);
+        assert_eq!(rig.selections(), []);
+
+        // Properties of an object the simulator has not described are
+        // dropped.
+        rig.named(&[properties(object(0x7F), "Ghost")]);
+        assert_eq!(rig.session.sightings().len(), 2);
+    }
+
+    #[test]
+    fn selections_name_at_most_255_objects() {
+        let mut rig = Rig::by_a_bench();
+        let many: Vec<(Uuid, u32, Vector3, Vector3)> = (0..300u32)
+            .map(|n| (Uuid::from_u128(u128::from(n) + 1), 2000 + n, [101.0, 100.0, 25.0], [0.0; 3]))
+            .collect();
+        for half in many.chunks(150) {
+            rig.receive(messages::OBJECT_UPDATE_COMPRESSED, &wire::object_update_compressed_at(half));
+        }
+        rig.session.reach(None, rig.now).unwrap();
+        rig.sent();
+        let ids: Vec<u32> = many.iter().map(|object| object.1).collect();
+        rig.session.ask_properties(&ids, rig.now);
+        let sent = rig.selections();
+        let (select, deselect) = (messages::OBJECT_SELECT, messages::OBJECT_DESELECT);
+        let shape: Vec<(packet::MessageId, usize)> = sent.iter().map(|(id, ids)| (*id, ids.len())).collect();
+        assert_eq!(shape, [(select, 255), (deselect, 255), (select, 45), (deselect, 45)]);
+        assert_eq!([&sent[0].1[..], &sent[2].1[..]].concat(), ids);
+        assert_eq!(sent[0].1, sent[1].1);
+    }
+
+    #[test]
+    fn sightings_are_the_prims_around_with_their_distance() {
+        let mut rig = Rig::by_a_bench();
+        let (cushion, jane, hat, strap, radio, tree, far, lost) = (
+            object(0x71),
+            object(0x80),
+            object(0x81),
+            object(0x82),
+            object(0x90),
+            object(0xA0),
+            object(0xB0),
+            object(0xC0),
+        );
+        let blocks = [
+            prim(cushion, 701, BENCH, [0.5, 0.0, 0.0]),
+            wire::Block {
+                data: wire::object_data([100.0, 104.0, 25.0], [0.0; 3], true),
+                ..prim(jane, 800, 0, [0.0; 3])
+            },
+            prim(hat, 801, 800, [0.0, 0.0, 0.9]),
+            prim(strap, 802, 801, [0.0, 0.1, 0.0]),
+            prim(radio, 810, OWN, [0.0, 0.2, 0.0]),
+            prim(tree, 820, 0, [101.0, 100.0, 25.0]),
+            prim(far, 830, 0, [100.0, 100.0, 55.0]),
+            // A prim whose update says nothing the bot reads of where it is.
+            wire::Block {
+                data: vec![0xCD; 32],
+                ..prim(lost, 840, 0, [0.0; 3])
+            },
+        ];
+        let kinds = [
+            (PCODE_PRIM, FLAG_SCRIPTED),
+            (PCODE_AVATAR, 0),
+            (PCODE_PRIM, 0),
+            (PCODE_PRIM, 0),
+            (PCODE_PRIM, FLAG_TOUCH),
+            (255, 0),
+        ];
+        rig.describe(&blocks, &kinds);
+
+        let seen = |rig: &Rig, object: Uuid| {
+            let sighting = rig.sighting(object).unwrap_or_else(|| panic!("{object} is not seen"));
+            (sighting.distance, sighting.attachment, sighting.child, sighting.flags)
+        };
+        assert_eq!(seen(&rig, bench()), (3.0, false, false, 0));
+        // A child prim is where its linkset's root is.
+        assert_eq!(seen(&rig, cushion), (3.0, false, true, FLAG_SCRIPTED));
+        // What an avatar wears is where the avatar is.
+        assert_eq!(seen(&rig, hat), (4.0, true, false, 0));
+        assert_eq!(seen(&rig, strap), (4.0, true, true, 0));
+        assert_eq!(seen(&rig, radio), (0.0, true, false, FLAG_TOUCH));
+        assert_eq!(seen(&rig, far), (30.0, false, false, 0));
+        // No avatars, the bot's own included, no trees, and nothing
+        // whose place is not known.
+        let mut all: Vec<Uuid> = rig.session.sightings().iter().map(|sighting| sighting.object).collect();
+        all.sort();
+        assert_eq!(all, [bench(), cushion, hat, strap, radio, far]);
+        assert_eq!(rig.sighting(bench()).unwrap().local_id, BENCH);
+
+        // An avatar that moves takes what it wears along.
+        rig.terse(800, true, [100.0, 110.0, 25.0]);
+        assert_eq!(seen(&rig, hat).0, 10.0);
+    }
+
+    #[test]
+    fn distances_are_measured_from_where_the_avatar_sits() {
+        let mut rig = Rig::on_chair([0.0, 0.0, 1.0]);
+        rig.chair_at([150.0, 100.0, 25.0], [0.0; 3]);
+        assert!(near(rig.position(), [150.0, 100.0, 26.0]));
+        let chair = rig.sighting(target()).unwrap();
+        assert!((chair.distance - 1.0).abs() < 1e-3 && !chair.child && !chair.attachment);
+    }
+
+    #[test]
+    fn compressed_updates_say_what_an_object_is_too() {
+        let mut rig = Rig::by_a_bench();
+        let (door, jane) = (object(0x71), object(0x80));
+        let avatar = wire::Compressed {
+            pcode: Some(PCODE_AVATAR),
+            ..wire::Compressed::default()
+        };
+        // `compressed_data` puts everything at 1, 2, 3.
+        let blocks = [
+            (FLAG_TOUCH, wire::compressed_data(door, 701, &wire::Compressed::default())),
+            (0, wire::compressed_data(jane, 800, &avatar)),
+        ];
+        rig.receive(messages::OBJECT_UPDATE_COMPRESSED, &wire::object_update_compressed_flagged(&blocks));
+        let seen = rig.sighting(door).unwrap();
+        assert_eq!(seen.flags, FLAG_TOUCH);
+        assert!((seen.distance - (99.0f32.powi(2) + 98.0f32.powi(2) + 22.0f32.powi(2)).sqrt()).abs() < 1e-3);
+        assert_eq!(rig.sighting(jane), None);
+    }
+
+    #[test]
+    fn the_surroundings_settle_three_seconds_after_the_last_new_object() {
+        let mut rig = Rig::entered();
+        rig.own_at(0, [100.0, 100.0, 25.0]);
+        rig.wait(secs(20));
+        let start = rig.now;
+        rig.session.reach(None, start).unwrap();
+        assert_eq!(rig.session.settled_at(), start + SCAN_QUIET);
+
+        rig.wait(secs(1));
+        rig.describe(&[prim(bench(), BENCH, 0, [103.0, 100.0, 25.0])], &[]);
+        assert_eq!(rig.session.settled_at(), start + secs(1) + SCAN_QUIET);
+        // The same object again is nothing new, nor is one that moves.
+        rig.wait(secs(1));
+        rig.describe(&[prim(bench(), BENCH, 0, [104.0, 100.0, 25.0])], &[]);
+        rig.terse(BENCH, false, [105.0, 100.0, 25.0]);
+        assert_eq!(rig.session.settled_at(), start + secs(1) + SCAN_QUIET);
+
+        // A raise of the distance starts the wait over; a scan that
+        // stays within it does not.
+        assert_eq!(rig.session.reach(Some(96.0), rig.now), Ok(96.0));
+        assert_eq!(rig.session.settled_at(), start + secs(2) + SCAN_QUIET);
+        rig.wait(secs(10));
+        assert_eq!(rig.session.reach(Some(50.0), rig.now), Ok(50.0));
+        assert_eq!(rig.session.reach(Some(96.0), rig.now), Ok(96.0));
+        assert_eq!(rig.session.settled_at(), start + secs(2) + SCAN_QUIET);
+    }
+
+    #[test]
+    fn the_seats_name_is_asked_for_once_per_sit() {
+        let mut rig = Rig::on_chair([0.0, 0.5, 0.6]);
+        // Nothing to ask by until the seat is described.
+        assert_eq!(rig.family_requests(), Vec::<Uuid>::new());
+        assert_eq!(rig.session.seat_name(), None);
+        rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
+        assert_eq!(rig.family_requests(), [target()]);
+        rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
+        assert_eq!(rig.family_requests(), Vec::<Uuid>::new());
+        assert_eq!(rig.session.seat_name(), None);
+
+        // An answer about another object is not the seat's.
+        let (owner, group) = (object(0x1A), Uuid::nil());
+        let body = wire::object_properties_family_named(object(0x55), owner, group, "Dance Ball", "");
+        rig.receive(messages::OBJECT_PROPERTIES_FAMILY, &body);
+        assert_eq!(rig.session.seat_name(), None);
+        let body = wire::object_properties_family_named(target(), owner, group, "Park Bench", "Sit here");
+        rig.receive(messages::OBJECT_PROPERTIES_FAMILY, &body);
+        assert_eq!(rig.session.seat_name(), Some("Park Bench"));
+        rig.events();
+
+        // The name goes when the avatar stands up, and is asked for
+        // again when it sits down again.
+        rig.own_at(0, [132.0, 65.0, 23.5]);
+        assert_eq!(rig.session.seat_name(), None);
+        assert_eq!(rig.family_requests(), Vec::<Uuid>::new());
+        rig.own_at(CHAIR, [0.0, 0.5, 0.6]);
+        assert_eq!(rig.family_requests(), [target()], "the seat is still described");
+        assert_eq!(rig.session.seat_name(), None);
+    }
+
+    #[test]
+    fn sitting_costs_two_requests_about_the_seat_and_nothing_else() {
+        let mut rig = Rig::entered();
+        rig.own_at(0, [100.0, 100.0, 25.0]);
+        rig.session.start_sit(target(), rig.now);
+        rig.sit_response(target());
+        rig.own_at(CHAIR, [0.0, 0.5, 0.6]);
+        rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
+        rig.wait(secs(30));
+        let learning = [messages::REQUEST_MULTIPLE_OBJECTS, messages::REQUEST_OBJECT_PROPERTIES_FAMILY];
+        let ids: Vec<packet::MessageId> = rig
+            .sent_ids()
+            .into_iter()
+            .filter(|id| *id != messages::AGENT_REQUEST_SIT && *id != messages::AGENT_SIT)
+            .collect();
+        assert_eq!(ids, learning);
+    }
+
+    #[test]
+    fn standing_and_ground_sits_ask_for_no_name() {
+        let mut rig = Rig::by_a_bench();
+        rig.session.sit_ground(rig.now).unwrap();
+        rig.own_at(0, [100.0, 100.0, 24.5]);
+        rig.describe(&[prim(object(0x71), 701, 0, [101.0, 100.0, 25.0])], &[]);
+        assert_eq!(rig.family_requests(), Vec::<Uuid>::new());
+        assert_eq!(rig.session.seat_name(), None);
+    }
+
+    #[test]
+    fn the_seats_name_is_forgotten_with_the_region() {
+        let mut rig = Rig::on_chair([0.0, 0.5, 0.6]);
+        rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
+        let body = wire::object_properties_family_named(target(), object(0x1A), Uuid::nil(), "Park Bench", "");
+        rig.receive(messages::OBJECT_PROPERTIES_FAMILY, &body);
+        assert_eq!(rig.session.seat_name(), Some("Park Bench"));
+        rig.session.handle_caps(rig.generation(), finish(), rig.now);
+        rig.enter("Elsewhere", HOME_HANDLE + 256);
+        assert_eq!(rig.session.seat_name(), None);
+    }
+
+    #[test]
+    fn a_scan_and_the_seat_share_what_the_simulator_said() {
+        // The scan named the chair before the avatar sat down: no request.
+        let mut rig = Rig::entered();
+        rig.own_at(0, [100.0, 100.0, 25.0]);
+        rig.chair_at([103.0, 100.0, 25.0], [0.0; 3]);
+        rig.session.reach(None, rig.now).unwrap();
+        rig.session.ask_properties(&[CHAIR], rig.now);
+        rig.named(&[properties(target(), "Sofa")]);
+        rig.session.start_sit(target(), rig.now);
+        rig.sit_response(target());
+        rig.own_at(CHAIR, [0.0, 0.0, 0.5]);
+        rig.chair_at([103.0, 100.0, 25.0], [0.0; 3]);
+        assert_eq!(rig.family_requests(), Vec::<Uuid>::new());
+        assert_eq!(rig.session.seat_name(), Some("Sofa"));
+
+        // The seat was named for `status`: a scan does not select it.
+        let mut rig = Rig::on_chair([0.0, 0.5, 0.6]);
+        rig.chair_at([131.0, 64.0, 22.4], [0.0; 3]);
+        let body = wire::object_properties_family_named(target(), object(0x1A), Uuid::nil(), "Park Bench", "Sit here");
+        rig.receive(messages::OBJECT_PROPERTIES_FAMILY, &body);
+        rig.session.reach(None, rig.now).unwrap();
+        rig.sent();
+        rig.session.ask_properties(&[CHAIR], rig.now);
+        assert_eq!(rig.selections(), []);
+        assert_eq!(rig.sighting(target()).unwrap().properties, Some(properties(target(), "Park Bench")));
     }
 }

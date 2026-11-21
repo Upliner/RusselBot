@@ -31,6 +31,9 @@ restarts, simulator outages and being unseated or teleported away; see
 verified there too, except IMs from scripts and delivery of offline IMs,
 which the rig cannot produce. The control socket and its commands are verified there as well,
 and `ctl im` by avatar name was checked by hand on Second Life on 2026-11-19.
+The `scan` command and the `seat name` line of `status` are verified there
+too (2026-11-21); nothing of them has been tried on Second Life, where the
+distance decides what the simulator describes at all.
 The movement, teleport-offer and touch commands have not been tried on
 Second Life yet, and neither has `persist` with the position tracking under
 it: whether Second Life answers the bot's question about a seat, and the
@@ -319,7 +322,7 @@ One TOML file; see `russelbot.example.toml`.
 | `fetch_offline_im` | no | `true` to also fetch IMs stored while the avatar was offline. Default: `false` |
 | `socket` | no | `true` to listen on the control socket, see [Control socket](#control-socket). Default: `false` |
 | `requesttp_timeout` | no | Minutes after `requesttp` during which the asked avatar's teleport offer is accepted. Default: `10` |
-| `scan_distance` | no | Metres (1 to 1024) within which objects are learned from the start, for `touch`; see [Touching objects](#touching-objects). Default: learn within 32 m when `touch` is first used, or when an RLV restriction such as `sittp` needs an object the bot does not know |
+| `scan_distance` | no | Metres (1 to 1024) within which objects are learned from the start, for `touch` and `scan`; see [Touching objects](#touching-objects). Default: learn within 32 m when `touch` or `scan` is first used, or when an RLV restriction such as `sittp` needs an object the bot does not know |
 | `restore_attachments` | no | `false` to keep the bot from attaching again, after each login, what the Current Outfit folder lists and the simulator did not bring; see [Attachments](#attachments). Default: `true` |
 | `perms` | no | Two tables, `[perms.autoaccept]` and `[perms.except]`, that say which teleport offers, inventory offers and scripts' permission requests the bot accepts by itself, see [Permission requests](#permission-requests). Default: none |
 | `rlv` | no | `true` to start with RLV on: the bot then reads the `@` commands of scripted objects the avatar owns, see [RLV](#rlv). Default: `false` |
@@ -467,6 +470,7 @@ target/release/rslbot ctl im "Jane Doe" are you there?
 target/release/rslbot ctl stand
 target/release/rslbot ctl tp 128 128 25 Blue Lagoon
 target/release/rslbot ctl status
+target/release/rslbot ctl scan 20 -n bench          # what is around, by name
 target/release/rslbot ctl persist                   # stay here, like this
 target/release/rslbot ctl home
 target/release/rslbot ctl inventory "Bot gear"      # what the avatar owns there
@@ -490,6 +494,7 @@ target/release/rslbot ctl rlv cmd @versionnum=5     # an RLV command, by hand
 | `accepttp [AVATAR]` | The older name of `accept tp [AVATAR]`; deprecated |
 | `sendtp AVATAR [MESSAGE...]` | Offer the avatar a teleport to the bot |
 | `touch UUID` | Click that object once |
+| `scan [DISTANCE] [FILTER...]` | List the objects around the avatar with their UUID, distance, owner and name. See [Scanning for objects](#scanning-for-objects) |
 | `inventory [-a] [-n] [FOLDER]` | List the avatar's inventory: everything, or what is under `FOLDER`. See [Inventory](#inventory) |
 | `attach ITEM [BODY PART...]` | Attach an object from the inventory, to the named attachment point or else to the one it was last on. See [Attachments](#attachments) |
 | `wear ITEM` | For an object, the same as `attach ITEM`. For clothing or a body part, put it on; only where the grid makes the avatar's appearance. See [Clothing](#clothing) |
@@ -507,7 +512,7 @@ target/release/rslbot ctl rlv cmd @versionnum=5     # an RLV command, by hand
 | `rlv status` | Print the RLV mode, the two `rlv persist` settings, and the restrictions that are kept |
 | `rlv reset` | Forget every restriction |
 | `rlv cmd COMMAND...` | Carry out RLV commands as if an object had sent them, and print what became of each. Restrictions given this way are held apart from every object's |
-| `status` | Print where the avatar is |
+| `status` | Print where the avatar is and what it sits on |
 | `quit` | Log out and stop the bot, like Ctrl-C |
 
 `AVATAR` is one argument: `"First Last"` (quoted), `first.last`, a single
@@ -545,8 +550,8 @@ kick or an outage (at the avatar's last location), but it no longer
 teleports or sits by itself. `persist` and `home` switch holding on, and
 the bot acts at once. `home` is not the avatar's home location: it is the place the bot
 held last. Manual mode ends with the bot process too; a restarted bot
-starts from its config. `sendtp`, `touch`, the talking commands and the
-inventory commands (`inventory`, `attach`, `wear`, `detach`, `anim`,
+starts from its config. `sendtp`, `touch`, `scan`, the talking commands and
+the inventory commands (`inventory`, `attach`, `wear`, `detach`, `anim`,
 `sound`) leave the mode alone.
 
 A sit, stand or teleport that a scripted object forces through [RLV](#rlv)
@@ -642,6 +647,7 @@ connected: yes
 region: Target
 position: 130, 128, 25.9
 seat: target
+seat name: Park Bench
 persist: Target/130/128/25.9 11111111-2222-3333-4444-555555555555
 mode: holding
 ```
@@ -650,7 +656,11 @@ mode: holding
 (another object, named by the prim the simulator sat the avatar on),
 `other` (attached to something the simulator did not name), `none` or
 `unknown`. A ground sit, by command or held, shows as `none`: the bot
-cannot see it. `persist` is the placement the bot holds, written the way
+cannot see it. `seat name` is what the object the avatar sits on is called:
+the name of its linkset's root prim, also when the avatar sits on a child
+prim. The bot asks the simulator for it each time the avatar sits down, so
+the line is missing for the moment that takes, and whenever the avatar
+does not sit on an object. `persist` is the placement the bot holds, written the way
 the `persist` command takes it; in manual mode it is what `home` goes back
 to, and its location is `unknown` until the first login of a config
 without `position`. `mode` is `holding` or `manual`.
@@ -687,11 +697,12 @@ rest it has to ask (a scan), and that costs traffic, so it asks only when
 there is a reason:
 
 - Without `scan_distance`, nothing extra is sent until `touch` names an
-  object the bot does not know, or an RLV restriction such as `sittp` or
-  `fartouch` has to be applied to one (see [Restrictions](#restrictions)).
-  The first of these starts a scan of the objects within 32 m and waits up
-  to 10 seconds for the object to turn up; later ones answer at once. A
-  new region starts over.
+  object the bot does not know, a [`scan`](#scanning-for-objects) command
+  is given, or an RLV restriction such as `sittp` or `fartouch` has to be
+  applied to an object the bot does not know (see
+  [Restrictions](#restrictions)). The first of these starts a scan of the
+  objects within 32 m; a `touch` waits up to 10 seconds for its object to
+  turn up, and later ones answer at once. A new region starts over.
 - With `scan_distance = N`, the bot scans from the moment it enters a
   region and asks the simulator to describe objects within N metres, so
   `touch` answers at once and reaches further, at the price of that
@@ -699,11 +710,100 @@ there is a reason:
 
 An object the bot has not learned of is an error naming the distance. On
 OpenSimulator the distance makes little difference: it describes objects
-regardless.
+regardless. `scan` with a larger distance widens the scan until the avatar
+leaves the region, and `touch` then reaches that far too.
 
-One request is made regardless of all this: each time the avatar becomes
+Two requests are made regardless of all this: each time the avatar becomes
 seated on an object, the bot asks the simulator about that one object, to
-know where the avatar is.
+know where the avatar is, and for its name, which `status` prints.
+
+### Scanning for objects
+
+```sh
+rslbot ctl scan                     # everything within 32 m, or `scan_distance`
+rslbot ctl scan 20 -n bench         # within 20 m, with "bench" in the name
+rslbot ctl scan -t                  # what handles touches
+rslbot ctl scan 96 -o "Jane Doe"    # Jane Doe's objects within 96 m
+rslbot ctl scan -a -c -o <uuid>     # an avatar's or a group's, worn ones and child prims too
+```
+
+`scan [DISTANCE] [FILTER...]` lists the objects around the avatar the way a
+viewer's area search does, nearest first, one line each:
+
+```
+0c1b2f6e-...   3.2   scripted,touch   7d9a41c0-...   Jane Doe   Park Bench   Sit here
+```
+
+The seven fields are separated by tabs, and there is no header line:
+
+| Field | |
+|---|---|
+| 1 | The prim's UUID, which is what `touch`, `sit` and `persist` take |
+| 2 | Its distance from the avatar in metres |
+| 3 | Its flags, separated by commas: `scripted`, `touch` (it handles touches), `physical`, `temporary`, `phantom`, `attachment` (an avatar wears it), `child` (not the root prim of its linkset); `-` when it has none |
+| 4 | Its owner's UUID; the group's when a group owns it |
+| 5 | Its owner's name, or `(group)` |
+| 6 | Its name |
+| 7 | Its description, which is often empty |
+
+A tab, line feed, carriage return or backslash in a name or description is
+written as `\t`, `\n`, `\r` and `\\`. Where the bot does not know a field
+from the fourth on, it prints `?`.
+
+| Filter | Lists only |
+|---|---|
+| `-n TEXT`, `--name TEXT` | prims with `TEXT` in their name, in any letter case |
+| `-d TEXT`, `--desc TEXT` | prims with `TEXT` in their description |
+| `-o WHO`, `--owner WHO` | prims of that avatar (`"First Last"`, `first.last`, one word, or a UUID) or of the group with that UUID |
+| `-s`, `--scripted` | scripted prims |
+| `-t`, `--touch` | prims that handle touches |
+| `-p`, `--physical` | physical prims |
+| `--temporary` | temporary prims |
+| `--phantom` | phantom prims |
+
+Two switches list more: `-a` (`--attachments`) adds what avatars wear, the
+bot's own avatar included, and `-c` (`--children`) the child prims of
+linksets, each with its own name. Without them a linkset is one line, for
+its root prim, and nothing worn is listed. Avatars, trees and grass are
+never listed. Filters and switches combine in any order, and a prim has to
+meet all the filters.
+
+The distance is measured from the avatar to the object's root prim; a
+child prim counts as being where its root is, and what an avatar wears as
+being where that avatar is. Without `DISTANCE` the listing reaches as far
+as the bot looks for objects: `scan_distance`, or 32 m. A larger
+`DISTANCE`, up to 1024, makes the bot look that far from then on, until
+the avatar leaves the region; a smaller one only shortens the listing.
+
+On OpenSimulator a distance that reaches towards a neighbouring region (64
+m or more from the middle of a region) makes the simulator count that
+region as in view, and it then keeps the avatar's presence in a region it
+leaves for the one next door. The bot does not keep such presences, and a
+teleport back into that region can cost the session: the bot logs in again
+after about a minute. That is so for `scan_distance` as well, and for
+`scan` only when the distance is widened in the moment the avatar arrives;
+see "Area scan" in `docs/test-rig.md`.
+
+A scan asks the simulator what each object in reach is called and whose it
+is, which it does the way the viewer does: by selecting the object and
+ending the selection at once. A physical object the avatar owns stops for
+that moment. The owners' names come from the grid's name service. Both are
+asked for once: a second `scan` of the same objects answers at once, and a
+renamed object keeps its old name in the listing until the avatar has left
+the region and come back.
+
+The answer comes when the simulator has described nothing new for 3
+seconds and everything in reach is named: after about 3 seconds for the
+first scan in a region or after a larger `DISTANCE`, at once later on. It
+comes after 30 seconds at the latest, with `?` for what is still missing; a
+second `scan` then goes on where the first stopped. A scan that waits when
+the avatar leaves the region fails.
+
+`-s` and `-t` go by what the simulator says of the listed prim itself. Where
+it marks only the child prim that holds the script, the root prim's line
+lacks the flag: add `-c` when an object you expect is missing.
+
+`scan` moves nothing and is not held to [RLV](#rlv) restrictions.
 
 ### Inventory
 
@@ -1143,8 +1243,8 @@ target/release/rslbot ctl stand              # carried out, whatever is held
 `rlv mode override` exempts your next command from every restriction. RLV
 is on again the moment that command arrives, whatever becomes of it: a
 command that fails for a reason of its own, or that no restriction
-concerns, uses the override up as well. Only `status`, `perms`, `quit` and
-the `rlv` commands never do. For `requesttp` the exemption includes
+concerns, uses the override up as well. Only `status`, `scan`, `perms`,
+`quit` and the `rlv` commands never do. For `requesttp` the exemption includes
 accepting the one offer that answers it; for `persist` and `home` it
 includes the bot's own way to the place they name, until the avatar is
 there for the first time.

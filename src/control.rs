@@ -45,6 +45,7 @@ Usage: rslbot ctl say MESSAGE...
        rslbot ctl accepttp [AVATAR]
        rslbot ctl sendtp AVATAR [MESSAGE...]
        rslbot ctl touch UUID
+       rslbot ctl scan [DISTANCE] [FILTER...]
        rslbot ctl inventory [-a] [-n] [FOLDER]
        rslbot ctl attach ITEM [BODY PART...]
        rslbot ctl wear ITEM
@@ -78,7 +79,19 @@ bot then leaves it where it is until `persist` or `home`. `tp` without
 REGION stays in the current region, and without Z keeps the current height.
 `requesttp` asks AVATAR to teleport the bot to them; `sendtp` offers AVATAR
 a teleport to the bot. `touch` clicks an object. `status` shows where the
-avatar is; `quit` logs out and stops the bot.
+avatar is and what it sits on; `quit` logs out and stops the bot.
+
+`scan` lists the objects within DISTANCE metres of the avatar, nearest
+first: one line each with the UUID, the distance, flags, the owner's UUID
+and name, the name and the description, separated by tabs, with `?` for
+what the simulator has not told. Without DISTANCE it lists as far as the
+bot looks for objects; a larger one makes it look that far until the avatar
+leaves the region. FILTERs: `-n TEXT` (`--name`) and `-d TEXT` (`--desc`)
+for a part of the name or the description; `-o WHO` (`--owner`) for the
+objects of an AVATAR or of a group given by its UUID; `-s` (`--scripted`),
+`-t` (`--touch`), `-p` (`--physical`), `--temporary` and `--phantom` for
+prims the simulator flags so; `-a` (`--attachments`) to list what avatars
+wear as well, and `-c` (`--children`) the child prims of linksets.
 
 `accept` accepts a request that waits because the bot did not accept it by
 itself. KIND is what was asked: `tp` (a teleport offer), `inventory` (an
@@ -186,6 +199,8 @@ pub enum Request {
     },
     /// A UUID, still to be read.
     Touch(String),
+    /// `[DISTANCE] [FILTER...]`, still to be read.
+    Scan(Vec<String>),
     /// `[-a] [-n] [folder]`, still to be read.
     Inventory(Vec<String>),
     /// An inventory item and, when given, the words of a body part.
@@ -236,6 +251,7 @@ impl Request {
             Request::Autoreply(_) => "autoreply",
             Request::SendTp { .. } => "sendtp",
             Request::Touch(_) => "touch",
+            Request::Scan(_) => "scan",
             Request::Persist { .. } => "persist",
             Request::Home => "home",
             Request::Status => "status",
@@ -447,6 +463,7 @@ impl Request {
                 arguments(1)?;
                 Ok(Request::Touch(fields.remove(0)))
             }
+            "scan" => Ok(Request::Scan(fields)),
             "inventory" => Ok(Request::Inventory(fields)),
             "attach" => {
                 at_least(1)?;
@@ -933,6 +950,23 @@ mod tests {
             reason.contains("`persist`") && reason.contains("not 3") && reason.contains("quoted"),
             "{reason}"
         );
+    }
+
+    #[test]
+    fn scan_requests_keep_their_arguments_for_the_bot_to_read() {
+        assert_eq!(Request::decode(b"scan"), Ok(Request::Scan(vec![])));
+        assert_eq!(
+            Request::decode(b"scan	96	-n	park bench	-s"),
+            Ok(Request::Scan(strings(&["96", "-n", "park bench", "-s"])))
+        );
+        assert_eq!(Request::Scan(vec![]).name(), "scan");
+        // The client passes options on as they are.
+        assert_eq!(
+            request_line(&strings(&["scan", "20", "--name", "park bench", "-a"])),
+            "scan	20	--name	park bench	-a
+"
+        );
+        assert!(CTL_USAGE.contains("rslbot ctl scan [DISTANCE] [FILTER...]"));
     }
 
     #[test]

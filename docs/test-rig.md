@@ -656,3 +656,61 @@ Not covered on this rig: a viewer showing the answer (no viewer was at
 hand), stored offline IMs (the rig cannot produce them), IMs from
 scripts, and two bots with autoreply on (both unit-tested: a bot drops
 dialog 20 unread). Nothing of this has been tried on Second Life.
+
+## Area scan
+
+Run on 2026-11-21 with the debug build and `--verbose`: `rslbot ctl scan`
+and the `seat name` line of `status`. The config is that of item 1 plus
+`persist = "cfg"` and `socket = true`, without `scan_distance` unless a row
+says so, and a `RUSSELBOT_SOCK` of the run's own. `ctl` is `rslbot ctl` on
+that socket. The seat was rezzed with `rezprim.py Target name=Seat`.
+
+`rezprim.py` rezzes what the rows name, beside the seat (give each run its
+own `east=` so the prims do not stack):
+
+```sh
+test-rig/rezprim.py Target name="Park Bench" desc="Sit here" east=3            # <bench>
+test-rig/rezprim.py Target name=Button desc=Teleporter touch east=5            # <button>
+test-rig/rezprim.py Target name=Sofa child=Cushion childtouch east=8           # <sofa>, child <cushion>
+test-rig/rezprim.py Target name="Far lamp" east=90                             # <lamp>
+```
+
+| # | Inject | Expected | Result (2026-11-21, OpenSim feccd9cc53) |
+|---|---|---|---|
+| 186 | `ctl scan`, the first command of the bot's stay | `scanning for objects within 32 m` in the log; answered no sooner than 3 s; one line each for the seat, `<bench>`, `<button>` and `<sofa>`, nearest first, each with seven tab-separated fields, owner `Rig Owner` and its UUID; no line for `<lamp>`, `<cushion>` or an avatar; with `--verbose`, `ObjectSelect` and `ObjectDeselect` once each and one `AgentThrottle` after the scan started | | Pass: answered after 3.0 s with the four lines. The seat was not selected: its name was known from the sit |
+| 187 | `ctl scan` again | The same lines within a second; no `ObjectSelect` | | Pass: 0.01 s |
+| 188 | `ctl scan 5`; `ctl scan 200` | Only what is within 5 m; then `scan distance raised to 200 m` in the log and `<lamp>` listed with a distance near 90 | | Pass: three lines; then 3.0 s and `<lamp>` at 84.7. Raising the distance made OpenSimulator offer the neighbouring region (`EnableSimulator`), which the bot ignores |
+| 189 | `ctl touch <lamp>` after item 188; `ctl scan` | The touch is answered at once; the scan without a distance lists `<lamp>` | | Pass, both |
+| 190 | `ctl scan -n bench`; `ctl scan --name "park b"`; `ctl scan -d tele` | `<bench>` alone, twice; `<button>` alone | | Pass, all three |
+| 191 | `ctl scan -o "rig owner"`; `ctl scan -o <Rig Owner's UUID>`; `ctl scan -o "Nobody Here"` | Everything, twice; then nothing, status 0 | | Pass, all three |
+| 192 | `ctl scan -t`; `ctl scan -s` | `<button>` with `scripted,touch`. Record whether `<sofa>` is listed too, that is, whether OpenSimulator marks the root prim for a script in the child | | Pass. OpenSimulator marks only the prim that holds the script: `<sofa>` is listed by neither, and `-c` (item 193) lists `<cushion>` with `scripted,touch,child` |
+| 193 | `ctl scan -c -n cushion`; `ctl scan -n cushion`; `ctl scan -c -t` | `<cushion>` with the sofa's distance and `child` in its flags; nothing; `<button>` and `<cushion>` | | Pass, all three |
+| 194 | `ctl attach "Bot gear/Radio"` (see `stock.py`), then `ctl scan -a` and `ctl scan` | The radio with distance `0.0` and `attachment`; not listed without `-a` | | Pass; with `-a -c` likewise |
+| 195 | `ctl scan -x`; `ctl scan -n`; `ctl scan 0`; `ctl scan 10 20` | Status 1 each, naming the argument; with `--verbose` nothing is sent | | Pass, all four |
+| 196 | `ctl scan 96 &` and at once `ctl tp 128 128 25 Home` | The scan exits with status 1 saying the avatar left the region; `ctl scan` in `Home` reaches 32 m again | | Pass, with the first `scan` of a stay given 18 s after arriving. Sooner than that the scan was answered first: a teleport by region name took about 10 s, as OpenSimulator sends the map's answer behind the terrain, which it sends at 1000 bytes a second. That is so without a scan too |
+| 197 | Stop the bot's session with `kick user Sit Bot bye`, and `ctl scan` before the next login | Status 1, `the avatar is not connected to a region` | | Pass |
+| 198 | `ctl rlv mode on`, `ctl rlv mode override`, `ctl scan`, `ctl rlv status` | The scan is answered; `rlv: override` still | | Pass |
+| 199 | `ctl status` while seated on the configured seat, named `Seat` in a viewer or rezzed with `name=Seat` | `seat: target`, then `seat name: Seat`; with `--verbose`, one `RequestObjectPropertiesFamily` after the sit and no `ObjectSelect` | | Pass. A `status` in the moment after the sit has no `seat name` line yet |
+| 200 | `ctl sit <cushion>`, `ctl status`; `ctl stand`, `ctl status` | `seat: object` with the prim OpenSimulator names and `seat name: Sofa`; then `seat: none` and no `seat name` line | | Pass. OpenSimulator names the root prim for a sit on the child: `seat: object <sofa>`. No request for the name: the scan had it |
+| 201 | Rename `<bench>` in a viewer, `ctl scan -n bench`; then `ctl tp 128 128 25 Home`, `ctl home`, `ctl scan` | The old name still; the new one after the round trip | | Pass, renamed with `ObjectName` from a script instead of a viewer |
+| 202 | `scan_distance = 64`, wait a minute, `ctl scan` | Answered within a second or two (only the properties are asked for); with `--verbose`, no `ObjectSelect` before the command | | Pass: asked 11 s after the login, answered in the second the properties were asked for |
+
+Found on this run, and the same with the bot as it was before `scan` (built
+from the commit before, `scan_distance = 64`, `ctl tp 128 128 25 Home`, 20
+seconds, `ctl home`): a session is lost on the way back. With a draw
+distance of 64 m or more in the middle of a region, this OpenSimulator
+counts the neighbouring region as in view (it adds 64 m to the draw
+distance) and keeps the avatar's presence in the region it left as a child
+agent. The bot drops that circuit when it leaves, and comes back from
+another UDP port; the simulator then closes the avatar's client in that
+region (`Reusing existing child scene presence`, `Close has been called`),
+the handshake times out after 30 s, and the bot logs in again. Without
+`scan_distance` the same happened once, when `scan 96` was given in the
+second the avatar arrived in `Home`; a `scan` that widens the distance
+later in a stay did not cause it, and after it the avatar's next region
+starts at 32 m again.
+
+Not covered on this rig: Second Life, where the distance decides what the
+simulator describes at all; a region with more objects than fit one
+`ObjectSelect`; the 30 second limit; an owner the name service does not
+know and objects owned by a group (unit tests only).

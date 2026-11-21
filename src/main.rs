@@ -18,6 +18,7 @@ mod perms;
 mod persist;
 mod reconciler;
 mod rlv;
+mod scan;
 mod session;
 mod udp {
     pub mod circuit;
@@ -270,6 +271,18 @@ fn sitting(session: &Session<RealNet>) -> Sitting {
 }
 
 impl Grid for Live<'_> {
+    fn reach(&mut self, distance: Option<f32>, now: Instant) -> Result<f32, String> {
+        self.session.reach(distance, now)
+    }
+    fn sightings(&self) -> Vec<scan::Sighting> {
+        self.session.sightings()
+    }
+    fn ask_properties(&mut self, local_ids: &[u32], now: Instant) {
+        self.session.ask_properties(local_ids, now);
+    }
+    fn settled_at(&self) -> Instant {
+        self.session.settled_at()
+    }
     fn restrictions(&self) -> Option<&Restrictions> {
         self.rlv.in_force()
     }
@@ -587,6 +600,23 @@ impl Bot {
         self.follow_commands();
     }
 
+    /// Looks at the `scan` commands that wait for the simulator (see
+    /// `Commands::scans_due`).
+    fn scan_objects(&mut self, now: Instant) {
+        #[cfg(test)]
+        if let Some(grid) = self.grid.as_mut() {
+            return self.commands.scans_due(Some(grid), now);
+        }
+        let mut live = live(
+            &mut self.session,
+            &self.search_url,
+            &self.avatar_searches,
+            &self.inventory,
+            &self.rlv,
+        );
+        self.commands.scans_due(live.as_mut(), now);
+    }
+
     /// Notices a hand-over to another simulator: the inventory services
     /// the bot knows are the old one's, and so is whatever a command is
     /// asking them.
@@ -851,6 +881,7 @@ impl Bot {
                 region,
                 position: session.position(),
                 seat: session.seat(),
+                seat_name: session.seat_name(),
             })
         });
         status_text(here, self.book.held(), self.reconciler.is_manual())
@@ -858,11 +889,12 @@ impl Bot {
 
     /// Carries out a command from the control socket.
     fn control(&mut self, request: Request, reply: Sender<Response>, now: Instant) -> Flow {
-        // While RLV is in override, the next command but these five is
-        // exempt from the restrictions, and RLV is on again with it.
+        // While RLV is in override, the next command but these six is
+        // exempt from the restrictions, and RLV is on again with it. No
+        // restriction applies to a `scan`, so it has no use for one.
         let never = matches!(
             request,
-            Request::Rlv(_) | Request::Status | Request::Perms(_) | Request::Autoreply(_) | Request::Quit
+            Request::Rlv(_) | Request::Status | Request::Perms(_) | Request::Autoreply(_) | Request::Scan(_) | Request::Quit
         );
         let exempt = !never && self.rlv.take_override(request.name());
         match request {
@@ -1886,6 +1918,9 @@ struct Whereabouts<'a> {
     region: &'a str,
     position: Option<Vector3>,
     seat: Seat,
+    /// What the object the avatar sits on is called, once the simulator
+    /// has said.
+    seat_name: Option<&'a str>,
 }
 
 /// The text of the `status` answer. `here` is missing while the avatar is
@@ -1893,12 +1928,19 @@ struct Whereabouts<'a> {
 fn status_text(here: Option<Whereabouts>, held: &Placement, manual: bool) -> String {
     let mut lines = Vec::new();
     lines.push(format!("connected: {}", if here.is_some() { "yes" } else { "no" }));
-    if let Some(Whereabouts { region, position, seat }) = here {
+    if let Some(Whereabouts {
+        region,
+        position,
+        seat,
+        seat_name,
+    }) = here
+    {
         lines.push(format!("region: {region}"));
         if let Some(position) = position {
             let [x, y, z] = position.map(persist::coordinate);
             lines.push(format!("position: {x}, {y}, {z}"));
         }
+        let on_object = matches!(seat, Seat::Object(_) | Seat::Other);
         let seat = match seat {
             Seat::Unknown => "unknown".to_string(),
             Seat::None => "none".to_string(),
@@ -1907,6 +1949,9 @@ fn status_text(here: Option<Whereabouts>, held: &Placement, manual: bool) -> Str
             Seat::Other => "other".to_string(),
         };
         lines.push(format!("seat: {seat}"));
+        if let Some(name) = seat_name.filter(|_| on_object) {
+            lines.push(format!("seat name: {}", escape::escape(name)));
+        }
     }
     lines.push(format!("persist: {held}"));
     lines.push(format!("mode: {}", if manual { "manual" } else { "holding" }));
@@ -2012,6 +2057,7 @@ fn run_loop(bot: &mut Bot, incoming: &Receiver<Event>) -> i32 {
         }
         bot.commands.tick(Instant::now());
         bot.decide_requests(Instant::now());
+        bot.scan_objects(Instant::now());
         bot.restore_attachments(Instant::now());
         bot.service_messages();
         bot.xmpp_presence();
@@ -2225,6 +2271,7 @@ mod tests {
             region: "Target",
             position: Some([131.004, 64.5, 23.0]),
             seat: sat(object(), None),
+            seat_name: None,
         };
         assert_eq!(
             status_text(Some(here), &held, false),
@@ -2239,6 +2286,7 @@ mod tests {
             region: "Home",
             position: None,
             seat: sat(other, Some(Uuid::from_u128(8))),
+            seat_name: None,
         };
         assert_eq!(
             status_text(Some(here), &held, true),
@@ -2249,9 +2297,49 @@ mod tests {
                 region: "Home",
                 position: None,
                 seat,
+                seat_name: None,
             };
             assert!(status_text(Some(here), &held, false).contains(&format!("\nseat: {word}\n")));
         }
+    }
+
+    #[test]
+    fn status_names_what_the_avatar_sits_on() {
+        let held = Placement {
+            location: Some(at("Target", 128.0, 128.5, 25.0)),
+            sit: SitState::Object(object()),
+        };
+        let seated = |seat, seat_name| {
+            let here = Whereabouts {
+                region: "Target",
+                position: None,
+                seat,
+                seat_name,
+            };
+            status_text(Some(here), &held, false)
+        };
+        // On the held object: the name follows the seat.
+        assert_eq!(
+            seated(sat(object(), None), Some("Park Bench")),
+            format!(
+                "connected: yes\nregion: Target\nseat: target\nseat name: Park Bench\npersist: Target/128/128.5/25 {OBJECT}\nmode: holding"
+            )
+        );
+        // On a child prim of another object: the prim the simulator
+        // named, and the name of the linkset's root.
+        let cushion = Uuid::from_u128(7);
+        let text = seated(sat(cushion, None), Some("Sofa"));
+        assert!(text.contains(&format!("\nseat: object {cushion}\nseat name: Sofa\n")), "{text}");
+        assert!(seated(Seat::Other, Some("Sofa")).contains("\nseat: other\nseat name: Sofa\n"));
+        // Not told yet: answered without the line.
+        assert!(!seated(sat(object(), None), None).contains("seat name"));
+        // Standing, on the ground, or not known: no seat to name.
+        for seat in [Seat::None, Seat::Unknown] {
+            assert!(!seated(seat, Some("Sofa")).contains("seat name"));
+        }
+        // A name stays on its line.
+        let text = seated(sat(object(), None), Some("Two\nlines\tand a \\"));
+        assert!(text.contains("\nseat name: Two\\nlines\\tand a \\\\\npersist:"), "{text}");
     }
 
     #[test]
@@ -2751,6 +2839,63 @@ mod tests {
         ok(&mut bot, "rlv\tmode\toverride");
         refused(&mut bot, "sit\tnowhere");
         assert_eq!(mode(&mut bot), "rlv: on");
+    }
+
+    #[test]
+    fn a_scan_reads_only() {
+        let mut bot = bot(full("rlv = true\n"));
+        let mut grid = commands::tests::FakeGrid::default();
+        let sign = Uuid::from_bytes([0x51; 16]);
+        grid.sightings = vec![scan::Sighting {
+            object: sign,
+            local_id: 700,
+            distance: 3.0,
+            flags: 0,
+            attachment: false,
+            child: false,
+            properties: Some(udp::messages::Properties {
+                object: sign,
+                owner: Uuid::nil(),
+                group: Uuid::from_bytes([0x6C; 16]),
+                name: "Sign".to_string(),
+                description: String::new(),
+            }),
+        }];
+        bot.grid = Some(grid);
+        ok(&mut bot, "rlv\tmode\toverride");
+        let held = bot.book.held().to_string();
+
+        // The answer comes once the waiting scans are looked at.
+        let (reply, answer) = mpsc::channel();
+        let request = Request::decode(b"scan\t20\t-n\tsign").unwrap();
+        assert!(matches!(bot.control(request, reply, Instant::now()), Flow::Continue));
+        assert!(answer.try_recv().is_err());
+        bot.scan_objects(Instant::now());
+        let Ok(Response::Ok(Some(line))) = answer.try_recv() else {
+            panic!("no listing");
+        };
+        assert!(
+            line.starts_with(&format!("{sign}\t3.0\t-\t")) && line.ends_with("\t(group)\tSign\t"),
+            "{line}"
+        );
+
+        // It did not use up the override, and neither does one that is
+        // refused.
+        assert!(refused(&mut bot, "scan\t-x").contains("`-x`"));
+        assert!(ok(&mut bot, "rlv\tstatus").starts_with("rlv: override\n"));
+        // Nor did it move the avatar or change what the bot holds.
+        assert!(!bot.reconciler.is_manual());
+        assert_eq!(bot.book.held().to_string(), held);
+        assert!(ok(&mut bot, "status").ends_with("mode: holding"));
+        let calls = &bot.grid.as_ref().unwrap().calls;
+        assert_eq!(calls[..], [commands::tests::Call::Reach(Some(20.0))]);
+    }
+
+    #[test]
+    fn a_scan_between_logins_is_refused() {
+        let mut bot = bot(full(""));
+        assert_eq!(refused(&mut bot, "scan"), session::NOT_CONNECTED);
+        assert_eq!(refused(&mut bot, "scan\t96\t-s"), session::NOT_CONNECTED);
     }
 
     #[test]

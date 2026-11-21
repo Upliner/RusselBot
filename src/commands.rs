@@ -12,6 +12,7 @@ use crate::perms::{self, Ask, Kind, Owner, Rules};
 use crate::persist::{Location, SitState};
 use crate::reconciler::same_region;
 use crate::rlv::{Check, Limits, Refusal, Restrictions, Sitting, Who};
+use crate::scan::{self, Query, Sighting};
 use crate::session::{InventoryOffer, Look, Thing, Touch, ATTACH_LIMIT, DETACH_LIMIT, NOT_CONNECTED};
 use crate::udp::messages::{Vector3, MAX_TEXT};
 use std::collections::{HashMap, HashSet};
@@ -298,7 +299,39 @@ pub trait Grid {
     fn look_for(&mut self, object: Uuid, now: Instant) -> Result<Look, String>;
     /// Why `object` cannot be touched when the scan did not turn it up.
     fn unknown_object(&self, object: Uuid) -> String;
+    /// Makes ready for a `scan` command that reaches `distance` metres,
+    /// or as far as the object scan does: starts that scan, and widens it
+    /// when the distance is more. Returns how far the command reaches.
+    fn reach(&mut self, distance: Option<f32>, now: Instant) -> Result<f32, String>;
+    /// The prims the simulator has described, with their distance.
+    fn sightings(&self) -> Vec<Sighting>;
+    /// Asks the simulator what the objects with these region-local ids
+    /// are called and whose they are, as far as it has not said and was
+    /// not asked a moment ago.
+    fn ask_properties(&mut self, local_ids: &[u32], now: Instant);
+    /// When the objects around the avatar count as all described.
+    fn settled_at(&self) -> Instant;
 }
+
+/// A `scan` command waiting for the simulator to describe and name the
+/// objects around the avatar.
+struct Scanning {
+    query: Query,
+    /// How far it lists, in metres.
+    distance: f32,
+    /// Its arguments, for the operator log.
+    args: String,
+    reply: Sender<Response>,
+    /// When it is answered with what is known.
+    deadline: Instant,
+}
+
+/// How long a `scan` waits for the simulator before it lists what it knows.
+pub const SCAN_LIMIT: Duration = Duration::from_secs(30);
+/// How often the waiting scans are looked at.
+const SCAN_POLL: Duration = Duration::from_millis(250);
+/// The most owners' names kept from one scan to the next.
+const MAX_OWNER_NAMES: usize = 10_000;
 
 /// A command that a restriction refuses for an object the simulator has
 /// not described, waiting for it to be: it is then carried out again from
@@ -546,6 +579,15 @@ pub struct Commands {
     /// `sit` and `touch` commands waiting for their object to be described
     /// before the restrictions decide them.
     looking: Vec<Looking>,
+    /// `scan` commands waiting for the simulator, and when they are next
+    /// looked at.
+    scanning: Vec<Scanning>,
+    scan_poll: Option<Instant>,
+    /// The names of the owners of scanned objects: `None` for one the
+    /// name service did not name. Kept from scan to scan when known.
+    owners: HashMap<Uuid, Option<String>>,
+    /// The owners whose names the name service has been or will be asked.
+    owner_lookups: HashSet<Uuid>,
     /// Whose command is being carried out.
     origin: Origin,
     /// A command moved the avatar since `take_manual` was last asked.
@@ -615,6 +657,10 @@ impl Commands {
             pending_teleport: None,
             touches: Vec::new(),
             looking: Vec::new(),
+            scanning: Vec::new(),
+            scan_poll: None,
+            owners: HashMap::new(),
+            owner_lookups: HashSet::new(),
             origin: Origin::Operator,
             went_manual: false,
             last_tp: None,
@@ -699,6 +745,7 @@ impl Commands {
                 check_length(&message, MAX_OFFER_TEXT).and_then(|()| self.with_avatar(&to, After::SendTp(message), &reply, grid, now))
             }
             Request::Touch(object) => self.touch(&object, &reply, grid, now),
+            Request::Scan(args) => self.scan(&args, &reply, grid, now),
             Request::Persist { .. } | Request::Home | Request::Status | Request::Rlv(_) | Request::Autoreply(_) | Request::Quit => {
                 Err("not a command for the grid".to_string())
             }
@@ -963,6 +1010,104 @@ impl Commands {
                 self.touches.push((object, reply.clone()));
                 Ok(Done::Parked)
             }
+        }
+    }
+
+    /// `scan`: lists the objects around the avatar once the simulator
+    /// has described and named them (see `scans_due`).
+    fn scan<G: Grid>(&mut self, args: &[String], reply: &Sender<Response>, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
+        let query = Query::parse(args)?;
+        let distance = grid.ok_or(NOT_CONNECTED)?.reach(query.distance, now)?;
+        self.scanning.push(Scanning {
+            query,
+            distance,
+            args: args.join(" "),
+            reply: reply.clone(),
+            deadline: now + SCAN_LIMIT,
+        });
+        self.scan_poll = Some(now);
+        Ok(Done::Parked)
+    }
+
+    /// Looks at the `scan` commands that wait: asks the simulator for the
+    /// properties their listings lack and the name service for the owners,
+    /// and answers those whose surroundings have settled and are all named,
+    /// or whose time is up, with what is known.
+    pub fn scans_due<G: Grid>(&mut self, grid: Option<&mut G>, now: Instant) {
+        // Without a session `session_lost` has answered them.
+        let (Some(grid), Some(at)) = (grid, self.scan_poll) else {
+            return;
+        };
+        if now < at {
+            return;
+        }
+        let sightings = grid.sightings();
+        let settled = now >= grid.settled_at();
+        for scan in std::mem::take(&mut self.scanning) {
+            let reachable: Vec<&Sighting> = sightings.iter().filter(|s| scan.query.reachable(s, scan.distance)).collect();
+            let unnamed: Vec<u32> = reachable.iter().filter(|s| s.properties.is_none()).map(|s| s.local_id).collect();
+            grid.ask_properties(&unnamed, now);
+            let mut nameless = 0;
+            for owner in reachable.iter().filter_map(|s| scan.query.owner_wanted(s)) {
+                if !self.owners.contains_key(&owner) {
+                    nameless += 1;
+                    if self.owner_lookups.insert(owner) {
+                        self.wanted_names.push(owner);
+                    }
+                }
+            }
+            let complete = settled && unnamed.is_empty() && nameless == 0;
+            if !complete && now < scan.deadline {
+                self.scanning.push(scan);
+                continue;
+            }
+            let listed: Vec<Sighting> = reachable
+                .into_iter()
+                .filter(|s| scan.query.matches(s, &self.owners))
+                .cloned()
+                .collect();
+            let count = listed.len();
+            let short = match complete {
+                true => String::new(),
+                false => format!(
+                    "; the simulator did not finish in {} s: {} without properties, {nameless} without an owner's name",
+                    SCAN_LIMIT.as_secs(),
+                    unnamed.len()
+                ),
+            };
+            let given = if scan.args.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", scan.args)
+            };
+            crate::info!("{CONTROL}: scan{given}: {count} listed within {} m{short}", scan.distance);
+            // The client may have gone away; the scan is done either way.
+            let _ = scan.reply.send(Response::Ok(scan::listing(listed, &self.owners)));
+        }
+        self.scan_poll = (!self.scanning.is_empty()).then(|| now + SCAN_POLL);
+        if self.scanning.is_empty() {
+            // An owner the name service did not name is asked for again
+            // by the next scan.
+            self.owners.retain(|_, name| name.is_some());
+            if self.owners.len() > MAX_OWNER_NAMES {
+                self.owners.clear();
+            }
+        }
+    }
+
+    /// Answers the `scan` commands that wait with an error.
+    fn fail_scans(&mut self, reason: &str) {
+        for scan in std::mem::take(&mut self.scanning) {
+            refuse(CONTROL, "scan", &scan.reply, reason.to_string());
+        }
+        self.scan_poll = None;
+    }
+
+    /// The name service answered for an owner of scanned objects, with a
+    /// name or without one.
+    fn owner_named(&mut self, id: Uuid, name: Option<&str>) {
+        if self.owner_lookups.remove(&id) {
+            self.owners.insert(id, name.map(str::to_string));
         }
     }
 
@@ -1642,6 +1787,8 @@ impl Commands {
     /// one's inventory service will not be used.
     pub fn simulator_changed(&mut self) {
         self.fail_jobs("the avatar changed simulator while the inventory was being read");
+        // The objects a scan waited for stayed behind too.
+        self.fail_scans("the avatar left the region");
         // The scripts that asked for permissions stayed behind.
         self.requests.clear_scripts();
         self.undecided.retain(|waiting| !matches!(waiting.needs, Needs::Owner(_)));
@@ -1842,6 +1989,8 @@ impl Commands {
             );
         }
         self.fail_jobs("the session was lost");
+        self.fail_scans("the session was lost");
+        self.owner_lookups.clear();
         for attach in std::mem::take(&mut self.attaching) {
             refuse(CONTROL, attach.command, &attach.reply, "the session was lost".to_string());
         }
@@ -1875,7 +2024,8 @@ impl Commands {
             Restore::Due(at) => Some(at),
             _ => None,
         };
-        lookups.chain(jobs).chain(filing).chain(undecided).chain(restore).min()
+        let scans = self.scan_poll;
+        lookups.chain(jobs).chain(filing).chain(undecided).chain(restore).chain(scans).min()
     }
 
     // ------------------------------------------- what the session reports
@@ -2366,6 +2516,7 @@ impl Commands {
     /// without a name.
     pub fn names_resolved<G: Grid>(&mut self, found: &[(Uuid, Names)], missing: &[Uuid], mut grid: Option<&mut G>, now: Instant) {
         for (id, names) in found {
+            self.owner_named(*id, Some(&names.legacy));
             let learn = |sender: &mut perms::Sender| {
                 if let perms::Sender::Object {
                     owner: Owner::Avatar { name, .. },
@@ -2384,6 +2535,7 @@ impl Commands {
     /// decided without the name.
     pub fn names_failed<G: Grid>(&mut self, ids: &[Uuid], mut grid: Option<&mut G>, now: Instant) {
         for id in ids {
+            self.owner_named(*id, None);
             self.settle(&Needs::Name(*id), |_| {}, grid.as_deref_mut(), now);
         }
     }
@@ -2605,6 +2757,10 @@ pub(crate) mod tests {
         AcceptInventory(Uuid, bool, Uuid, Uuid),
         /// A look for an object the simulator has not described.
         LookFor(Uuid),
+        /// A `scan` made ready, with the distance it named.
+        Reach(Option<f32>),
+        /// A question about the properties of these objects.
+        Properties(Vec<u32>),
     }
 
     pub(crate) struct FakeGrid {
@@ -2635,6 +2791,13 @@ pub(crate) mod tests {
         pub(crate) things: Vec<(Uuid, Thing)>,
         /// What `look_for` answers for an object not in `things`.
         pub(crate) look: Result<Look, String>,
+        /// How far the object scan reaches.
+        pub(crate) reach: f32,
+        /// The prims the simulator has described.
+        pub(crate) sightings: Vec<Sighting>,
+        /// When the surroundings count as all described; long ago when
+        /// left out.
+        pub(crate) settled_at: Option<Instant>,
     }
 
     impl Default for FakeGrid {
@@ -2656,6 +2819,9 @@ pub(crate) mod tests {
                 sitting: Sitting::No,
                 things: Vec::new(),
                 look: Ok(Look::Waiting),
+                reach: 32.0,
+                sightings: Vec::new(),
+                settled_at: None,
             }
         }
     }
@@ -2678,6 +2844,25 @@ pub(crate) mod tests {
     }
 
     impl Grid for FakeGrid {
+        fn reach(&mut self, distance: Option<f32>, _: Instant) -> Result<f32, String> {
+            self.check()?;
+            self.calls.push(Call::Reach(distance));
+            if let Some(distance) = distance {
+                self.reach = self.reach.max(distance);
+            }
+            Ok(distance.unwrap_or(self.reach))
+        }
+        fn sightings(&self) -> Vec<Sighting> {
+            self.sightings.clone()
+        }
+        fn ask_properties(&mut self, local_ids: &[u32], _: Instant) {
+            if !local_ids.is_empty() {
+                self.calls.push(Call::Properties(local_ids.to_vec()));
+            }
+        }
+        fn settled_at(&self) -> Instant {
+            self.settled_at.unwrap_or_else(|| Instant::now() - Duration::from_secs(60))
+        }
         fn say(&mut self, channel: i32, chat_type: u8, text: &str, _: Instant) -> Result<(), String> {
             self.check()?;
             self.calls.push(Call::Say(channel, chat_type, text.to_string()));
@@ -6363,5 +6548,325 @@ pub(crate) mod tests {
         rig.hold(&["denypermission"]);
         held_back(&rig.accept("controls", None), "denypermission");
         assert_eq!(rig.waiting().len(), 1);
+    }
+
+    // ------------------------------------------------------------- scan
+
+    use crate::udp::messages::{Properties, FLAG_SCRIPTED};
+
+    /// A prim at this distance; with a name it is named, as its owner's.
+    fn seen(n: u8, distance: f32, named: Option<(&str, Uuid)>) -> Sighting {
+        let object = Uuid::from_bytes([n; 16]);
+        Sighting {
+            object,
+            local_id: u32::from(n),
+            distance,
+            flags: 0,
+            attachment: false,
+            child: false,
+            properties: named.map(|(name, owner)| Properties {
+                object,
+                owner,
+                group: Uuid::nil(),
+                name: name.to_string(),
+                description: String::new(),
+            }),
+        }
+    }
+
+    fn names_of(id: Uuid, legacy: &str) -> (Uuid, Names) {
+        let names = Names {
+            legacy: legacy.to_string(),
+            display: legacy.to_string(),
+        };
+        (id, names)
+    }
+
+    /// The names in the listing's sixth field, in order.
+    fn listed(answer: &Receiver<Response>) -> Vec<String> {
+        match answer.try_recv() {
+            Ok(Response::Ok(Some(text))) => text.lines().map(|line| line.split('\t').nth(5).unwrap().to_string()).collect(),
+            Ok(Response::Ok(None)) => Vec::new(),
+            other => panic!("expected a listing, got {other:?}"),
+        }
+    }
+
+    impl Rig {
+        fn scan_for(&mut self, args: &[&str]) -> Receiver<Response> {
+            let args = args.iter().map(|arg| arg.to_string()).collect();
+            self.run(Request::Scan(args)).0
+        }
+
+        /// The waiting scans are looked at.
+        fn look(&mut self) {
+            self.commands.scans_due(Some(&mut self.grid), self.now);
+        }
+
+        /// The simulator names the object with this local id.
+        fn name_object(&mut self, local_id: u32, name: &str, owner: Uuid) {
+            let sighting = self.grid.sightings.iter_mut().find(|s| s.local_id == local_id).unwrap();
+            sighting.properties = seen(0, 0.0, Some((name, owner))).properties;
+        }
+
+        fn named_by_the_grid(&mut self, found: &[(Uuid, Names)], missing: &[Uuid]) {
+            self.commands.names_resolved(found, missing, Some(&mut self.grid), self.now);
+        }
+
+        /// A bench of Jane's 3 metres away and a lamp of John's 10 metres
+        /// away, both named, and both owners known to the name service.
+        fn among_objects() -> Rig {
+            let mut rig = Rig::new();
+            rig.grid.sightings = vec![seen(2, 10.0, Some(("Lamp", john()))), seen(1, 3.0, Some(("Bench", jane())))];
+            let answer = rig.scan_for(&[]);
+            rig.look();
+            assert_eq!(rig.commands.take_name_lookups().len(), 2);
+            rig.named_by_the_grid(&[names_of(jane(), "Jane Doe"), names_of(john(), "John Roe")], &[]);
+            rig.now += Duration::from_millis(250);
+            rig.look();
+            assert_eq!(listed(&answer), ["Bench", "Lamp"]);
+            rig.calls();
+            rig
+        }
+    }
+
+    #[test]
+    fn scan_lists_what_is_around_once_it_is_named() {
+        let mut rig = Rig::new();
+        rig.grid.sightings = vec![seen(2, 10.0, None), seen(1, 3.0, Some(("Bench", jane())))];
+        let answer = rig.scan_for(&[]);
+        assert_eq!(rig.calls(), [Call::Reach(None)]);
+        assert!(answer.try_recv().is_err(), "it waits for the simulator");
+
+        // The lamp has no name yet, and nobody has named Jane.
+        rig.look();
+        assert_eq!(rig.calls(), [Call::Properties(vec![2])]);
+        assert_eq!(rig.commands.take_name_lookups(), [jane()]);
+        assert!(answer.try_recv().is_err());
+        assert_eq!(rig.commands.next_deadline(), Some(rig.now + SCAN_POLL));
+
+        // Looked at four times a second, and not in between.
+        rig.name_object(2, "Lamp", jane());
+        rig.named_by_the_grid(&[names_of(jane(), "Jane Doe")], &[]);
+        rig.now += Duration::from_millis(100);
+        rig.look();
+        assert!(answer.try_recv().is_err());
+        rig.now += Duration::from_millis(150);
+        rig.look();
+        let Ok(Response::Ok(Some(text))) = answer.try_recv() else {
+            panic!("no listing");
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let bench = format!("{}\t3.0\t-\t{}\tJane Doe\tBench\t", Uuid::from_bytes([1; 16]), jane());
+        assert_eq!(lines[0], bench);
+        assert!(lines[1].ends_with("\tJane Doe\tLamp\t") && lines[1].contains("\t10.0\t"));
+        // Nothing waits any more.
+        assert_eq!((rig.calls(), rig.commands.next_deadline()), (vec![], None));
+        assert_eq!(rig.commands.take_name_lookups(), Vec::<Uuid>::new());
+    }
+
+    #[test]
+    fn scan_with_nothing_within_the_distance_prints_nothing() {
+        let mut rig = Rig::new();
+        rig.grid.sightings = vec![seen(1, 10.0, Some(("Bench", jane())))];
+        let answer = rig.scan_for(&["5"]);
+        assert_eq!(rig.calls(), [Call::Reach(Some(5.0))]);
+        rig.look();
+        assert_eq!(answer.try_recv(), Ok(Response::Ok(None)));
+        // Nothing was asked for the sake of what is out of reach.
+        assert_eq!(rig.calls(), []);
+        assert_eq!(rig.commands.take_name_lookups(), Vec::<Uuid>::new());
+    }
+
+    #[test]
+    fn scan_needs_the_avatar_in_a_region() {
+        let mut rig = Rig::new();
+        let (reply, answer) = mpsc::channel();
+        rig.commands.handle(Request::Scan(vec![]), reply, None::<&mut FakeGrid>, rig.now);
+        assert_eq!(error(&answer), NOT_CONNECTED);
+        rig.grid.offline = true;
+        assert_eq!(error(&rig.scan_for(&["96"])), NOT_CONNECTED);
+        assert_eq!(rig.calls(), []);
+        assert_eq!(rig.commands.next_deadline(), None);
+    }
+
+    #[test]
+    fn scan_with_wrong_arguments_asks_the_simulator_nothing() {
+        let mut rig = Rig::new();
+        assert!(error(&rig.scan_for(&["-x"])).contains("`-x`"));
+        assert!(error(&rig.scan_for(&["-n"])).contains("`-n` takes a text"));
+        assert!(error(&rig.scan_for(&["2000"])).contains("from 1 to 1024"));
+        assert!(error(&rig.scan_for(&["10", "20"])).contains("one distance"));
+        assert!(error(&rig.scan_for(&["-o", "a b c"])).contains("\"a b c\""));
+        assert_eq!(rig.calls(), []);
+        assert_eq!(rig.grid.reach, 32.0);
+    }
+
+    #[test]
+    fn scan_waits_for_the_surroundings_to_settle() {
+        let mut rig = Rig::among_objects();
+        // The object scan has only just started.
+        rig.grid.settled_at = Some(rig.now + Duration::from_secs(3));
+        let answer = rig.scan_for(&[]);
+        for _ in 0..11 {
+            rig.look();
+            assert!(answer.try_recv().is_err());
+            rig.now += SCAN_POLL;
+        }
+        rig.now += SCAN_POLL;
+        rig.look();
+        assert_eq!(listed(&answer), ["Bench", "Lamp"]);
+    }
+
+    #[test]
+    fn scan_gives_up_on_the_simulator_after_thirty_seconds() {
+        let mut rig = Rig::among_objects();
+        rig.grid.sightings.push(seen(3, 5.0, None));
+        let plain = rig.scan_for(&[]);
+        let by_name = rig.scan_for(&["-n", "e"]);
+        let by_owner = rig.scan_for(&["-o", &jane().to_string()]);
+        rig.look();
+        rig.now += SCAN_LIMIT - SCAN_POLL;
+        rig.look();
+        assert!(plain.try_recv().is_err() && by_name.try_recv().is_err() && by_owner.try_recv().is_err());
+        rig.now += SCAN_POLL;
+        rig.look();
+        // What the simulator did not name is listed as unknown, and meets
+        // no filter on what it is called or whose it is.
+        let Ok(Response::Ok(Some(text))) = plain.try_recv() else {
+            panic!("no listing");
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1], format!("{}\t5.0\t-\t?\t?\t?\t?", Uuid::from_bytes([3; 16])));
+        assert_eq!(listed(&by_name), ["Bench"]);
+        assert_eq!(listed(&by_owner), ["Bench"]);
+        assert_eq!(rig.commands.next_deadline(), None);
+    }
+
+    #[test]
+    fn scan_asks_only_for_what_it_reaches() {
+        let mut rig = Rig::new();
+        let scripted = Sighting {
+            flags: FLAG_SCRIPTED,
+            ..seen(3, 4.0, None)
+        };
+        let hat = Sighting {
+            attachment: true,
+            ..seen(4, 2.0, None)
+        };
+        let cushion = Sighting {
+            child: true,
+            ..seen(5, 3.0, None)
+        };
+        rig.grid.sightings = vec![seen(1, 3.0, None), seen(2, 50.0, None), scripted, hat, cushion];
+        let asked = |rig: &mut Rig, args: &[&str]| -> Vec<u32> {
+            let _answer = rig.scan_for(args);
+            rig.look();
+            rig.commands.fail_scans("done");
+            match &rig.calls()[..] {
+                [Call::Reach(_), Call::Properties(ids)] => ids.clone(),
+                [Call::Reach(_)] => Vec::new(),
+                other => panic!("unexpected calls: {other:?}"),
+            }
+        };
+        assert_eq!(asked(&mut rig, &["10"]), [1, 3]);
+        assert_eq!(asked(&mut rig, &["100"]), [1, 2, 3]);
+        assert_eq!(asked(&mut rig, &["10", "-s"]), [3]);
+        assert_eq!(asked(&mut rig, &["10", "-a"]), [1, 3, 4]);
+        assert_eq!(asked(&mut rig, &["10", "-c", "-n", "cushion"]), [1, 3, 5]);
+        assert_eq!(asked(&mut rig, &["1"]), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn a_second_scan_of_the_same_objects_asks_nothing() {
+        let mut rig = Rig::among_objects();
+        let answer = rig.scan_for(&["20"]);
+        rig.look();
+        assert_eq!(listed(&answer), ["Bench", "Lamp"]);
+        assert_eq!(rig.calls(), [Call::Reach(Some(20.0))]);
+        assert_eq!(rig.commands.take_name_lookups(), Vec::<Uuid>::new());
+    }
+
+    #[test]
+    fn scan_asks_for_the_names_of_the_owners_it_lists() {
+        let mut rig = Rig::new();
+        rig.grid.sightings = vec![
+            seen(1, 3.0, Some(("Bench", jane()))),
+            seen(2, 4.0, Some(("Table", jane()))),
+            seen(3, 10.0, Some(("Lamp", john()))),
+        ];
+        // Only the lamp is listed: Jane's name is not needed.
+        let answer = rig.scan_for(&["-n", "lamp"]);
+        rig.look();
+        assert_eq!(rig.commands.take_name_lookups(), [john()]);
+        // The name service does not know John.
+        rig.named_by_the_grid(&[], &[john()]);
+        rig.now += SCAN_POLL;
+        rig.look();
+        let Ok(Response::Ok(Some(text))) = answer.try_recv() else {
+            panic!("no listing");
+        };
+        assert!(text.ends_with(&format!("\t{}\t?\tLamp\t", john())), "{text}");
+
+        // Each owner once, and John again: he may have a name by now.
+        let answer = rig.scan_for(&[]);
+        rig.look();
+        let mut wanted = rig.commands.take_name_lookups();
+        wanted.sort();
+        assert_eq!(wanted, [jane(), john()]);
+        rig.named_by_the_grid(&[names_of(jane(), "Jane Doe"), names_of(john(), "John Roe")], &[]);
+        rig.now += SCAN_POLL;
+        rig.look();
+        assert_eq!(listed(&answer), ["Bench", "Table", "Lamp"]);
+    }
+
+    #[test]
+    fn scan_by_an_owners_name_waits_for_the_names() {
+        let mut rig = Rig::new();
+        rig.grid.sightings = vec![seen(1, 3.0, Some(("Bench", jane()))), seen(2, 10.0, Some(("Lamp", john())))];
+        let janes = rig.scan_for(&["-o", "jane doe"]);
+        let nobodys = rig.scan_for(&["-o", "Nobody Here"]);
+        rig.look();
+        // Two scans, one lookup of each owner.
+        let mut wanted = rig.commands.take_name_lookups();
+        wanted.sort();
+        assert_eq!(wanted, [jane(), john()]);
+        assert!(janes.try_recv().is_err() && nobodys.try_recv().is_err());
+        rig.named_by_the_grid(&[names_of(jane(), "Jane Doe"), names_of(john(), "John Roe")], &[]);
+        rig.now += SCAN_POLL;
+        rig.look();
+        assert_eq!(listed(&janes), ["Bench"]);
+        assert_eq!(nobodys.try_recv(), Ok(Response::Ok(None)));
+    }
+
+    #[test]
+    fn a_waiting_scan_fails_when_the_avatar_leaves() {
+        let mut rig = Rig::new();
+        rig.grid.sightings = vec![seen(1, 3.0, None)];
+        let answer = rig.scan_for(&["96"]);
+        rig.look();
+        rig.commands.simulator_changed();
+        assert_eq!(error(&answer), "the avatar left the region");
+        assert_eq!(rig.commands.next_deadline(), None);
+
+        let answer = rig.scan_for(&[]);
+        rig.commands.session_lost();
+        assert_eq!(error(&answer), "the session was lost");
+        // Nothing is left to look at, with or without a session.
+        rig.look();
+        rig.commands.scans_due(None::<&mut FakeGrid>, rig.now);
+        assert!(answer.try_recv().is_err());
+    }
+
+    #[test]
+    fn scan_leaves_the_avatar_and_the_placement_alone() {
+        let mut rig = Rig::among_objects();
+        let answer = rig.scan_for(&["96", "-a", "-c"]);
+        rig.look();
+        assert_eq!(listed(&answer), ["Bench", "Lamp"]);
+        assert_eq!(rig.calls(), [Call::Reach(Some(96.0))]);
+        assert!(!rig.commands.take_manual());
+        assert_eq!((rig.commands.last_tp(), rig.commands.last_sit()), (None, None));
     }
 }
