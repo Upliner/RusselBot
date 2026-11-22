@@ -183,3 +183,18 @@ sit = "00000000-0000-0000-0000-000000000000"
 # server = "127.0.0.1:5347"
 # secret = "the component_secret of the server"
 # owners = ["me@example.org"]
+
+# The web interface: the bot serves a page at http://<listen>/ with tabs for
+# the world around the avatar (status, teleport, scans of avatars and
+# objects with teleport, sit and touch), local chat, instant messages, the
+# inventory, a command console and the page's theme. `listen` is `host:port`;
+# the host is `localhost` or an IP address. With `password` the page asks
+# for it before it shows or does anything; without it, whoever reaches the
+# address controls the avatar. The connection is not encrypted: keep
+# `listen` on 127.0.0.1, and for use from elsewhere put a reverse proxy
+# with TLS in front of it and set a password. Several bots on one machine
+# need a port each. This is a table: like `[xmpp]`, it has to come after
+# all the keys above.
+# [web]
+# listen = "127.0.0.1:8080"
+# password = "choose one"

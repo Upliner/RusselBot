@@ -20,6 +20,8 @@ pub struct Sighting {
     /// How far it is from the avatar, in metres: its linkset's root for a
     /// child prim, the wearer for what an avatar wears.
     pub distance: f32,
+    /// Where the distance is measured to, in the region.
+    pub position: [f32; 3],
     /// Its `UpdateFlags`.
     pub flags: u32,
     /// An avatar wears it.
@@ -65,6 +67,8 @@ pub struct Query {
     pub attachments: bool,
     /// Also list the child prims of linksets.
     pub children: bool,
+    /// Write each prim's position into its line.
+    pub position: bool,
 }
 
 /// What a `scan` command is: a scan of the objects around the avatar, or
@@ -141,6 +145,7 @@ impl Query {
                 "--phantom" => query.flags |= FLAG_PHANTOM,
                 "-a" | "--attachments" => query.attachments = true,
                 "-c" | "--children" => query.children = true,
+                "--position" => query.position = true,
                 option if option.starts_with('-') => return Err(format!("`scan` has no option `{option}`")),
                 given => match distance.replace(given) {
                     None => {}
@@ -236,7 +241,20 @@ fn flag_words(sighting: &Sighting) -> String {
 /// description, separated by tabs, with `?` for what is not known and for
 /// an owner in `hidden`, unless it is a group. `None` when there is
 /// nothing to list.
-pub fn listing(mut sightings: Vec<Sighting>, owners: &HashMap<Uuid, Option<String>>, hidden: &HashSet<Uuid>) -> Option<String> {
+#[cfg(test)]
+pub fn listing(sightings: Vec<Sighting>, owners: &HashMap<Uuid, Option<String>>, hidden: &HashSet<Uuid>) -> Option<String> {
+    listing_with(sightings, owners, hidden, false)
+}
+
+/// `listing`, and with `position` each line has the prim's position in the
+/// region, `x,y,z` in whole metres, as a field of its own after the
+/// distance.
+pub fn listing_with(
+    mut sightings: Vec<Sighting>,
+    owners: &HashMap<Uuid, Option<String>>,
+    hidden: &HashSet<Uuid>,
+    position: bool,
+) -> Option<String> {
     sightings.sort_by(|a, b| a.distance.total_cmp(&b.distance).then(a.object.cmp(&b.object)));
     let lines: Vec<String> = sightings
         .iter()
@@ -260,8 +278,15 @@ pub fn listing(mut sightings: Vec<Sighting>, owners: &HashMap<Uuid, Option<Strin
                 }
             };
             let [owner, owner_name, name, description] = known;
+            let place = match position {
+                true => {
+                    let [x, y, z] = sighting.position.map(|v| v.round() as i64);
+                    format!("{x},{y},{z}\t")
+                }
+                false => String::new(),
+            };
             format!(
-                "{}\t{:.1}\t{}\t{owner}\t{owner_name}\t{name}\t{description}",
+                "{}\t{:.1}\t{place}{}\t{owner}\t{owner_name}\t{name}\t{description}",
                 sighting.object,
                 sighting.distance,
                 flag_words(sighting)
@@ -311,6 +336,7 @@ mod tests {
             object: id(n),
             local_id: u32::from(n),
             distance,
+            position: [0.0; 3],
             flags: 0,
             attachment: false,
             child: false,
@@ -635,6 +661,63 @@ mod tests {
             line,
             format!("{}\t3.2\tscripted,touch\t{}\tJane Doe\tBench\tSit here", id(1), jane())
         );
+    }
+
+    #[test]
+    fn a_line_with_its_position() {
+        let bench = Sighting {
+            flags: FLAG_SCRIPTED | FLAG_TOUCH,
+            position: [103.24, 100.0, 25.0],
+            ..sighting(1, 3.24, named("Bench", "Sit here"))
+        };
+        let line = listing_with(vec![bench.clone()], &owners(), &HashSet::new(), true).unwrap();
+        assert_eq!(
+            line,
+            format!("{}\t3.2\t103,100,25\tscripted,touch\t{}\tJane Doe\tBench\tSit here", id(1), jane())
+        );
+        // Without the switch the line is what it always was.
+        assert_eq!(
+            listing_with(vec![bench.clone()], &owners(), &HashSet::new(), false),
+            listing(vec![bench], &owners(), &HashSet::new())
+        );
+        // A child prim is where its linkset's root is: the position the
+        // sighting carries, whatever the prim.
+        let cushion = Sighting {
+            child: true,
+            position: [50.4, 59.6, 22.0],
+            ..sighting(2, 4.0, named("Cushion", ""))
+        };
+        let line = listing_with(vec![cushion], &owners(), &HashSet::new(), true).unwrap();
+        assert_eq!(line.split('\t').nth(2), Some("50,60,22"));
+        assert_eq!(line.split('\t').count(), 8);
+    }
+
+    #[test]
+    fn the_position_switch_filters_nothing_and_goes_anywhere() {
+        let plain = parse(&["20", "-n", "bench"]).unwrap();
+        for words in [
+            &["--position", "20", "-n", "bench"][..],
+            &["20", "--position", "-n", "bench"],
+            &["20", "-n", "bench", "--position"],
+        ] {
+            let query = parse(words).unwrap();
+            assert!(query.position);
+            assert_eq!(Query { position: false, ..query }, plain);
+        }
+        assert!(!plain.position);
+        let query = parse(&["-t", "--position", "whisper"]).unwrap();
+        assert_eq!((query.flags, query.distance, query.position), (FLAG_TOUCH, Some(10.0), true));
+        // The same prims in the same order, each line a field longer.
+        let (near, far) = (sighting(1, 2.0, named("Bench", "")), sighting(2, 9.0, named("Bench two", "")));
+        let with = listing_with(vec![far.clone(), near.clone()], &owners(), &HashSet::new(), true).unwrap();
+        let without = listing(vec![far, near], &owners(), &HashSet::new()).unwrap();
+        let ids = |text: &str| -> Vec<String> { text.lines().map(|line| line.split('\t').next().unwrap().to_string()).collect() };
+        assert_eq!(ids(&with), ids(&without));
+        assert!(with.lines().all(|line| line.split('\t').count() == 8));
+        assert!(without.lines().all(|line| line.split('\t').count() == 7));
+        // Not for avatars.
+        let refused = Command::parse(&args(&["avatars", "--position"])).unwrap_err();
+        assert!(refused.contains("--position"), "{refused}");
     }
 
     #[test]

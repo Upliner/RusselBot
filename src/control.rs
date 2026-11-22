@@ -81,8 +81,9 @@ one argument: \"First Last\", first.last, a single word or a UUID.
 bot then leaves it where it is until `persist` or `home`. `tp` without
 REGION stays in the current region, and without Z keeps the current height.
 `requesttp` asks AVATAR to teleport the bot to them; `sendtp` offers AVATAR
-a teleport to the bot. `touch` clicks an object. `status` shows where the
-avatar is and what it sits on; `quit` logs out and stops the bot.
+a teleport to the bot. `touch` clicks an object; the UUID of an inventory
+item that is attached to the avatar clicks that attachment. `status` shows
+where the avatar is and what it sits on; `quit` logs out and stops the bot.
 
 `scan` (or `scan objects`) lists the objects within DISTANCE metres of the
 avatar, nearest first: one line each with the UUID, the distance, flags,
@@ -96,8 +97,10 @@ far until the avatar leaves the region. FILTERs: `-n TEXT` (`--name`) and
 `-s` (`--scripted`), `-t` (`--touch`), `-p` (`--physical`), `--temporary`
 and `--phantom` for prims the simulator flags so; `-a` (`--attachments`) to
 list what avatars wear as well, and `-c` (`--children`) the child prims of
-linksets. `scan avatars` lists the other avatars in the region, or those
-within DISTANCE: UUID, distance, position, name and display name.
+linksets; `--position` to add each object's position in the region, X,Y,Z
+in whole metres, as a field after the distance. `scan avatars` lists the
+other avatars in the region, or those within DISTANCE: UUID, distance,
+position, name and display name.
 
 `friends` lists the avatar's friends: UUID, `online`, `offline` or `?` (a
 friend that does not show it), name and display name. `profile` prints the
@@ -633,6 +636,33 @@ pub fn request_line(args: &[String]) -> String {
         _ => fields.extend(args.iter().cloned()),
     }
     encode_line(&fields.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// The answer to `help` where commands are typed as lines, at the XMPP
+/// control contact and in the web console: the command list of
+/// `rslbot ctl` as commands to send there.
+pub fn help() -> String {
+    let mut out = String::from("Commands (an argument with spaces goes in double quotes):\n");
+    let mut paragraphs = CTL_USAGE.split("\n\n");
+    let usage = paragraphs.next().unwrap_or_default();
+    for line in usage.lines() {
+        let line = line.trim_start_matches("Usage:").trim_start();
+        out.push_str(line.strip_prefix("rslbot ctl ").unwrap_or(line));
+        out.push('\n');
+    }
+    let rest: Vec<&str> = paragraphs.collect();
+    // The last paragraph is about the socket's address, of no use here;
+    // the first starts with a sentence about the socket.
+    for (index, paragraph) in rest.iter().enumerate().take(rest.len().saturating_sub(1)) {
+        let paragraph = match index {
+            0 => paragraph.split_once(".\n").map_or(*paragraph, |(_, after)| after),
+            _ => paragraph,
+        };
+        out.push('\n');
+        out.push_str(&paragraph.replace("rslbot ctl ", ""));
+        out.push('\n');
+    }
+    out.trim_end().to_string()
 }
 
 /// The longest command line.
@@ -1416,6 +1446,24 @@ mod tests {
             CTL_USAGE.lines().all(|line| line.len() <= 79),
             "a usage line is too long for a terminal"
         );
+    }
+
+    #[test]
+    fn help_lists_the_commands_without_the_ctl_prefix() {
+        let text = help();
+        assert!(text.contains("\nsay MESSAGE...\n"), "{text}");
+        assert!(text.contains("\nquit"), "{text}");
+        assert!(text.contains("\nrlv cmd COMMAND...\n"), "{text}");
+        assert!(!text.contains("rslbot ctl"), "{text}");
+        assert!(!text.contains("RUSSELBOT_SOCK"), "{text}");
+        assert!(!text.contains("socket = true"), "{text}");
+        // What is not saved belongs in the startup script, not in the
+        // deprecated tables; how `rslbot ctl` relates to it is left out.
+        let flowed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(flowed.matches("the config's startup script").count(), 3, "{text}");
+        assert!(!text.contains("[autoreply]") && !text.contains("[perms."), "{text}");
+        assert!(!text.contains("are the lines of"), "{text}");
+        assert!(text.contains("`say` speaks in local chat"), "{text}");
     }
 
     mod command_line {

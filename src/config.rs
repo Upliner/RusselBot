@@ -125,6 +125,8 @@ pub struct Config {
     pub perms: Rules,
     /// The XMPP gateway, when the config has an `[xmpp]` table.
     pub xmpp: Option<XmppConfig>,
+    /// The web interface, when the config has a `[web]` table.
+    pub web: Option<WebConfig>,
     /// Autoreplies to instant messages, when the config has an
     /// `[autoreply]` table.
     pub autoreply: Option<AutoreplyConfig>,
@@ -189,6 +191,15 @@ pub struct XmppConfig {
     pub owners: Vec<String>,
 }
 
+/// The `[web]` table: the web interface the bot serves itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WebConfig {
+    /// The address to listen on; `localhost` is 127.0.0.1.
+    pub listen: std::net::SocketAddr,
+    /// The password the page asks for, if any.
+    pub password: Option<Secret>,
+}
+
 #[derive(Debug, PartialEq)]
 pub struct ConfigError(pub String);
 
@@ -222,6 +233,7 @@ struct Raw {
     rlv: Option<toml::Value>,
     perms: Option<toml::Value>,
     xmpp: Option<toml::Value>,
+    web: Option<toml::Value>,
     autoreply: Option<toml::Value>,
     startup: Option<toml::Value>,
     startup_file: Option<toml::Value>,
@@ -569,6 +581,62 @@ fn xmpp(value: Option<toml::Value>) -> Result<Option<XmppConfig>, ConfigError> {
     }))
 }
 
+const WEB_KEYS: &str = "`listen` and `password`";
+
+/// The `[web]` table.
+fn web(value: Option<toml::Value>) -> Result<Option<WebConfig>, ConfigError> {
+    const FORM: &str = "it must be `host:port`, such as \"127.0.0.1:8080\"";
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let toml::Value::Table(table) = value else {
+        return err(format!("`web` must be a table with the keys {WEB_KEYS}"));
+    };
+    let (mut listen, mut password) = (None, None);
+    for (key, value) in table {
+        match key.as_str() {
+            "listen" => listen = Some(value),
+            "password" => password = Some(value),
+            _ => return err(format!("`web.{key}` is not a key of `web`; its keys are {WEB_KEYS}")),
+        }
+    }
+
+    let listen = match required(listen, "web.listen")? {
+        toml::Value::String(address) => address.trim().to_string(),
+        _ => return err(format!("`web.listen` must be a string; {FORM}")),
+    };
+    let Some((host, port)) = listen.rsplit_once(':') else {
+        return err(format!("`web.listen` is \"{listen}\"; {FORM}"));
+    };
+    let Some(port) = port.parse::<u16>().ok().filter(|port| *port > 0) else {
+        return err(format!("`web.listen` is \"{listen}\"; {FORM}, with a port from 1 to 65535"));
+    };
+    let ip: Option<std::net::IpAddr> = if host.eq_ignore_ascii_case("localhost") {
+        Some(std::net::Ipv4Addr::LOCALHOST.into())
+    } else if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        v6.parse::<std::net::Ipv6Addr>().ok().map(Into::into)
+    } else {
+        host.parse::<std::net::Ipv4Addr>().ok().map(Into::into)
+    };
+    let Some(ip) = ip else {
+        return err(format!(
+            "`web.listen` is on \"{host}\"; {FORM}: the host must be `localhost` or an IP address, \
+             an IPv6 address in square brackets"
+        ));
+    };
+
+    let password = match password {
+        None => None,
+        Some(toml::Value::String(password)) if !password.is_empty() => Some(Secret::new(password)),
+        Some(_) => return err("`web.password` must be a non-empty string"),
+    };
+
+    Ok(Some(WebConfig {
+        listen: std::net::SocketAddr::new(ip, port),
+        password,
+    }))
+}
+
 /// The table form of `persist`. `atstart` says whether anything is held
 /// once the config placement is reached; `position` and `sit` imply it.
 fn persist_table(table: &toml::Table) -> Result<(Persist, RlvPersist, PersistOverride), ConfigError> {
@@ -852,6 +920,7 @@ impl Config {
             deprecated.push(perms_note(&perms));
         }
         let xmpp = xmpp(raw.xmpp)?;
+        let web = web(raw.web)?;
         let autoreply_given = raw.autoreply.clone();
         let autoreply = autoreply(raw.autoreply)?;
         if let (Some(given), Some(auto)) = (&autoreply_given, &autoreply) {
@@ -887,6 +956,7 @@ impl Config {
             persist_override,
             perms,
             xmpp,
+            web,
             autoreply,
             startup,
             startup_file,
@@ -1698,6 +1768,121 @@ mod tests {
             let msg = rejected(&xmpp_table(&broken));
             assert!(!msg.contains(secret), "{msg}");
         }
+    }
+
+    fn web_table(lines: &str) -> String {
+        base() + "[web]\n" + lines
+    }
+
+    #[test]
+    fn web_interface_configured() {
+        let web = Config::parse(&web_table("listen = \"127.0.0.1:8080\"\n")).unwrap().web.unwrap();
+        assert_eq!(web.listen, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(web.password, None);
+        let web = Config::parse(&web_table("listen = \"127.0.0.1:8080\"\npassword = \"s3cret\"\n"))
+            .unwrap()
+            .web
+            .unwrap();
+        assert_eq!(web.password.unwrap().expose(), "s3cret");
+        for (given, address) in [
+            ("localhost:8080", "127.0.0.1:8080"),
+            ("LocalHost:1", "127.0.0.1:1"),
+            ("0.0.0.0:65535", "0.0.0.0:65535"),
+            ("[::1]:8080", "[::1]:8080"),
+            ("[::]:8080", "[::]:8080"),
+            ("192.168.1.5:8080", "192.168.1.5:8080"),
+        ] {
+            let web = Config::parse(&web_table(&format!("listen = \"{given}\"\n"))).unwrap().web.unwrap();
+            assert_eq!(web.listen, address.parse().unwrap(), "{given}");
+        }
+    }
+
+    #[test]
+    fn web_not_mentioned() {
+        assert_eq!(Config::parse(&base()).unwrap().web, None);
+    }
+
+    #[test]
+    fn web_table_without_listen() {
+        for table in ["password = \"s3cret\"\n", ""] {
+            let msg = rejected(&web_table(table));
+            assert!(msg.contains("`web.listen`"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn malformed_listen() {
+        for listen in [
+            "\"8080\"",
+            "\"127.0.0.1\"",
+            "\"127.0.0.1:0\"",
+            "\"127.0.0.1:70000\"",
+            "\"127.0.0.1:x\"",
+            "8080",
+        ] {
+            let msg = rejected(&web_table(&format!("listen = {listen}\n")));
+            assert!(msg.contains("`web.listen`") && msg.contains("`host:port`"), "{listen}: {msg}");
+        }
+    }
+
+    #[test]
+    fn listen_on_a_host_name() {
+        for listen in ["bot.example.org:8080", "::1:8080", "[localhost]:8080", ":8080"] {
+            let msg = rejected(&web_table(&format!("listen = \"{listen}\"\n")));
+            assert!(
+                msg.contains("`web.listen`") && msg.contains("`localhost`") && msg.contains("IP address"),
+                "{listen}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_key_in_the_web_table() {
+        let msg = rejected(&web_table("listen = \"127.0.0.1:8080\"\nuser = \"me\"\n"));
+        assert!(
+            msg.contains("`web.user`") && msg.contains("`listen`") && msg.contains("`password`"),
+            "{msg}"
+        );
+        let msg = rejected(&(base() + "web = \"127.0.0.1:8080\"\n"));
+        assert!(msg.contains("`web`"), "{msg}");
+    }
+
+    #[test]
+    fn empty_web_password() {
+        for password in ["\"\"", "1234"] {
+            let msg = rejected(&web_table(&format!("listen = \"127.0.0.1:8080\"\npassword = {password}\n")));
+            assert!(msg.contains("`web.password`"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn the_web_password_stays_out_of_debug_output_and_errors() {
+        let password = "Very-Secret-43";
+        let cfg = Config::parse(&web_table(&format!("listen = \"127.0.0.1:8080\"\npassword = \"{password}\"\n"))).unwrap();
+        let shown = format!("{cfg:?} {:?} {:#?}", cfg.web, cfg);
+        assert!(!shown.contains(password), "{shown}");
+        assert!(shown.contains("***"));
+        for broken in [
+            format!("listen = \"bot.example.org:8080\"\npassword = \"{password}\"\n"),
+            format!("password = \"{password}\"\n"),
+            format!("listen = \"127.0.0.1:8080\"\npassword = \"{password}\"\nother = 1\n"),
+        ] {
+            let msg = rejected(&web_table(&broken));
+            assert!(!msg.contains(password), "{msg}");
+        }
+    }
+
+    #[test]
+    fn example_file_is_valid_with_its_web_table_enabled() {
+        let text = include_str!("../russelbot.example.toml");
+        let mut enabled = text.to_string();
+        for line in ["# [web]", "# listen = \"127.0.0.1:8080\"", "# password = \"choose one\""] {
+            assert_eq!(text.matches(&format!("\n{line}\n")).count(), 1, "{line} is not once in the example");
+            enabled = enabled.replace(&format!("\n{line}\n"), &format!("\n{}\n", &line[2..]));
+        }
+        let web = Config::parse(&enabled).unwrap().web.unwrap();
+        assert_eq!(web.listen, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(web.password.unwrap().expose(), "choose one");
     }
 
     #[test]

@@ -28,6 +28,20 @@ original stays untouched, builds it, creates `OpenSim.ini` and
 account `Rig Owner` (password `rigowner`) without asking questions, and takes
 about a minute.
 
+On macOS the simulator does not start without `libgdiplus`, which its
+module for drawing on textures loads (Homebrew: `mono-libgdiplus`). The rig
+needs none of what that module does; without the library, add this to the
+end of `test-rig/opensim/bin/OpenSim.ini`, as was done for the run of
+[Web interface](#web-interface):
+
+```ini
+[Modules]
+    Setup_VectorRenderModule = disabled
+
+[Map]
+    GenerateMaptiles = false
+```
+
 On the OpenSim console, `show regions` must list `Home` and `Target`.
 
 To drive the console from scripts, start the simulator with its input on a
@@ -824,3 +838,86 @@ Not covered on this rig: an avatar known by the simulator's list only
 heights, its 60-avatar limit and var regions; the `AgentProfile` service,
 which OpenSimulator does not have; a friendship accepted while the bot
 runs, and friends online when the bot logs in; Second Life.
+
+## Web interface
+
+Run on 2026-11-22 with the debug build on macOS, against the rig set up
+anew there (`setup.sh`, the `OpenSim.ini` lines of
+[Build and start](#build-and-start), `create user Sit Bot ...`,
+`rezprim.py name="Park Bench" desc="Sit here" touch`, `stock.py`,
+`friend.py make`), and a second prim rezzed to try hostile text:
+`rezprim.py name='<img src=x onerror=alert(1)>' desc='<b>bold</b> & "quoted"' east=9 touch`.
+The bot's config is that of item 1 with `socket = true`, the startup script
+`persist cfg cfg` and
+
+```toml
+[web]
+listen = "127.0.0.1:8088"
+```
+
+`test-rig/web.py [--at HOST:PORT] [--password P] [--wait SECONDS] ACTION...`
+is a client for the web interface without a browser: it sends what the
+page sends and prints the answers. `cmd:NAME:ARG:...` is a command,
+`own:...` the same marked as the page's own refresh, `line:TEXT` a console
+line, `events` and `events:LAST` the event stream, `raw:METHOD:PATH` a
+request without the page's marker, `host:NAME` another `Host` header. Its
+default address is `127.0.0.1:8080`; the items below ran with
+`--at 127.0.0.1:8088`.
+
+The server:
+
+| # | Inject | Expected | Result (2026-11-22, OpenSim feccd9cc53, macOS) |
+|---|---|---|---|
+| 237 | `web.py session cmd:status` with the avatar seated | `200: open`; the text `rslbot ctl status` prints | Pass: `connected: yes`, `region: Target`, `seat: target`, `seat name: Park Bench`, `mode: holding` |
+| 238 | `web.py "line:scan --position 20"`; `ctl scan --position 20`; `ctl scan avatars --position` | Eight fields a line, the position third; the same from both; the last refused | Pass: `130,128,26` for the bench and `133,128,26` for the other prim; `` `scan avatars` has no option `--position` `` |
+| 239 | `web.py cmd:scan:avatars own:friends "cmd:inventory:-n"` | Nothing (alone in the region); the friend's line; the 19 folders of My Inventory and nothing below them | Pass |
+| 240 | `web.py --wait 3 events "cmd:say:first line" "cmd:say:second line"`; `events:<id of the first>`; `events:5-1` | What was kept, the status, then each line as it is heard; only `second line` and the status; `reset` and everything kept | Pass: ids `<start>-12` and `-13`; the replay after `-12` was `-13` alone |
+| 241 | `line:rlv mode on`, `line:rlv cmd @shownearby=n,showinv=n,tploc=n`; `own:scan:avatars:chat`; `line:rlv mode override`; `own:scan:avatars:chat`, `own:friends`; `line:rlv status`; `cmd:scan:avatars:chat`; `line:rlv status`; `cmd:scan:avatars:chat`, `cmd:inventory:-n`, `cmd:tp:128:128:25` | The page's own scan refused naming `shownearby`, before and after the override; `rlv: override` still; the operator's scan answered and `rlv: on`; then the three refused naming `shownearby`, `showinv` and `tploc` | Pass, all of it |
+| 242 | `web.py own:say:hello own:scan:20` | Refused: only `scan avatars` and `friends` can be the page's own; nothing said | Pass, and `web: bad command` in the log for each |
+| 243 | `web.py raw:POST:/api/command raw:POST:/api/console raw:OPTIONS:/api/command` | 403, 403, 405; nothing said; a log line for each 403 with the address and the path | Pass: `web: refused a request from 127.0.0.1 for "127.0.0.1:8088/api/command": it was not sent by the page of the web interface` |
+| 244 | `web.py host:bot.attacker.example:8088 session cmd:say:hello` | 403 with the text about IP addresses and `password`; nothing said; a log line naming the host | Pass, both |
+| 245 | Start a second bot with the same `listen` | It exits with status 2 naming `web.listen`, the address and the reason; the first keeps serving | Pass: `` `web.listen`: cannot listen on 127.0.0.1:8088: Address already in use (os error 48) `` |
+| 246 | Leave the page open on its Local chat tab through items 250 to 258; count the `scan avatars chat` lines of the log | Only the ones the operator gave: the refresh button and the command of item 241 | Pass: 2 lines in that run of the bot; none for `friends` |
+| 247 | `ctl attach "Bot gear/Radio"`; `ctl inventory -a`; `ctl touch <the item's UUID>`; `ctl detach <it>`; `ctl touch <it>` again | The attachment touched at once, the log naming its root prim; after the detach, status 1 saying the object is not known | Pass: `control: touched 56a51ecf-...`, the prim and not the item; then `object eac8f033-... is not known to the bot` |
+| 248 | A bot with `password` in `[web]` (not logged in to the grid): a wrong password, the right one, a logout, from the page | `web: wrong password from 127.0.0.1`, `web: login from 127.0.0.1`, `web: logout from 127.0.0.1`; neither password in the log | Pass |
+| 249 | Resident memory of the bot seated in `Target`, with `[web]` and a page open, and without `[web]` | About the same | 12,272 KB and 12,192 KB (`ps -o rss`, debug build) |
+| 264 | Two event streams, one of which is never read; 1200 `say` commands of 1000 bytes each through the web interface, as fast as they are answered | None refused; the reading stream gets every line; the bot closes the other's stream; the avatar stays connected and seated | Pass: 1200 lines in 0.5 s, all 1200 on the reading stream; 840,314 bytes were waiting on the stream that was not read when the bot closed it; `ctl status` answered at once afterwards |
+
+The page, in the built-in browser of the Claude desktop app (Chromium), at
+its desktop width and with the viewport set to 360 by 740 pixels:
+
+| # | Inject | Expected | Result (2026-11-22) |
+|---|---|---|---|
+| 250 | Open `/`, `/#console`, `/#inventory`; type in the chat box, switch tabs and come back; every tab at 360 pixels | World first; the tab of the address; the text still there; no tab wider than the screen | Pass: `scrollWidth` 360 on all six, also with scan rows listed |
+| 251 | The status panel while seated, after "Stand up", after a teleport, after "Sit", and with the bot between logins | `Target`, the position, `Park Bench (the held seat)`, `holding`; each change without loading the page; `not connected` | Pass |
+| 252 | Teleport form: `12o` as X; then `128`, `128` | The X box marked and nothing sent; `arrived in Target` | Pass |
+| 253 | "Scan objects" within 20; "Touch", "Teleport" and "Sit" on the rows | Two rows, the bench first; `Touched.` from the prim in local chat; `arrived in Target`; `seated on <uuid>` and the seat in the status panel | Pass |
+| 254 | The prim named `<img src=x onerror=alert(1)>` in the object scan, in local chat (it speaks when touched) and in the notices | The name and the description letter by letter; no element made of them; nothing loaded | Pass: no `img` and no `b` element under the list. Not seen in an instant message: the rig has no object that sends one |
+| 255 | `listen.py 240 at=131,128,25`; "Scan avatars"; "Teleport" and "IM" on the row | `Rig Owner`, `1.8 m`, `at 131,128,26`; `arrived in Target`; the IM tab with the conversation `Rig Owner` open | Pass |
+| 256 | Local chat while `talk.py` runs; then `hello everyone` and `/shout come here` from the box; scroll to the top and say another line | `Rig Owner: hello from the rig`, `Rig Owner whispers: psst`, `Rig Owner shouts: HEY`, the line with a tab and a line end as those characters, `Object: Script running`; the avatar's own lines as heard, the box emptied; `Rig Owner 6.7 m` in the chat-range list while it is there; the view stays at the top and "New lines" shows | Pass |
+| 257 | IM: the message `talk.py` sends; open it; answer `see you`; "Open" with `rig.owner`; "Open" with `Nobody Here` and send `hi`; `autoreply message ...` in the Console and `talk.py` again | The tab marked and `1` at the conversation, gone when it is opened; `see you` set apart as sent; the same conversation, not a second one; the error naming `Nobody Here` with `hi` still in the box; the autoreply under the message, marked as sent by the bot itself | Pass. The friend list showed `Rig Owner` as `offline`; it was not looked at while `Rig Owner` was online |
+| 258 | Inventory: open the tab; open `Bot gear`; "Attach" on `Radio`; "Touch"; "Attached only"; back; "Detach" | 19 entries, folders only; `Bell`, `Dance`, `Radio`, `Watch` with their types; `Radio` then `Left Hand`, `attached`, with "Detach" and "Touch"; `done`; the one entry `Bot gear/Radio`; the folder still open; "Attach" again | Pass |
+| 259 | Items 252, 255, 256 and 258 with `rlv cmd @shownearby=n,showinv=n,tploc=n` held | The teleport and the avatar scan refused naming `tploc` and `shownearby`, the avatar list unchanged; the chat-range list empty naming `shownearby`, chat still said; the inventory tab with the error naming `showinv` in place of the tree | Pass |
+| 260 | Console: `tp 128 128 25` and at once `status`; `scan 10`; with the bot between logins `sit ground`, `im "Jane Doe hi`, three spaces, `help`, the up arrow | Each answer under its own line; the listing's fields in columns (`white-space: pre`, tabs of 8); `error: ` and the reason; the error about the quote; nothing sent; the command list; `help` in the box | Pass |
+| 261 | Settings: light, dark, as the browser asks for; then the browser's own scheme switched to light | The page follows each choice and keeps it over a reload; with the browser's, it turns light without being loaded again | Pass |
+| 262 | The bot of item 248: open `/#inventory`; a wrong password; the right one; reload; "Log out" | The login box and nothing else; `The password is wrong.` and an empty box; the tabs; still logged in; the login box again, with nothing of the console's output left | Pass. Which tab was shown right after the login was not read off; after the reload it was the one of the address |
+| 263 | Stop the bot with the page open; press "Stand up"; start the bot | The page says that the bot cannot be reached; the error says so too and nothing is sent later; the bar is gone by itself | Pass: found again 3 s after the start |
+
+What the rig has nobody to send was looked at in the same browser with the
+page's own files served by a stand-in that answers every command and the
+event stream with fixed text (item 265, not on the rig):
+
+| # | Inject | Expected | Result (2026-11-22) |
+|---|---|---|---|
+| 265 | Events: an instant message stored offline from `Jane Doe` (`Janey`), one from an object named `Collar <i>x</i>` with the text `locked <script>alert(1)</script>`, one with neither UUID, chat of kind `owner` and a `/me`. Answers: three friends, `online`, `offline` and `?`; an inventory with clothing, a body part, a link, an attached object named `Radio\/TV`; an error for `detach`; a `scan avatars` with a hidden avatar and one at `128,64,?` | Three conversations, newest first, none marked as new; the object's and the grid's without a box and saying that they cannot be answered; the stored one marked; the texts letter by letter; `Collar <i>x</i> [owner]: ready` and `Janey (Jane Doe) waves`; the friends in that order with their status, and a click sends `im` with the UUID; "Wear" and "Take off" on clothing and the link, "Wear" on the body part, "Detach" and "Touch" on `Radio/TV`; the error of "Take off" shown; `Someone (hidden)` without an IM button; `tp 103 100 25` and `tp 128 64` | Pass, all of it. The commands the page sent by itself, `friends` and `scan avatars chat`, carried its mark, and no other did |
+
+`listen.py` printed nothing but `listening` in this run, on macOS, though
+its avatar was in the region (item 255) and the bot saw it; its `im=`
+message did not arrive. `talk.py` worked as described.
+
+Not covered: a phone and browsers other than the one above; a
+seventeenth waiting command, which only the unit tests produce; on the
+rig itself, what item 265 stands in for; an inventory of thousands of
+folders; two windows of one browser at a logout; a reverse proxy in front
+of the bot, so the nginx and Caddy examples of the README are untried;
+Second Life.

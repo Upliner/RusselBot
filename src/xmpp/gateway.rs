@@ -5,7 +5,6 @@
 
 use super::address::{self, AddressBook, Contact, Recipient};
 use super::chat;
-use super::command;
 use super::conn::{self, Settings, Stop, Writer, XmppEvent};
 use super::presence::{self, Presence};
 use super::queue::{Outgoing, WaitQueue};
@@ -360,7 +359,7 @@ impl Gateway {
                 match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
                     [] => return self.refuse(&pending, "there is no command; send `help` for the list".to_string()),
                     ["help"] => {
-                        self.answer(&pending, Response::Ok(Some(command::help())));
+                        self.answer(&pending, Response::Ok(Some(crate::control::help())));
                         return None;
                     }
                     _ => {}

@@ -16,7 +16,7 @@ use crate::profile::{self, Profile};
 use crate::reconciler::same_region;
 use crate::rlv::{Check, Limits, Refusal, Restrictions, Sitting, Who};
 use crate::scan::{self, Query, Sighting};
-use crate::session::{InventoryOffer, Look, Thing, Touch, ATTACH_LIMIT, DETACH_LIMIT, NOT_CONNECTED};
+use crate::session::{InventoryOffer, Look, Placement, Thing, Touch, ATTACH_LIMIT, DETACH_LIMIT, NOT_CONNECTED};
 use crate::udp::messages::{Vector3, MAX_TEXT};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Sender;
@@ -187,6 +187,10 @@ pub enum Origin {
     /// What the bot does by itself: accepting offers and requests,
     /// restoring attachments.
     Bot,
+    /// A command the page of the web interface sent by itself, to keep a
+    /// list up to date: the operator's, but never the exempt one, and
+    /// with no line in the operator log.
+    Page,
 }
 
 /// How the operator log marks the operator's commands.
@@ -196,7 +200,7 @@ impl Origin {
     /// How the operator log marks a command of this origin.
     fn tag(self) -> &'static str {
         match self {
-            Origin::Operator | Origin::Exempt => CONTROL,
+            Origin::Operator | Origin::Exempt | Origin::Page => CONTROL,
             Origin::Rlv(_) => "rlv",
             Origin::Bot => "bot",
         }
@@ -204,7 +208,12 @@ impl Origin {
 
     /// Whether this is a command of the operator's own.
     fn is_operator(self) -> bool {
-        matches!(self, Origin::Operator | Origin::Exempt)
+        matches!(self, Origin::Operator | Origin::Exempt | Origin::Page)
+    }
+
+    /// Whether what this origin asks for stays out of the operator log.
+    fn quiet(self) -> bool {
+        matches!(self, Origin::Page)
     }
 
     /// The restrictions that are in force for what this origin does: none
@@ -214,7 +223,7 @@ impl Origin {
         match self {
             Origin::Exempt => Limits::none(),
             Origin::Rlv(who) => Limits::new(kept, Some(who)),
-            Origin::Operator | Origin::Bot => Limits::new(kept, None),
+            Origin::Operator | Origin::Bot | Origin::Page => Limits::new(kept, None),
         }
     }
 
@@ -362,6 +371,7 @@ struct AvatarScan {
 
 /// A `friends` command waiting for its friends' names.
 struct FriendsWait {
+    origin: Origin,
     reply: Sender<Response>,
     deadline: Instant,
 }
@@ -683,10 +693,35 @@ impl Default for Commands {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The refusals written to the operator log by this thread's tests.
+    static REFUSALS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The refusals logged since this was last asked, on this thread.
+#[cfg(test)]
+pub(crate) fn take_refusals() -> Vec<String> {
+    REFUSALS.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
+}
+
 fn refuse(tag: &str, what: &str, reply: &Sender<Response>, reason: String) {
     crate::info!("{tag}: {what} refused: {reason}");
+    #[cfg(test)]
+    REFUSALS.with(|lines| lines.borrow_mut().push(format!("{tag}: {what} refused: {reason}")));
     // The client may have gone away; the command is settled either way.
     let _ = reply.send(Response::Error(reason));
+}
+
+/// `refuse` for a command of `origin`: one that is quiet is answered and
+/// not logged.
+fn refuse_from(origin: Origin, what: &str, reply: &Sender<Response>, reason: String) {
+    match origin.quiet() {
+        true => {
+            let _ = reply.send(Response::Error(reason));
+        }
+        false => refuse(origin.tag(), what, reply, reason),
+    }
 }
 
 pub(crate) fn whom(id: Uuid, name: &str) -> String {
@@ -752,6 +787,12 @@ impl Commands {
         crate::info!("{line}");
         #[cfg(test)]
         self.told.push(line);
+    }
+
+    /// The lines written to the operator log since this was last asked.
+    #[cfg(test)]
+    pub(crate) fn take_told(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.told)
     }
 
     /// The restrictions in force for the command that is being carried out.
@@ -832,7 +873,7 @@ impl Commands {
                 self.find(&item, then, command, &reply, grid, now)
             }
         };
-        let sent = finish(origin.tag(), command, done, &reply);
+        let sent = finish(origin, command, done, &reply);
         self.origin = Origin::Operator;
         sent
     }
@@ -1047,8 +1088,14 @@ impl Commands {
     }
 
     fn touch<G: Grid>(&mut self, object: &str, reply: &Sender<Response>, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
-        let object = Uuid::parse_str(object.trim()).map_err(|_| format!("\"{}\" is not an object's UUID", object.trim()))?;
+        let given = Uuid::parse_str(object.trim()).map_err(|_| format!("\"{}\" is not an object's UUID", object.trim()))?;
         let grid = grid.ok_or(NOT_CONNECTED)?;
+        // Where no object has this UUID, an inventory item that is attached
+        // to the avatar stands for the root prim of its attachment.
+        let object = match grid.thing(given).placement {
+            Placement::Unknown => grid.attachment_prims(given).first().copied().unwrap_or(given),
+            _ => given,
+        };
         let check = self.limits(&*grid).touch_on(&grid.thing(object));
         match check {
             Check::Allowed => {}
@@ -1139,6 +1186,7 @@ impl Commands {
     fn friends<G: Grid>(&mut self, reply: &Sender<Response>, grid: Option<&mut G>, now: Instant) -> Result<Done, String> {
         grid.ok_or(NOT_CONNECTED)?.present()?;
         self.friend_lists.push(FriendsWait {
+            origin: self.origin,
             reply: reply.clone(),
             deadline: now + LOOKUP_LIMIT,
         });
@@ -1228,7 +1276,8 @@ impl Commands {
                 scan.distance
             ));
             // The client may have gone away; the scan is done either way.
-            let _ = scan.reply.send(Response::Ok(scan::listing(listed, &legacy, &hidden)));
+            let text = scan::listing_with(listed, &legacy, &hidden, scan.query.position);
+            let _ = scan.reply.send(Response::Ok(text));
         }
         self.avatar_scans_due(grid, now);
         self.friends_due(grid, now);
@@ -1285,7 +1334,9 @@ impl Commands {
                 false if !known => format!("; the simulator did not list the region's avatars in {} s", LOOKUP_LIMIT.as_secs()),
                 false => format!("; {nameless} without a name after {} s", LOOKUP_LIMIT.as_secs()),
             };
-            self.tell(format!("{}: scan{given}: {} listed{short}", scan.origin.tag(), listed.len()));
+            if !scan.origin.quiet() {
+                self.tell(format!("{}: scan{given}: {} listed{short}", scan.origin.tag(), listed.len()));
+            }
             let text = avatars::listing(&listed, from, &self.owners, limits.minimap());
             let _ = scan.reply.send(Response::Ok(text));
         }
@@ -1313,11 +1364,13 @@ impl Commands {
                 0 => String::new(),
                 _ => format!("; {nameless} without a name after {} s", LOOKUP_LIMIT.as_secs()),
             };
-            self.tell(format!(
-                "{CONTROL}: friends: {} listed, {} online{short}",
-                friends.len(),
-                friends.online_count()
-            ));
+            if !wait.origin.quiet() {
+                self.tell(format!(
+                    "{CONTROL}: friends: {} listed, {} online{short}",
+                    friends.len(),
+                    friends.online_count()
+                ));
+            }
             let _ = wait.reply.send(Response::Ok(friends.listing(&self.owners)));
         }
     }
@@ -1377,7 +1430,7 @@ impl Commands {
     /// Answers the `scan avatars` commands that wait with an error.
     fn fail_avatar_scans(&mut self, reason: &str) {
         for scan in std::mem::take(&mut self.avatar_scans) {
-            refuse(scan.origin.tag(), "scan", &scan.reply, reason.to_string());
+            refuse_from(scan.origin, "scan", &scan.reply, reason.to_string());
         }
     }
 
@@ -1627,7 +1680,7 @@ impl Commands {
             Ok(outcome) => self.go_on(then, outcome, command, &reply, deadline, grid, now),
         };
         self.origin = Origin::Operator;
-        finish(origin.tag(), command, done, &reply);
+        finish(origin, command, done, &reply);
     }
 
     /// What a command does with the inventory's answer.
@@ -2223,7 +2276,7 @@ impl Commands {
                 }
             };
             self.origin = Origin::Operator;
-            sent.extend(finish(CONTROL, what, done, &reply));
+            sent.extend(finish(Origin::Operator, what, done, &reply));
         }
         sent
     }
@@ -2304,7 +2357,7 @@ impl Commands {
         self.fail_jobs("the session was lost");
         self.fail_scans("the session was lost");
         for wait in std::mem::take(&mut self.friend_lists) {
-            refuse(CONTROL, "friends", &wait.reply, "the session was lost".to_string());
+            refuse_from(wait.origin, "friends", &wait.reply, "the session was lost".to_string());
         }
         self.scan_poll = None;
         self.owner_lookups.clear();
@@ -2939,7 +2992,7 @@ fn check_length(text: &str, limit: usize) -> Result<(), String> {
 
 /// Answers a command that has come to an end, and hands back the instant
 /// message it sent, if it did.
-fn finish(tag: &str, command: &str, done: Result<Done, String>, reply: &Sender<Response>) -> Option<SentIm> {
+fn finish(origin: Origin, command: &str, done: Result<Done, String>, reply: &Sender<Response>) -> Option<SentIm> {
     match done {
         Ok(Done::Answer(text)) => {
             let _ = reply.send(Response::Ok(text));
@@ -2951,7 +3004,7 @@ fn finish(tag: &str, command: &str, done: Result<Done, String>, reply: &Sender<R
         }
         Ok(Done::Parked) => None,
         Err(reason) => {
-            refuse(tag, command, reply, reason);
+            refuse_from(origin, command, reply, reason);
             None
         }
     }
@@ -4924,6 +4977,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn touch_takes_the_inventory_item_of_an_attachment() {
+        let (radio, item, loose) = (
+            Uuid::from_bytes([0x63; 16]),
+            Uuid::from_bytes([0x64; 16]),
+            Uuid::from_bytes([0x65; 16]),
+        );
+        let mut rig = Rig::new();
+        rig.grid.worn = vec![(radio, item)];
+        // Answered at once, with the attachment's root prim touched and
+        // no scan started for the item's UUID.
+        assert_eq!(ok(&rig.command(Request::Touch(item.to_string()))), None);
+        assert_eq!(rig.calls(), [Call::Touch(radio)]);
+        // An item that is not attached is an object nobody knows.
+        rig.grid.touch = Err("object is not known to the bot".to_string());
+        assert!(error(&rig.command(Request::Touch(loose.to_string()))).contains("not known"));
+        assert_eq!(rig.calls(), [Call::Touch(loose)]);
+    }
+
+    #[test]
     fn touch_waits_for_a_scan_and_reports_how_it_ended() {
         let mut rig = Rig::new();
         rig.grid.touch = Ok(Touch::Waiting);
@@ -6362,6 +6434,11 @@ pub(crate) mod tests {
         rig.lift_all();
         rig.hold(&["touchattachself", "fartouch"]);
         held_back(&rig.command(touch(collar())), "touchattachself");
+        // By its inventory item the collar is the same attachment.
+        let collar_item = Uuid::from_bytes([0xC1; 16]);
+        rig.grid.worn = vec![(collar(), collar_item)];
+        held_back(&rig.command(touch(collar_item)), "touchattachself");
+        rig.grid.worn.clear();
         held_back(&rig.command(touch(button)), "fartouch");
         assert_eq!(rig.command(touch(door)).try_recv(), Ok(Response::Ok(None)));
         // An object that holds `touchme` can be touched, but not under `interact`.
@@ -6911,6 +6988,7 @@ pub(crate) mod tests {
             object,
             local_id: u32::from(n),
             distance,
+            position: [0.0; 3],
             flags: 0,
             attachment: false,
             child: false,

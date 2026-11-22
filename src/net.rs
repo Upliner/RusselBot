@@ -66,6 +66,9 @@ pub enum Event {
     },
     /// What the XMPP component connection reports.
     Xmpp(crate::xmpp::conn::XmppEvent),
+    /// A command of a page of the web interface, or a page that opens its
+    /// event stream.
+    Web(crate::web::WebEvent),
     /// The operator asked the bot to stop.
     Signal,
 }

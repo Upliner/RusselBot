@@ -414,6 +414,7 @@ name = "russelbot"
 version = "0.1.0"
 dependencies = [
  "ctrlc",
+ "getrandom",
  "md-5",
  "quick-xml",
  "roxmltree",

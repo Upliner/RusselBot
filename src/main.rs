@@ -24,6 +24,7 @@ mod rlv;
 mod scan;
 mod session;
 mod startup;
+mod web;
 mod udp {
     pub mod circuit;
     pub mod messages;
@@ -229,6 +230,9 @@ struct Bot {
     held_stand: Option<String>,
     /// The XMPP gateway, when the config has one.
     xmpp: Option<xmpp::gateway::Gateway>,
+    /// What the pages of the web interface are sent, when the config has
+    /// one: the messages kept for them, and the pages that are open.
+    web: Option<web::hub::Hub>,
     /// Whether and with what the bot answers instant messages by itself.
     autoreply: Autoreply,
     /// Stands in for a session's view of the world, which tests have none of.
@@ -512,6 +516,10 @@ impl Bot {
             grid: None,
             // Started once the head of the startup script has run.
             xmpp: None,
+            web: config.web.as_ref().map(|_| {
+                let started = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                web::hub::Hub::new(started)
+            }),
             autoreply: match &config.autoreply {
                 Some(auto) => Autoreply::new(Some(auto.message.clone()), auto.pause),
                 None => Autoreply::new(None, autoreply::DEFAULT_PAUSE),
@@ -1022,6 +1030,13 @@ impl Bot {
 
     /// Carries out a command from the control socket.
     fn control(&mut self, request: Request, reply: Sender<Response>, now: Instant) -> Flow {
+        self.control_as(request, reply, false, now)
+    }
+
+    /// Carries out a command. `own` for one the page of the web interface
+    /// sent by itself: it is never the exempt command of an RLV override,
+    /// which it leaves in place, and the operator log gets no line for it.
+    fn control_as(&mut self, request: Request, reply: Sender<Response>, own: bool, now: Instant) -> Flow {
         // While RLV is in override, the next command but these seven is
         // exempt from the restrictions, and RLV is on again with it. No
         // restriction applies to `friends` and `profile`, so they have no
@@ -1036,7 +1051,7 @@ impl Bot {
                 | Request::Profile(_)
                 | Request::Quit
         );
-        let exempt = !never && self.rlv.take_override(request.name());
+        let exempt = !never && !own && self.rlv.take_override(request.name());
         match request {
             Request::Status => {
                 // The client may have gone away; nothing depends on it.
@@ -1088,7 +1103,9 @@ impl Bot {
                 return self.stop();
             }
             request => {
-                let origin = if exempt {
+                let origin = if own {
+                    commands::Origin::Page
+                } else if exempt {
                     commands::Origin::Exempt
                 } else {
                     commands::Origin::Operator
@@ -1447,6 +1464,9 @@ impl Bot {
             if let Some(xmpp) = &mut self.xmpp {
                 xmpp.record(&record, now);
             }
+            if let Some(hub) = &mut self.web {
+                hub.record(&record);
+            }
         }
     }
 
@@ -1472,6 +1492,9 @@ impl Bot {
             self.logs.write(&record);
             if let Some(xmpp) = &mut self.xmpp {
                 xmpp.record(&record, now);
+            }
+            if let Some(hub) = &mut self.web {
+                hub.record(&record);
             }
         }
     }
@@ -1514,6 +1537,42 @@ impl Bot {
     fn xmpp_stop(&mut self) {
         if let Some(xmpp) = &mut self.xmpp {
             xmpp.stop();
+        }
+    }
+
+    // -------------------------------------------------------------- web
+
+    /// Something from the web interface: a page's command is carried out
+    /// as the control socket's are, and a page that opens its stream gets
+    /// what it missed and the status.
+    fn web_event(&mut self, event: web::WebEvent, now: Instant) -> Flow {
+        match event {
+            web::WebEvent::Command { request, reply, own } => self.control_as(request, reply, own, now),
+            web::WebEvent::Subscribe { last, page } => {
+                let status = self.status();
+                if let Some(hub) = &mut self.web {
+                    hub.subscribe(last.as_deref(), page, &status);
+                }
+                Flow::Continue
+            }
+        }
+    }
+
+    /// Sends the open pages the status when it has changed. Nothing is
+    /// put together while no page is open.
+    fn web_status(&mut self) {
+        if self.web.as_ref().is_some_and(web::hub::Hub::watched) {
+            let status = self.status();
+            if let Some(hub) = &mut self.web {
+                hub.status(&status);
+            }
+        }
+    }
+
+    /// The bot is done: the pages' streams end.
+    fn web_stop(&mut self) {
+        if let Some(hub) = &mut self.web {
+            hub.close();
         }
     }
 
@@ -1903,6 +1962,7 @@ impl Bot {
             (Event::Signal, _) => return self.stop(),
             (Event::Control { request, reply }, _) => return self.control(request, reply, now),
             (Event::Xmpp(event), _) => return self.xmpp_event(event, now),
+            (Event::Web(event), _) => return self.web_event(event, now),
             (Event::AvatarsFound { query, avatars }, _) => self.avatars_found(query, &avatars, now),
             (Event::AvatarSearchFailed { query, reason }, _) => self.commands.lookup_failed(query, &reason),
             (Event::Datagram { generation, data }, Some(session)) => session.handle_datagram(generation, &data, now),
@@ -2114,6 +2174,18 @@ fn run_bot(config_path: &Path) -> i32 {
     } else {
         None
     };
+    // Likewise held until the bot is done, and likewise a config error
+    // when its address cannot be listened on.
+    let web = match &config.web {
+        Some(web) => match web::listen(web, events.clone()) {
+            Ok(server) => Some(server),
+            Err(e) => {
+                eprintln!("rslbot: {}: `web.listen`: {e}", config_path.display());
+                return EXIT_CONFIG;
+            }
+        },
+        None => None,
+    };
     install_signal_handler(events.clone());
     for note in &config.deprecated {
         info!("{}: {note}", config_path.display());
@@ -2130,6 +2202,10 @@ fn run_bot(config_path: &Path) -> i32 {
     let code = run_loop(&mut bot, &incoming);
     bot.flush_messages();
     bot.xmpp_stop();
+    bot.web_stop();
+    if let Some(server) = &web {
+        server.stop();
+    }
     code
 }
 
@@ -2144,6 +2220,7 @@ fn run_loop(bot: &mut Bot, incoming: &Receiver<Event>) -> i32 {
         bot.restore_attachments(Instant::now());
         bot.service_messages();
         bot.xmpp_presence();
+        bot.web_status();
         let mut wake = Instant::now() + IDLE_WAIT;
         if !bot.stopping {
             match bot.reconcile() {
@@ -2948,6 +3025,7 @@ mod tests {
             object: sign,
             local_id: 700,
             distance: 3.0,
+            position: [0.0; 3],
             flags: 0,
             attachment: false,
             child: false,
@@ -3009,6 +3087,7 @@ mod tests {
             object: sign,
             local_id: 700,
             distance: 3.0,
+            position: [0.0; 3],
             flags: 0,
             attachment: false,
             child: false,
@@ -4937,6 +5016,470 @@ mod tests {
         #[test]
         fn no_xmpp_table_no_gateway() {
             assert!(bot(full("")).xmpp.is_none());
+        }
+    }
+
+    // -------------------------------------------------------------- web
+
+    mod web_interface {
+        use super::*;
+        use commands::tests::{Call, FakeGrid};
+        use std::net::SocketAddr;
+        use std::thread;
+        use web::tests::{body, listen_quick, post_to, Stream};
+
+        fn jane() -> Uuid {
+            Uuid::from_bytes([0x1a; 16])
+        }
+
+        fn janes_names() -> (Uuid, names::Names) {
+            let names = names::Names {
+                legacy: "Jane Doe".into(),
+                display: "Janey".into(),
+            };
+            (jane(), names)
+        }
+
+        fn from_jane(kind: &str, text: &str) -> session::Message {
+            session::Message {
+                kind: kind.into(),
+                source: session::Source::Avatar {
+                    id: jane(),
+                    name: "Jane Doe".into(),
+                },
+                sent_at: None,
+                text: text.into(),
+            }
+        }
+
+        /// A bot with a web interface on a port of its own, and on a
+        /// simulator that takes everything when `grid`.
+        struct Rig {
+            bot: Bot,
+            incoming: Receiver<Event>,
+            server: web::Server,
+            /// The bot asked to be stopped.
+            exited: bool,
+        }
+
+        impl Rig {
+            fn new(grid: bool) -> Rig {
+                let mut config = full("[web]\nlisten = \"127.0.0.1:8080\"\n");
+                // Any free port, which a config cannot ask for.
+                config.web.as_mut().unwrap().listen.set_port(0);
+                let (events, incoming) = mpsc::channel();
+                let server = listen_quick(config.web.as_ref().unwrap(), events.clone());
+                let mut bot = Bot::new(config, Logs::open(None, None).ok().unwrap(), events);
+                if grid {
+                    bot.grid = Some(FakeGrid::default());
+                }
+                Rig {
+                    bot,
+                    incoming,
+                    server,
+                    exited: false,
+                }
+            }
+
+            fn address(&self) -> SocketAddr {
+                self.server.address()
+            }
+
+            /// Handles the next event, as the main loop does. Whether
+            /// there was one.
+            fn next(&mut self, wait: Duration) -> bool {
+                let Ok(event) = self.incoming.recv_timeout(wait) else {
+                    return false;
+                };
+                if let Flow::Exit(_) = self.bot.handle(event) {
+                    self.exited = true;
+                }
+                self.bot.service_messages();
+                self.bot.web_status();
+                true
+            }
+
+            /// Sends what the page sends, without waiting for the answer,
+            /// which comes on what is returned.
+            fn begin(&mut self, path: &'static str, line: &str, own: bool) -> Receiver<String> {
+                let (address, line) = (self.address(), line.to_string());
+                let (done, answer) = mpsc::channel();
+                thread::spawn(move || {
+                    let headers: &[&str] = if own { &["X-Rslbot-Own: 1"] } else { &[] };
+                    let _ = done.send(body(&post_to(address, path, headers, &line)).to_string());
+                });
+                // The command has reached the bot once it has been handled.
+                assert!(self.next(Duration::from_secs(5)), "the command did not arrive");
+                answer
+            }
+
+            /// Sends what the page sends and gives the answer line, with
+            /// the waits a listing has run out.
+            fn send(&mut self, path: &'static str, line: &str, own: bool) -> String {
+                let answer = self.begin(path, line, own);
+                let later = Instant::now() + commands::SCAN_LIMIT + Duration::from_secs(1);
+                self.bot.scan_objects(later);
+                answer.recv_timeout(Duration::from_secs(5)).expect("an answer")
+            }
+
+            fn page(&mut self, line: &str) -> String {
+                self.send("/api/command", line, false)
+            }
+
+            /// Sends what the page sends where the answer is the web
+            /// interface's own and nothing reaches the bot.
+            fn unread(&self, path: &str, line: &str) -> String {
+                let answer = body(&post_to(self.address(), path, &[], line)).to_string();
+                assert!(self.incoming.try_recv().is_err(), "{line} reached the bot");
+                answer
+            }
+
+            fn console(&mut self, line: &str) -> String {
+                self.send("/api/console", line, false)
+            }
+
+            /// A page opens its event stream; what it is sent first has
+            /// been read.
+            fn open(&mut self, path: &str) -> (Stream, Vec<String>) {
+                let mut stream = self.server.stream(path, &[]);
+                assert!(self.next(Duration::from_secs(5)), "the page did not arrive");
+                let kept = stream.opening();
+                (stream, kept)
+            }
+
+            /// Records a message whose names are known, as the session
+            /// hands it over.
+            fn heard(&mut self, channel: Channel, message: session::Message) {
+                let now = Instant::now();
+                self.bot.names_resolved(vec![janes_names()], vec![], now);
+                self.bot.record(channel, message, now);
+                self.bot.service_messages();
+            }
+
+            fn calls(&mut self) -> Vec<Call> {
+                std::mem::take(&mut self.bot.grid.as_mut().unwrap().calls)
+            }
+        }
+
+        /// The answer line the control socket writes for `line`.
+        fn by_socket(bot: &mut Bot, line: &str) -> String {
+            command(bot, line).encode()
+        }
+
+        #[test]
+        fn the_pages_commands_are_answered_as_the_control_sockets() {
+            // Between logins.
+            let mut rig = Rig::new(false);
+            let status = rig.page("status");
+            assert!(status.starts_with("ok\tconnected: no\\npersist: "), "{status}");
+            assert_eq!(status, by_socket(&mut rig.bot, "status"));
+            let refused = rig.page("sit\tground");
+            assert!(refused.starts_with("error\t"), "{refused}");
+            assert_eq!(refused, by_socket(&mut rig.bot, "sit\tground"));
+            assert_eq!(rig.console("sit ground"), refused);
+            assert_eq!(rig.console("status"), status);
+            // Unknown, and with the wrong arguments: an error, and nothing more.
+            assert!(rig.unread("/api/command", "dance").contains("dance"));
+            assert!(rig.unread("/api/command", "im\tjane").starts_with("error\t"));
+            assert!(rig.unread("/api/console", "dance").contains("dance"));
+        }
+
+        #[test]
+        fn an_argument_is_taken_as_it_is() {
+            let mut rig = Rig::new(true);
+            let region = "Joe's \"Blue\" Lagoon";
+            let answer = rig.begin("/api/command", &format!("tp\t128\t128\t25\t{region}"), false);
+            assert_eq!(rig.calls(), [Call::Teleport(region.to_string(), [128.0, 128.0, 25.0])]);
+            assert!(answer.try_recv().is_err(), "answered before the avatar arrived");
+            rig.bot.commands.arrived(region);
+            assert_eq!(
+                answer.recv_timeout(Duration::from_secs(5)).unwrap(),
+                format!("ok\tarrived in {region}\n")
+            );
+        }
+
+        #[test]
+        fn a_teleport_does_not_hold_back_other_commands_or_pages() {
+            let mut rig = Rig::new(true);
+            let (mut page, _) = rig.open("/api/events");
+            let teleport = rig.begin("/api/command", "tp\t128\t128\t25\tHome", false);
+            assert!(matches!(&rig.calls()[..], [Call::Teleport(region, _)] if region == "Home"));
+            // Chat is said at once, and heard chat reaches the page.
+            assert_eq!(rig.page("say\thi"), "ok\n");
+            assert_eq!(rig.calls(), [Call::Say(0, 1, "hi".into())]);
+            rig.heard(Channel::Chat, from_jane("say", "going somewhere?"));
+            // The command put the bot in manual mode, which the page was told.
+            assert!(page.event().ends_with("mode: manual\n"));
+            assert_eq!(page.chat(), "going somewhere?");
+            assert!(teleport.try_recv().is_err(), "no answer to the teleport yet");
+            rig.bot.commands.arrived("Home");
+            assert_eq!(teleport.recv_timeout(Duration::from_secs(5)).unwrap(), "ok\tarrived in Home\n");
+        }
+
+        #[test]
+        fn quit_is_answered_and_stops_the_bot() {
+            let mut rig = Rig::new(false);
+            let (mut page, _) = rig.open("/api/events");
+            assert_eq!(rig.page("quit"), "ok\n");
+            assert!(rig.exited && rig.bot.stopping);
+            // As the main loop does on its way out: the page's stream ends,
+            // and nothing is left for the server to wait for.
+            rig.bot.flush_messages();
+            rig.bot.web_stop();
+            assert_eq!(page.event(), "");
+            let started = Instant::now();
+            rig.server.stop();
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn console_lines_are_split_as_the_control_contact_splits_them() {
+            let mut rig = Rig::new(true);
+            // Name with a space: the answer comes once the name is found.
+            let answer = rig.begin("/api/console", "im \"Jane Doe\" see you later", false);
+            let query = match &rig.calls()[..] {
+                [Call::Find(query, _)] => *query,
+                other => panic!("expected a lookup, got {other:?}"),
+            };
+            rig.bot.avatars_found(query, &[(jane(), "Jane Doe".into())], Instant::now());
+            assert_eq!(rig.calls(), [Call::Im(jane(), "see you later".into())]);
+            assert_eq!(
+                answer.recv_timeout(Duration::from_secs(5)).unwrap(),
+                format!("ok\tsent to Jane Doe <{}>\n", jane())
+            );
+            // Unclosed quote: an error, and nothing is sent to the grid.
+            let unclosed = rig.unread("/api/console", "im \"Jane Doe hi");
+            assert!(unclosed.starts_with("error\t") && unclosed.contains("double quotes"), "{unclosed}");
+            assert_eq!(rig.calls(), []);
+            // Help, with no `[xmpp]` table in the config.
+            assert!(rig.bot.xmpp.is_none());
+            let help = rig.unread("/api/console", "help");
+            assert!(
+                help.starts_with("ok\tCommands") && help.contains("\\nscan avatars [DISTANCE]\\n"),
+                "{help}"
+            );
+        }
+
+        /// Carries out `line` as the page's own or as the operator's and
+        /// answers it after the waits it has.
+        fn listed(bot: &mut Bot, line: &str, own: bool) -> Result<Option<String>, String> {
+            let (reply, answer) = mpsc::channel();
+            let request = Request::decode(line.as_bytes()).unwrap();
+            let event = Event::Web(web::WebEvent::Command { request, reply, own });
+            assert!(matches!(bot.handle(event), Flow::Continue));
+            let at_once = answer.try_recv();
+            let response = at_once.or_else(|_| {
+                let later = Instant::now() + commands::SCAN_LIMIT + Duration::from_secs(1);
+                bot.scan_objects(later);
+                answer.try_recv()
+            });
+            match response {
+                Ok(Response::Ok(text)) => Ok(text),
+                Ok(Response::Error(reason)) => Err(reason),
+                Err(e) => panic!("{line}: no answer: {e:?}"),
+            }
+        }
+
+        /// What the operator log got of commands since this was last asked.
+        fn logged(bot: &mut Bot) -> Vec<String> {
+            let mut lines = bot.commands.take_told();
+            lines.extend(commands::take_refusals());
+            lines
+        }
+
+        #[test]
+        fn the_pages_own_refresh_leaves_an_override_in_place() {
+            let mut bot = among_others(&["shownearby"]);
+            ok(&mut bot, "rlv\tmode\toverride");
+            logged(&mut bot);
+            // The page's own: held to the restriction, and not logged.
+            let reason = listed(&mut bot, "scan\tavatars\tchat", true).unwrap_err();
+            assert!(reason.contains("shownearby"), "{reason}");
+            assert_eq!(logged(&mut bot), [] as [&str; 0]);
+            assert!(ok(&mut bot, "rlv\tstatus").starts_with("rlv: override\n"));
+            // The next command the operator gives is the exempt one: the
+            // page's refresh button, here.
+            let listing = listed(&mut bot, "scan\tavatars\tchat", false).unwrap().unwrap();
+            assert!(listing.starts_with(&Uuid::from_bytes([1; 16]).to_string()), "{listing}");
+            assert!(ok(&mut bot, "rlv\tstatus").starts_with("rlv: on\n"));
+            assert_eq!(
+                logged(&mut bot),
+                ["control: scan avatars chat: 1 listed; 1 without a name after 10 s"]
+            );
+            // And only that one.
+            let reason = listed(&mut bot, "scan\tavatars\tchat", false).unwrap_err();
+            assert!(reason.contains("shownearby"), "{reason}");
+            assert_eq!(logged(&mut bot).len(), 1);
+        }
+
+        #[test]
+        fn what_the_page_sends_by_itself_is_not_logged() {
+            let mut bot = among_others(&[]);
+            logged(&mut bot);
+            let by_page = (
+                listed(&mut bot, "scan\tavatars\tchat", true).unwrap(),
+                listed(&mut bot, "friends", true).unwrap(),
+            );
+            assert_eq!(logged(&mut bot), [] as [&str; 0]);
+            // The same commands of the operator's are answered the same,
+            // and logged.
+            let by_operator = (
+                listed(&mut bot, "scan\tavatars\tchat", false).unwrap(),
+                listed(&mut bot, "friends", false).unwrap(),
+            );
+            assert_eq!(by_page, by_operator);
+            assert!(by_page.0.is_some() && by_page.1.is_some());
+            let lines = logged(&mut bot);
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(lines[0].starts_with("control: scan avatars chat: 1 listed"), "{lines:?}");
+            assert!(lines[1].starts_with("control: friends: 1 listed, 0 online"), "{lines:?}");
+            // Refused, between logins: answered, and still not logged.
+            let mut offline = bot_between_logins();
+            for line in ["scan\tavatars\tchat", "friends"] {
+                let reason = listed(&mut offline, line, true).unwrap_err();
+                assert!(reason.contains("not connected"), "{reason}");
+            }
+            assert_eq!(logged(&mut offline), [] as [&str; 0]);
+            let reason = listed(&mut offline, "friends", false).unwrap_err();
+            assert!(reason.contains("not connected"), "{reason}");
+            assert_eq!(logged(&mut offline).len(), 1);
+            // It moves nothing and changes no mode.
+            assert!(!bot.reconciler.is_manual());
+        }
+
+        fn bot_between_logins() -> Bot {
+            let mut bot = bot(full(""));
+            bot.grid = Some(FakeGrid {
+                offline: true,
+                ..FakeGrid::default()
+            });
+            bot
+        }
+
+        #[test]
+        fn the_own_mark_comes_through_from_the_page() {
+            // Over HTTP, from the header to the origin of the command.
+            let mut rig = Rig::new(false);
+            rig.bot.grid = among_others(&["shownearby"]).grid.take();
+            rig.bot.rlv = Rlv::new(true, RlvPersist::Drop, PersistOverride::default());
+            assert_eq!(rig.page("rlv\tmode\toverride"), "ok\trlv: override\n");
+            logged(&mut rig.bot);
+            let refused = rig.send("/api/command", "scan\tavatars\tchat", true);
+            assert!(refused.starts_with("error\t") && refused.contains("shownearby"), "{refused}");
+            assert_eq!(logged(&mut rig.bot), [] as [&str; 0]);
+            assert!(rig.page("rlv\tstatus").starts_with("ok\trlv: override\\n"));
+        }
+
+        #[test]
+        fn pages_get_what_is_recorded_and_the_status_when_it_changes() {
+            let mut rig = Rig::new(true);
+            // Recorded before any page was open: kept.
+            rig.heard(Channel::Im, from_jane("im", "are you there?"));
+            let (mut page, kept) = rig.open("/api/events");
+            assert_eq!(kept, ["are you there?"]);
+            let (mut other, kept) = rig.open("/api/events");
+            assert_eq!(kept, ["are you there?"]);
+            // Chat heard: with the names and the avatar's UUID.
+            rig.heard(Channel::Chat, from_jane("say", "hi all"));
+            let event = page.event();
+            let fields: Vec<&str> = event.lines().nth(2).unwrap().strip_prefix("data: ").unwrap().split('\t').collect();
+            assert_eq!(
+                fields[1..],
+                ["say", &jane().to_string(), "Jane Doe", "Janey", "", "", "0", "hi all"]
+            );
+            assert!(event.starts_with("event: chat\nid: "), "{event}");
+            assert_eq!(other.chat(), "hi all");
+            // An IM sent from elsewhere, here the control socket.
+            assert_eq!(ok(&mut rig.bot, &format!("im\t{}\tsee you", jane())), format!("sent to {}", jane()));
+            rig.bot.service_messages();
+            for stream in [&mut page, &mut other] {
+                let event = stream.event();
+                assert!(event.starts_with("event: im\n"), "{event}");
+                assert!(
+                    event.contains(&format!("\tim_out\t{}\tJane Doe\tJaney\t\t\t0\tsee you\n", jane())),
+                    "{event}"
+                );
+            }
+            // The status, when it changes and not otherwise.
+            rig.bot.web_status();
+            rig.bot.web_status();
+            assert!(by_socket(&mut rig.bot, "status").ends_with("mode: holding\n"));
+            assert!(matches!(command(&mut rig.bot, "stand"), Response::Ok(None)));
+            rig.bot.web_status();
+            rig.heard(Channel::Chat, from_jane("say", "after"));
+            let event = page.event();
+            assert!(
+                event.starts_with("event: status\ndata: connected: no\\n") && event.ends_with("mode: manual\n"),
+                "{event}"
+            );
+            assert_eq!(page.chat(), "after");
+            // A page that opens now gets all four, in the order of recording.
+            let (_, kept) = rig.open("/api/events");
+            assert_eq!(kept, ["are you there?", "hi all", "see you", "after"]);
+            // One that lost its stream goes on after the event it got last.
+            let newest = event_id(&mut rig);
+            let (start, number) = newest.split_once('-').unwrap();
+            assert_eq!(number, "4");
+            let mut resumed = rig.server.stream(&format!("/api/events?last={start}-2"), &[]);
+            assert!(rig.next(Duration::from_secs(5)));
+            assert_eq!(
+                (resumed.chat_or_im(), resumed.chat_or_im()),
+                ("see you".to_string(), "after".to_string())
+            );
+            assert!(resumed.event().starts_with("event: status\n"));
+        }
+
+        /// The id of the newest event, from a page opened for it.
+        fn event_id(rig: &mut Rig) -> String {
+            let mut stream = rig.server.stream("/api/events", &[]);
+            assert!(rig.next(Duration::from_secs(5)));
+            let mut newest = String::new();
+            loop {
+                let event = stream.event();
+                if let Some(id) = event.lines().find_map(|line| line.strip_prefix("id: ")) {
+                    newest = id.to_string();
+                }
+                if event.starts_with("event: status\n") {
+                    return newest;
+                }
+            }
+        }
+
+        #[test]
+        fn a_message_that_looks_like_a_command_is_shown_and_not_carried_out() {
+            let mut rig = Rig::new(true);
+            let (mut page, _) = rig.open("/api/events");
+            rig.heard(Channel::Im, from_jane("im", "say hello"));
+            let event = page.event();
+            assert!(event.starts_with("event: im\n") && event.ends_with("\tsay hello\n"), "{event}");
+            assert_eq!(rig.calls(), []);
+        }
+
+        #[test]
+        fn the_streams_end_when_the_bot_stops() {
+            let mut rig = Rig::new(false);
+            let (mut page, _) = rig.open("/api/events");
+            assert!(matches!(rig.bot.handle(Event::Signal), Flow::Exit(EXIT_OK)));
+            rig.bot.flush_messages();
+            rig.bot.web_stop();
+            let started = Instant::now();
+            assert_eq!(page.event(), "");
+            rig.server.stop();
+            assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        }
+
+        #[test]
+        fn no_web_table_nothing_kept() {
+            let mut bot = bot(full(""));
+            assert!(bot.web.is_none());
+            let now = Instant::now();
+            bot.names_resolved(vec![janes_names()], vec![], now);
+            bot.record(Channel::Chat, from_jane("say", "hi"), now);
+            bot.service_messages();
+            bot.web_status();
+            assert!(bot.web.is_none());
+            // With the table, the bot keeps what it records from the start.
+            assert!(Rig::new(false).bot.web.is_some());
         }
     }
 }

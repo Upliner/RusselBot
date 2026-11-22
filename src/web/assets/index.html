@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>RusselBot</title>
+<link rel="stylesheet" href="style.css">
+<script src="app.js"></script>
+</head>
+<body>
+
+<form id="login" class="login" hidden autocomplete="off">
+  <h1>RusselBot</h1>
+  <label for="login-password">Password</label>
+  <input id="login-password" type="password" autocomplete="current-password" required>
+  <button id="login-button" type="submit">Log in</button>
+  <p id="login-message" class="error" role="alert" hidden></p>
+</form>
+
+<div id="app" hidden>
+  <header>
+    <nav id="tabs" aria-label="Tabs">
+      <a href="#world" data-tab="world">World</a>
+      <a href="#chat" data-tab="chat">Local chat<span class="mark" id="mark-chat" hidden title="New lines"></span></a>
+      <a href="#im" data-tab="im">IM<span class="mark" id="mark-im" hidden title="New messages"></span></a>
+      <a href="#inventory" data-tab="inventory">Inventory</a>
+      <a href="#console" data-tab="console">Console</a>
+      <a href="#settings" data-tab="settings">Settings</a>
+    </nav>
+    <p id="lost" class="lost" role="status" hidden>The bot cannot be reached. Trying again…</p>
+    <div id="notices" class="notices" aria-live="polite"></div>
+  </header>
+
+  <main>
+    <!-- World -->
+    <section id="tab-world" class="tab" hidden>
+      <div class="status" data-status></div>
+
+      <form id="tp-form" class="panel" novalidate>
+        <h2>Teleport</h2>
+        <div class="fields">
+          <label>X <input id="tp-x" inputmode="decimal" autocomplete="off" size="6"></label>
+          <label>Y <input id="tp-y" inputmode="decimal" autocomplete="off" size="6"></label>
+          <label>Z <input id="tp-z" inputmode="decimal" autocomplete="off" size="6" placeholder="same"></label>
+          <label class="wide">Region <input id="tp-region" autocomplete="off" placeholder="this region"></label>
+        </div>
+        <div class="buttons">
+          <button id="tp-button" type="submit">Teleport</button>
+          <button id="stand-button" type="button">Stand up</button>
+        </div>
+      </form>
+
+      <div class="panel">
+        <h2>Avatars</h2>
+        <form id="avatars-form" class="fields" novalidate>
+          <label>Within <input id="avatars-distance" autocomplete="off" size="6" placeholder="region"> m</label>
+          <button id="avatars-button" type="submit">Scan avatars</button>
+        </form>
+        <p id="avatars-made" class="made" hidden></p>
+        <ul id="avatars-list" class="rows"></ul>
+      </div>
+
+      <div class="panel">
+        <h2>Objects</h2>
+        <form id="objects-form" class="fields" novalidate>
+          <label>Within <input id="objects-distance" autocomplete="off" size="6" placeholder="default"> m</label>
+          <label class="wide">Name has <input id="objects-name" autocomplete="off"></label>
+          <button id="objects-button" type="submit">Scan objects</button>
+        </form>
+        <p id="objects-made" class="made" hidden></p>
+        <ul id="objects-list" class="rows"></ul>
+      </div>
+    </section>
+
+    <!-- Local chat -->
+    <section id="tab-chat" class="tab" hidden>
+      <div class="status" data-status></div>
+      <div class="panel">
+        <h2>In chat range <button id="nearby-refresh" type="button" class="small">Refresh</button></h2>
+        <p id="nearby-note" class="made" hidden></p>
+        <ul id="nearby-list" class="chips"></ul>
+      </div>
+      <div class="panel chat">
+        <div id="chat-log" class="log" tabindex="0" aria-label="Local chat"></div>
+        <button id="chat-new" type="button" class="new" hidden>New lines ↓</button>
+        <form id="chat-form" class="send">
+          <input id="chat-text" autocomplete="off" aria-label="Message" placeholder="Say something; /shout, /whisper, /5 text">
+          <button id="chat-button" type="submit">Say</button>
+        </form>
+      </div>
+    </section>
+
+    <!-- IM -->
+    <section id="tab-im" class="tab" hidden>
+      <div class="im">
+        <div class="im-side">
+          <form id="im-open-form" class="send">
+            <input id="im-open-name" autocomplete="off" aria-label="Avatar name or UUID" placeholder="Name or UUID">
+            <button type="submit">Open</button>
+          </form>
+          <h2>Conversations</h2>
+          <ul id="im-conversations" class="picks"></ul>
+          <h2>Friends <button id="friends-refresh" type="button" class="small">Refresh</button></h2>
+          <p id="friends-note" class="made" hidden></p>
+          <ul id="im-friends" class="picks"></ul>
+        </div>
+        <div class="im-main panel">
+          <h2 id="im-title">No conversation chosen</h2>
+          <div id="im-log" class="log" tabindex="0" aria-label="Conversation"></div>
+          <p id="im-readonly" class="made" hidden>This conversation cannot be answered.</p>
+          <form id="im-form" class="send" hidden>
+            <input id="im-text" autocomplete="off" aria-label="Message" placeholder="Message">
+            <button id="im-button" type="submit">Send</button>
+            <button id="im-close" type="button" class="small" hidden>Close</button>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <!-- Inventory -->
+    <section id="tab-inventory" class="tab" hidden>
+      <div class="panel">
+        <h2>Inventory
+          <label class="switch"><input id="inventory-attached" type="checkbox"> Attached only</label>
+          <button id="inventory-refresh" type="button" class="small">Refresh</button>
+        </h2>
+        <p id="inventory-note" class="made" hidden></p>
+        <ul id="inventory-tree" class="tree"></ul>
+      </div>
+    </section>
+
+    <!-- Console -->
+    <section id="tab-console" class="tab" hidden>
+      <div class="panel console">
+        <div id="console-out" class="out" tabindex="0" aria-label="Console output"></div>
+        <form id="console-form" class="send">
+          <input id="console-line" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Command line" placeholder="status, help, scan 20 -n bench, im &quot;Jane Doe&quot; hello">
+          <button type="submit">Send</button>
+        </form>
+      </div>
+    </section>
+
+    <!-- Settings -->
+    <section id="tab-settings" class="tab" hidden>
+      <div class="panel">
+        <h2>Theme</h2>
+        <div class="choices" id="theme-choices">
+          <label><input type="radio" name="theme" value=""> As the browser asks for</label>
+          <label><input type="radio" name="theme" value="light"> Light</label>
+          <label><input type="radio" name="theme" value="dark"> Dark</label>
+        </div>
+        <p class="made">Kept in this browser only.</p>
+      </div>
+      <div class="panel" id="logout-panel" hidden>
+        <h2>Session</h2>
+        <button id="logout-button" type="button">Log out</button>
+      </div>
+    </section>
+  </main>
+</div>
+
+<noscript><p class="login">This page needs JavaScript.</p></noscript>
+</body>
+</html>

@@ -1119,6 +1119,7 @@ impl<N: Net> Session<N> {
                 object: *object,
                 local_id: *local_id,
                 distance: [0, 1, 2].map(|i| (at[i] - avatar[i]).powi(2)).iter().sum::<f32>().sqrt(),
+                position: [at[0], at[1], at[2]],
                 flags,
                 attachment: wearer.is_some(),
                 child: lineage.get(1).is_some_and(|parent| !self.is_avatar(*parent)),

@@ -21,7 +21,9 @@ scripts' requests for permissions are [accepted by
 itself](#permission-requests) from the avatars and objects the config
 names, and wait for a command otherwise. As an [XMPP gateway](#xmpp-gateway)
 it puts the avatar's instant messages, local chat and commands into an
-ordinary Jabber client.
+ordinary Jabber client, and as a [web interface](#web-interface) it serves
+a page of its own, with the world around the avatar, chat, instant messages
+and the inventory, to any browser.
 
 ## Status
 
@@ -230,6 +232,20 @@ waiting. Nothing of this has been tried on Second Life: that it takes the
 bot's answers to an inventory offer and to a script's permission request
 as the bot builds them is known from the viewer's source only.
 
+The [web interface](#web-interface) is verified by unit tests, among them
+the server over real connections and the bot with its pages' event
+streams, and on the local OpenSim (`docs/test-rig.md`, items 237 to 265,
+2026-11-22) with `test-rig/web.py` and in one browser, at desktop width
+and at 360 pixels: the six tabs, teleports, both scans with their buttons,
+local chat and instant messages as they happen, the inventory with attach,
+touch and detach, the console, the theme, the login box, the page losing
+and finding the bot, the RLV refusals `tploc`, `shownearby` and `showinv`
+on the page, and an override left in place by the page's own refreshes.
+`scan --position` and `touch` with the UUID of an attached item were tried
+there too. Not tried: a phone, other browsers, a reverse proxy in front of
+the bot (the nginx and Caddy examples below are written from their
+documentation), and anything of it on Second Life.
+
 The [XMPP gateway](#xmpp-gateway) is verified by unit tests, against a fake
 component server in the tests, and on the local OpenSim with a local
 Prosody 13 (`docs/test-rig.md`, items 165 to 178, 2026-11-20): starting
@@ -340,6 +356,7 @@ One TOML file; see `russelbot.example.toml`.
 | `startup` | no, and not with `startup_file` | The [startup script](#startup-script): commands the bot carries out by itself when it starts, one per line. Default: none |
 | `startup_file` | no, and not with `startup` | A file that holds the startup script; a relative path is relative to the working directory |
 | `xmpp` | no | A table, `[xmpp]`, that makes the bot an XMPP component, see [XMPP gateway](#xmpp-gateway). Default: no XMPP connection |
+| `web` | no | A table, `[web]`, that makes the bot serve a web page to use it from, see [Web interface](#web-interface). Default: no web interface |
 | `persist`, `rlv`, `perms`, `autoreply` | no | Deprecated: what the startup script says with commands, see [Deprecated keys](#deprecated-keys) |
 
 ### Startup script
@@ -830,6 +847,16 @@ there is a reason:
   `touch` answers at once and reaches further, at the price of that
   traffic all the time.
 
+`touch` also takes the UUID of an inventory item, as
+[`inventory`](#inventory) prints it, when that item is attached to the
+avatar: it then clicks the attachment, with no scan and no wait, and under
+the RLV restrictions that hold a touch of that attachment.
+
+```sh
+rslbot ctl inventory -a             # what is attached, with the items' UUIDs
+rslbot ctl touch <item uuid>        # click that attachment
+```
+
 An object the bot has not learned of is an error naming the distance. On
 OpenSimulator the distance makes little difference: it describes objects
 regardless. `scan` with a larger distance widens the scan until the avatar
@@ -847,6 +874,7 @@ rslbot ctl scan 20 -n bench         # within 20 m, with "bench" in the name
 rslbot ctl scan -t                  # what handles touches
 rslbot ctl scan 96 -o "Jane Doe"    # Jane Doe's objects within 96 m
 rslbot ctl scan -a -c -o <uuid>     # an avatar's or a group's, worn ones and child prims too
+rslbot ctl scan --position 20       # within 20 m, each with where it is
 ```
 
 `scan [objects] [DISTANCE] [FILTER...]` lists the objects around the avatar
@@ -891,6 +919,16 @@ linksets, each with its own name. Without them a linkset is one line, for
 its root prim, and nothing worn is listed. Avatars, trees and grass are
 never listed. Filters and switches combine in any order, and a prim has to
 meet all the filters.
+
+`--position` adds a field to every line, between the distance and the
+flags: where the object is in the region, as `X,Y,Z` in whole metres, which
+is what `tp` takes to go there. It is the position the distance is
+measured to, so a child prim has its root's. The lines then have eight
+fields; without the switch they are the seven above.
+
+```
+0c1b2f6e-...   3.2   103,100,25   scripted,touch   7d9a41c0-...   Jane Doe   Park Bench   Sit here
+```
 
 The distance is measured from the avatar to the object's root prim; a
 child prim counts as being where its root is, and what an avatar wears as
@@ -2081,3 +2119,156 @@ chat room for local chat or for groups, the avatars nearby, profile
 pictures, ad-hoc command forms, delivery receipts, IMs sent with
 `rslbot ctl` in the XMPP conversation, TLS on the component connection,
 and a server on another host.
+
+## Web interface
+
+The bot can serve a web page to use it from: the status of the avatar,
+teleports, scans of the avatars and objects around it with buttons to go
+there, sit and touch, local chat and instant messages as they happen, the
+inventory as a tree, and a console for everything else. The page is part
+of the `rslbot` binary and loads nothing from anywhere else; there is
+nothing to install beside the bot, and it works on a phone.
+
+Everything the page does is one of the commands of the
+[control socket](#control-socket), carried out the same way: the same
+answers, the same RLV restrictions, the same lines in the log. The page can
+do nothing `rslbot ctl` cannot.
+
+### Setting it up
+
+```toml
+[web]
+listen = "127.0.0.1:8080"
+password = "choose one"
+```
+
+`listen` is the address the page is served at, `host:port`, here
+`http://127.0.0.1:8080/`. The host is `localhost` or an IP address; several
+bots on one machine need a port each. The bot starts listening before its
+first login, and an address it cannot listen on, such as one another
+program has, is a config error. Like every table, `[web]` comes after the
+plain keys of the config.
+
+`password` is optional. With it, the page shows a login box and nothing
+else, and the bot carries out nothing and shows nothing, until the password
+is given. A browser that gave it stays logged in until you log out in the
+Settings tab, for 30 days without use at most, and until the bot is
+restarted. After five wrong passwords within a minute every login is
+refused for a minute. Without `password`, whoever can reach the address
+controls the avatar: that is meant for `127.0.0.1` on a machine of your
+own, and the bot says so in its log when it is asked to listen elsewhere
+without one.
+
+**The connection is not encrypted.** Keep `listen` on `127.0.0.1`. To use
+the page from another machine, either forward the port over SSH
+(`ssh -L 8080:127.0.0.1:8080 yourserver`, then open
+`http://127.0.0.1:8080/` at home), or put a web server with TLS in front
+of it and set a password:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name bot.example.org;
+    # ssl_certificate ...; ssl_certificate_key ...;
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_buffering off;          # the page's live updates are one long answer
+        proxy_read_timeout 1h;
+    }
+}
+```
+
+```
+bot.example.org {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+The first is for nginx, the second a whole Caddyfile.
+
+Two things keep other web sites away from the bot while your browser has
+them open. A request that changes anything is carried out only when the
+page itself sent it, which a form or a script on another site cannot
+imitate. And without a password the bot answers only when it is opened by
+IP address or as `localhost`, never under a host name, since a name can be
+made to point at your machine by whoever owns it; behind a proxy that
+passes your own host name on, as Caddy does, set a password. Both
+refusals are logged with the address they came from.
+
+### The tabs
+
+**World.** The status: region, position, what the avatar sits on, and
+whether the bot holds a place or leaves the avatar where commands put it
+(see [Holding a place](#holding-a-place)). It follows the bot by itself. A
+teleport form with a box each for X, Y, Z and the region; an empty Z keeps
+the height and an empty region stays in this one. "Stand up". "Scan
+avatars" lists everyone in the region, or within the distance you give,
+with a button to teleport to each and one to open an IM. "Scan objects"
+lists the objects around the avatar, within a distance and with a part of
+the name if you like, each with "Teleport", "Sit" and "Touch". A list stays
+as it is until you scan again, and says when it was made.
+
+**Local chat.** The same status, the avatars within chat range (kept up to
+date every 15 seconds while you look at the tab), and local chat as it is
+heard, one line each as the [XMPP gateway](#xmpp-gateway) writes them.
+What you type is said as a viewer's chat bar would say it: `/shout`,
+`/whisper`, `/7 text` and `//` work. The avatar's own lines appear when
+the simulator delivers them back.
+
+**IM.** One conversation for each avatar and each object the bot has
+exchanged instant messages with, the newest first, with a count of the
+messages you have not seen. Messages the bot sent, from here or with
+`rslbot ctl im` or by its [autoreply](#autoreplies), are in the
+conversation too. To write to someone new, type a name (`Jane Doe`,
+`jane.doe`, one word) or a UUID into the box and press "Open"; the name is
+looked up when the first message is sent. The friend list shows who is
+online, and a click on a friend opens the conversation. Objects cannot be
+answered.
+
+**Inventory.** My Inventory as a tree. A folder is read when you open it,
+so a large inventory costs nothing until you look into it. An object has
+"Attach", and once attached "Detach" and "Touch"; clothing has "Wear" and
+"Take off", a body part "Wear". "Attached only" shows what the avatar
+wears now, in place of the tree.
+
+**Console.** A command line that takes what `rslbot ctl` takes, without
+`rslbot ctl` in front and with double quotes around an argument that holds
+spaces, as the XMPP control contact does: `status`, `scan 20 -n bench`,
+`im "Jane Doe" see you later`, `help`. The arrow keys bring back earlier
+lines. Everything the tabs have no button for is here: `persist` and
+`home`, `accept` and `perms`, `rlv`, `autoreply`, `anim` and `sound`,
+`profile`, `quit`.
+
+**Settings.** The theme of the page: as the browser asks for (the
+default), light, or dark. The choice is kept in that browser. With a
+password, the button to log out.
+
+What a button did, or why it could not, is shown under the tabs on every
+tab; an error stays until you dismiss it.
+
+### What the page keeps
+
+The bot keeps the newest 500 lines of local chat and the newest 500
+instant messages in memory, from the moment it starts, so that a page you
+open later, or open again, has them. A page that lost its connection gets
+what it missed when it is back, and says meanwhile that it cannot reach
+the bot. Nothing of this is written to disk for the page: after a restart
+of the bot the IM tab is empty. `log_chat` and `log_im` are the record
+that lasts (see [Chat and IM logs](#chat-and-im-logs)).
+
+The lists the page keeps up to date by itself, the avatars in chat range
+and the friends, are ordinary `scan avatars chat` and `friends` commands,
+with two differences: they get no line in the bot's log, and they never
+use up an RLV [override](#override), which stays for the next command you
+give yourself. Their "Refresh" buttons are commands of yours like any
+other.
+
+At most 32 connections are served at once, 8 of them open pages; a ninth
+page says that the bot cannot be reached until one of the others is
+closed.
+
+Not there yet: a panel for the teleport offers and permission requests
+that wait (the console has `perms status` and `accept`), group chats,
+pictures, a map, history from before the bot started, several accounts or
+read-only access, browser notifications, and TLS in the bot itself.

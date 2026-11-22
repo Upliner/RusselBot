@@ -94,7 +94,7 @@ Ids are `<start>-<n>`: `<start>` is the second the bot started, `<n>` counts rec
 - `last` with our `<start>` and an `<n>` not below either ring's highest dropped: the records after `<n>`, merged;
 - otherwise (a restart, or more was missed than is kept): `reset`, then both rings.
 
-Then the status, then live events. Since the hub does this inside the main loop, between two records, nothing is missed and nothing is sent twice. Memory: 1000 records of a few hundred bytes, well under a megabyte, and only while `[web]` is configured.
+Then the status, then live events. Since the hub does this inside the main loop, between two records, nothing is missed and nothing is sent twice. The replay and the status go into the page's queue as one piece, however many messages it holds, so that a full backlog of 1000 fits a queue of 256. When a page opens with a status the other pages have not been sent yet, they are sent it then, so that "the status sent last" is one value for all of them. Memory: 1000 records of a few hundred bytes, well under a megabyte, and only while `[web]` is configured.
 
 ### Password, sessions and the cookie
 
@@ -111,7 +111,7 @@ Two attacks are in scope, and both matter most for the setup the config makes ea
 1. **A page elsewhere makes the operator's browser send a request to the bot** (a form, an image, `fetch`). Every `POST` must carry the header `X-Rslbot: 1`, which the page's script sets. A form cannot set a header, and a script on another origin can only send one after a preflight `OPTIONS`, which the bot answers 405 without any `Access-Control-*` header, so the browser never sends the real request. The bot sends no CORS header on anything, so another origin can read neither answers nor the event stream. `GET` requests change nothing. This holds behind any reverse proxy, which a comparison of `Origin` with `Host` would not (nginx passes the upstream address as `Host` by default). The cookie's `SameSite=Strict` is a second line where there is a password.
 2. **DNS rebinding**: a name the attacker controls resolves to `127.0.0.1`, which makes the attacker's script same-origin with the bot. With a password the script has no session and learns nothing. Without one the bot serves only requests whose `Host` is an IP address literal or `localhost` (with any port), since a rebound name is never either.
 
-The page is served with `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`, so that it cannot be framed for clickjacking and an injected string could not load or run anything even if the page had a markup bug. API answers are `Cache-Control: no-store`; the three files carry an `ETag` made from the bot's version and `Cache-Control: no-cache`, so a new build is picked up on the next load.
+The page is served with `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'`, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`, so that it cannot be framed for clickjacking and an injected string could not load or run anything even if the page had a markup bug. API answers are `Cache-Control: no-store`; the three files carry an `ETag` made from the bot's version and a hash of the file itself, and `Cache-Control: no-cache`, so a new build is picked up on the next load, also one of the same version.
 
 ### The page's own commands: `Origin::Page`
 
@@ -151,6 +151,18 @@ Three files in `src/web/assets/`, built into the binary with `include_str!`: `in
 - [A page left open on the Local chat tab asks for the avatar list every 15 seconds] → `scan avatars` answers from what the simulator has already told the bot and sends the simulator nothing new once names are known; the timer stops when the tab or the window is hidden.
 - [The page reads the commands' text answers; a change of a listing's form breaks it silently] → The forms are specified (`area-scan`, `avatar-scan`, `friend-list`, `inventory-list`, `avatar-commands`), and the rig items parse real answers.
 - [Kept messages are lost at a restart, and a page opened after one shows an empty IM tab] → Stated in the spec; `log_im` and `log_chat` remain the durable record. Reading history back from the TSV files is a possible later change.
+
+## Browsers (task 9.2)
+
+The page was tried in one browser, the Chromium of the Claude desktop app,
+at desktop width and with the viewport set to 360 by 740 pixels
+(`docs/test-rig.md`, items 250 to 263). It uses nothing newer than
+`fetch`, `EventSource`, `classList` and CSS custom properties, so no
+difference is expected in Firefox or Safari, but none of them and no phone
+was tried, and so nothing here asks for a later change yet. One thing seen
+in that browser: while its pane is hidden, timers run about once a minute,
+so the page's own refreshes pause, as they are meant to for a window that
+is not looked at; events and answers arrive regardless.
 
 ## Migration Plan
 

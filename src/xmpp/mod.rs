@@ -4,7 +4,6 @@
 
 pub mod address;
 pub mod chat;
-pub mod command;
 pub mod conn;
 pub mod gateway;
 pub mod presence;
