@@ -1,0 +1,7 @@
+[submodule "references/kokua"]
+	path = references/kokua
+	url = https://bitbucket.org/kokua/kokua-release.git
+	branch = Kokua-MKRLV
+[submodule "references/opensim"]
+	path = references/opensim
+	url = git@github.com:Upliner/opensim.git
