@@ -565,7 +565,7 @@ For this, the restrictions that the sender of the force command itself holds SHA
 - **THEN** the seat becomes the held seat and the bot seats the avatar on it
 
 ### Requirement: Override exempts one command
-While RLV is in override (see `rlv-commands`, "RLV mode"), the next control-socket command the bot receives other than `rlv`, `status`, `perms` and `quit` SHALL be the exempt command. For the exempt command no restriction SHALL be in force: it SHALL be carried out exactly as it would be with no restriction kept. RLV SHALL be `on` again at the moment the exempt command is taken up, before anything is known of its outcome and whatever its outcome is, also when it is refused for a reason that has nothing to do with RLV. A line the bot cannot read as a command SHALL NOT be the exempt command.
+While RLV is in override (see `rlv-commands`, "RLV mode"), the next control-socket command the bot receives other than `rlv`, `status`, `perms` and `quit` SHALL be the exempt command. For the exempt command no restriction SHALL be in force: it SHALL be carried out exactly as it would be with no restriction kept. RLV SHALL be `on` again at the moment the exempt command is taken up, before anything is known of its outcome and whatever its outcome is, also when it is refused for a reason that has nothing to do with RLV. A line the bot cannot read as a command SHALL NOT be the exempt command. A command the page of the web interface sent by itself (see `web-server`, "Requests the page makes by itself") SHALL NOT be the exempt command either, whatever command it is: it SHALL be carried out as while RLV is on and SHALL leave RLV in override.
 
 The exemption SHALL cover everything that command does until it is answered, and in addition:
 
@@ -613,6 +613,10 @@ Override SHALL change nothing else. While RLV is in override, the commands objec
 #### Scenario: Home under override
 - **WHEN** the persist override setting is empty, the bot holds a chair in `Target`, the avatar is in `Home`, a collar holds `tploc` and `sittp`, and `rslbot ctl rlv mode override` and `rslbot ctl home` are run
 - **THEN** the bot teleports the avatar to `Target` and seats it on the chair; when the avatar is unseated afterwards, the bot's next sit is held to `sittp`
+
+#### Scenario: The page's own refresh does not use it up
+- **WHEN** a collar holds `shownearby`, a page of the web interface shows its Local chat tab, `rslbot ctl rlv mode override` is run, and the page then refreshes its list of avatars by itself
+- **THEN** that refresh is refused naming `shownearby`, and `rlv status` then still prints `rlv: override`
 
 ### Requirement: Status queries
 While RLV is on or in override the bot SHALL answer `@getstatus[:<part>[;<separator>]]=<channel>` by saying, once and at normal volume on that channel, the restrictions its sender holds, and `@getstatusall` with the same option and param by saying the restrictions every holder holds, the operator included. The reply SHALL be, for each restriction in the order the holders first set one and each holder's in the order it set them, the separator followed by the restriction's text; a restriction two holders hold appears once for each. `<part>` SHALL leave out the restrictions whose text does not contain it, compared without regard to letter case. The separator SHALL be `/` when none is given or the one given is empty. The reply SHALL be sent as it is also when it is empty, and SHALL be cut off at 1023 bytes. The channel SHALL be as for the version queries (see `rlv-commands`, "Version queries"). Restrictions without an effect SHALL be part of the reply like the others.

@@ -160,7 +160,7 @@ The bot SHALL remember, for each avatar, the latest teleport offer that avatar s
 - **THEN** the avatar stays seated and the bot's placement mode does not change
 
 ### Requirement: Touch command
-`touch <uuid>` SHALL make the avatar click the object with that UUID once, as a press followed at once by a release. It SHALL be answered with success once both have been handed to the simulator connection. It SHALL be answered with an error and send nothing when the argument is not a UUID, or when the bot has not learned of an object with that UUID in the current region. When the bot has not yet scanned the region (see "Object scan"), a `touch` on an object it does not know SHALL start the scan and wait up to 10 seconds for the object to be learned before answering.
+`touch <uuid>` SHALL make the avatar click the object with that UUID once, as a press followed at once by a release. The UUID of an inventory item that is attached to the bot's avatar (see `avatar-outfit`, "Knowing what is attached") SHALL stand for the root prim of that attachment when the bot has learned of no object with that UUID in the current region; the touch SHALL then be held to every rule that holds a touch of that attachment. It SHALL be answered with success once both have been handed to the simulator connection. It SHALL be answered with an error and send nothing when the argument is not a UUID, or when the bot has not learned of an object with that UUID in the current region and the UUID is not that of an item attached to the avatar. When the bot has not yet scanned the region (see "Object scan"), a `touch` with a UUID that is neither that of an object it knows nor that of such an item SHALL start the scan and wait up to 10 seconds for the object to be learned before answering.
 
 #### Scenario: Touching a scripted object
 - **WHEN** `rslbot ctl touch <uuid>` names a nearby object whose script reacts to touches
@@ -177,6 +177,14 @@ The bot SHALL remember, for each avatar, the latest teleport offer that avatar s
 #### Scenario: Touching does not move the avatar
 - **WHEN** `rslbot ctl touch <uuid>` is run while the avatar is seated on the configured object
 - **THEN** the avatar stays seated and the bot's placement mode does not change
+
+#### Scenario: Touching an attachment by its inventory item
+- **WHEN** the avatar wears the object `Radio`, whose script reacts to touches, and `rslbot ctl touch <uuid>` is run with the UUID `rslbot ctl inventory -a` printed for `Radio`
+- **THEN** the radio's touch events fire once with the bot's avatar as the toucher, and the command exits with status 0 at once
+
+#### Scenario: Inventory item that is not attached
+- **WHEN** `rslbot ctl touch <uuid>` is run with the UUID of an inventory item that is not attached to the avatar
+- **THEN** the command exits with status 1 saying the object is not known
 
 ### Requirement: Object scan
 To touch an object the bot must have learned of it from the simulator. Until a scan has started in a region, the bot SHALL NOT send the simulator anything for the sake of learning objects, with one exception: the requests about the object the avatar has become seated on, which are the one `region-teleport` ("Know the current position") calls for and the one for its name (see "Status command"). Apart from those requests its traffic SHALL be what it is without the `touch` and `scan` commands and without RLV restrictions. A scan SHALL start when the avatar enters a region if `scan_distance` is configured, and otherwise at the first of these in that region: a `touch` command that names an object the bot does not know, a `scan` command (see `area-scan`), or an RLV restriction that has to be applied to an object the bot does not know (see `rlv-restrictions`, "Objects the bot does not know"). A restriction that is kept and has nothing to be applied to SHALL NOT start a scan. From the start of a scan until the avatar leaves the region the bot SHALL ask the simulator to describe every object it mentions without describing, and SHALL remember the objects described. The distance within which the simulator is asked to mention objects SHALL be `scan_distance` when configured and 32 metres otherwise, or the largest distance a `scan` command has named in that region when that is more (see `area-scan`, "Scan distance"). What the bot has learned in a region, and a distance a `scan` command raised there, SHALL be forgotten when the avatar leaves it or the session is lost.

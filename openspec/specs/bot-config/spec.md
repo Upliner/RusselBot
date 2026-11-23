@@ -31,6 +31,7 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `rlv` | no | Deprecated in favour of the startup script. Boolean; when true the bot starts with RLV on and reads the RLV commands of the objects the avatar owns (see `rlv-commands`). Defaults to false |
 | `perms` | no | Deprecated in favour of the startup script. Table saying which requests the bot accepts by itself (see `permission-requests`); its form is given below. Without it the bot accepts none by itself |
 | `xmpp` | no | Table that switches on the XMPP gateway (see `xmpp-gateway`); its form is given below. Without it the bot makes no XMPP connection |
+| `web` | no | Table that switches on the web interface (see `web-server`); its form is given below. Without it the bot listens on no web address |
 | `autoreply` | no | Deprecated in favour of the startup script. Table that switches on autoreplies to instant messages (see `im-autoreply`); its form is given below. Without it the bot starts with autoreply off and no autoreply text |
 | `startup` | no, and not together with `startup_file` | The startup script, a string of one or more lines: commands the bot carries out by itself when it starts (see `startup-script`) |
 | `startup_file` | no, and not together with `startup` | Path of a file that holds the startup script |
@@ -57,6 +58,13 @@ In the table form, `atstart` is a boolean that says whether the bot holds anythi
 | `server` | no | `host:port` of the XMPP server's component port. The host SHALL be `localhost` or a loopback address. Defaults to `127.0.0.1:5347` |
 | `secret` | yes | The shared secret the XMPP server has for that component |
 | `owners` | yes | A non-empty array of bare XMPP addresses, `user@domain`, of the accounts that may use the gateway. Letter case does not matter, and an address given twice SHALL count once |
+
+`web` SHALL be a table with these keys:
+
+| Key | Required | Meaning |
+|---|---|---|
+| `listen` | yes | `host:port` of the address the web interface listens on, such as `127.0.0.1:8080`. The host SHALL be `localhost` or an IP address, an IPv6 address in square brackets; the port a number from 1 to 65535 |
+| `password` | no | The password the page of the web interface asks for, a non-empty string. Without it the web interface asks for none |
 
 `autoreply` SHALL be a table with these keys:
 
@@ -296,8 +304,20 @@ An exception under `[perms.except]` for a kind whose rule is not `all` has no co
 - **WHEN** the config has `anim = ["Jane Doe"]` under `[perms.autoaccept]` and `anim = ["01234567-9abc-defe-dcba-987654321000"]` under `[perms.except]`
 - **THEN** the bot starts with that rule and that exception, and the line that names `perms` as deprecated says that the exception for `anim` cannot be written in the startup script
 
+#### Scenario: Web interface configured
+- **WHEN** the config ends with a `[web]` table containing `listen = "127.0.0.1:8080"`
+- **THEN** the bot serves its web interface at `http://127.0.0.1:8080/` and asks for no password
+
+#### Scenario: Web interface with a password
+- **WHEN** the `[web]` table also contains `password = "s3cret"`
+- **THEN** the page at that address shows nothing of the bot until `s3cret` is given
+
+#### Scenario: Web not mentioned
+- **WHEN** the config has no `[web]` table
+- **THEN** the bot listens on no web address
+
 ### Requirement: Config validation before any network activity
-The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `atstart`, `position`, `sit`, `rlv` and `override`, with a `position` or `sit` other than `"cur"` and `"cfg"`, with an `atstart` that is not a boolean, with an `rlv` other than `"drop"` and `"follow"`, with an `override` that is neither `"sit"`, `"tp"` nor an array of these two strings, or with `atstart = false` together with `position` or `sit`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, a `restore_attachments` that is not a boolean, an `rlv` that is not a boolean, a `perms` that is not in its form (a value that is not a table, a key other than `autoaccept` and `except`, an `autoaccept` or `except` that is not a table, a key in either that is not a kind of request, a value under `autoaccept` that is neither `"all"`, a boolean nor an array of strings, a value under `except` that is not an array of strings, an entry that is neither a UUID nor a name of one or two words, the entry `"all"` inside an array, or one entry both in a kind's `autoaccept` array and in its `except` array), an `xmpp` that is not in its form (a value that is not a table, a key other than `component`, `server`, `secret` and `owners`, a missing `component`, `secret` or `owners`, a `component` that is not a domain name or that holds `@` or `/`, a `server` that is not `host:port` with a port from 1 to 65535 or whose host is neither `localhost` nor a loopback address, a `secret` that is not a non-empty string, an `owners` that is not a non-empty array of strings, or an owner that is not a bare address `user@domain`), an `autoreply` that is not in its form (a value that is not a table, a key other than `message` and `pause`, a missing `message`, a `message` that is not a string, is blank or is longer than 1023 bytes, or a `pause` that is not a string in the duration form or is longer than 365 days), both `startup` and `startup_file`, a `startup` that is not a string, a `startup_file` that is not a non-empty string, a `startup_file` file that cannot be read or is not valid UTF-8, a startup script that is not in its form (see `startup-script`: a command that ends inside double quotes, that is longer than 8192 bytes, whose name the control socket does not know, or that has a number or form of arguments for which the control socket refuses it without looking at the bot's state), a setting command at the head of the startup script that is refused when it is carried out (see `startup-script`, "Setting commands run before the first login"), and an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything. For a startup script the message SHALL name `startup` or `startup_file`, whichever the config has, and the line the offending command starts on. A command of the startup script that is in its form and is no setting command at the head SHALL NOT be judged before it is due: when it is refused then, the bot keeps running, as `startup-script` says.
+The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `atstart`, `position`, `sit`, `rlv` and `override`, with a `position` or `sit` other than `"cur"` and `"cfg"`, with an `atstart` that is not a boolean, with an `rlv` other than `"drop"` and `"follow"`, with an `override` that is neither `"sit"`, `"tp"` nor an array of these two strings, or with `atstart = false` together with `position` or `sit`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, a `restore_attachments` that is not a boolean, an `rlv` that is not a boolean, a `perms` that is not in its form (a value that is not a table, a key other than `autoaccept` and `except`, an `autoaccept` or `except` that is not a table, a key in either that is not a kind of request, a value under `autoaccept` that is neither `"all"`, a boolean nor an array of strings, a value under `except` that is not an array of strings, an entry that is neither a UUID nor a name of one or two words, the entry `"all"` inside an array, or one entry both in a kind's `autoaccept` array and in its `except` array), an `xmpp` that is not in its form (a value that is not a table, a key other than `component`, `server`, `secret` and `owners`, a missing `component`, `secret` or `owners`, a `component` that is not a domain name or that holds `@` or `/`, a `server` that is not `host:port` with a port from 1 to 65535 or whose host is neither `localhost` nor a loopback address, a `secret` that is not a non-empty string, an `owners` that is not a non-empty array of strings, or an owner that is not a bare address `user@domain`), a `web` that is not in its form (a value that is not a table, a key other than `listen` and `password`, a missing `listen`, a `listen` that is not `host:port` with a port from 1 to 65535 or whose host is neither `localhost` nor an IP address, or a `password` that is not a non-empty string), an `autoreply` that is not in its form (a value that is not a table, a key other than `message` and `pause`, a missing `message`, a `message` that is not a string, is blank or is longer than 1023 bytes, or a `pause` that is not a string in the duration form or is longer than 365 days), both `startup` and `startup_file`, a `startup` that is not a string, a `startup_file` that is not a non-empty string, a `startup_file` file that cannot be read or is not valid UTF-8, a startup script that is not in its form (see `startup-script`: a command that ends inside double quotes, that is longer than 8192 bytes, whose name the control socket does not know, or that has a number or form of arguments for which the control socket refuses it without looking at the bot's state), a setting command at the head of the startup script that is refused when it is carried out (see `startup-script`, "Setting commands run before the first login"), an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on, and a web interface whose `listen` address is in use by another process or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything. For a startup script the message SHALL name `startup` or `startup_file`, whichever the config has, and the line the offending command starts on. A command of the startup script that is in its form and is no setting command at the head SHALL NOT be judged before it is due: when it is refused then, the bot keeps running, as `startup-script` says.
 
 #### Scenario: Both password forms given
 - **WHEN** the config contains both `password` and `password_hash`
@@ -483,6 +503,30 @@ The bot SHALL validate the whole config before contacting any server. It SHALL r
 - **WHEN** `startup` is the two lines `say hello` and `autoreply pause soon`
 - **THEN** the bot starts and logs in; the refusal of `autoreply pause soon` is in the operator log once the avatar has said `hello`
 
+#### Scenario: Web table without listen
+- **WHEN** the config has a `[web]` table containing only `password = "s3cret"`, or an empty `[web]` table
+- **THEN** the bot prints an error naming `web.listen` and exits with status 2
+
+#### Scenario: Malformed listen
+- **WHEN** the `[web]` table contains `listen = "8080"`, `listen = "127.0.0.1"`, `listen = "127.0.0.1:0"`, `listen = "127.0.0.1:70000"` or `listen = 8080`
+- **THEN** the bot prints an error naming `web.listen` and the form `host:port`, and exits with status 2
+
+#### Scenario: Listen on a host name
+- **WHEN** the `[web]` table contains `listen = "bot.example.org:8080"`
+- **THEN** the bot prints an error naming `web.listen` that says the host is `localhost` or an IP address, and exits with status 2
+
+#### Scenario: Unknown key in the web table
+- **WHEN** the `[web]` table contains `user = "me"`
+- **THEN** the bot prints an error naming `web.user` and the keys there are, and exits with status 2
+
+#### Scenario: Empty web password
+- **WHEN** the `[web]` table contains `password = ""` or `password = 1234`
+- **THEN** the bot prints an error naming `web.password` and exits with status 2
+
+#### Scenario: Web address in use
+- **WHEN** the `[web]` table contains `listen = "127.0.0.1:8080"` and another process listens on that address
+- **THEN** the bot prints an error naming `web.listen`, the address and the reason, and exits with status 2 without contacting the login server
+
 ### Requirement: Password hash subcommand
 The bot SHALL provide a `hash` subcommand that reads a password from standard input and prints the corresponding hash on standard output as `$1$` followed by the 32 lowercase hexadecimal digits of the MD5 digest of the password. The password SHALL NOT be accepted as a command-line argument. When standard input is a terminal the password SHALL NOT be echoed. A trailing line ending SHALL NOT be part of the hashed password. An empty password SHALL be rejected with a non-zero exit status.
 
@@ -499,7 +543,7 @@ The bot SHALL provide a `hash` subcommand that reads a password from standard in
 - **THEN** it prints an error and exits with a non-zero status without printing a hash
 
 ### Requirement: Secrets stay out of output
-The bot SHALL NOT write the plain password, the password hash or the XMPP component secret to its log or to any error message.
+The bot SHALL NOT write the plain password, the password hash, the XMPP component secret or the password of the web interface to its log or to any error message, and SHALL NOT send any of them to a page of the web interface.
 
 #### Scenario: Login failure logging
 - **WHEN** a login attempt is rejected
@@ -508,3 +552,7 @@ The bot SHALL NOT write the plain password, the password hash or the XMPP compon
 #### Scenario: Component handshake refused
 - **WHEN** the XMPP server refuses the component's handshake because the secret is wrong
 - **THEN** the logged message names the component domain and the server's reason but not the secret
+
+#### Scenario: Wrong web password
+- **WHEN** someone gives the web interface a wrong password
+- **THEN** the logged message names the address the attempt came from, and holds neither what was given nor the password of the config
