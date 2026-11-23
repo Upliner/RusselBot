@@ -921,3 +921,74 @@ rig itself, what item 265 stands in for; an inventory of thousands of
 folders; two windows of one browser at a logout; a reverse proxy in front
 of the bot, so the nginx and Caddy examples of the README are untried;
 Second Life.
+
+### Second run: Firefox, a phone, nginx and Caddy
+
+Run on 2026-11-23 with the debug build on Linux (Manjaro), against the rig
+of [Build and start](#build-and-start) as it was left there (the seat
+`Seat` at 130, 128, `friend.py make` done, `stock.py`'s inventory), with
+the hostile prim of the first run rezzed again at 133, 128. The bot's
+config is the first run's with `sit` set to `Seat` and
+
+```toml
+[web]
+listen = "192.168.0.70:8088"   # the machine's address on the home network
+password = "..."
+```
+
+so that a phone on the same network reaches it. Firefox 160 ran headless
+and was driven over WebDriver BiDi (`--remote-debugging-port`) from a
+Python script, which clicked the page's own controls and read what they
+showed; the viewport was 360 by 740 pixels except where noted.
+
+| # | Inject | Expected | Result (2026-11-23, Firefox 160, Linux) |
+|---|---|---|---|
+| 266 | Open `/` without a session; a wrong password; the right one; `/#inventory` | The login box and nothing else; `The password is wrong.` and an empty box; the tabs; the Inventory tab | Pass, and `web: wrong password from 192.168.0.70`, `web: login from 192.168.0.70` |
+| 267 | With the login box shown, change the address to `/#inventory`; log in | Nothing asked of the bot behind the box; after the login the 19 folders | **Failed first**: the tab asked for its folder behind the box, got 401, and after the login showed `the session has ended; log in again` and no tree until "Refresh". The page now asks nothing while the login box is up (`route` in `app.js`); after that change, pass. The same happens in every browser, not only Firefox |
+| 268 | World: the status panel; `12o` as X; "Scan objects" within 20; on the rows "Touch" (the hostile prim), "Teleport" (`Garden Seat`), "Sit" (`Seat`); "Stand up"; `listen.py 240 at=131,128,25`, "Scan avatars", "Teleport" and "IM" on its row | `Target`, `Seat (the held seat)`, `holding`; the X box marked and nothing sent; six rows, the hostile name and description letter by letter; `done`, `arrived in Target`, `seated on <uuid>`, `done`; `Rig Owner`, `2.3 m`, `at 131,128,26`; `arrived in Target`; the IM tab with `Rig Owner` open | Pass: no `img`, `b` or `script` element under the list; `listen.py` heard `<img src=x onerror=alert(1)>: Touched.` |
+| 269 | Local chat while `talk.py` runs; `hello everyone` and `/shout come here` from the box | The lines of item 256, the one with a tab and a line end as those characters; `Sit Bot: hello everyone`, `Sit Bot shouts: come here`, the box emptied; the IM tab marked | Pass |
+| 270 | IM: open `Rig Owner`'s conversation; answer `see you`; "Open" with `rig.owner`; "Open" with `Nobody Here` and send `hi` | `are you there?` and the mark gone; `see you` set apart as sent; still one conversation; the error naming `Nobody Here` with `hi` still in the box; the friend list with `Rig Owner`, `offline` | Pass |
+| 271 | Inventory: open `Bot gear`; on `Radio` (attached) "Touch", "Detach", "Attach"; "Attached only"; back | `done`; `detached "Radio"` and "Attach" in place of "Detach"; `is attached to Left Hand` and "Detach" and "Touch" again; the one entry `Bot gear/Radio`; the tree again | Pass |
+| 272 | Console: `tp 128 128 25 Home` and at once `status`; `scan 10`; `im "Jane Doe hi`; three spaces; `help`; the up arrow | `status` answered with `region: Target` while the teleport was still under way, each answer under its own line; the listing in columns (`white-space: pre`, `tab-size: 8`, a monospace font); the error about the quote; nothing sent; the command list; `help` in the box | Pass |
+| 273 | Settings with Firefox set to light: the browser's, light, dark; reload; Firefox restarted set to dark (`layout.css.prefers-color-scheme.content-override`); light; the browser's | Light, light, dark; dark kept over the reload; light; dark | Pass, and still logged in after the restart of Firefox |
+| 274 | `rlv mode on`, `rlv cmd @shownearby=n,showinv=n,tploc=n`, `rlv mode override` from the Console; the Local chat tab for 6 s and the IM tab; `rlv status`; `rlv mode on`; the teleport form, "Scan avatars", the Inventory tab | The chat-range list refused naming `shownearby`; `rlv: override` still; the three refused naming `tploc`, `shownearby` and `showinv` | Pass |
+| 275 | Stop the bot with the page open; "Stand up"; start the bot | The bar saying the bot cannot be reached; `the bot cannot be reached; nothing was sent`; the bar gone by itself | Pass: found again 8 s after the start; no `stand` in the bot's log |
+| 276 | Every tab at 360 pixels | No tab wider than the screen | Pass: `scrollWidth` 348 on all six, the rest being headless Firefox's scroll bar |
+
+No difference between Firefox and the Chromium of the first run showed,
+in behaviour or in layout.
+
+On an Android phone, on the same network, by the operator (its browser
+was not noted), with the page open at `http://192.168.0.70:8088/`:
+
+| # | Inject | Expected | Result (2026-11-23, Android phone) |
+|---|---|---|---|
+| 280 | Log in; World; Local chat while `talk.py` runs; IM: open `Rig Owner`'s conversation and answer `yes` | The tabs; the status panel and the teleport form within the screen; the lines of item 256 as they are said and `Rig Owner` in the chat-range list; the IM tab marked, `are you there?`, `yes` set apart as sent | Pass, from the operator's screenshots: no tab wider than the screen, the line with a tab and a line end shown as those characters; `web: login from 192.168.0.55` and `im [im_out] Rig Owner (Rig Owner): yes` in the log. **Partial**: a wrong password, the scans and their buttons, speaking from the chat box, the Inventory and Console tabs, the theme and losing and finding the bot were not tried on the phone; nothing of them reached the bot's log |
+
+The README's reverse proxy examples, with nginx 1.30 and Caddy 2.11 run
+as an ordinary user from a scratch directory, each with a self-signed
+certificate for `bot.example.org` and `localhost` (`curl --resolve` sends
+the name to 127.0.0.1). The nginx `server` block is the README's with
+`listen 8443 ssl`, the two `ssl_` lines and the bot's address in
+`proxy_pass`, inside a minimal `nginx.conf` (`pid`, the logs and the
+temporary paths in the scratch directory). The Caddyfile is the README's
+with the port, a `tls` line naming the certificate, and, in the global
+options, `auto_https disable_redirects` and `admin off`, since an
+ordinary user cannot take port 80 for the redirect:
+
+| # | Inject | Expected | Result (2026-11-23) |
+|---|---|---|---|
+| 277 | Through each proxy with `curl`: `/`; `/api/session`; log in; `status`; a `POST` without `X-Rslbot`; the event stream while `say` runs | The page; `login`; a session cookie; the status; 403; the said line on the stream as it is said | Pass, both: the line arrived 0.03 s after the `say` was answered, so nginx's `proxy_buffering off` is enough and Caddy needs nothing |
+| 278 | The page in Firefox at `https://localhost:8443/` and `https://localhost:8444/`: log in, say a line from Local chat | The line comes back on the page's stream; no bar | Pass, both |
+| 279 | A second bot without `password`, `listen = "127.0.0.1:8090"` and a `login_url` nobody answers at, behind one more site of each proxy; `/api/session` as `bot.example.org` and as `localhost` | Behind nginx, `open` under both names (nginx sends the upstream's address as `Host`); behind Caddy, `open` for `localhost` and the refusal naming IP addresses and `password` for `bot.example.org`, as the README says | Pass, and `web: refused a request from 127.0.0.1 for "bot.example.org:8446"` |
+
+Behind a proxy the bot's log names the proxy's address, not the
+browser's: the logins of items 277 and 278 were all logged as from
+`192.168.0.70`, the machine the proxies ran on.
+
+The checks of the change on the same machine:
+
+| # | Inject | Expected | Result (2026-11-23, Linux) |
+|---|---|---|---|
+| 281 | `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`, `openspec validate add-web-interface --strict` | All clean | Pass: 1117 tests passed, 1 ignored; the two control-socket tests that fail on macOS pass here |
+| 282 | Resident memory (`ps -o rss`, debug build) of the bot seated in `Target` 185 s after its start, with `[web]` and two pages open (Firefox and the phone of item 280), and without `[web]` | About the same | 12,276 KB and 11,580 KB |

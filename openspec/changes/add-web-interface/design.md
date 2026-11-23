@@ -158,8 +158,13 @@ The page was tried in one browser, the Chromium of the Claude desktop app,
 at desktop width and with the viewport set to 360 by 740 pixels
 (`docs/test-rig.md`, items 250 to 263). It uses nothing newer than
 `fetch`, `EventSource`, `classList` and CSS custom properties, so no
-difference is expected in Firefox or Safari, but none of them and no phone
-was tried, and so nothing here asks for a later change yet. One thing seen
+difference is expected in Firefox or Safari. Firefox 160 was then tried
+the same way on Linux (items 266 to 276), and an Android phone in part
+(item 280: login, World, local chat, an instant message): no difference
+showed, and nothing here asks for a later change. Safari was not tried.
+The one fault the second run found, a tab asking the bot for its contents
+behind the login box, was the page's in every browser and is fixed in
+`route`. One thing seen
 in that browser: while its pane is hidden, timers run about once a minute,
 so the page's own refreshes pause, as they are meant to for a window that
 is not looked at; events and answers arrive regardless.

@@ -441,6 +441,9 @@
       links[i].classList.toggle('current', current);
       if (current) { links[i].setAttribute('aria-current', 'page'); } else { links[i].removeAttribute('aria-current'); }
     }
+    // Behind the login box nothing is asked of the bot; `enter` routes
+    // again once the page is let in.
+    if ($('app').hidden) { return; }
     if (tab === 'chat') {
       show($('mark-chat'), false);
       if (state.chatFollow) { scrollToEnd($('chat-log')); }

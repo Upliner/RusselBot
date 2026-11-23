@@ -242,9 +242,12 @@ touch and detach, the console, the theme, the login box, the page losing
 and finding the bot, the RLV refusals `tploc`, `shownearby` and `showinv`
 on the page, and an override left in place by the page's own refreshes.
 `scan --position` and `touch` with the UUID of an attached item were tried
-there too. Not tried: a phone, other browsers, a reverse proxy in front of
-the bot (the nginx and Caddy examples below are written from their
-documentation), and anything of it on Second Life.
+there too. On 2026-11-23 (items 266 to 282) the same went through Firefox
+on Linux without a difference; on an Android phone, the login, the World
+tab, local chat and an instant message answered; and the nginx and Caddy
+examples below, over TLS with the page and its live updates. Not tried:
+the rest of the page on a phone, Safari, and anything of it on Second
+Life.
 
 The [XMPP gateway](#xmpp-gateway) is verified by unit tests, against a fake
 component server in the tests, and on the local OpenSim with a local
@@ -2194,7 +2197,8 @@ imitate. And without a password the bot answers only when it is opened by
 IP address or as `localhost`, never under a host name, since a name can be
 made to point at your machine by whoever owns it; behind a proxy that
 passes your own host name on, as Caddy does, set a password. Both
-refusals are logged with the address they came from.
+refusals are logged with the address they came from, which behind a proxy
+is the proxy's.
 
 ### The tabs
 
