@@ -1,5 +1,6 @@
 /.zed/
 /target
+/test/
 /test-rig/opensim/
 /test-rig/prosody/
 /russelbot.toml
