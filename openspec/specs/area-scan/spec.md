@@ -148,7 +148,7 @@ The lines SHALL be ordered by distance, nearest first, and by UUID where distanc
 - **THEN** its line has seven fields, with `\t` in the name
 
 ### Requirement: Flags in the listing
-The flags field SHALL be made of these words, in this order and separated by commas, or `-` when none applies: `scripted`, `touch`, `physical`, `temporary` and `phantom`, each when the simulator's description of the listed prim itself marks it so (`touch` when it marks the prim as handling touches); `attachment` for a prim an avatar wears; `child` for a prim that is not the root of its linkset.
+The flags field SHALL be made of these words, in this order and separated by commas, or `-` when none applies: `scripted`, `touch`, `pay`, `physical`, `temporary` and `phantom`, each when the simulator's description of the listed prim itself marks it so (`touch` when it marks the prim as handling touches, `pay` when it marks it as taking money); `attachment` for a prim an avatar wears; `child` for a prim that is not the root of its linkset.
 
 #### Scenario: Plain object
 - **WHEN** an unscripted, non-physical object rezzed for good is listed
@@ -161,6 +161,10 @@ The flags field SHALL be made of these words, in this order and separated by com
 #### Scenario: Script added later
 - **WHEN** a script is dropped into an object the bot has listed as `-` and `rslbot ctl scan` is run again
 - **THEN** its flags field has `scripted`
+
+#### Scenario: Object that takes money
+- **WHEN** a tip jar whose script handles payments is listed
+- **THEN** its flags field has `scripted,pay`, or `scripted,touch,pay` when it handles touches as well
 
 ### Requirement: Text filters
 `-n <text>` (also spelled `--name <text>`) SHALL list only prims whose name contains `<text>`, and `-d <text>` (also spelled `--desc <text>`) only prims whose description contains `<text>`, in both cases whatever the case of the letters. A prim whose name and description the bot does not know SHALL match neither.
@@ -197,7 +201,7 @@ The flags field SHALL be made of these words, in this order and separated by com
 - **THEN** the command exits with status 0 and prints nothing
 
 ### Requirement: Flag filters
-`-s` (`--scripted`), `-t` (`--touch`), `-p` (`--physical`), `--temporary` and `--phantom` SHALL each list only prims whose flags field would have that word.
+`-s` (`--scripted`), `-t` (`--touch`), `--pay`, `-p` (`--physical`), `--temporary` and `--phantom` SHALL each list only prims whose flags field would have that word.
 
 #### Scenario: Things to touch
 - **WHEN** `rslbot ctl scan -t` is run and of the objects nearby only a button's root prim handles touches
@@ -206,6 +210,10 @@ The flags field SHALL be made of these words, in this order and separated by com
 #### Scenario: Two flags
 - **WHEN** `rslbot ctl scan -s -p` is run
 - **THEN** only prims that are both scripted and physical are listed
+
+#### Scenario: Things to pay
+- **WHEN** `rslbot ctl scan --pay` is run and of the objects nearby only a tip jar's root prim takes money
+- **THEN** only the tip jar is listed
 
 ### Requirement: Attachments and child prims
 With `-a` (also spelled `--attachments`) the listing SHALL also have what avatars wear, the bot's avatar included, as far as the simulator has described it. With `-c` (also spelled `--children`) it SHALL also have the child prims of the linksets it lists, each with its own name and description. With both, the child prims of what avatars wear are listed too.

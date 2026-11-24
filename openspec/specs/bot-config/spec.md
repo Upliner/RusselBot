@@ -21,8 +21,9 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `sit` | no | Sit state of the config placement: the UUID of an object, or the word `ground`. When absent the config placement's sit state is `stand` and the bot does not seat the avatar at startup |
 | `object` | no | Deprecated spelling of `sit`, accepting a UUID only |
 | `persist` | no | Deprecated in favour of the startup script, as said below. What the bot holds once it has reached the config placement after startup (see `placement-persist`), and in its table form also what a forced RLV movement does to the held placement and which of the bot's own steps RLV restrictions do not hold back (see `rlv-commands`); the forms are given below. Defaults to `"off"` |
-| `log_chat` | no | Path of the TSV file that receives local chat; no chat file is written when absent |
-| `log_im` | no | Path of the TSV file that receives instant messages; no IM file is written when absent |
+| `log_chat` | no, and not together with `chat` in the `logs` table | Deprecated spelling of `chat` in the `logs` table |
+| `log_im` | no, and not together with `im` in the `logs` table | Deprecated spelling of `im` in the `logs` table |
+| `logs` | no | Table with the paths of the log files (see `message-log` and `transaction-log`); its form is given below. Without it, and without the two deprecated keys, the bot writes no log file |
 | `fetch_offline_im` | no | Boolean; when true the bot fetches instant messages stored while the avatar was offline. Defaults to false |
 | `socket` | no | Boolean; when true the bot listens on the control socket. Defaults to false |
 | `requesttp_timeout` | no | Number of minutes, greater than zero, during which the bot accepts a teleport offer from an avatar it has asked with `requesttp`. Defaults to 10 |
@@ -32,6 +33,7 @@ The bot SHALL read all of its settings from one TOML file. The file path SHALL b
 | `perms` | no | Deprecated in favour of the startup script. Table saying which requests the bot accepts by itself (see `permission-requests`); its form is given below. Without it the bot accepts none by itself |
 | `xmpp` | no | Table that switches on the XMPP gateway (see `xmpp-gateway`); its form is given below. Without it the bot makes no XMPP connection |
 | `web` | no | Table that switches on the web interface (see `web-server`); its form is given below. Without it the bot listens on no web address |
+| `payments` | no | Table that switches on payments (see `payments`); its form is given below. Without it the bot pays nothing |
 | `autoreply` | no | Deprecated in favour of the startup script. Table that switches on autoreplies to instant messages (see `im-autoreply`); its form is given below. Without it the bot starts with autoreply off and no autoreply text |
 | `startup` | no, and not together with `startup_file` | The startup script, a string of one or more lines: commands the bot carries out by itself when it starts (see `startup-script`) |
 | `startup_file` | no, and not together with `startup` | Path of a file that holds the startup script |
@@ -66,6 +68,27 @@ In the table form, `atstart` is a boolean that says whether the bot holds anythi
 | `listen` | yes | `host:port` of the address the web interface listens on, such as `127.0.0.1:8080`. The host SHALL be `localhost` or an IP address, an IPv6 address in square brackets; the port a number from 1 to 65535 |
 | `password` | no | The password the page of the web interface asks for, a non-empty string. Without it the web interface asks for none |
 
+`logs` SHALL be a table with these keys:
+
+| Key | Required | Meaning |
+|---|---|---|
+| `chat` | no | Path of the TSV file that receives local chat; no chat file is written when absent |
+| `im` | no | Path of the TSV file that receives instant messages; no IM file is written when absent |
+| `transactions` | no, but required when `payments.limit` is a number | Path of the TSV file that receives the avatar's transactions (see `transaction-log`); no transactions file is written, and none is read at startup, when absent |
+
+`payments` SHALL be a table with these keys:
+
+| Key | Required | Meaning |
+|---|---|---|
+| `limit` | yes | What the bot may pay in one period: a whole number of L$ from 0 to 2147483647, or the string `"unlimited"` |
+| `perms` | yes | The interfaces that may pay: an array of the strings `"ctl"`, `"xmpp"` and `"web"`, which may be empty. A string given twice SHALL count once. An interface the config does not switch on may be listed and then has no effect |
+| `limit_renew` | no | The length of a period of the limit, as a duration greater than zero. Without it the limit never renews. With `limit = "unlimited"` it has no effect |
+| `whitelist` | no | Array of entries: with it, only who is on it or on `unlimited_list` can be paid |
+| `blacklist` | no | Array of entries: who is on it is never paid |
+| `unlimited_list` | no | Array of entries: a payment to who is on it does not count against the limit |
+
+An entry of the three lists SHALL be a string holding a UUID, of an avatar or of an object, or an avatar's login name, written `First Last`, `first.last` or as a single word, in the forms `permission-requests`, "Auto-accept rules", gives for an entry; a display name is no entry (see `payments`, "Login names, not display names"). An entry that is given twice in one array SHALL count once.
+
 `autoreply` SHALL be a table with these keys:
 
 | Key | Required | Meaning |
@@ -75,7 +98,7 @@ In the table form, `atstart` is a boolean that says whether the bot holds anythi
 
 A duration SHALL be a string of one or more groups, each a whole number followed by one of the units `s` (seconds), `m` (minutes), `h` (hours) and `d` (days), written without spaces, such as `"90s"`, `"30m"`, `"2h"` or `"1h30m"`, or the string `"0"`. A unit SHALL appear at most once, and the units SHALL be in the order `d`, `h`, `m`, `s`. The duration is the sum of the groups and SHALL be at most 365 days. A config with an `autoreply` table SHALL start the bot with autoreply on.
 
-A relative `log_chat`, `log_im` or `startup_file` path SHALL be taken relative to the directory the bot was started in. A config that uses `object` SHALL behave exactly as the same config with that value under `sit`, and the bot SHALL write a line to standard error at startup that names `object` as deprecated and `sit` as its replacement.
+A relative path under `logs`, and a relative `log_chat`, `log_im` or `startup_file` path, SHALL be taken relative to the directory the bot was started in. A config that uses `log_chat` or `log_im` SHALL behave exactly as the same config with that path under `chat` or `im` of the `logs` table, and for each of the two keys the config contains the bot SHALL write a line to standard error at startup that names the key as deprecated and what to write under `[logs]` instead. A config that uses `object` SHALL behave exactly as the same config with that value under `sit`, and the bot SHALL write a line to standard error at startup that names `object` as deprecated and `sit` as its replacement.
 
 The keys `persist`, `rlv`, `perms` and `autoreply` are deprecated in favour of the startup script. A config that uses them SHALL behave as this requirement says, and what they set SHALL be in place before the first command of the startup script is carried out: the bot starts with what `rlv`, `perms`, `autoreply` and the `[persist]` keys `rlv` and `override` give, and it applies the `persist` setting before the rest of the script starts (see `startup-script`, "The rest waits for the config placement"). For each of these four keys the config contains, the bot SHALL write a line to standard error at startup that names the key as deprecated and the startup script commands that replace what the config gives for it:
 
@@ -149,12 +172,40 @@ An exception under `[perms.except]` for a kind whose rule is not `all` has no co
 - **THEN** the bot logs in with first name `sitbot` and last name `Resident`
 
 #### Scenario: No logging keys
-- **WHEN** the config contains none of `log_chat`, `log_im` and `fetch_offline_im`
+- **WHEN** the config contains none of `logs`, `log_chat`, `log_im` and `fetch_offline_im`
 - **THEN** the bot starts, writes no log file and does not fetch offline instant messages
 
 #### Scenario: Chat log configured
-- **WHEN** the config contains `log_chat = "chat.tsv"`
+- **WHEN** the `[logs]` table contains `chat = "chat.tsv"`
 - **THEN** the bot creates `chat.tsv` in the directory it was started in if it does not exist, and appends chat rows to it
+
+#### Scenario: All three log files
+- **WHEN** the `[logs]` table contains `chat = "chat.tsv"`, `im = "im.tsv"` and `transactions = "transactions.tsv"`
+- **THEN** local chat, instant messages and transactions each go to their own file
+
+#### Scenario: Old log keys
+- **WHEN** the config contains `log_chat = "chat.tsv"` and `log_im = "im.tsv"` and no `[logs]` table
+- **THEN** the bot writes both files as with `chat` and `im` under `[logs]`, and its log names `log_chat` and `log_im` as deprecated and shows the `[logs]` table to write instead
+
+#### Scenario: Old and new key for different files
+- **WHEN** the config contains `log_chat = "chat.tsv"` and a `[logs]` table with `im = "im.tsv"` only
+- **THEN** the bot writes both files, and its log names `log_chat` as deprecated
+
+#### Scenario: Payments not mentioned
+- **WHEN** the config has no `[payments]` table
+- **THEN** the bot starts, pays nothing on any command, and does not ask the grid for the avatar's balance
+
+#### Scenario: Payments table
+- **WHEN** the config has a `[payments]` table with `limit = 1000`, `limit_renew = "7d"` and `perms = ["ctl", "web"]`, and `transactions` under `[logs]`
+- **THEN** the bot starts, and `pay` is carried out from the control socket and from the web interface, within L$1000 in seven days
+
+#### Scenario: Unlimited without a transactions file
+- **WHEN** the `[payments]` table has `limit = "unlimited"` and `perms = ["ctl"]`, and the config has no `[logs]` table
+- **THEN** the bot starts and `rslbot ctl pay` is carried out without a limit
+
+#### Scenario: Interface that is not switched on
+- **WHEN** the `[payments]` table has `perms = ["ctl", "xmpp"]` and the config has no `[xmpp]` table
+- **THEN** the bot starts as with `perms = ["ctl"]`
 
 #### Scenario: Control socket enabled
 - **WHEN** the config contains `socket = true`
@@ -317,7 +368,7 @@ An exception under `[perms.except]` for a kind whose rule is not `all` has no co
 - **THEN** the bot listens on no web address
 
 ### Requirement: Config validation before any network activity
-The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `atstart`, `position`, `sit`, `rlv` and `override`, with a `position` or `sit` other than `"cur"` and `"cfg"`, with an `atstart` that is not a boolean, with an `rlv` other than `"drop"` and `"follow"`, with an `override` that is neither `"sit"`, `"tp"` nor an array of these two strings, or with `atstart = false` together with `position` or `sit`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `log_chat` or `log_im` file that cannot be opened for appending, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, a `restore_attachments` that is not a boolean, an `rlv` that is not a boolean, a `perms` that is not in its form (a value that is not a table, a key other than `autoaccept` and `except`, an `autoaccept` or `except` that is not a table, a key in either that is not a kind of request, a value under `autoaccept` that is neither `"all"`, a boolean nor an array of strings, a value under `except` that is not an array of strings, an entry that is neither a UUID nor a name of one or two words, the entry `"all"` inside an array, or one entry both in a kind's `autoaccept` array and in its `except` array), an `xmpp` that is not in its form (a value that is not a table, a key other than `component`, `server`, `secret` and `owners`, a missing `component`, `secret` or `owners`, a `component` that is not a domain name or that holds `@` or `/`, a `server` that is not `host:port` with a port from 1 to 65535 or whose host is neither `localhost` nor a loopback address, a `secret` that is not a non-empty string, an `owners` that is not a non-empty array of strings, or an owner that is not a bare address `user@domain`), a `web` that is not in its form (a value that is not a table, a key other than `listen` and `password`, a missing `listen`, a `listen` that is not `host:port` with a port from 1 to 65535 or whose host is neither `localhost` nor an IP address, or a `password` that is not a non-empty string), an `autoreply` that is not in its form (a value that is not a table, a key other than `message` and `pause`, a missing `message`, a `message` that is not a string, is blank or is longer than 1023 bytes, or a `pause` that is not a string in the duration form or is longer than 365 days), both `startup` and `startup_file`, a `startup` that is not a string, a `startup_file` that is not a non-empty string, a `startup_file` file that cannot be read or is not valid UTF-8, a startup script that is not in its form (see `startup-script`: a command that ends inside double quotes, that is longer than 8192 bytes, whose name the control socket does not know, or that has a number or form of arguments for which the control socket refuses it without looking at the bot's state), a setting command at the head of the startup script that is refused when it is carried out (see `startup-script`, "Setting commands run before the first login"), an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on, and a web interface whose `listen` address is in use by another process or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything. For a startup script the message SHALL name `startup` or `startup_file`, whichever the config has, and the line the offending command starts on. A command of the startup script that is in its form and is no setting command at the head SHALL NOT be judged before it is due: when it is refused then, the bot keeps running, as `startup-script` says.
+The bot SHALL validate the whole config before contacting any server. It SHALL reject a missing or unreadable file, invalid TOML, an unknown key, a missing required key, both or neither of `password` and `password_hash`, a `password_hash` that is not in the hash format, a `user` with more than two words, a `sit` that is neither a UUID nor the word `ground`, an `object` that is not a UUID, both `sit` and `object`, a `login_url` that is not an `http` or `https` URL, a `region` without `position` or a `position` without `region`, a `region` that is empty, a `position` that is not three finite numbers, a `start` that is neither `home` nor `latest`, a `start` together with `region` and `position`, a `persist` that is not in one of its forms (a string other than `cur`, `cfg` and `off`, the boolean `true`, an array that is not exactly two of `"cur"` and `"cfg"`, a table with a key other than `atstart`, `position`, `sit`, `rlv` and `override`, with a `position` or `sit` other than `"cur"` and `"cfg"`, with an `atstart` that is not a boolean, with an `rlv` other than `"drop"` and `"follow"`, with an `override` that is neither `"sit"`, `"tp"` nor an array of these two strings, or with `atstart = false` together with `position` or `sit`, or a value of any other type), a `log_chat` or `log_im` that is not a non-empty string, a `logs` that is not in its form (a value that is not a table, a key other than `chat`, `im` and `transactions`, or a path that is not a non-empty string), `log_chat` together with `logs.chat`, `log_im` together with `logs.im`, a log file that cannot be opened for appending, a transactions file that exists and cannot be read or whose first line is not the header row of `transaction-log`, a `fetch_offline_im` that is not a boolean, a `socket` that is not a boolean, a `requesttp_timeout` that is not a number greater than zero, a `scan_distance` that is not a number from 1 to 1024, a `restore_attachments` that is not a boolean, an `rlv` that is not a boolean, a `perms` that is not in its form (a value that is not a table, a key other than `autoaccept` and `except`, an `autoaccept` or `except` that is not a table, a key in either that is not a kind of request, a value under `autoaccept` that is neither `"all"`, a boolean nor an array of strings, a value under `except` that is not an array of strings, an entry that is neither a UUID nor a name of one or two words, the entry `"all"` inside an array, or one entry both in a kind's `autoaccept` array and in its `except` array), an `xmpp` that is not in its form (a value that is not a table, a key other than `component`, `server`, `secret` and `owners`, a missing `component`, `secret` or `owners`, a `component` that is not a domain name or that holds `@` or `/`, a `server` that is not `host:port` with a port from 1 to 65535 or whose host is neither `localhost` nor a loopback address, a `secret` that is not a non-empty string, an `owners` that is not a non-empty array of strings, or an owner that is not a bare address `user@domain`), a `web` that is not in its form (a value that is not a table, a key other than `listen` and `password`, a missing `listen`, a `listen` that is not `host:port` with a port from 1 to 65535 or whose host is neither `localhost` nor an IP address, or a `password` that is not a non-empty string), a `payments` that is not in its form (a value that is not a table, a key other than `limit`, `perms`, `limit_renew`, `whitelist`, `blacklist` and `unlimited_list`, a missing `limit` or `perms`, a `limit` that is neither a whole number from 0 to 2147483647 nor the string `"unlimited"`, a `perms` that is not an array of the strings `"ctl"`, `"xmpp"` and `"web"`, a `limit_renew` that is not a string in the duration form, is `"0"` or is longer than 365 days, a list that is not an array of strings, an entry that is neither a UUID nor a name of one or two words, or one entry both in `blacklist` and in `whitelist` or `unlimited_list`), a `payments.limit` that is a number without `logs.transactions`, an `autoreply` that is not in its form (a value that is not a table, a key other than `message` and `pause`, a missing `message`, a `message` that is not a string, is blank or is longer than 1023 bytes, or a `pause` that is not a string in the duration form or is longer than 365 days), both `startup` and `startup_file`, a `startup` that is not a string, a `startup_file` that is not a non-empty string, a `startup_file` file that cannot be read or is not valid UTF-8, a startup script that is not in its form (see `startup-script`: a command that ends inside double quotes, that is longer than 8192 bytes, whose name the control socket does not know, or that has a number or form of arguments for which the control socket refuses it without looking at the bot's state), a setting command at the head of the startup script that is refused when it is carried out (see `startup-script`, "Setting commands run before the first login"), an enabled control socket that cannot be set up: its address cannot be determined, is malformed, is in use by another process, or cannot be listened on, and a web interface whose `listen` address is in use by another process or cannot be listened on. On rejection it SHALL print a message naming the offending key and the reason, and exit with status 2 without sending anything. For a startup script the message SHALL name `startup` or `startup_file`, whichever the config has, and the line the offending command starts on. A command of the startup script that is in its form and is no setting command at the head SHALL NOT be judged before it is due: when it is refused then, the bot keeps running, as `startup-script` says.
 
 #### Scenario: Both password forms given
 - **WHEN** the config contains both `password` and `password_hash`
@@ -364,12 +415,28 @@ The bot SHALL validate the whole config before contacting any server. It SHALL r
 - **THEN** the bot prints an error naming that key and exits with status 2
 
 #### Scenario: Log file cannot be opened
+- **WHEN** `im` under `[logs]` names a file in a directory that does not exist
+- **THEN** the bot prints an error naming `logs.im` and the reason, and exits with status 2 without contacting the login server
+
+#### Scenario: Old log key that cannot be opened
 - **WHEN** `log_im` names a file in a directory that does not exist
 - **THEN** the bot prints an error naming `log_im` and the reason, and exits with status 2 without contacting the login server
 
 #### Scenario: Empty log path
-- **WHEN** `log_chat` is an empty string
-- **THEN** the bot prints an error naming `log_chat` and exits with status 2
+- **WHEN** `log_chat` is an empty string, or `chat` under `[logs]` is an empty string or a number
+- **THEN** the bot prints an error naming `log_chat` or `logs.chat` and exits with status 2
+
+#### Scenario: Both spellings of one log file
+- **WHEN** the config contains `log_chat = "chat.tsv"` and a `[logs]` table with `chat = "chat.tsv"`
+- **THEN** the bot prints an error naming `log_chat` and `logs.chat`, and exits with status 2
+
+#### Scenario: Unknown key in the logs table
+- **WHEN** the `[logs]` table contains `payments = "pay.tsv"`
+- **THEN** the bot prints an error naming `logs.payments` and the keys there are, and exits with status 2
+
+#### Scenario: Transactions file that is something else
+- **WHEN** `transactions` under `[logs]` names an existing file whose first line is not the header row
+- **THEN** the bot prints an error naming `logs.transactions` and the file, and exits with status 2 without contacting the login server
 
 #### Scenario: Socket key of the wrong type
 - **WHEN** the config contains `socket = "yes"`
@@ -526,6 +593,38 @@ The bot SHALL validate the whole config before contacting any server. It SHALL r
 #### Scenario: Web address in use
 - **WHEN** the `[web]` table contains `listen = "127.0.0.1:8080"` and another process listens on that address
 - **THEN** the bot prints an error naming `web.listen`, the address and the reason, and exits with status 2 without contacting the login server
+
+#### Scenario: Payments table without its mandatory keys
+- **WHEN** the config has a `[payments]` table without `limit`, without `perms`, or with neither
+- **THEN** the bot prints an error naming `payments.limit` or `payments.perms` as required, and exits with status 2
+
+#### Scenario: Malformed limit
+- **WHEN** the `[payments]` table contains `limit = -1`, `limit = 10.5`, `limit = "1000"`, `limit = "none"` or `limit = true`
+- **THEN** the bot prints an error naming `payments.limit` that says it is a whole number of L$ or `"unlimited"`, and exits with status 2
+
+#### Scenario: Malformed payment perms
+- **WHEN** the `[payments]` table contains `perms = "web"`, `perms = ["ctl", "socket"]` or `perms = [1]`
+- **THEN** the bot prints an error naming `payments.perms` and the three interfaces, and exits with status 2
+
+#### Scenario: Malformed limit renewal
+- **WHEN** the `[payments]` table contains `limit_renew = "7 days"`, `limit_renew = "0"`, `limit_renew = 7` or `limit_renew = "400d"`
+- **THEN** the bot prints an error naming `payments.limit_renew` and the duration form, and exits with status 2
+
+#### Scenario: Limit without a transactions file
+- **WHEN** the `[payments]` table contains `limit = 1000` and the config has no `transactions` under `[logs]`
+- **THEN** the bot prints an error naming `payments.limit` and `logs.transactions`, saying that the limit is kept in that file, and exits with status 2
+
+#### Scenario: Malformed payment list
+- **WHEN** the `[payments]` table contains `whitelist = "Jane Doe"`, `blacklist = [42]` or `unlimited_list = ["Jane Mary Doe"]`
+- **THEN** the bot prints an error naming that key and exits with status 2
+
+#### Scenario: Entry on the blacklist and on another list
+- **WHEN** the `[payments]` table contains `blacklist = ["Jane Doe"]` and `whitelist = ["jane.doe"]`
+- **THEN** the bot prints an error naming `payments.blacklist`, `payments.whitelist` and the entry, and exits with status 2
+
+#### Scenario: Unknown key in the payments table
+- **WHEN** the `[payments]` table contains `max = 100`
+- **THEN** the bot prints an error naming `payments.max` and the keys there are, and exits with status 2
 
 ### Requirement: Password hash subcommand
 The bot SHALL provide a `hash` subcommand that reads a password from standard input and prints the corresponding hash on standard output as `$1$` followed by the 32 lowercase hexadecimal digits of the MD5 digest of the password. The password SHALL NOT be accepted as a command-line argument. When standard input is a terminal the password SHALL NOT be echoed. A trailing line ending SHALL NOT be part of the hashed password. An empty password SHALL be rejected with a non-zero exit status.

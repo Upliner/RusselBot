@@ -75,7 +75,7 @@ The script SHALL take every command the control socket takes, written without `r
 - **THEN** the bot rejects its config, naming the line and `rslbot` as an unknown command
 
 ### Requirement: Script commands are the operator's
-A script command SHALL be carried out as the control socket carries out the same command, with the same effects, and SHALL count as a command of the operator: RLV restrictions apply to it and `rlv mode override` exempts it as they do the operator's, and it changes the placement mode as the operator's does. The script SHALL need no other way of sending commands to be enabled: it SHALL be carried out with and without the control socket.
+A script command SHALL be carried out as the control socket carries out the same command, with the same effects, and SHALL count as a command of the operator and of the interface `ctl` (see `payments`, "Interfaces that may pay"), whether or not the control socket is enabled: RLV restrictions apply to it and `rlv mode override` exempts it as they do the operator's, and it changes the placement mode as the operator's does. The script SHALL need no other way of sending commands to be enabled: it SHALL be carried out with and without the control socket.
 
 #### Scenario: No socket
 - **WHEN** the config has a script and no `socket = true`
@@ -88,6 +88,10 @@ A script command SHALL be carried out as the control socket carries out the same
 #### Scenario: Restricted command
 - **WHEN** an attachment has said `@sendchat=n` to its owner before the script's command `say hello` is due, and RLV is on
 - **THEN** the command is refused as `rslbot ctl say hello` would be
+
+#### Scenario: Paying from the script
+- **WHEN** `payments.perms` has `ctl`, the config has no `socket = true`, and the script's command `pay 10 avatar "Jane Doe"` is due
+- **THEN** Jane Doe is paid L$10, within the limit and the lists as a payment from `rslbot ctl` is
 
 ### Requirement: Order of the commands
 The commands SHALL be carried out in the order the script has them, one at a time: a command SHALL start only when the one before it has been answered. The script SHALL be carried out at most once in a run of the bot; it SHALL NOT start again, or go on, because of a session loss or a later login.
