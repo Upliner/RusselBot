@@ -5,3 +5,4 @@
 [submodule "references/opensim"]
 	path = references/opensim
 	url = git@github.com:Upliner/opensim.git
+	branch = rig-money-module
