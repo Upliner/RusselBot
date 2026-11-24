@@ -101,6 +101,14 @@ input:not([type="checkbox"]):not([type="radio"]) {
   max-width: 100%;
 }
 
+select {
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: .3rem .4rem;
+  max-width: 100%;
+}
+
 input.bad { border-color: var(--error); outline: 2px solid var(--error); outline-offset: -1px; }
 
 button {
@@ -123,7 +131,8 @@ button.small, .rows button, .tree button, .picks button.x, .notice button {
 }
 
 button:hover { filter: brightness(1.08); }
-button.small:hover, .rows button:hover, .tree button:hover { background: var(--hover); filter: none; }
+button.secondary { background: transparent; color: var(--accent); border-color: var(--line); }
+button.small:hover, .rows button:hover, .tree button:hover, button.secondary:hover { background: var(--hover); filter: none; }
 button:disabled { opacity: .55; cursor: default; }
 button.busy { cursor: progress; }
 button.busy::after { content: " …"; }
@@ -381,6 +390,63 @@ ul { list-style: none; margin: 0; padding: 0; }
 .tree .more { color: var(--muted); font-size: .85rem; }
 .tree .attached { color: var(--online); font-weight: 600; font-size: .85rem; }
 .tree .acts { display: flex; flex-wrap: wrap; gap: .3rem; }
+
+/* ---------------------------------------------------------------- money */
+
+#money-header .item { flex-wrap: wrap; }
+#money-header .name, #money-header .value { white-space: nowrap; }
+#money-header .renew { color: var(--muted); }
+
+.money { display: flex; flex-wrap: wrap; gap: .6rem; align-items: flex-start; margin-bottom: .6rem; }
+.money-form { flex: 2 1 20rem; min-width: 0; margin-bottom: 0; }
+.money-side {
+  flex: 1 1 15rem;
+  max-width: 100%;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: .7rem;
+}
+.money-side h2:not(:first-child) { margin-top: .8rem; }
+.money-side ul { max-height: 14rem; overflow-y: auto; }
+
+/* The answer or the error of a payment, or that it is under way. */
+.result {
+  margin: .5rem 0 0;
+  padding: .35rem .55rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--ok-bg);
+  white-space: pre-wrap;
+}
+.result.wait { background: transparent; color: var(--muted); }
+.result.error { background: var(--error-bg); color: var(--error); border-color: var(--error); }
+
+.rows .pay-area { flex: 1 1 100%; min-width: 0; }
+.rows .pay-area:empty { display: none; }
+.rows .pay-area .fields { margin-top: .3rem; }
+.rows .pay-area button.pay-send { background: var(--accent); color: var(--accent-text); border-color: transparent; }
+
+.tx .kind { font-weight: 600; }
+.tx .time { color: var(--muted); font-size: .85rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rows li.tx.failed, .rows li.tx.unconfirmed { padding-left: .5rem; padding-right: .5rem; border-left: 3px solid var(--error); }
+.tx.failed { background: var(--error-bg); }
+.tx.unconfirmed { background: var(--warn-bg); }
+.rows li.tx.unconfirmed { border-left-style: dashed; }
+.tx.failed .kind, .tx.unconfirmed .kind { color: var(--error); }
+
+.dialog {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1rem;
+  width: 28rem;
+  max-width: calc(100vw - 2rem);
+}
+.dialog::backdrop { background: rgba(0, 0, 0, .5); }
+.dialog p { margin: 0 0 .5rem; white-space: pre-wrap; }
+.dialog .buttons { justify-content: flex-end; }
 
 /* -------------------------------------------------------------- console */
 

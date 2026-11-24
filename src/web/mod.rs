@@ -392,7 +392,7 @@ fn command(route: Route, request: &http::Request, shared: &Arc<Shared>) -> http:
     let own = request.marked(http::OWN_MARKER);
     if own && !http::may_be_own(&command) {
         let reason = format!(
-            "`{}` cannot be sent as the page's own; only `scan avatars` and `friends` can",
+            "`{}` cannot be sent as the page's own; only `scan avatars`, `friends` and `payees` can",
             command.name()
         );
         shared.log(format!("web: bad command: {reason}"));

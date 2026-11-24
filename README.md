@@ -349,8 +349,7 @@ One TOML file; see `russelbot.example.toml`.
 | `start` | no, and only without `region` and `position` | Where the first login puts the avatar: `"home"` (its home location) or `"latest"` (where it was last). Default: `"latest"` |
 | `sit` | no | What to sit on at the start: the UUID of an object, or `"ground"`. Default: the avatar stands, and the bot does not sit it |
 | `object` | no | Deprecated spelling of `sit`, for a UUID only; the bot logs a warning. Not together with `sit` |
-| `log_chat` | no | File that receives local chat, see [Chat and IM logs](#chat-and-im-logs) |
-| `log_im` | no | File that receives instant messages |
+| `logs` | no | A table, `[logs]`, with the paths of the log files: `chat`, `im` and `transactions`, see [Chat and IM logs](#chat-and-im-logs). Default: no log file |
 | `fetch_offline_im` | no | `true` to also fetch IMs stored while the avatar was offline. Default: `false` |
 | `socket` | no | `true` to listen on the control socket, see [Control socket](#control-socket). Default: `false` |
 | `requesttp_timeout` | no | Minutes after `requesttp` during which the asked avatar's teleport offer is accepted. Default: `10` |
@@ -360,7 +359,9 @@ One TOML file; see `russelbot.example.toml`.
 | `startup_file` | no, and not with `startup` | A file that holds the startup script; a relative path is relative to the working directory |
 | `xmpp` | no | A table, `[xmpp]`, that makes the bot an XMPP component, see [XMPP gateway](#xmpp-gateway). Default: no XMPP connection |
 | `web` | no | A table, `[web]`, that makes the bot serve a web page to use it from, see [Web interface](#web-interface). Default: no web interface |
+| `payments` | no | A table, `[payments]`, that lets the bot pay, see [Payments](#payments). Default: the bot pays nothing |
 | `persist`, `rlv`, `perms`, `autoreply` | no | Deprecated: what the startup script says with commands, see [Deprecated keys](#deprecated-keys) |
+| `log_chat`, `log_im` | no | Deprecated spellings of `chat` and `im` in the `[logs]` table, see [Deprecated keys](#deprecated-keys) |
 
 ### Startup script
 
@@ -457,6 +458,20 @@ each of them a config uses, the bot logs at startup what to write instead:
 | `anim = [...]` under `[perms.except]` | `perms revoke anim ...`, after `perms autoaccept anim all` |
 | `[autoreply]` with `message` and `pause` | `autoreply message ...` and `autoreply pause ...` |
 
+`log_chat` and `log_im` are the older spellings of `chat` and `im` in the
+`[logs]` table. They still work, and the bot logs at startup the line to
+write under `[logs]` instead:
+
+```toml
+# was: log_chat = "chat.tsv"
+[logs]
+chat = "chat.tsv"
+```
+
+A config may not name one file both ways: `log_chat` together with `chat`
+under `[logs]` is an error. Like every table, `[logs]` goes after the keys
+that are not in a table.
+
 `[perms.except]` was meant for kinds whose rule is `"all"`. The table also
 takes an exception for a kind whose rule is a list (one object of an
 avatar that is listed), and no command sets that; the bot says so when a
@@ -523,6 +538,12 @@ Configs written for earlier versions still load, but these things changed:
 * `persist`, `rlv`, `[perms]` and `[autoreply]` are deprecated in favour of
   the [startup script](#startup-script). They still work; the bot logs
   what to write instead, see [Deprecated keys](#deprecated-keys).
+* `log_chat` and `log_im` are deprecated in favour of the `[logs]` table,
+  which also takes the new transactions file. They still work; the bot
+  logs what to write instead.
+* `status` has a second line, `avatar`, with the avatar's name, and, for
+  an interface that may pay, two lines `balance` and `limit` at its end. A
+  script that reads `status` by line number needs adjusting.
 
 To keep the plain password out of the file:
 
@@ -546,11 +567,21 @@ kind `im_auto`. Group chat, offers (teleport offers
 and requests included; those appear on standard error only), invitations
 and typing notifications are not recorded.
 
-With `log_chat` and/or `log_im` set, each message is also appended to that
-file as one tab-separated line (UTF-8). The file is created when missing and
-gets a header line when it is empty; relative paths are relative to the
-directory the bot is started in. A file that cannot be opened makes the bot
-exit with status 2 before it logs in.
+The `[logs]` table names the files the bot appends to:
+
+```toml
+[logs]
+chat = "chat.tsv"
+im = "im.tsv"
+transactions = "transactions.tsv"
+```
+
+With `chat` and/or `im` set, each message is also appended to that file as
+one tab-separated line (UTF-8). The file is created when missing and gets a
+header line when it is empty; relative paths are relative to the directory
+the bot is started in. A file that cannot be opened makes the bot exit with
+status 2 before it logs in. `transactions` is described
+[below](#transactions).
 
 | Column | Content |
 |---|---|
@@ -592,6 +623,49 @@ viewer logging in as this avatar afterwards will not see them.
 The bot logs in with `agree_to_tos` set, so it accepts a grid's terms of
 service on the account's behalf, including changed terms, without showing
 them to anyone.
+
+### Transactions
+
+The bot records the avatar's L$ transactions: every payment it makes (see
+[Payments](#payments)) and every transaction the grid reports to the avatar
+while it is online: a payment received, an object's payout, a fee. Each one
+is written to standard error, with or without a `[payments]` table, and,
+with `transactions` set under `[logs]`, appended to that file as one row of
+twelve tab-separated fields, with the same escaping, header line and
+appending as the chat and IM files:
+
+```
+time	kind	amount	balance	counted	type	party_uuid	avatar_name	display_name	object_name	object_uuid	text
+```
+
+| Column | Content |
+|---|---|
+| `time` | UTC, `YYYY-MM-DDTHH:MM:SSZ`: when the bot learned how it ended |
+| `kind` | `paid` (the bot's payment, confirmed by the grid), `unconfirmed` (the bot's payment, neither confirmed nor refused within 15 s), `failed` (the grid reports it failed), `received` (the avatar was paid), `spent` (the avatar paid, and it was no payment of the bot's: a fee, a purchase in a viewer, a confirmation that came too late) |
+| `amount` | Whole L$ |
+| `balance` | The balance the grid reported with it; empty for `unconfirmed` |
+| `counted` | How much of the amount counts against the limit: the amount for a `paid` or `unconfirmed` payment that counts, 0 for everything else |
+| `type` | The grid's number for the kind of transaction (5001 a gift to an avatar, 5008 paying an object, ...) |
+| `party_uuid` | The avatar or group that paid or was paid; for a payment to an object, its owner |
+| `avatar_name`, `display_name` | That avatar's names, looked up as for messages; empty for a group |
+| `object_name`, `object_uuid` | For a payment of the bot to an object: the object |
+| `text` | What the grid said about it |
+
+A payment of the bot and the grid's confirmation of it are one row. The
+grid has no request by which a viewer, or the bot, can fetch past
+transactions: what happens while the avatar is offline shows in the
+balance only.
+
+The transactions file is also the record of the [spending
+limit](#payments): at startup the bot reads it, and the rows with
+`counted` greater than zero give what was spent in the current period, so
+a restart does not renew the limit. Moving, truncating or editing the file
+does: that is the operator's decision to make. A row that is cut short or
+cannot be read is skipped, and the bot says how many it skipped; a file
+whose first line is not the header above is a config error. When a row
+cannot be written (a full disk, a file made read-only), it waits, and the
+bot refuses every further payment that counts until it is written; it
+tries again at each `pay`.
 
 ## Control socket
 
@@ -655,6 +729,9 @@ target/release/rslbot ctl rlv cmd @versionnum=5     # an RLV command, by hand
 | `rlv reset` | Forget every restriction |
 | `rlv cmd COMMAND...` | Carry out RLV commands as if an object had sent them, and print what became of each. Restrictions given this way are held apart from every object's |
 | `status` | Print where the avatar is and what it sits on |
+| `pay AMOUNT avatar AVATAR...`, `pay AMOUNT object UUID` | Pay an avatar or an object nearby. Only with a `[payments]` table; see [Payments](#payments) |
+| `prices UUID` | Print what an object offers to be paid |
+| `payees` | List the avatars the whitelist and the unlimited list name |
 | `quit` | Log out and stop the bot, like Ctrl-C |
 
 `AVATAR` is one argument: `"First Last"` (quoted), `first.last`, a single
@@ -786,13 +863,19 @@ the position is the last one from before the sit. That position is what
 
 ```
 connected: yes
+avatar: Sit Bot
 region: Target
 position: 130, 128, 25.9
 seat: target
 seat name: Park Bench
 persist: Target/130/128/25.9 11111111-2222-3333-4444-555555555555
 mode: holding
+balance: L$1200
+limit: L$750 (renews to L$1000 on 2026-12-08T12:00:00Z)
 ```
+
+`avatar` is the avatar's name as the config gives it (a single word with
+`Resident`).
 
 `seat` is `target` (the object the bot holds as the seat), `object <uuid>`
 (another object, named by the prim the simulator sat the avatar on),
@@ -806,8 +889,14 @@ does not sit on an object. `persist` is the placement the bot holds, written the
 the `persist` command takes it; in manual mode it is what `home` goes back
 to, and its location is `unknown` until the first login of a config
 without `position`. `mode` is `holding` or `manual`.
-While the avatar is not in a region, only `connected: no`, `persist` and
-`mode` are printed.
+`balance` and `limit` are there only for an interface that may pay (see
+[Payments](#payments)): `balance` is the newest balance the grid reported,
+`unknown` before it has; `limit` is what is left of the limit, `unlimited`,
+and, while part of a renewing limit is used, when it renews. Without a
+`[payments]` table, and for `rslbot ctl` when `perms` does not list
+`ctl`, neither line is printed.
+While the avatar is not in a region, only `connected: no`, `avatar`,
+`persist`, `mode` and the money lines are printed.
 
 ### Teleport offers
 
@@ -875,6 +964,7 @@ know where the avatar is, and for its name, which `status` prints.
 rslbot ctl scan                     # everything within 32 m, or `scan_distance`
 rslbot ctl scan 20 -n bench         # within 20 m, with "bench" in the name
 rslbot ctl scan -t                  # what handles touches
+rslbot ctl scan --pay               # what takes money
 rslbot ctl scan 96 -o "Jane Doe"    # Jane Doe's objects within 96 m
 rslbot ctl scan -a -c -o <uuid>     # an avatar's or a group's, worn ones and child prims too
 rslbot ctl scan --position 20       # within 20 m, each with where it is
@@ -895,7 +985,7 @@ The seven fields are separated by tabs, and there is no header line:
 |---|---|
 | 1 | The prim's UUID, which is what `touch`, `sit` and `persist` take |
 | 2 | Its distance from the avatar in metres |
-| 3 | Its flags, separated by commas: `scripted`, `touch` (it handles touches), `physical`, `temporary`, `phantom`, `attachment` (an avatar wears it), `child` (not the root prim of its linkset); `-` when it has none |
+| 3 | Its flags, separated by commas: `scripted`, `touch` (it handles touches), `pay` (it takes money), `physical`, `temporary`, `phantom`, `attachment` (an avatar wears it), `child` (not the root prim of its linkset); `-` when it has none |
 | 4 | Its owner's UUID; the group's when a group owns it |
 | 5 | Its owner's name, or `(group)` |
 | 6 | Its name |
@@ -912,6 +1002,7 @@ from the fourth on, it prints `?`.
 | `-o WHO`, `--owner WHO` | prims of that avatar (`"First Last"`, `first.last`, one word, or a UUID) or of the group with that UUID |
 | `-s`, `--scripted` | scripted prims |
 | `-t`, `--touch` | prims that handle touches |
+| `--pay` | prims that take money: what `pay ... object` and `prices` take |
 | `-p`, `--physical` | physical prims |
 | `--temporary` | temporary prims |
 | `--phantom` | phantom prims |
@@ -1956,6 +2047,118 @@ restriction refuses them, and they are not saved: a restarted bot starts
 from its config and the `autoreply` commands in its startup script. The
 pauses are kept across logins until the bot stops.
 
+### Payments
+
+The bot can pay avatars and objects in L$, as a viewer's Pay does, and say
+what an object offers to be paid. Nothing is paid without a `[payments]`
+table in the config:
+
+```toml
+[logs]
+transactions = "transactions.tsv"
+
+[payments]
+limit = 1000
+limit_renew = "7d"
+perms = ["ctl", "web"]
+whitelist = ["Jane Doe", "11111111-2222-3333-4444-555555555555"]
+blacklist = ["john.roe"]
+unlimited_list = ["Owner Resident"]
+```
+
+| Key of `[payments]` | Required | Meaning |
+|---|---|---|
+| `limit` | yes | What the bot may pay in one period: a whole number of L$ from 0 to 2147483647, or `"unlimited"`. A number needs `transactions` under `[logs]` |
+| `perms` | yes | The interfaces that may pay: any of `"ctl"` (`rslbot ctl` and the startup script), `"xmpp"` (the [XMPP gateway](#xmpp-gateway)'s control contact) and `"web"` (the [web interface](#web-interface) and its console). `[]` lets none pay |
+| `limit_renew` | no | The length of a period: `7d`, `12h`, `1d12h`, up to 365 days. Without it the limit never renews |
+| `whitelist` | no | With it, only who is on it, or on `unlimited_list`, can be paid. `[]` lets only `unlimited_list` be paid |
+| `blacklist` | no | Who is on it is never paid, whatever the other lists say |
+| `unlimited_list` | no | A payment to who is on it does not count against the limit, and goes through also when nothing is left |
+
+The **limit** is what the bot may pay in one period. A period starts with
+the first payment that counts while none runs, and ends `limit_renew`
+later: then the whole limit is back, whatever was paid in between. A
+payment counts from the moment it is sent, and stops counting only when
+the grid reports that it failed. The bot keeps what was paid in the
+[transactions file](#transactions) and reads it back when it starts, so
+stopping and starting the bot does not renew the limit; this is why a
+`limit` that is a number needs that file. The limit is against the
+interfaces, not against whoever can edit the config or the file.
+
+An entry of the **lists** is an avatar's UUID or login name (`First Last`,
+`first.last`, or one word for a `Resident`), or an object's UUID. A name is
+compared with the account's name the grid gives, never with a display
+name, which anybody can set to anything. An avatar on a list stands for
+the objects it owns too; an object a group owns is matched by its own UUID
+only. Login names change only by the grid's hand, but a UUID is the stable
+form. When a list holds a name and the grid does not say within 5 seconds
+whose the payee or the object is, the payment is refused.
+
+```sh
+rslbot ctl pay 25 avatar jane.doe          # an avatar, by name or UUID
+rslbot ctl pay 25 avatar Jane Doe          # the words of a name may be separate
+rslbot ctl prices <uuid>                   # what an object offers
+rslbot ctl pay 250 object <uuid>           # pay a vendor one of its prices
+rslbot ctl scan --pay                      # what takes money nearby
+rslbot ctl payees                          # who the lists name
+```
+
+`pay AMOUNT avatar AVATAR` pays an avatar, found as `im` finds one; the
+bot's own avatar is not a payee. `pay AMOUNT object UUID` pays an object
+in the region, as a viewer's Pay on it does: the object's script is told
+that the bot's avatar paid it. The object has to be one the bot can find,
+as for `touch`, and one that takes money: the simulator marks it (or the
+root prim of its linkset) so, and `scan` shows it with the flag `pay`. It
+takes only an amount it offers: one of its quick-pay amounts, or any
+amount when it has a box for one. `AMOUNT` is a whole number of L$, at
+least 1.
+
+Before it sends a payment the bot checks, in this order: the object's
+amounts, the lists, the balance (it does not pay more than the avatar has,
+as a viewer does not), the record of the limit, and the limit. One payment
+waits for the grid at a time: a second `pay` meanwhile is refused.
+
+`pay` is answered when the grid reports the payment: with the amount, the
+payee and the new balance, or with the grid's reason when it failed. When
+the grid says nothing within 15 seconds, or the session ends first, the
+answer is an error saying that the payment was sent and is **not
+confirmed**, and it counts as paid. Do not simply pay again: look at the
+balance in `status` first, which shows whether the L$ left. The bot never
+pays anything again by itself. A grid that reports nothing about payments,
+such as OpenSim with its stock money module, makes every payment end
+unconfirmed.
+
+`prices UUID` prints what an object offers, for example:
+
+```
+object: Hat Vendor
+owner: Jane Doe
+prices: 100, 250
+other amounts: no
+```
+
+`owner` is the owner's login name, its UUID when the grid does not name it
+within 5 seconds, or `group` and the group's UUID. `other amounts` is
+`yes`, `yes, suggested 50` or `no`.
+
+`payees` lists the avatars of `whitelist` and `unlimited_list`, one line
+each, tab-separated: the UUID (`?` for an entry by name), the login name,
+and the lists (`whitelist`, `unlimited` or `whitelist,unlimited`). Objects
+and UUIDs the grid does not know as avatars are left out.
+
+Every `pay` is written to the bot's log with the interface it came through,
+the amount, the payee, and what became of it. When the bot starts with a
+`[payments]` table it logs who may pay, the limit and what is left, and
+warns when `web` may pay and the `[web]` table has no `password`.
+
+None of the three commands moves the avatar or touches the place the bot
+holds, no RLV restriction applies to them, and `rlv mode override` is not
+used up by them. Not there: paying groups, buying objects, land or
+passes, a message with a payment, letting a script take money from the
+avatar (always refused), the transaction history of the Second Life web
+site, transactions over XMPP, and changing the limit or the lists while
+the bot runs.
+
 ### Exit status and limits
 
 | Exit status of `rslbot ctl` | Meaning |
@@ -2092,7 +2295,10 @@ quotes; inside them `\"` is a double quote and `\\` a backslash. Every
 command is answered with one message: its text, `ok`, or `error: ` and the
 reason. `help` lists the commands. A command that takes time, such as a
 teleport, is answered when it ends and does not hold up the other
-contacts; at most 16 commands wait for their answers at once.
+contacts; at most 16 commands wait for their answers at once. Commands
+here are those of the interface `xmpp`: `status` has its `balance` and
+`limit` lines, and `pay`, `prices` and `payees` are carried out, only when
+`perms` in `[payments]` lists `xmpp` (see [Payments](#payments)).
 
 **Presence.** The domain is online with the region's name as status while
 the avatar is in a region, away with `not in a region` otherwise, and
@@ -2202,7 +2408,7 @@ is the proxy's.
 
 ### The tabs
 
-**World.** The status: region, position, what the avatar sits on, and
+**World.** The status: the avatar's name, region, position, what it sits on, and
 whether the bot holds a place or leaves the avatar where commands put it
 (see [Holding a place](#holding-a-place)). It follows the bot by itself. A
 teleport form with a box each for X, Y, Z and the region; an empty Z keeps
@@ -2210,8 +2416,9 @@ the height and an empty region stays in this one. "Stand up". "Scan
 avatars" lists everyone in the region, or within the distance you give,
 with a button to teleport to each and one to open an IM. "Scan objects"
 lists the objects around the avatar, within a distance and with a part of
-the name if you like, each with "Teleport", "Sit" and "Touch". A list stays
-as it is until you scan again, and says when it was made.
+the name if you like, each with "Teleport", "Sit" and "Touch", and "Pay"
+for an object that takes money (see the Money tab). A list stays as it is
+until you scan again, and says when it was made.
 
 **Local chat.** The same status, the avatars within chat range (kept up to
 date every 15 seconds while you look at the tab), and local chat as it is
@@ -2228,7 +2435,8 @@ conversation too. To write to someone new, type a name (`Jane Doe`,
 `jane.doe`, one word) or a UUID into the box and press "Open"; the name is
 looked up when the first message is sent. The friend list shows who is
 online, and a click on a friend opens the conversation. Objects cannot be
-answered.
+answered. A conversation with an avatar has "Pay", which shows the Money
+tab with that avatar as the payee.
 
 **Inventory.** My Inventory as a tree. A folder is read when you open it,
 so a large inventory costs nothing until you look into it. An object has
@@ -2236,10 +2444,36 @@ so a large inventory costs nothing until you look into it. An object has
 "Take off", a body part "Wear". "Attached only" shows what the avatar
 wears now, in place of the tree.
 
+**Money.** There only while the web interface may pay: with a
+`[payments]` table whose `perms` lists `web` (see [Payments](#payments));
+otherwise the page has no Money tab and no "Pay" button anywhere. At the
+top: the avatar, its "Balance", and what is "Left of the limit", with when
+it renews, in your time zone. "Send money" takes a "Payee", a name or a
+UUID as `pay` takes one, and an "Amount L$". Beside it, the "Friends" and
+the avatars of the config's "Whitelist" and "Unlimited list" (what
+`payees` lists); choosing one makes it the payee, paid by its UUID, or by
+name for a list entry given by name. Below, the "Transactions": the ones
+recorded since the bot started and the newest 500 of the [transactions
+file](#transactions), newest first, a failed or unconfirmed payment set
+apart and saying so.
+
+"Pay" on a row of the object scan asks the object what it offers and
+shows its amounts in a list, with "Another amount" and a box when it takes
+other amounts, and "Pay the object". Every payment a button sends is
+confirmed first in a dialog that names the amount and the payee, for an
+object its name and its owner: nothing is sent until "Pay L$..." is
+pressed, and "Cancel", Escape or a click beside the dialog send nothing.
+`pay` typed into the Console is sent at once, as every typed command is.
+Without a `password` in `[web]`, whoever reaches the page can pay, within
+the limit; the bot warns about that when it starts.
+
 **Console.** A command line that takes what `rslbot ctl` takes, without
 `rslbot ctl` in front and with double quotes around an argument that holds
 spaces, as the XMPP control contact does: `status`, `scan 20 -n bench`,
-`im "Jane Doe" see you later`, `help`. The arrow keys bring back earlier
+`im "Jane Doe" see you later`, `help`. The page and its console are the
+interface `web`: their `status` has the `balance` and `limit` lines, and
+`pay`, `prices` and `payees` are carried out, only when `perms` in
+`[payments]` lists `web`. The arrow keys bring back earlier
 lines. Everything the tabs have no button for is here: `persist` and
 `home`, `accept` and `perms`, `rlv`, `autoreply`, `anim` and `sound`,
 `profile`, `quit`.

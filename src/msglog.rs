@@ -1,11 +1,14 @@
-//! Recording of chat and instant messages: a queue that holds each message
-//! until the names that go with it are known (or given up on), and the
-//! standard-error line and TSV row it is then written as.
+//! Recording of chat and instant messages, and of the avatar's
+//! transactions: a queue that holds each until the names that go with it
+//! are known (or given up on), and the standard-error line and TSV row it
+//! is then written as.
 
+use crate::config::{LogPath, LogPaths};
 use crate::escape::escape;
 use crate::log::format_timestamp;
 use crate::names::Names;
 use crate::session::{Message, Source};
+use crate::txlog::Transaction;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -50,9 +53,41 @@ pub struct Record {
     pub offline: bool,
 }
 
+/// What waits in the queue.
+enum Item {
+    Message(Channel, Message),
+    Transaction(Transaction),
+}
+
+/// What leaves the queue, in arrival order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Recorded {
+    Message(Record),
+    Transaction(Transaction),
+}
+
+#[cfg(test)]
+impl Recorded {
+    /// The message this is; a test's mistake otherwise.
+    pub fn message(&self) -> &Record {
+        match self {
+            Recorded::Message(record) => record,
+            Recorded::Transaction(tx) => panic!("a transaction, not a message: {tx:?}"),
+        }
+    }
+}
+
+/// Lets the tests compare what leaves the queue with the messages they
+/// expect.
+#[cfg(test)]
+impl PartialEq<Record> for Recorded {
+    fn eq(&self, other: &Record) -> bool {
+        matches!(self, Recorded::Message(record) if record == other)
+    }
+}
+
 struct Entry {
-    channel: Channel,
-    message: Message,
+    item: Item,
     time: u64,
     /// The avatar whose names the record needs: the sender, or the owner.
     needs: Option<Uuid>,
@@ -96,9 +131,27 @@ impl Recorder {
         }
         let time = message.sent_at.map_or(received, u64::from);
         self.pending.push_back(Entry {
-            channel,
-            message,
+            item: Item::Message(channel, message),
             time,
+            needs,
+            deadline: now + NAME_WAIT,
+        });
+    }
+
+    /// Queues a transaction; it waits for the names of its party, an
+    /// avatar, as a message waits for its sender's.
+    pub fn push_transaction(&mut self, transaction: Transaction, now: Instant) {
+        let needs = transaction
+            .party
+            .filter(|id| !transaction.party_group && !id.is_nil() && self.pending.len() < MAX_PENDING);
+        if let Some(id) = needs {
+            if self.cached(id, now).is_none() && !self.awaited(id) {
+                self.wanted.push(id);
+            }
+        }
+        self.pending.push_back(Entry {
+            time: transaction.time,
+            item: Item::Transaction(transaction),
             needs,
             deadline: now + NAME_WAIT,
         });
@@ -145,38 +198,48 @@ impl Recorder {
         now >= entry.deadline || entry.needs.is_none_or(|id| !self.awaited(id))
     }
 
-    fn record(&self, entry: Entry, now: Instant) -> Record {
+    fn record(&self, entry: Entry, now: Instant) -> Recorded {
         let names = entry.needs.and_then(|id| self.cached(id, now).cloned().flatten());
+        let (channel, message) = match entry.item {
+            Item::Message(channel, message) => (channel, message),
+            Item::Transaction(mut transaction) => {
+                if let Some(names) = names {
+                    transaction.avatar_name = names.legacy;
+                    transaction.display_name = names.display;
+                }
+                return Recorded::Transaction(transaction);
+            }
+        };
         let (legacy, display) = names.map(|n| (n.legacy, n.display)).unwrap_or_default();
-        let avatar_uuid = match &entry.message.source {
+        let avatar_uuid = match &message.source {
             Source::Avatar { id, .. } if !id.is_nil() => Some(*id),
             _ => None,
         };
-        let offline = entry.message.sent_at.is_some();
-        let (avatar_name, object_name, object_uuid) = match entry.message.source {
+        let offline = message.sent_at.is_some();
+        let (avatar_name, object_name, object_uuid) = match message.source {
             // The simulator names the speaker itself; the recipient of an
             // IM sent by UUID is known by the looked-up name only.
             Source::Avatar { name, .. } if name.is_empty() => (legacy, String::new(), None),
             Source::Avatar { name, .. } | Source::System { name } => (name, String::new(), None),
             Source::Object { id, name, .. } => (legacy, name, id),
         };
-        Record {
-            channel: entry.channel,
+        Recorded::Message(Record {
+            channel,
             time: entry.time,
-            kind: entry.message.kind,
+            kind: message.kind,
             avatar_name,
             display_name: display,
             object_name,
             object_uuid,
-            text: entry.message.text,
+            text: message.text,
             avatar_uuid,
             offline,
-        }
+        })
     }
 
-    /// The messages that can be written now, in arrival order. A message is
-    /// never released before one that arrived earlier.
-    pub fn flush(&mut self, now: Instant) -> Vec<Record> {
+    /// The messages and transactions that can be written now, in arrival
+    /// order. None is released before one that arrived earlier.
+    pub fn flush(&mut self, now: Instant) -> Vec<Recorded> {
         let mut records = Vec::new();
         while self.pending.front().is_some_and(|entry| self.settled(entry, now)) {
             let entry = self.pending.pop_front().expect("front was checked");
@@ -186,7 +249,7 @@ impl Recorder {
     }
 
     /// Everything still waiting, with whatever names are known.
-    pub fn flush_all(&mut self, now: Instant) -> Vec<Record> {
+    pub fn flush_all(&mut self, now: Instant) -> Vec<Recorded> {
         let entries = std::mem::take(&mut self.pending);
         entries.into_iter().map(|entry| self.record(entry, now)).collect()
     }
@@ -251,10 +314,12 @@ struct LogFile {
 }
 
 impl LogFile {
-    fn open(path: &Path) -> io::Result<LogFile> {
+    /// Opens the file for appending, creating it, and writes `header` where
+    /// it is new or empty.
+    fn open(path: &Path, header: &str) -> io::Result<LogFile> {
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         if file.metadata()?.len() == 0 {
-            file.write_all(header().as_bytes())?;
+            file.write_all(header.as_bytes())?;
         }
         Ok(LogFile {
             path: path.to_path_buf(),
@@ -270,10 +335,46 @@ impl LogFile {
     }
 }
 
+/// The transactions file. It is opened for each row, so that a file that
+/// could not be written to takes rows again once it can; the rows that
+/// could not be written wait, and whether one of them counted against the
+/// limit.
+struct TransactionsFile {
+    path: PathBuf,
+    unwritten: Vec<(String, bool)>,
+}
+
+impl TransactionsFile {
+    fn append(&self, rows: &str) -> io::Result<()> {
+        let mut file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        if file.metadata()?.len() == 0 {
+            file.write_all(crate::txlog::header().as_bytes())?;
+        }
+        file.write_all(rows.as_bytes())
+    }
+
+    /// Writes the rows that wait, oldest first, in one `write`. `fresh` of
+    /// them were added just now; the log names the ones that waited.
+    fn retry(&mut self, fresh: usize) -> io::Result<()> {
+        if self.unwritten.is_empty() {
+            return Ok(());
+        }
+        let rows: String = self.unwritten.iter().map(|(row, _)| row.as_str()).collect();
+        self.append(&rows)?;
+        let waited = self.unwritten.len().saturating_sub(fresh);
+        if waited > 0 {
+            crate::info!("wrote {waited} row(s) that waited to {}", self.path.display());
+        }
+        self.unwritten.clear();
+        Ok(())
+    }
+}
+
 /// Where records go: standard error, and the configured files.
 pub struct Logs {
     chat: Option<LogFile>,
     im: Option<LogFile>,
+    transactions: Option<TransactionsFile>,
 }
 
 /// A log file that could not be opened: the config key naming it and why.
@@ -286,17 +387,41 @@ pub struct OpenError {
 impl Logs {
     /// Opens the configured files, creating them and writing the header row
     /// where they are new or empty.
-    pub fn open(chat: Option<&Path>, im: Option<&Path>) -> Result<Logs, OpenError> {
-        let open = |path: Option<&Path>, key| {
-            path.map(LogFile::open).transpose().map_err(|e| OpenError {
-                key,
-                message: format!("cannot open {}: {e}", path.unwrap_or(Path::new("")).display()),
-            })
+    pub fn open(paths: &LogPaths) -> Result<Logs, OpenError> {
+        let error = |log: &LogPath, e: io::Error| OpenError {
+            key: log.key,
+            message: format!("cannot open {}: {e}", log.path.display()),
+        };
+        let open = |log: &Option<LogPath>| {
+            log.as_ref()
+                .map(|log| LogFile::open(&log.path, &header()).map_err(|e| error(log, e)))
+                .transpose()
+        };
+        let transactions = match &paths.transactions {
+            None => None,
+            Some(log) => {
+                LogFile::open(&log.path, &crate::txlog::header()).map_err(|e| error(log, e))?;
+                Some(TransactionsFile {
+                    path: log.path.clone(),
+                    unwritten: Vec::new(),
+                })
+            }
         };
         Ok(Logs {
-            chat: open(chat, "log_chat")?,
-            im: open(im, "log_im")?,
+            chat: open(&paths.chat)?,
+            im: open(&paths.im)?,
+            transactions,
         })
+    }
+
+    /// Logs that write nothing but standard error.
+    #[cfg(test)]
+    pub fn none() -> Logs {
+        Logs {
+            chat: None,
+            im: None,
+            transactions: None,
+        }
     }
 
     pub fn write(&mut self, record: &Record) {
@@ -308,6 +433,35 @@ impl Logs {
         if let Some(file) = file {
             file.append(&record.row());
         }
+    }
+
+    /// Writes a transaction to standard error and, when one is configured,
+    /// to the transactions file, after the rows that wait. A row that
+    /// cannot be written waits for the next try.
+    pub fn write_transaction(&mut self, transaction: &Transaction) {
+        crate::info!("{}", transaction.log_line());
+        let Some(file) = &mut self.transactions else {
+            return;
+        };
+        file.unwritten.push((transaction.row(), transaction.counted > 0));
+        if let Err(e) = file.retry(1) {
+            crate::info!(
+                "cannot write to {}: {e}; {} row(s) wait to be written",
+                file.path.display(),
+                file.unwritten.len()
+            );
+        }
+    }
+
+    /// Tries again to write the rows that could not be written. Returns
+    /// whether one that counted against the limit still waits, and the
+    /// file's path then.
+    pub fn retry_transactions(&mut self) -> Option<PathBuf> {
+        let file = self.transactions.as_mut()?;
+        if let Err(e) = file.retry(0) {
+            crate::info!("cannot write to {}: {e}", file.path.display());
+        }
+        file.unwritten.iter().any(|(_, counted)| *counted).then(|| file.path.clone())
     }
 }
 
@@ -390,6 +544,36 @@ mod tests {
         records.iter().map(|r| r.text.as_str()).collect()
     }
 
+    /// The messages among what left the queue; a transaction is a test's
+    /// mistake.
+    fn messages(recorded: Vec<Recorded>) -> Vec<Record> {
+        recorded.iter().map(|r| r.message().clone()).collect()
+    }
+
+    fn all_texts(records: &[Recorded]) -> Vec<&str> {
+        records
+            .iter()
+            .map(|r| match r {
+                Recorded::Message(record) => record.text.as_str(),
+                Recorded::Transaction(tx) => tx.text.as_str(),
+            })
+            .collect()
+    }
+
+    fn paths(chat: Option<&Path>, im: Option<&Path>, transactions: Option<&Path>) -> LogPaths {
+        let log = |path: Option<&Path>, key| {
+            path.map(|path| LogPath {
+                path: path.to_path_buf(),
+                key,
+            })
+        };
+        LogPaths {
+            chat: log(chat, "logs.chat"),
+            im: log(im, "logs.im"),
+            transactions: log(transactions, "logs.transactions"),
+        }
+    }
+
     // ------------------------------------------------------------ formatting
 
     #[test]
@@ -447,11 +631,11 @@ mod tests {
         rec.push(Channel::Chat, said(1, "Jane Doe", "hello"), T0, now);
         assert_eq!(rec.take_lookups(), [id(1)]);
         assert!(rec.take_lookups().is_empty(), "an id is handed out once");
-        assert_eq!(rec.flush(now), []);
+        assert_eq!(messages(rec.flush(now)), []);
         assert_eq!(rec.next_deadline(), Some(now + NAME_WAIT));
 
         rec.names_resolved(vec![(id(1), jane())], vec![], now);
-        assert_eq!(rec.flush(now), [by(1, record("Jane Doe", "JD", "hello"))]);
+        assert_eq!(messages(rec.flush(now)), [by(1, record("Jane Doe", "JD", "hello"))]);
         assert_eq!(rec.next_deadline(), None);
     }
 
@@ -485,7 +669,7 @@ mod tests {
         rec.push(Channel::Im, sent(1, "Jane Doe", "are you there?"), T0, now);
         assert_eq!(rec.take_lookups(), [id(1)]);
         rec.names_resolved(vec![(id(1), jane())], vec![], now);
-        let records = rec.flush(now);
+        let records = messages(rec.flush(now));
         assert_eq!(records, [by(1, im_record("im_out", "Jane Doe", "JD", "are you there?"))]);
         assert_eq!(records[0].row(), "2026-11-18T17:04:23Z\tim_out\tJane Doe\tJD\t\t\tare you there?\n");
         assert_eq!(records[0].log_line(), "im [im_out] Jane Doe (JD): are you there?");
@@ -498,13 +682,13 @@ mod tests {
         rec.push(Channel::Im, sent(1, "", "hello"), T0, now);
         assert_eq!(rec.take_lookups(), [id(1)]);
         rec.names_resolved(vec![(id(1), jane())], vec![], now);
-        assert_eq!(rec.flush(now), [by(1, im_record("im_out", "Jane Doe", "JD", "hello"))]);
+        assert_eq!(messages(rec.flush(now)), [by(1, im_record("im_out", "Jane Doe", "JD", "hello"))]);
 
         // A recipient the grid cannot name still gets its row.
         rec.push(Channel::Im, sent(2, "", "anyone?"), T0, now);
         assert_eq!(rec.take_lookups(), [id(2)]);
-        assert_eq!(rec.flush(now + NAME_WAIT - Duration::from_millis(1)), []);
-        let records = rec.flush(now + NAME_WAIT);
+        assert_eq!(messages(rec.flush(now + NAME_WAIT - Duration::from_millis(1))), []);
+        let records = messages(rec.flush(now + NAME_WAIT));
         assert_eq!(records, [by(2, im_record("im_out", "", "", "anyone?"))]);
         assert_eq!(records[0].row(), "2026-11-18T17:04:23Z\tim_out\t\t\t\t\tanyone?\n");
     }
@@ -528,7 +712,7 @@ mod tests {
                 ..by(1, im_record("im", "Jane Doe", "JD", "yes"))
             },
         ];
-        assert_eq!(rec.flush(now), expected);
+        assert_eq!(messages(rec.flush(now)), expected);
     }
 
     #[test]
@@ -551,9 +735,9 @@ mod tests {
             vec![],
             now,
         );
-        assert_eq!(rec.flush(now), []);
+        assert_eq!(messages(rec.flush(now)), []);
         rec.names_resolved(vec![(id(1), jane())], vec![], now);
-        assert_eq!(texts(&rec.flush(now)), ["first", "second"]);
+        assert_eq!(texts(&messages(rec.flush(now))), ["first", "second"]);
     }
 
     #[test]
@@ -562,8 +746,8 @@ mod tests {
         let mut rec = Recorder::default();
         rec.push(Channel::Chat, said(1, "Jane Doe", "hello"), T0, now);
         // No lookup service is known, so nothing is even handed out.
-        assert_eq!(rec.flush(now + NAME_WAIT - Duration::from_millis(1)), []);
-        assert_eq!(rec.flush(now + NAME_WAIT), [by(1, record("Jane Doe", "", "hello"))]);
+        assert_eq!(messages(rec.flush(now + NAME_WAIT - Duration::from_millis(1))), []);
+        assert_eq!(messages(rec.flush(now + NAME_WAIT)), [by(1, record("Jane Doe", "", "hello"))]);
     }
 
     #[test]
@@ -573,7 +757,7 @@ mod tests {
         rec.push(Channel::Chat, said(1, "Jane Doe", "hello"), T0, now);
         let ids = rec.take_lookups();
         rec.lookup_failed(&ids);
-        assert_eq!(rec.flush(now), [by(1, record("Jane Doe", "", "hello"))]);
+        assert_eq!(messages(rec.flush(now)), [by(1, record("Jane Doe", "", "hello"))]);
 
         rec.push(Channel::Chat, said(1, "Jane Doe", "again"), T0, now);
         assert_eq!(rec.take_lookups(), [id(1)]);
@@ -588,7 +772,7 @@ mod tests {
         let later = now + CACHE_LIFETIME - Duration::from_secs(1);
         rec.push(Channel::Chat, said(1, "Jane Doe", "hello"), T0, later);
         assert!(!rec.has_lookups());
-        assert_eq!(rec.flush(later), [by(1, record("Jane Doe", "JD", "hello"))]);
+        assert_eq!(messages(rec.flush(later)), [by(1, record("Jane Doe", "JD", "hello"))]);
 
         let expired = now + CACHE_LIFETIME;
         rec.push(Channel::Chat, said(1, "Jane Doe", "hello"), T0, expired);
@@ -605,7 +789,7 @@ mod tests {
         rec.push(Channel::Chat, said(1, "Jane Doe", "three"), T0, now);
         assert!(!rec.has_lookups());
         rec.names_resolved(vec![(id(1), jane())], vec![], now);
-        assert_eq!(texts(&rec.flush(now)), ["one", "two", "three"]);
+        assert_eq!(texts(&messages(rec.flush(now))), ["one", "two", "three"]);
     }
 
     #[test]
@@ -628,7 +812,7 @@ mod tests {
             kind: "im".into(),
             ..record("Second Life", "", "notice")
         };
-        assert_eq!(rec.flush(now), [expected]);
+        assert_eq!(messages(rec.flush(now)), [expected]);
     }
 
     #[test]
@@ -638,7 +822,7 @@ mod tests {
         rec.push(Channel::Chat, object_said(1, "tick"), T0, now);
         assert_eq!(rec.take_lookups(), [id(1)]);
         rec.names_resolved(vec![(id(1), jane())], vec![], now);
-        assert_eq!(rec.flush(now), [object_record("Jane Doe", "JD")]);
+        assert_eq!(messages(rec.flush(now)), [object_record("Jane Doe", "JD")]);
     }
 
     #[test]
@@ -648,11 +832,11 @@ mod tests {
         rec.push(Channel::Chat, object_said(9, "tick"), T0, now);
         assert_eq!(rec.take_lookups(), [id(9)]);
         rec.names_resolved(vec![], vec![id(9)], now);
-        assert_eq!(rec.flush(now), [object_record("", "")]);
+        assert_eq!(messages(rec.flush(now)), [object_record("", "")]);
         // The grid's "unknown" is remembered like a name.
         rec.push(Channel::Chat, object_said(9, "tick"), T0, now);
         assert!(!rec.has_lookups());
-        assert_eq!(rec.flush(now).len(), 1);
+        assert_eq!(messages(rec.flush(now)).len(), 1);
     }
 
     #[test]
@@ -671,7 +855,7 @@ mod tests {
             ..object_said(9, "locked")
         };
         rec.push(Channel::Im, object_im, T0, now);
-        let records = rec.flush(now);
+        let records = messages(rec.flush(now));
         assert_eq!(
             records.iter().map(|r| r.avatar_uuid).collect::<Vec<_>>(),
             [Some(id(1)), Some(id(1)), None]
@@ -688,7 +872,7 @@ mod tests {
         let mut message = said(1, "Jane Doe", "earlier");
         message.sent_at = Some(1_700_000_000);
         rec.push(Channel::Im, message, T0, now);
-        let record = &rec.flush_all(now)[0];
+        let record = &messages(rec.flush_all(now))[0];
         assert_eq!(record.time, 1_700_000_000);
         assert!(record.offline);
     }
@@ -700,12 +884,12 @@ mod tests {
         rec.names_resolved(vec![(id(2), jane())], vec![], now);
         rec.push(Channel::Chat, said(1, "John Roe", "first"), T0, now);
         rec.push(Channel::Chat, said(2, "Jane Doe", "second"), T0, now);
-        assert_eq!(rec.flush(now), []);
+        assert_eq!(messages(rec.flush(now)), []);
         assert_eq!(
-            rec.flush_all(now),
+            messages(rec.flush_all(now)),
             [by(1, record("John Roe", "", "first")), by(2, record("Jane Doe", "JD", "second"))]
         );
-        assert_eq!(rec.flush_all(now), []);
+        assert_eq!(messages(rec.flush_all(now)), []);
     }
 
     #[test]
@@ -719,7 +903,7 @@ mod tests {
         rec.push(Channel::Chat, said(2, "John Roe", "late"), T0, now);
         assert!(!rec.has_lookups(), "no lookup for a message that will not wait");
         rec.lookup_failed(&[id(1)]);
-        assert_eq!(rec.flush(now).len(), MAX_PENDING + 1);
+        assert_eq!(messages(rec.flush(now)).len(), MAX_PENDING + 1);
     }
 
     // ----------------------------------------------------------------- files
@@ -741,11 +925,11 @@ mod tests {
         let dir = temp_dir("append");
         let path = dir.join("chat.tsv");
         let first = record("Jane Doe", "JD", "hello");
-        Logs::open(Some(&path), None).unwrap().write(&first);
+        Logs::open(&paths(Some(&path), None, None)).unwrap().write(&first);
         assert_eq!(read(&path), header() + &first.row());
 
         let second = record("Jane Doe", "JD", "again");
-        Logs::open(Some(&path), None).unwrap().write(&second);
+        Logs::open(&paths(Some(&path), None, None)).unwrap().write(&second);
         assert_eq!(read(&path), header() + &first.row() + &second.row());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -755,7 +939,7 @@ mod tests {
         let dir = temp_dir("empty");
         let path = dir.join("im.tsv");
         File::create(&path).unwrap();
-        drop(Logs::open(None, Some(&path)).unwrap());
+        drop(Logs::open(&paths(None, Some(&path), None)).unwrap());
         assert_eq!(read(&path), header());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -771,7 +955,7 @@ mod tests {
             ..record("Jane Doe", "JD", "psst")
         };
 
-        let mut logs = Logs::open(Some(&chat_path), Some(&im_path)).unwrap();
+        let mut logs = Logs::open(&paths(Some(&chat_path), Some(&im_path), None)).unwrap();
         logs.write(&chat);
         logs.write(&im);
         assert_eq!(read(&chat_path), header() + &chat.row());
@@ -779,7 +963,7 @@ mod tests {
 
         // With only the IM file configured, chat reaches no file.
         std::fs::remove_file(&chat_path).unwrap();
-        let mut logs = Logs::open(None, Some(&im_path)).unwrap();
+        let mut logs = Logs::open(&paths(None, Some(&im_path), None)).unwrap();
         logs.write(&chat);
         logs.write(&im);
         assert!(!chat_path.exists());
@@ -791,8 +975,16 @@ mod tests {
     fn a_file_that_cannot_be_opened_names_its_key() {
         let dir = temp_dir("missing");
         let path = dir.join("no-such-dir").join("im.tsv");
-        let error = Logs::open(None, Some(&path)).err().unwrap();
-        assert_eq!(error.key, "log_im");
+        let error = Logs::open(&paths(None, Some(&path), None)).err().unwrap();
+        assert_eq!(error.key, "logs.im");
+        let old = LogPaths {
+            im: Some(LogPath {
+                path: path.clone(),
+                key: "log_im",
+            }),
+            ..LogPaths::default()
+        };
+        assert_eq!(Logs::open(&old).err().unwrap().key, "log_im");
         assert!(error.message.contains("no-such-dir"), "{}", error.message);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -810,5 +1002,168 @@ mod tests {
         };
         file.append("row\n");
         file.append("row\n");
+    }
+
+    // ---------------------------------------------------------- transactions
+
+    fn received_from(party: u8, amount: u64) -> Transaction {
+        Transaction {
+            time: T0,
+            kind: crate::txlog::Kind::Received,
+            amount,
+            balance: Some(1250),
+            counted: 0,
+            code: 5001,
+            party: Some(id(party)),
+            party_group: false,
+            avatar_name: String::new(),
+            display_name: String::new(),
+            object_name: String::new(),
+            object: None,
+            text: "paid you".into(),
+        }
+    }
+
+    #[test]
+    fn a_transaction_gets_its_partys_names() {
+        let now = Instant::now();
+        let mut rec = Recorder::default();
+        rec.push_transaction(received_from(1, 50), now);
+        assert_eq!(rec.take_lookups(), [id(1)]);
+        assert_eq!(rec.flush(now), Vec::<Recorded>::new());
+        rec.names_resolved(vec![(id(1), jane())], vec![], now);
+        let Recorded::Transaction(tx) = &rec.flush(now)[0] else {
+            panic!("not a transaction")
+        };
+        assert_eq!((tx.avatar_name.as_str(), tx.display_name.as_str()), ("Jane Doe", "JD"));
+    }
+
+    #[test]
+    fn a_transaction_does_not_wait_longer_than_a_message_for_a_name() {
+        let now = Instant::now();
+        let mut rec = Recorder::default();
+        rec.push_transaction(received_from(1, 50), now);
+        rec.take_lookups();
+        assert_eq!(rec.next_deadline(), Some(now + NAME_WAIT));
+        let Recorded::Transaction(tx) = &rec.flush(now + NAME_WAIT)[0] else {
+            panic!("not a transaction")
+        };
+        assert_eq!((tx.party, tx.avatar_name.as_str()), (Some(id(1)), ""));
+    }
+
+    #[test]
+    fn a_groups_transaction_waits_for_no_name() {
+        let now = Instant::now();
+        let mut rec = Recorder::default();
+        rec.push_transaction(
+            Transaction {
+                party_group: true,
+                ..received_from(1, 50)
+            },
+            now,
+        );
+        assert!(!rec.has_lookups());
+        assert_eq!(rec.flush(now).len(), 1);
+    }
+
+    #[test]
+    fn messages_and_transactions_leave_in_arrival_order() {
+        let now = Instant::now();
+        let mut rec = Recorder::default();
+        rec.push(Channel::Chat, said(1, "Jane Doe", "before"), T0, now);
+        rec.push_transaction(received_from(2, 50), now);
+        rec.push(Channel::Chat, said(3, "John Roe", "after"), T0, now);
+        rec.take_lookups();
+        // The transaction's name is in; the first message's is not.
+        rec.names_resolved(vec![(id(2), jane()), (id(3), jane())], vec![], now);
+        assert_eq!(rec.flush(now), Vec::<Recorded>::new());
+        rec.names_resolved(vec![(id(1), jane())], vec![], now);
+        assert_eq!(all_texts(&rec.flush(now)), ["before", "paid you", "after"]);
+    }
+
+    fn tx_log(path: &Path) -> Logs {
+        Logs::open(&paths(None, None, Some(path))).unwrap()
+    }
+
+    #[test]
+    fn the_transactions_file_gets_its_own_header_and_rows() {
+        let dir = temp_dir("transactions");
+        let path = dir.join("transactions.tsv");
+        let tx = received_from(1, 50);
+        tx_log(&path).write_transaction(&tx);
+        tx_log(&path).write_transaction(&tx);
+        assert_eq!(read(&path), crate::txlog::header() + &tx.row() + &tx.row());
+        // Chat goes elsewhere, and a transaction to no chat file.
+        let chat = dir.join("chat.tsv");
+        let mut logs = Logs::open(&paths(Some(&chat), None, Some(&path))).unwrap();
+        logs.write(&record("Jane Doe", "JD", "hello"));
+        assert_eq!(read(&chat), header() + &record("Jane Doe", "JD", "hello").row());
+        assert_eq!(crate::txlog::read(&path).unwrap().rows.len(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn transactions_without_a_file_go_to_standard_error_only() {
+        let mut logs = Logs::none();
+        logs.write_transaction(&received_from(1, 50));
+        assert_eq!(logs.retry_transactions(), None);
+    }
+
+    /// Whether this process may write where the permissions say it may
+    /// not, as root may.
+    fn permissions_are_ignored(dir: &Path) -> bool {
+        let probe = dir.join("probe");
+        File::create(&probe).unwrap();
+        set_read_only(&probe, true);
+        let ignored = OpenOptions::new().append(true).open(&probe).is_ok();
+        set_read_only(&probe, false);
+        std::fs::remove_file(probe).unwrap();
+        ignored
+    }
+
+    fn set_read_only(path: &Path, read_only: bool) {
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_readonly(read_only);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[test]
+    fn rows_that_cannot_be_written_wait_and_are_written_later() {
+        let dir = temp_dir("readonly");
+        if permissions_are_ignored(&dir) {
+            return;
+        }
+        let path = dir.join("transactions.tsv");
+        let mut logs = tx_log(&path);
+        let paid = Transaction {
+            kind: crate::txlog::Kind::Paid,
+            counted: 100,
+            ..received_from(1, 100)
+        };
+        set_read_only(&path, true);
+        logs.write_transaction(&paid);
+        logs.write_transaction(&received_from(1, 50));
+        assert_eq!(read(&path), crate::txlog::header(), "nothing written");
+        assert_eq!(logs.retry_transactions(), Some(path.clone()), "a counted row waits");
+        set_read_only(&path, false);
+        assert_eq!(logs.retry_transactions(), None);
+        assert_eq!(read(&path), crate::txlog::header() + &paid.row() + &received_from(1, 50).row());
+        // A row that does not count waits too, but holds nothing back.
+        set_read_only(&path, true);
+        logs.write_transaction(&received_from(1, 5));
+        assert_eq!(logs.retry_transactions(), None);
+        set_read_only(&path, false);
+        logs.write_transaction(&received_from(1, 6));
+        assert_eq!(crate::txlog::read(&path).unwrap().rows.len(), 4);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_transactions_file_that_cannot_be_opened_names_its_key() {
+        let dir = temp_dir("tx-missing");
+        let path = dir.join("no-such-dir").join("tx.tsv");
+        let error = Logs::open(&paths(None, None, Some(&path))).err().unwrap();
+        assert_eq!(error.key, "logs.transactions");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

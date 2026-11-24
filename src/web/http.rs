@@ -268,11 +268,11 @@ pub const HOST_REFUSED: &str = "This web interface has no password, so it answer
 or as localhost, which keeps other web sites from reaching it under a name of their own.\n\
 Open it by its IP address, or set `password` in the `[web]` table of the bot's config.\n";
 
-/// Whether a command may be marked as the page's own: the two that keep a
-/// list up to date, `scan avatars` and `friends`.
+/// Whether a command may be marked as the page's own: those that keep a
+/// list up to date, `scan avatars`, `friends` and `payees`.
 pub fn may_be_own(command: &Command) -> bool {
     match command {
-        Command::Friends => true,
+        Command::Friends | Command::Payees => true,
         Command::Scan(args) => args.first().is_some_and(|first| first == "avatars"),
         _ => false,
     }
@@ -633,6 +633,8 @@ mod tests {
     fn only_the_two_listings_can_be_the_pages_own() {
         let scan = |words: &[&str]| Command::Scan(words.iter().map(|word| word.to_string()).collect());
         assert!(may_be_own(&Command::Friends));
+        assert!(may_be_own(&Command::Payees));
+        assert!(!may_be_own(&Command::Prices("x".into())));
         assert!(may_be_own(&scan(&["avatars"])));
         assert!(may_be_own(&scan(&["avatars", "chat"])));
         assert!(!may_be_own(&scan(&[])));

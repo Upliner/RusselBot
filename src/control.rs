@@ -58,6 +58,10 @@ Usage: rslbot ctl say MESSAGE...
        rslbot ctl persist [LOCATION] [SIT]
        rslbot ctl home
        rslbot ctl status
+       rslbot ctl pay AMOUNT avatar AVATAR...
+       rslbot ctl pay AMOUNT object UUID
+       rslbot ctl prices UUID
+       rslbot ctl payees
        rslbot ctl perms autoaccept KIND all | WHO...
        rslbot ctl perms revoke KIND all | WHO...
        rslbot ctl perms status
@@ -131,6 +135,17 @@ sitting and standing alone). Either can also be `cur` (where the avatar is
 and what it sits on now; the default), `cfg` (what the config says), `last`
 (what was last persisted) or `last_cmd` (where the last `tp` went, what the
 last `sit` named). `home` is `persist last last`.
+
+`pay` pays AMOUNT L$ to an avatar, or to an object nearby, as a viewer's
+Pay does; an object takes only an amount it offers. `prices` prints what an
+object offers: its name, its owner, its quick-pay amounts and whether it
+takes other amounts. `payees` lists the avatars of the config's whitelist
+and unlimited list. These three work only with a `[payments]` table in the
+config, and only through an interface its `perms` names: `ctl` for this
+socket and the config's `startup`, `xmpp` and `web` for the others. A
+payment is answered once the grid confirms or refuses it; one the grid has
+not confirmed within 15 seconds counts as paid against the limit. Do not
+pay it again before `status` shows whether the balance went down.
 
 `inventory` lists what is under FOLDER, or all of My Inventory: one line
 per entry with its UUID, type, attach or wear point, `attached` or `-`, and
@@ -248,6 +263,15 @@ pub enum Request {
     },
     Home,
     Status,
+    /// A payment, read in full: the amount is a number of L$ the grid
+    /// takes, the payee one of its two forms.
+    Pay {
+        amount: u32,
+        payee: PayTo,
+    },
+    /// An object's UUID, still to be read.
+    Prices(String),
+    Payees,
     Rlv(RlvRequest),
     Perms(PermsRequest),
     Autoreply(AutoreplyRequest),
@@ -277,6 +301,9 @@ impl Request {
             Request::Persist { .. } => "persist",
             Request::Home => "home",
             Request::Status => "status",
+            Request::Pay { .. } => "pay",
+            Request::Prices(_) => "prices",
+            Request::Payees => "payees",
             Request::Rlv(_) => "rlv",
             Request::Quit => "quit",
             Request::Inventory(_) => "inventory",
@@ -287,6 +314,27 @@ impl Request {
             Request::Anim { stop: true, .. } => "anim stop",
             Request::Sound(_) => "sound",
         }
+    }
+}
+
+/// Whom `pay` pays.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PayTo {
+    /// An avatar, still to be read as `im` reads one.
+    Avatar(String),
+    Object(uuid::Uuid),
+}
+
+/// The two forms of `pay`, for its errors.
+pub const PAY_FORMS: &str = "`pay AMOUNT avatar AVATAR` or `pay AMOUNT object UUID`";
+
+/// Reads an amount of L$: digits only, from 1 to the most the grid takes.
+pub fn parse_amount(text: &str) -> Result<u32, String> {
+    let max = crate::payments::MAX_AMOUNT;
+    let digits = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    match text.parse::<u32>() {
+        Ok(amount) if digits && (1..=max).contains(&amount) => Ok(amount),
+        _ => Err(format!("the amount \"{text}\" is not a whole number of L$ from 1 to {max}")),
     }
 }
 
@@ -597,6 +645,36 @@ impl Request {
                     _ => Err(FORMS.to_string()),
                 }
             }
+            "pay" => {
+                let forms = || format!("`pay` takes {PAY_FORMS}; AVATAR is a name or a UUID");
+                let [amount, kind, rest @ ..] = &fields[..] else {
+                    return Err(forms());
+                };
+                if rest.is_empty() || !matches!(kind.as_str(), "avatar" | "object") {
+                    return Err(forms());
+                }
+                let amount = parse_amount(amount).map_err(|e| format!("`pay`: {e}"))?;
+                let payee = match kind.as_str() {
+                    "avatar" => PayTo::Avatar(rest.join(" ")),
+                    _ => match rest {
+                        [uuid] => PayTo::Object(uuid::Uuid::parse_str(uuid.trim()).map_err(|_| {
+                            format!("`pay`: an object is given by its UUID, not \"{uuid}\"; `scan` lists the objects nearby")
+                        })?),
+                        _ => {
+                            return Err(format!(
+                                "`pay`: an object is given by its UUID, not \"{}\"; `scan` lists the objects nearby",
+                                rest.join(" ")
+                            ))
+                        }
+                    },
+                };
+                Ok(Request::Pay { amount, payee })
+            }
+            "prices" => {
+                arguments(1)?;
+                Ok(Request::Prices(fields.remove(0)))
+            }
+            "payees" => arguments(0).map(|()| Request::Payees),
             "home" => arguments(0).map(|()| Request::Home),
             "status" => arguments(0).map(|()| Request::Status),
             "quit" => arguments(0).map(|()| Request::Quit),
@@ -946,6 +1024,10 @@ mod tests {
         words.iter().map(|word| word.to_string()).collect()
     }
 
+    fn text(word: &str) -> String {
+        word.to_string()
+    }
+
     #[test]
     fn requests_are_read_from_their_lines() {
         assert_eq!(Request::decode(b"say\thello there"), Ok(Request::Say("hello there".into())));
@@ -1022,6 +1104,81 @@ mod tests {
         assert_eq!(Request::decode(b"quit"), Ok(Request::Quit));
         assert_eq!(Request::decode(b"shout\tover\there"), Ok(Request::Shout(text("over here"))));
         assert_eq!(Request::decode(b"whisper\tpsst"), Ok(Request::Whisper(text("psst"))));
+    }
+
+    #[test]
+    fn decodes_the_forms_of_pay() {
+        let jane = uuid::Uuid::from_bytes([0x71; 16]);
+        assert_eq!(
+            Request::decode(b"pay\t10\tavatar\tJane\tDoe"),
+            Ok(Request::Pay {
+                amount: 10,
+                payee: PayTo::Avatar(text("Jane Doe"))
+            })
+        );
+        assert_eq!(
+            Request::decode(b"pay\t25\tavatar\tjane.doe"),
+            Ok(Request::Pay {
+                amount: 25,
+                payee: PayTo::Avatar(text("jane.doe"))
+            })
+        );
+        assert_eq!(
+            Request::decode(format!("pay\t10\tobject\t{jane}").as_bytes()),
+            Ok(Request::Pay {
+                amount: 10,
+                payee: PayTo::Object(jane)
+            })
+        );
+        for bad in ["pay\t10\tJane Doe", "pay\t10", "pay", "pay\t10\tavatar", "pay\t10\tgroup\tx"] {
+            let error = Request::decode(bad.as_bytes()).unwrap_err();
+            assert!(
+                error.contains("pay AMOUNT avatar AVATAR") && error.contains("pay AMOUNT object UUID"),
+                "{bad}: {error}"
+            );
+        }
+        let error = Request::decode(b"pay\t10\tobject\tTip Jar").unwrap_err();
+        assert!(error.contains("an object is given by its UUID"), "{error}");
+        assert_eq!(
+            request_line(&strings(&["pay", "10", "avatar", "Jane", "Doe"])),
+            "pay\t10\tavatar\tJane\tDoe\n"
+        );
+        assert_eq!(
+            Request::Pay {
+                amount: 1,
+                payee: PayTo::Object(jane)
+            }
+            .name(),
+            "pay"
+        );
+    }
+
+    #[test]
+    fn amounts_are_whole_positive_numbers_the_grid_takes() {
+        for bad in ["0", "-5", "10.5", "L$10", "ten", "3000000000", "+5", " 5", ""] {
+            let line = format!("pay\t{bad}\tavatar\tJane Doe");
+            let error = Request::decode(line.as_bytes()).unwrap_err();
+            assert!(error.contains(&format!("\"{bad}\"")), "{bad}: {error}");
+        }
+        assert_eq!(parse_amount("2147483647"), Ok(2_147_483_647));
+        assert_eq!(parse_amount("007"), Ok(7));
+    }
+
+    #[test]
+    fn decodes_prices_and_payees() {
+        assert_eq!(Request::decode(b"prices\tabc"), Ok(Request::Prices(text("abc"))));
+        assert!(Request::decode(b"prices").unwrap_err().contains("`prices` takes 1 argument"));
+        assert_eq!(Request::decode(b"payees"), Ok(Request::Payees));
+        assert!(Request::decode(b"payees\tall").unwrap_err().contains("`payees` takes no arguments"));
+        assert_eq!((Request::Prices(text("x")).name(), Request::Payees.name()), ("prices", "payees"));
+        for line in [
+            "rslbot ctl pay AMOUNT avatar AVATAR...",
+            "rslbot ctl pay AMOUNT object UUID",
+            "rslbot ctl prices UUID",
+            "rslbot ctl payees",
+        ] {
+            assert!(CTL_USAGE.contains(&format!("{line}\n")), "{line}");
+        }
     }
 
     #[test]

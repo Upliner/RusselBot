@@ -181,6 +181,22 @@ pub enum SessionEvent {
         object: Uuid,
         owner: Uuid,
         group: Uuid,
+        /// The object's name, when the answer has it.
+        name: Option<String>,
+    },
+    /// The grid reported the avatar's balance, alone or with one of its
+    /// transactions. The session keeps none of it.
+    Money {
+        balance: i32,
+        success: bool,
+        description: String,
+        info: Option<messages::TransactionInfo>,
+    },
+    /// What an object offers to be paid, in answer to `request_pay_price`.
+    PayPrice {
+        object: Uuid,
+        default: i32,
+        buttons: Vec<i32>,
     },
     /// An object the simulator had described is gone: deleted, detached,
     /// or out of what the simulator shows.
@@ -891,6 +907,57 @@ impl<N: Net> Session<N> {
         self.present()?;
         self.send(messages::request_object_properties_family(&self.agent, object), true, now);
         Ok(())
+    }
+
+    /// Asks the grid for the avatar's balance; a `Money` event follows.
+    pub fn request_balance(&mut self, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::money_balance_request(&self.agent), true, now);
+        Ok(())
+    }
+
+    /// Pays `dest`, an avatar or an object, `amount` L$ with the
+    /// transaction type `kind`. The grid answers with a `Money` event, or
+    /// not at all.
+    pub fn pay(&mut self, dest: Uuid, amount: i32, kind: i32, description: &str, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(
+            messages::money_transfer_request(&self.agent, dest, amount, kind, description),
+            true,
+            now,
+        );
+        Ok(())
+    }
+
+    /// Asks the simulator what `object` offers to be paid; a `PayPrice`
+    /// event follows if it knows the object.
+    pub fn request_pay_price(&mut self, object: Uuid, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::request_pay_price(object), true, now);
+        Ok(())
+    }
+
+    /// The root prim of the linkset `object` is part of, and whether the
+    /// simulator marks the object itself or that root as taking money;
+    /// `None` for an object it has not described.
+    pub fn money_target(&self, object: Uuid) -> Option<(Uuid, bool)> {
+        let local_id = *self.sim.objects.get(&object)?;
+        let lineage = self.lineage(local_id);
+        // The root is the last prim before an avatar that wears it.
+        let root = lineage
+            .iter()
+            .take_while(|local| **local == local_id || !self.is_avatar(**local))
+            .last()
+            .copied()
+            .unwrap_or(local_id);
+        let takes = |local: u32| {
+            self.sim
+                .kinds
+                .get(&local)
+                .is_some_and(|(_, flags)| flags & messages::FLAG_MONEY != 0)
+        };
+        let root_id = self.sim.local_ids.get(&root).copied().unwrap_or(object);
+        Some((root_id, takes(local_id) || takes(root)))
     }
 
     /// Grants the script `item` in `object` the permissions it asked for
@@ -1853,6 +1920,13 @@ impl<N: Net> Session<N> {
             }
             Incoming::KickUser { reason } => self.lose(format!("kicked: {reason}")),
             Incoming::Alert { message } => self.events.push(SessionEvent::Alert(message)),
+            Incoming::MoneyBalanceReply(report) => self.events.push(SessionEvent::Money {
+                balance: report.balance,
+                success: report.success,
+                description: report.description,
+                info: report.info,
+            }),
+            Incoming::PayPriceReply { object, default, buttons } => self.events.push(SessionEvent::PayPrice { object, default, buttons }),
             Incoming::Chat {
                 from_name,
                 source_id,
@@ -1989,7 +2063,12 @@ impl<N: Net> Session<N> {
                 group,
                 named,
             } => {
-                self.events.push(SessionEvent::ObjectOwner { object, owner, group });
+                self.events.push(SessionEvent::ObjectOwner {
+                    object,
+                    owner,
+                    group,
+                    name: named.as_ref().map(|(name, _)| name.clone()),
+                });
                 // The answer about the seat, when it is one.
                 let seat = self.sim.seat_asked.filter(|seat| self.sim.local_ids.get(seat) == Some(&object));
                 if let (Some(seat), Some((name, description))) = (seat, named) {
@@ -3508,7 +3587,87 @@ mod tests {
             messages::OBJECT_PROPERTIES_FAMILY,
             &wire::object_properties_family(object, owner, group),
         );
-        assert_eq!(rig.events(), [SessionEvent::ObjectOwner { object, owner, group }]);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::ObjectOwner {
+                object,
+                owner,
+                group,
+                name: Some("Dance Ball".into())
+            }]
+        );
+        rig.receive(
+            messages::OBJECT_PROPERTIES_FAMILY,
+            &wire::object_properties_family_named(object, owner, group, "Hat Vendor", "hats"),
+        );
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::ObjectOwner {
+                object,
+                owner,
+                group,
+                name: Some("Hat Vendor".into())
+            }]
+        );
+    }
+
+    #[test]
+    fn money_calls_send_one_message_each() {
+        let mut rig = Rig::entered();
+        rig.sent();
+        let now = rig.now;
+        let (jane, jar) = (Uuid::from_bytes([0x71; 16]), Uuid::from_bytes([0xB0; 16]));
+        assert_eq!(rig.session.request_balance(now), Ok(()));
+        assert_eq!(rig.sent_ids(), [messages::MONEY_BALANCE_REQUEST]);
+        assert_eq!(rig.session.pay(jane, 25, messages::TRANSACTION_GIFT, "", now), Ok(()));
+        let sent = rig.sent();
+        assert_eq!(sent.len(), 1);
+        let expected = messages::money_transfer_request(&rig.agent(), jane, 25, messages::TRANSACTION_GIFT, "");
+        assert_eq!((sent[0].id, &sent[0].body), (expected.id, &expected.body));
+        assert_eq!(rig.session.request_pay_price(jar, now), Ok(()));
+        assert_eq!(rig.sent_ids(), [messages::REQUEST_PAY_PRICE]);
+        // None of them without a region.
+        let mut lost = Rig::new();
+        lost.sent();
+        assert!(lost.session.request_balance(now).is_err());
+        assert!(lost.session.pay(jane, 25, messages::TRANSACTION_GIFT, "", now).is_err());
+        assert!(lost.session.request_pay_price(jar, now).is_err());
+        assert_eq!(lost.sent_ids(), []);
+    }
+
+    #[test]
+    fn money_replies_become_events() {
+        let mut rig = Rig::entered();
+        let info = messages::TransactionInfo {
+            kind: messages::TRANSACTION_GIFT,
+            source: Uuid::from_bytes([0x71; 16]),
+            source_group: false,
+            dest: rig.agent().agent_id,
+            dest_group: false,
+            amount: 50,
+            item: String::new(),
+        };
+        let body = wire::money_balance_reply(true, 1250, "Jane Doe paid you L$50.", Some(&info));
+        rig.receive(messages::MONEY_BALANCE_REPLY, &body);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::Money {
+                balance: 1250,
+                success: true,
+                description: "Jane Doe paid you L$50.".into(),
+                info: Some(info),
+            }]
+        );
+        let jar = Uuid::from_bytes([0xB0; 16]);
+        rig.receive(messages::PAY_PRICE_REPLY, &wire::pay_price_reply(jar, -2, &[-2, -2, -2, -2]));
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::PayPrice {
+                object: jar,
+                default: -2,
+                buttons: vec![-2; 4],
+            }]
+        );
     }
 
     #[test]
@@ -5107,7 +5266,7 @@ mod tests {
 
     // ------------------------------------------------------ the area scan
 
-    use crate::udp::messages::{FLAG_SCRIPTED, FLAG_TOUCH, PCODE_AVATAR, PCODE_PRIM};
+    use crate::udp::messages::{FLAG_MONEY, FLAG_SCRIPTED, FLAG_TOUCH, PCODE_AVATAR, PCODE_PRIM};
 
     /// A full update's block for a prim at `position`: in the region, or
     /// on its parent when it has one.
@@ -5201,6 +5360,28 @@ mod tests {
             &[(PCODE_PRIM, FLAG_SCRIPTED | FLAG_TOUCH)],
         );
         assert_eq!(rig.sighting(bench()).unwrap().flags, FLAG_SCRIPTED | FLAG_TOUCH);
+    }
+
+    #[test]
+    fn the_money_flag_is_the_prims_or_its_roots_and_follows_later_updates() {
+        let mut rig = Rig::by_a_bench();
+        assert_eq!(rig.session.money_target(bench()), Some((bench(), false)));
+        assert_eq!(rig.session.money_target(object(0x99)), None);
+        rig.describe(
+            &[prim(bench(), BENCH, 0, [103.0, 100.0, 25.0])],
+            &[(PCODE_PRIM, FLAG_SCRIPTED | FLAG_MONEY)],
+        );
+        assert_eq!(rig.session.money_target(bench()), Some((bench(), true)));
+        assert_eq!(rig.sighting(bench()).unwrap().flags, FLAG_SCRIPTED | FLAG_MONEY);
+        // A child prim of a root that takes money is paid through it.
+        rig.describe(&[prim(object(0x72), 701, BENCH, [1.0, 0.0, 0.0])], &[(PCODE_PRIM, 0)]);
+        assert_eq!(rig.session.money_target(object(0x72)), Some((bench(), true)));
+        // The flag goes with a later update.
+        rig.describe(&[prim(bench(), BENCH, 0, [103.0, 100.0, 25.0])], &[(PCODE_PRIM, FLAG_SCRIPTED)]);
+        assert_eq!(rig.session.money_target(object(0x72)), Some((bench(), false)));
+        // A child of its own that takes money, under a root that does not.
+        rig.describe(&[prim(object(0x72), 701, BENCH, [1.0, 0.0, 0.0])], &[(PCODE_PRIM, FLAG_MONEY)]);
+        assert_eq!(rig.session.money_target(object(0x72)), Some((bench(), true)));
     }
 
     #[test]

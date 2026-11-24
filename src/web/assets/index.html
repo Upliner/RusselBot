@@ -25,6 +25,7 @@
       <a href="#chat" data-tab="chat">Local chat<span class="mark" id="mark-chat" hidden title="New lines"></span></a>
       <a href="#im" data-tab="im">IM<span class="mark" id="mark-im" hidden title="New messages"></span></a>
       <a href="#inventory" data-tab="inventory">Inventory</a>
+      <a href="#money" data-tab="money" id="tab-link-money" hidden>Money</a>
       <a href="#console" data-tab="console">Console</a>
       <a href="#settings" data-tab="settings">Settings</a>
     </nav>
@@ -106,7 +107,7 @@
           <ul id="im-friends" class="picks"></ul>
         </div>
         <div class="im-main panel">
-          <h2 id="im-title">No conversation chosen</h2>
+          <h2><span id="im-title">No conversation chosen</span> <button id="im-pay" type="button" class="small" hidden>Pay</button></h2>
           <div id="im-log" class="log" tabindex="0" aria-label="Conversation"></div>
           <p id="im-readonly" class="made" hidden>This conversation cannot be answered.</p>
           <form id="im-form" class="send" hidden>
@@ -127,6 +128,47 @@
         </h2>
         <p id="inventory-note" class="made" hidden></p>
         <ul id="inventory-tree" class="tree"></ul>
+      </div>
+    </section>
+
+    <!-- Money: only while the status has a `limit` line -->
+    <section id="tab-money" class="tab" hidden>
+      <div id="money-header" class="status">
+        <span class="item"><span class="name">Avatar</span><span id="money-avatar" class="value"></span></span>
+        <span class="item"><span class="name">Balance</span><span id="money-balance" class="value"></span></span>
+        <span class="item"><span class="name">Left of the limit</span><span id="money-left" class="value"></span><span id="money-renews" class="renew" hidden></span></span>
+      </div>
+
+      <div class="money">
+        <form id="pay-form" class="panel money-form" novalidate autocomplete="off">
+          <h2>Send money</h2>
+          <div class="fields">
+            <label class="wide">Payee <input id="pay-payee" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Name or UUID"></label>
+            <label>Amount L$ <input id="pay-amount" inputmode="numeric" autocomplete="off" size="7"></label>
+          </div>
+          <p id="pay-chosen" class="made" hidden></p>
+          <div class="buttons">
+            <button id="pay-button" type="submit">Pay</button>
+          </div>
+          <p id="pay-result" class="result" role="status" hidden></p>
+        </form>
+
+        <div class="money-side">
+          <h2>Friends <button id="money-lists-refresh" type="button" class="small">Refresh</button></h2>
+          <p id="money-friends-note" class="made" hidden></p>
+          <ul id="money-friends" class="picks"></ul>
+          <h2 id="money-whitelist-heading" hidden>Whitelist</h2>
+          <ul id="money-whitelist" class="picks"></ul>
+          <h2 id="money-unlimited-heading" hidden>Unlimited list</h2>
+          <ul id="money-unlimited" class="picks"></ul>
+          <p id="money-payees-note" class="made" hidden></p>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Transactions</h2>
+        <p id="money-none" class="made">No transactions.</p>
+        <ul id="money-list" class="rows"></ul>
       </div>
     </section>
 
@@ -159,6 +201,16 @@
     </section>
   </main>
 </div>
+
+<dialog id="pay-dialog" class="dialog" aria-labelledby="pay-dialog-title" aria-describedby="pay-dialog-text">
+  <h2 id="pay-dialog-title">Confirm the payment</h2>
+  <p id="pay-dialog-text"></p>
+  <div id="pay-dialog-more" class="made"></div>
+  <div class="buttons">
+    <button id="pay-dialog-cancel" type="button" class="secondary" autofocus>Cancel</button>
+    <button id="pay-dialog-pay" type="button">Pay</button>
+  </div>
+</dialog>
 
 <noscript><p class="login">This page needs JavaScript.</p></noscript>
 </body>

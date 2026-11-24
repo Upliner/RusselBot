@@ -16,6 +16,7 @@ mod login;
 mod msglog;
 mod names;
 mod net;
+mod payments;
 mod perms;
 mod persist;
 mod profile;
@@ -24,6 +25,7 @@ mod rlv;
 mod scan;
 mod session;
 mod startup;
+mod txlog;
 mod web;
 mod udp {
     pub mod circuit;
@@ -36,11 +38,12 @@ mod xmpp;
 use autoreply::Autoreply;
 use commands::{Commands, Grid, SentIm};
 use config::{Config, Persist, PersistOverride, Place, RlvPersist, Sit, Source};
-use control::{AutoreplyRequest, Request, Response, RlvRequest};
+use control::{AutoreplyRequest, PayTo, Request, Response, RlvRequest};
 use login::Outcome;
-use msglog::{Channel, Logs, Recorder};
+use msglog::{Channel, Logs, Recorded, Recorder};
 use names::{Lookup, Search};
 use net::{Event, RealNet};
+use payments::{Interface, Ledger};
 use persist::{Book, Location, LocationArg, Placement, SitArg, SitState, World};
 use reconciler::{Action, Decision, Goal, Reconciler, SeatGoal};
 use rlv::{After, Check, Command, Follow, Issuer, Limits, OwnStep, Restrictions, Rlv, Sitting, Step, Verdict, Who};
@@ -235,6 +238,8 @@ struct Bot {
     web: Option<web::hub::Hub>,
     /// Whether and with what the bot answers instant messages by itself.
     autoreply: Autoreply,
+    /// The balance has been asked for since the last login.
+    balance_asked: bool,
     /// Stands in for a session's view of the world, which tests have none of.
     #[cfg(test)]
     world: Option<Box<dyn World>>,
@@ -290,6 +295,15 @@ fn sitting(session: &Session<RealNet>) -> Sitting {
 }
 
 impl Grid for Live<'_> {
+    fn pay(&mut self, dest: Uuid, amount: i32, kind: i32, description: &str, now: Instant) -> Result<(), String> {
+        self.session.pay(dest, amount, kind, description, now)
+    }
+    fn request_pay_price(&mut self, object: Uuid, now: Instant) -> Result<(), String> {
+        self.session.request_pay_price(object, now)
+    }
+    fn money_target(&self, object: Uuid) -> Option<(Uuid, bool)> {
+        self.session.money_target(object)
+    }
     fn reach(&mut self, distance: Option<f32>, now: Instant) -> Result<f32, String> {
         self.session.reach(distance, now)
     }
@@ -500,6 +514,10 @@ impl Bot {
         let mut commands = Commands::new(config.requesttp_timeout);
         commands.set_restore(config.restore_attachments);
         commands.set_rules(config.perms.clone());
+        // The limit as far as the transactions file says comes with
+        // `start_payments`.
+        let ledger = config.payments.as_ref().map_or(Ledger::new(None, None), Ledger::from_config);
+        commands.set_payments(config.payments.clone(), ledger);
         Bot {
             rlv: Rlv::new(config.rlv, config.rlv_persist, config.persist_override),
             follow: Follow::default(),
@@ -520,6 +538,7 @@ impl Bot {
                 let started = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
                 web::hub::Hub::new(started)
             }),
+            balance_asked: false,
             autoreply: match &config.autoreply {
                 Some(auto) => Autoreply::new(Some(auto.message.clone()), auto.pause),
                 None => Autoreply::new(None, autoreply::DEFAULT_PAUSE),
@@ -553,6 +572,21 @@ impl Bot {
             http: caps::http_agent(LOGIN_HTTP_TIMEOUT),
             next_generation: 1,
             stopping: false,
+        }
+    }
+
+    /// Restores the limit from the transactions file read at startup,
+    /// says how payments stand, and gives the pages the newest rows when
+    /// the web interface may pay.
+    fn start_payments(&mut self, back: &txlog::ReadBack, now: u64) {
+        let (ledger, lines) = payments_start(&self.config, back, now);
+        for line in lines {
+            info!("{line}");
+        }
+        self.commands.set_payments(self.config.payments.clone(), ledger);
+        let web_pays = self.config.payments.as_ref().is_some_and(|p| p.may(Interface::Web));
+        if let (Some(hub), true) = (&mut self.web, web_pays) {
+            hub.allow_money(back.newest());
         }
     }
 
@@ -681,6 +715,7 @@ impl Bot {
                 let generation = self.next_generation;
                 let session = Session::new(net, &info, &name, cfg.scan_distance, cfg.fetch_offline_im, generation, now);
                 self.session = Some(session);
+                self.balance_asked = false;
             }
             Outcome::NeedsOperator(failure) => {
                 info!("login needs the operator ({}): {}", failure.reason, failure.message);
@@ -1014,8 +1049,21 @@ impl Bot {
         self.seat_sender = seat_sender;
     }
 
-    /// The answer to the `status` command.
-    fn status(&self) -> String {
+    /// The answer to the `status` command as `via` gets it: with the
+    /// money lines for an interface that may pay.
+    fn status(&self, via: Interface) -> String {
+        let avatar = format!("{} {}", self.config.first_name, self.config.last_name);
+        let money = self
+            .config
+            .payments
+            .as_ref()
+            .filter(|payments| payments.may(via))
+            .map(|_| (self.commands.balance(), self.commands.limit_text()));
+        status_answer(&avatar, &self.place_status(), money)
+    }
+
+    /// The lines of `status` about where the avatar is and what is held.
+    fn place_status(&self) -> String {
         let here = self.session.as_ref().and_then(|session| {
             let region = session.region()?;
             Some(Whereabouts {
@@ -1028,15 +1076,18 @@ impl Bot {
         status_text(here, self.book.held(), self.reconciler.is_manual())
     }
 
-    /// Carries out a command from the control socket.
+    /// Carries out a command from the control socket or the startup
+    /// script.
     fn control(&mut self, request: Request, reply: Sender<Response>, now: Instant) -> Flow {
-        self.control_as(request, reply, false, now)
+        self.control_as(request, reply, false, Interface::Ctl, now)
     }
 
     /// Carries out a command. `own` for one the page of the web interface
     /// sent by itself: it is never the exempt command of an RLV override,
     /// which it leaves in place, and the operator log gets no line for it.
-    fn control_as(&mut self, request: Request, reply: Sender<Response>, own: bool, now: Instant) -> Flow {
+    /// `via` is the interface it came through, which decides whether it
+    /// may pay and what `status` shows.
+    fn control_as(&mut self, request: Request, reply: Sender<Response>, own: bool, via: Interface, now: Instant) -> Flow {
         // While RLV is in override, the next command but these seven is
         // exempt from the restrictions, and RLV is on again with it. No
         // restriction applies to `friends` and `profile`, so they have no
@@ -1050,12 +1101,18 @@ impl Bot {
                 | Request::Friends
                 | Request::Profile(_)
                 | Request::Quit
+                | Request::Pay { .. }
+                | Request::Prices(_)
+                | Request::Payees
         );
         let exempt = !never && !own && self.rlv.take_override(request.name());
         match request {
             Request::Status => {
                 // The client may have gone away; nothing depends on it.
-                let _ = reply.send(Response::Ok(Some(self.status())));
+                let _ = reply.send(Response::Ok(Some(self.status(via))));
+            }
+            request @ (Request::Pay { .. } | Request::Prices(_) | Request::Payees) => {
+                self.money_command(request, reply, own, via, now);
             }
             Request::Persist { location, sit } => {
                 let (location, sit) = (location.as_deref().unwrap_or("cur"), sit.as_deref().unwrap_or("cur"));
@@ -1126,6 +1183,66 @@ impl Bot {
             }
         }
         Flow::Continue
+    }
+
+    /// `pay`, `prices` and `payees`, for an interface that may pay. They
+    /// never move the avatar and no RLV restriction applies to them.
+    fn money_command(&mut self, request: Request, reply: Sender<Response>, own: bool, via: Interface, now: Instant) {
+        let command = request.name();
+        let refusal = match &self.config.payments {
+            None => Some("payments are not enabled: the config has no `[payments]` table".to_string()),
+            Some(payments) if !payments.may(via) => Some(format!(
+                "payments are not enabled for `{via}`: `perms` in the config's `[payments]` table does not list it"
+            )),
+            Some(_) => None,
+        };
+        if let Some(reason) = refusal {
+            let what = match &request {
+                Request::Pay { amount, payee } => format!("pay L${amount} to {}", payee_words(payee)),
+                _ => command.to_string(),
+            };
+            if !own {
+                info!("{via}: {what} refused: {reason}");
+            }
+            let _ = reply.send(Response::Error(reason));
+            return;
+        }
+        if matches!(request, Request::Pay { .. }) {
+            // A row the limit needs is written first, if it can be now.
+            let unwritten = self.logs.retry_transactions();
+            self.commands.set_unwritten(unwritten);
+        }
+        let origin = if own { commands::Origin::Page } else { commands::Origin::Operator };
+        #[cfg(test)]
+        if let Some(grid) = self.grid.as_mut() {
+            self.commands.money_command(origin, via, request, reply, Some(grid), now);
+            return;
+        }
+        let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
+        self.commands.money_command(origin, via, request, reply, live.as_mut(), now);
+    }
+
+    /// Asks the grid for the avatar's balance, once after each login, when
+    /// payments are switched on.
+    fn ask_balance(&mut self, now: Instant) {
+        if self.config.payments.is_none() || self.balance_asked {
+            return;
+        }
+        if let Some(session) = &mut self.session {
+            if session.request_balance(now).is_ok() {
+                self.balance_asked = true;
+            }
+        }
+    }
+
+    /// Gives up on the payment commands that waited too long.
+    fn pay_due(&mut self, now: Instant) {
+        #[cfg(test)]
+        if let Some(grid) = self.grid.as_mut() {
+            return self.commands.money_due(Some(grid), now);
+        }
+        let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
+        self.commands.money_due(live.as_mut(), now);
     }
 
     // -------------------------------------------------------------- RLV
@@ -1439,6 +1556,7 @@ impl Bot {
     /// Sends pending name lookups on their way and writes the messages
     /// whose names are settled.
     fn service_messages(&mut self) {
+        self.take_transactions(Instant::now());
         // The simulator has not said yet whether it knows names: the
         // messages wait, and so do the requests, which give up by themselves.
         if let Some(url) = self.names_url.clone() {
@@ -1459,20 +1577,50 @@ impl Bot {
             }
         }
         let now = Instant::now();
-        for record in self.recorder.flush(now) {
-            self.logs.write(&record);
-            if let Some(xmpp) = &mut self.xmpp {
-                xmpp.record(&record, now);
+        let recorded = self.recorder.flush(now);
+        self.write_recorded(recorded, now);
+    }
+
+    /// Hands what the recorder released to the logs, the XMPP gateway and
+    /// the pages.
+    fn write_recorded(&mut self, recorded: Vec<Recorded>, now: Instant) {
+        for recorded in recorded {
+            match recorded {
+                Recorded::Message(record) => {
+                    self.logs.write(&record);
+                    if let Some(xmpp) = &mut self.xmpp {
+                        xmpp.record(&record, now);
+                    }
+                    if let Some(hub) = &mut self.web {
+                        hub.record(&record);
+                    }
+                }
+                Recorded::Transaction(transaction) => {
+                    self.logs.write_transaction(&transaction);
+                    if let Some(hub) = &mut self.web {
+                        hub.transaction(&transaction);
+                    }
+                }
             }
-            if let Some(hub) = &mut self.web {
-                hub.record(&record);
-            }
+        }
+    }
+
+    /// Queues the transactions the payment commands recorded.
+    fn take_transactions(&mut self, now: Instant) {
+        for transaction in self.commands.take_transactions() {
+            self.recorder.push_transaction(transaction, now);
         }
     }
 
     /// The grid named these avatars and does not know those: the message
     /// log and the requests that waited for a name go on.
     fn names_resolved(&mut self, found: Vec<(Uuid, names::Names)>, missing: Vec<Uuid>, now: Instant) {
+        #[cfg(test)]
+        if let Some(grid) = self.grid.as_mut() {
+            self.commands.names_resolved(&found, &missing, Some(grid), now);
+            self.recorder.names_resolved(found, missing, now);
+            return;
+        }
         let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
         self.commands.names_resolved(&found, &missing, live.as_mut(), now);
         self.recorder.names_resolved(found, missing, now);
@@ -1480,6 +1628,12 @@ impl Bot {
 
     /// A name lookup came to nothing.
     fn names_failed(&mut self, ids: &[Uuid], now: Instant) {
+        #[cfg(test)]
+        if let Some(grid) = self.grid.as_mut() {
+            self.commands.names_failed(ids, Some(grid), now);
+            self.recorder.lookup_failed(ids);
+            return;
+        }
         let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
         self.commands.names_failed(ids, live.as_mut(), now);
         self.recorder.lookup_failed(ids);
@@ -1488,15 +1642,11 @@ impl Bot {
     /// Writes every message still waiting for names; for use on the way out.
     fn flush_messages(&mut self) {
         let now = Instant::now();
-        for record in self.recorder.flush_all(now) {
-            self.logs.write(&record);
-            if let Some(xmpp) = &mut self.xmpp {
-                xmpp.record(&record, now);
-            }
-            if let Some(hub) = &mut self.web {
-                hub.record(&record);
-            }
-        }
+        // A payment that waits for the grid is recorded as unconfirmed.
+        self.commands.money_stop();
+        self.take_transactions(now);
+        let recorded = self.recorder.flush_all(now);
+        self.write_recorded(recorded, now);
     }
 
     // ------------------------------------------------------------- XMPP
@@ -1526,7 +1676,7 @@ impl Bot {
             return Flow::Continue;
         };
         let xmpp::gateway::Command { request, reply, waiting } = command;
-        let flow = self.control(request, reply, now);
+        let flow = self.control_as(request, reply, false, Interface::Xmpp, now);
         if let Some(xmpp) = &mut self.xmpp {
             xmpp.waited(waiting);
         }
@@ -1547,9 +1697,9 @@ impl Bot {
     /// what it missed and the status.
     fn web_event(&mut self, event: web::WebEvent, now: Instant) -> Flow {
         match event {
-            web::WebEvent::Command { request, reply, own } => self.control_as(request, reply, own, now),
+            web::WebEvent::Command { request, reply, own } => self.control_as(request, reply, own, Interface::Web, now),
             web::WebEvent::Subscribe { last, page } => {
-                let status = self.status();
+                let status = self.status(Interface::Web);
                 if let Some(hub) = &mut self.web {
                     hub.subscribe(last.as_deref(), page, &status);
                 }
@@ -1562,7 +1712,7 @@ impl Bot {
     /// put together while no page is open.
     fn web_status(&mut self) {
         if self.web.as_ref().is_some_and(web::hub::Hub::watched) {
-            let status = self.status();
+            let status = self.status(Interface::Web);
             if let Some(hub) = &mut self.web {
                 hub.status(&status);
             }
@@ -1598,6 +1748,7 @@ impl Bot {
                 }
                 self.commands.arrived(&name);
                 self.commands.entered_region(now);
+                self.ask_balance(now);
                 let after = self.follow.arrived();
                 self.after_forced(after, "", now);
             }
@@ -1691,9 +1842,29 @@ impl Bot {
                 self.commands
                     .permission_request(object, item, &object_name, &owner_name, permissions, live.as_mut(), now);
             }
-            SessionEvent::ObjectOwner { object, owner, group } => {
+            SessionEvent::ObjectOwner {
+                object,
+                owner,
+                group,
+                name,
+            } => {
                 let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
                 self.commands.object_owner(object, owner, group, live.as_mut(), now);
+                self.commands.pay_owner(object, owner, group, name.as_deref(), live.as_mut(), now);
+            }
+            SessionEvent::PayPrice { object, default, buttons } => {
+                let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
+                self.commands.pay_price(object, default, &buttons, live.as_mut(), now);
+            }
+            SessionEvent::Money {
+                balance,
+                success,
+                description,
+                info,
+            } => {
+                let own = self.inventory.agent;
+                self.commands.money_report(balance, success, &description, info.as_ref(), own);
+                self.take_transactions(now);
             }
             SessionEvent::TeleportRequested { from, name, text } => {
                 let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
@@ -1941,6 +2112,10 @@ impl Bot {
             return Flow::Exit(EXIT_OK);
         }
         self.stopping = true;
+        // A payment that waits for the grid is answered, and recorded as
+        // unconfirmed, while whoever sent it can still be told.
+        self.commands.money_stop();
+        self.take_transactions(Instant::now());
         match &mut self.session {
             Some(session) => {
                 info!("stop requested; logging out");
@@ -2091,6 +2266,29 @@ fn status_text(here: Option<Whereabouts>, held: &Placement, manual: bool) -> Str
     lines.join("\n")
 }
 
+/// The answer to `status`: `connected`, then the avatar's name, then the
+/// rest of `place`, and the money lines when given: the balance as far as
+/// known and the `limit` line's value.
+fn status_answer(avatar: &str, place: &str, money: Option<(Option<i64>, String)>) -> String {
+    let (connected, rest) = place.split_once('\n').unwrap_or((place, ""));
+    let mut lines = vec![connected.to_string(), format!("avatar: {avatar}")];
+    lines.extend(rest.lines().map(String::from));
+    if let Some((balance, limit)) = money {
+        let balance = balance.map_or("unknown".to_string(), |balance| format!("L${balance}"));
+        lines.push(format!("balance: {balance}"));
+        lines.push(format!("limit: {limit}"));
+    }
+    lines.join("\n")
+}
+
+/// The payee of a `pay` as the log names it before it is resolved.
+fn payee_words(payee: &PayTo) -> String {
+    match payee {
+        PayTo::Avatar(given) => format!("\"{given}\""),
+        PayTo::Object(object) => format!("the object {object}"),
+    }
+}
+
 /// What the bot sees of the avatar when it asks whether the config
 /// placement is reached.
 #[derive(Debug, Clone, Copy)]
@@ -2144,6 +2342,62 @@ fn startup_due(sit: SitState, setting: Persist, rest: bool, arrival: Arrival, si
     Startup::Now { settled: true }
 }
 
+/// Seconds since the Unix epoch.
+fn wall_clock() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Opens the log files and reads the transactions file back. An error
+/// names the key the config gave the file under.
+fn open_logs(config: &Config) -> Result<(Logs, txlog::ReadBack), String> {
+    let back = match &config.logs.transactions {
+        Some(log) => txlog::read(&log.path).map_err(|e| format!("`{}`: {e}", log.key))?,
+        None => txlog::ReadBack::default(),
+    };
+    let logs = Logs::open(&config.logs).map_err(|e| format!("`{}`: {}", e.key, e.message))?;
+    if back.skipped > 0 {
+        if let Some(log) = &config.logs.transactions {
+            info!("{}: skipped {} row(s) that could not be read", log.path.display(), back.skipped);
+        }
+    }
+    Ok((logs, back))
+}
+
+/// The limit as the transactions file leaves it at `now`, and the lines
+/// the bot writes about payments when it starts.
+fn payments_start(config: &Config, back: &txlog::ReadBack, now: u64) -> (Ledger, Vec<String>) {
+    let Some(payments) = &config.payments else {
+        return (Ledger::new(None, None), Vec::new());
+    };
+    let mut ledger = Ledger::from_config(payments);
+    ledger.replay(back.counted(), now);
+    let interfaces: Vec<String> = payments.interfaces().iter().map(|i| format!("`{i}`")).collect();
+    let who = match interfaces.len() {
+        0 => "no interface may pay".to_string(),
+        1 => format!("{} may pay", interfaces[0]),
+        n => format!("{} and {} may pay", interfaces[..n - 1].join(", "), interfaces[n - 1]),
+    };
+    let limit = match (payments.limit, payments.renew) {
+        (None, _) => "no limit".to_string(),
+        (Some(limit), Some(renew)) => format!(
+            "a limit of L${limit} every {}, {} left",
+            autoreply::format_duration(renew),
+            payments::limit_text(&ledger, now)
+        ),
+        (Some(limit), None) => format!("a limit of L${limit}, {} left", payments::limit_text(&ledger, now)),
+    };
+    let mut lines = vec![format!("payments: {who}, with {limit}")];
+    let open_web = config.web.as_ref().is_some_and(|web| web.password.is_none());
+    if payments.may(Interface::Web) && open_web {
+        lines.push(
+            "warning: `web` may pay and `[web]` has no `password`: whoever reaches the web interface \
+             can pay; set `web.password`"
+                .to_string(),
+        );
+    }
+    (ledger, lines)
+}
+
 fn run_bot(config_path: &Path) -> i32 {
     let config = match Config::load(config_path) {
         Ok(config) => config,
@@ -2152,12 +2406,12 @@ fn run_bot(config_path: &Path) -> i32 {
             return EXIT_CONFIG;
         }
     };
-    // Before anything touches the network: a log that cannot be written is
-    // a config error.
-    let logs = match Logs::open(config.log_chat.as_deref(), config.log_im.as_deref()) {
-        Ok(logs) => logs,
+    // Before anything touches the network: a log that cannot be written,
+    // or a transactions file that is something else, is a config error.
+    let (logs, back) = match open_logs(&config) {
+        Ok(opened) => opened,
         Err(e) => {
-            eprintln!("rslbot: {}: `{}`: {}", config_path.display(), e.key, e.message);
+            eprintln!("rslbot: {}: {e}", config_path.display());
             return EXIT_CONFIG;
         }
     };
@@ -2191,6 +2445,7 @@ fn run_bot(config_path: &Path) -> i32 {
         info!("{}: {note}", config_path.display());
     }
     let mut bot = Bot::new(config, logs, events);
+    bot.start_payments(&back, wall_clock());
     // Still before anything touches the network: a setting command of the
     // startup script that is refused is a config error.
     if let Err(e) = bot.startup_head(Instant::now()) {
@@ -2218,6 +2473,7 @@ fn run_loop(bot: &mut Bot, incoming: &Receiver<Event>) -> i32 {
         bot.decide_requests(Instant::now());
         bot.scan_objects(Instant::now());
         bot.restore_attachments(Instant::now());
+        bot.pay_due(Instant::now());
         bot.service_messages();
         bot.xmpp_presence();
         bot.web_status();
@@ -2660,7 +2916,7 @@ mod tests {
     /// A bot that has not logged in, and the control answers it gives.
     fn bot(config: Config) -> Bot {
         let (events, _incoming) = mpsc::channel();
-        Bot::new(config, Logs::open(None, None).ok().unwrap(), events)
+        Bot::new(config, Logs::none(), events)
     }
 
     fn command(bot: &mut Bot, line: &str) -> Response {
@@ -2682,7 +2938,9 @@ mod tests {
         assert_eq!(bot.book.held().to_string(), "Blue Lagoon/128/128/25 ground");
         assert_eq!(bot.reconciler.goal().region.as_deref(), Some("Blue Lagoon"));
         assert_eq!(bot.reconciler.goal().seat, Some(SeatGoal::Ground));
-        assert!(bot.status().ends_with("persist: Blue Lagoon/128/128/25 ground\nmode: holding"));
+        assert!(bot
+            .status(Interface::Ctl)
+            .ends_with("persist: Blue Lagoon/128/128/25 ground\nmode: holding"));
         // Back to the config.
         let answer = command(&mut bot, "persist\tcfg\tcfg");
         assert_eq!(answer, Response::Ok(Some(format!("Target/128/128/25 {OBJECT}"))));
@@ -2768,7 +3026,10 @@ mod tests {
     #[test]
     fn a_config_without_a_position_holds_no_location_before_the_first_login() {
         let mut bot = bot(Config::parse(ACCOUNT).unwrap());
-        assert_eq!(bot.status(), "connected: no\npersist: unknown stand\nmode: holding");
+        assert_eq!(
+            bot.status(Interface::Ctl),
+            "connected: no\navatar: Sit Bot\npersist: unknown stand\nmode: holding"
+        );
         assert_eq!(next_login(&bot), Decision::Start(Action::Login(login::Start::Last)));
         // `cfg` is accepted all the same, and still waits for that login.
         assert_eq!(
@@ -3236,7 +3497,8 @@ mod tests {
         hear(&mut bot, SessionEvent::Chat(said));
         let records = bot.recorder.flush_all(Instant::now());
         assert_eq!(records.len(), 1);
-        assert_eq!((records[0].avatar_name.as_str(), records[0].avatar_uuid), ("Jane Doe", Some(jane)));
+        let record = records[0].message();
+        assert_eq!((record.avatar_name.as_str(), record.avatar_uuid), ("Jane Doe", Some(jane)));
     }
 
     #[test]
@@ -4182,7 +4444,11 @@ mod tests {
     /// The instant messages recorded since the last call: kind and text.
     fn recorded(bot: &mut Bot) -> Vec<(String, String)> {
         let records = bot.recorder.flush_all(Instant::now());
-        records.into_iter().map(|record| (record.kind, record.text)).collect()
+        records
+            .into_iter()
+            .map(|record| record.message().clone())
+            .map(|record| (record.kind, record.text))
+            .collect()
     }
 
     fn pair(kind: &str, text: &str) -> (String, String) {
@@ -4570,13 +4836,18 @@ mod tests {
 
         impl Rig {
             fn new(grid: bool) -> Rig {
+                Rig::with("", grid)
+            }
+
+            /// The same with `more` after the `[xmpp]` table.
+            fn with(more: &str, grid: bool) -> Rig {
                 let fake = Fake::new();
                 let config = full(&format!(
-                    "[xmpp]\ncomponent = \"{DOMAIN}\"\nserver = \"{}\"\nsecret = \"{SECRET}\"\nowners = [\"{OWNER}\"]\n",
+                    "[xmpp]\ncomponent = \"{DOMAIN}\"\nserver = \"{}\"\nsecret = \"{SECRET}\"\nowners = [\"{OWNER}\"]\n{more}",
                     fake.address()
                 ));
                 let (events, incoming) = mpsc::channel();
-                let mut bot = Bot::new(config, Logs::open(None, None).ok().unwrap(), events);
+                let mut bot = Bot::new(config, Logs::none(), events);
                 bot.start_gateway();
                 if grid {
                     bot.grid = Some(FakeGrid::default());
@@ -4585,7 +4856,11 @@ mod tests {
             }
 
             fn connected(grid: bool) -> Rig {
-                let mut rig = Rig::new(grid);
+                Rig::connected_with("", grid)
+            }
+
+            fn connected_with(more: &str, grid: bool) -> Rig {
+                let mut rig = Rig::with(more, grid);
                 rig.connect();
                 rig.fake.expect(&format!("from='local@{DOMAIN}' to='{OWNER}'/>"));
                 rig
@@ -4751,10 +5026,29 @@ mod tests {
         }
 
         #[test]
+        fn the_control_contact_is_the_interface_xmpp() {
+            for (perms, shown) in [("[\"xmpp\"]", true), ("[\"ctl\"]", false)] {
+                let mut rig = Rig::connected_with(&format!("[payments]\nlimit = \"unlimited\"\nperms = {perms}\n"), true);
+                rig.owner_sends(DOMAIN, "status");
+                let status = answer(&mut rig);
+                assert_eq!(status.ends_with("balance: unknown\nlimit: unlimited"), shown, "{perms}: {status}");
+                rig.owner_sends(DOMAIN, &format!("pay 10 avatar {}", jane()));
+                if shown {
+                    assert_eq!(rig.calls(), []);
+                    let (id, names) = janes_names();
+                    rig.bot.names_resolved(vec![(id, names)], Vec::new(), Instant::now());
+                    assert_eq!(rig.calls(), [Call::Pay(jane(), 10, udp::messages::TRANSACTION_GIFT, String::new())]);
+                } else {
+                    assert!(answer(&mut rig).contains("`xmpp`"));
+                }
+            }
+        }
+
+        #[test]
         fn commands_are_answered_as_the_control_socket_answers_them() {
             let mut rig = Rig::connected(false);
             rig.owner_sends(DOMAIN, "status");
-            assert_eq!(answer(&mut rig), rig.bot.status());
+            assert_eq!(answer(&mut rig), rig.bot.status(Interface::Xmpp));
             rig.owner_sends(DOMAIN, "sit ground");
             let reason = refused(&mut rig.bot, "sit\tground");
             assert_eq!(answer(&mut rig), format!("error: {reason}"));
@@ -5021,6 +5315,478 @@ mod tests {
 
     // -------------------------------------------------------------- web
 
+    mod payments {
+        use super::*;
+        use commands::tests::{Call, FakeGrid};
+        use udp::messages::{TransactionInfo, TRANSACTION_GIFT};
+
+        const JANE: Uuid = Uuid::from_bytes([0x71; 16]);
+
+        fn janes_names() -> (Uuid, names::Names) {
+            let names = names::Names {
+                legacy: "Jane Doe".into(),
+                display: "JD".into(),
+            };
+            (JANE, names)
+        }
+
+        /// A temporary directory of this test's own.
+        fn temp_dir(name: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!("rslbot-pay-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        /// A bot with `table` as its `[payments]` table, unlimited, on a
+        /// simulator that takes everything.
+        fn paying(table: &str) -> Bot {
+            let mut bot = bot(full(&format!("[payments]\nlimit = \"unlimited\"\n{table}\n")));
+            bot.start_payments(&txlog::ReadBack::default(), wall_clock());
+            bot.grid = Some(FakeGrid::default());
+            bot
+        }
+
+        fn calls(bot: &mut Bot) -> Vec<Call> {
+            std::mem::take(&mut bot.grid.as_mut().unwrap().calls)
+        }
+
+        /// Hands the bot a command through `via`; the receiver of its answer.
+        fn through(bot: &mut Bot, via: Interface, own: bool, line: &str) -> Receiver<Response> {
+            let (reply, answer) = mpsc::channel();
+            let request = Request::decode(line.as_bytes()).unwrap();
+            assert!(matches!(bot.control_as(request, reply, own, via, Instant::now()), Flow::Continue));
+            answer
+        }
+
+        fn pay_jane(bot: &mut Bot, via: Interface) -> Receiver<Response> {
+            let answer = through(bot, via, false, &format!("pay\t10\tavatar\t{JANE}"));
+            let (id, names) = janes_names();
+            bot.names_resolved(vec![(id, names)], Vec::new(), Instant::now());
+            answer
+        }
+
+        fn paid(bot: &mut Bot) -> bool {
+            calls(bot).iter().any(|call| matches!(call, Call::Pay(..)))
+        }
+
+        fn error(answer: &Receiver<Response>) -> String {
+            match answer.try_recv() {
+                Ok(Response::Error(reason)) => reason,
+                other => panic!("expected an error, got {other:?}"),
+            }
+        }
+
+        fn report(bot: &mut Bot, balance: i32, info: Option<TransactionInfo>) {
+            hear(
+                bot,
+                SessionEvent::Money {
+                    balance,
+                    success: true,
+                    description: String::new(),
+                    info,
+                },
+            );
+        }
+
+        // ------------------------------------------------------ the gate
+
+        #[test]
+        fn without_the_table_nothing_is_paid() {
+            let mut bot = bot(full(""));
+            bot.grid = Some(FakeGrid::default());
+            for line in ["pay\t10\tavatar\tJane Doe", "prices\tx", "payees"] {
+                for via in Interface::ALL {
+                    let reason = error(&through(&mut bot, via, false, line));
+                    assert!(reason.contains("[payments]"), "{line} via {via}: {reason}");
+                }
+            }
+            assert_eq!(calls(&mut bot), []);
+            assert!(!bot.status(Interface::Ctl).contains("balance"));
+        }
+
+        #[test]
+        fn only_the_interfaces_perms_lists_pay() {
+            let mut bot = paying("perms = [\"ctl\"]");
+            let reason = error(&through(&mut bot, Interface::Web, false, "pay\t10\tavatar\tJane Doe"));
+            assert!(reason.contains("`web`"), "{reason}");
+            let reason = error(&through(&mut bot, Interface::Xmpp, false, "payees"));
+            assert!(reason.contains("`xmpp`"), "{reason}");
+            assert_eq!(calls(&mut bot), []);
+            pay_jane(&mut bot, Interface::Ctl);
+            assert_eq!(calls(&mut bot), [Call::Pay(JANE, 10, TRANSACTION_GIFT, String::new())]);
+        }
+
+        #[test]
+        fn paying_over_xmpp_only() {
+            let mut bot = paying("perms = [\"xmpp\"]");
+            pay_jane(&mut bot, Interface::Xmpp);
+            assert!(paid(&mut bot));
+            report(&mut bot, 990, Some(gift(10)));
+            assert!(error(&through(&mut bot, Interface::Ctl, false, "pay\t10\tavatar\tJane Doe")).contains("`ctl`"));
+        }
+
+        #[test]
+        fn nobody_listed_is_as_without_the_table() {
+            let mut bot = paying("perms = []");
+            for via in Interface::ALL {
+                assert!(error(&through(&mut bot, via, false, "pay\t10\tavatar\tJane Doe")).contains("not enabled"));
+            }
+            assert!(!bot.status(Interface::Ctl).contains("limit"));
+        }
+
+        #[test]
+        fn the_startup_script_pays_as_ctl() {
+            let script = format!("pay 10 avatar {JANE}\n");
+            let mut ctl = scripted("[payments]\nlimit = \"unlimited\"\nperms = [\"ctl\"]\n", &script);
+            ctl.grid = Some(FakeGrid::default());
+            ctl.startup_reached(Persist::Off, true, Instant::now());
+            assert_eq!(ctl.startup_rest(), Ok(true));
+            let (id, names) = janes_names();
+            ctl.names_resolved(vec![(id, names)], Vec::new(), Instant::now());
+            assert!(paid(&mut ctl));
+            // With only `web` in `perms` the line is refused, and the
+            // script stops there.
+            let mut web = scripted("[payments]\nlimit = \"unlimited\"\nperms = [\"web\"]\n", &script);
+            web.grid = Some(FakeGrid::default());
+            web.startup_reached(Persist::Off, true, Instant::now());
+            assert_eq!(web.startup_rest(), Ok(true));
+            assert!(!paid(&mut web));
+            assert!(script_is_over(&web));
+        }
+
+        #[test]
+        fn an_override_is_not_used_up_by_payments() {
+            let mut bot = paying("perms = [\"ctl\"]");
+            ok(&mut bot, "rlv\tmode\ton");
+            ok(&mut bot, "rlv\tmode\toverride");
+            through(&mut bot, Interface::Ctl, false, "prices\t11111111-2222-3333-4444-555555555555");
+            through(&mut bot, Interface::Ctl, false, "payees");
+            assert!(ok(&mut bot, "rlv\tstatus").starts_with("rlv: override"));
+        }
+
+        #[test]
+        fn the_interface_travels_with_the_command() {
+            // A probe: `status` shows the money lines only to an
+            // interface that may pay, and each way in is its interface.
+            let mut bot = paying("perms = [\"web\"]");
+            let status = |bot: &mut Bot, via| match through(bot, via, false, "status").try_recv() {
+                Ok(Response::Ok(Some(text))) => text,
+                other => panic!("{other:?}"),
+            };
+            assert!(!status(&mut bot, Interface::Ctl).contains("limit"));
+            assert!(!status(&mut bot, Interface::Xmpp).contains("limit"));
+            assert!(status(&mut bot, Interface::Web).ends_with("balance: unknown\nlimit: unlimited"));
+            // The control socket and the script use `control`, which is
+            // `ctl`.
+            assert!(!ok(&mut bot, "status").contains("limit"));
+        }
+
+        // --------------------------------------------------------- status
+
+        fn gift(amount: i32) -> TransactionInfo {
+            TransactionInfo {
+                kind: TRANSACTION_GIFT,
+                source: Uuid::nil(),
+                source_group: false,
+                dest: JANE,
+                dest_group: false,
+                amount,
+                item: String::new(),
+            }
+        }
+
+        #[test]
+        fn status_lines() {
+            let mut bot = bot(full(&format!(
+                "[logs]\ntransactions = \"{}\"\n[payments]\nlimit = 1000\nperms = [\"ctl\"]\n",
+                temp_dir("status").join("tx.tsv").display()
+            )));
+            bot.start_payments(&txlog::ReadBack::default(), wall_clock());
+            let status = ok(&mut bot, "status");
+            assert_eq!(status.lines().nth(1), Some("avatar: Sit Bot"));
+            assert!(status.ends_with("mode: holding\nbalance: unknown\nlimit: L$1000"), "{status}");
+            report(&mut bot, 1200, None);
+            assert!(ok(&mut bot, "status").ends_with("balance: L$1200\nlimit: L$1000"));
+            // A payment received changes it without asking.
+            let received = TransactionInfo {
+                source: JANE,
+                dest: Uuid::nil(),
+                ..gift(50)
+            };
+            report(&mut bot, 1250, Some(received));
+            assert!(ok(&mut bot, "status").contains("balance: L$1250"));
+        }
+
+        #[test]
+        fn a_single_word_user_is_named_as_resident() {
+            let mut bot = bot(Config::parse("user = \"sitbot\"\npassword = \"x\"\n").unwrap());
+            assert_eq!(ok(&mut bot, "status").lines().nth(1), Some("avatar: sitbot Resident"));
+        }
+
+        #[test]
+        fn the_readmes_status_example_is_what_the_bot_prints() {
+            let held = Placement {
+                location: Some(at("Target", 130.0, 128.0, 25.9)),
+                sit: SitState::Object(object()),
+            };
+            let here = Whereabouts {
+                region: "Target",
+                position: Some([130.0, 128.0, 25.9]),
+                seat: sat(object(), None),
+                seat_name: Some("Park Bench"),
+            };
+            let mut ledger = Ledger::new(Some(1000), Some(Duration::from_secs(7 * 86_400)));
+            let paid = 1_796_126_400; // 2026-12-01T12:00:00Z
+            ledger.reserve(250, paid).unwrap();
+            let money = (Some(1200), crate::payments::limit_text(&ledger, paid + 60));
+            let text = status_answer("Sit Bot", &status_text(Some(here), &held, false), Some(money));
+            assert!(include_str!("../README.md").contains(&format!("```\n{text}\n```")), "{text}");
+        }
+
+        #[test]
+        fn status_answer_puts_the_avatar_second_and_money_last() {
+            assert_eq!(
+                status_answer("Sit Bot", "connected: no\npersist: unknown stand\nmode: holding", None),
+                "connected: no\navatar: Sit Bot\npersist: unknown stand\nmode: holding"
+            );
+            assert_eq!(
+                status_answer(
+                    "Sit Bot",
+                    "connected: no\nmode: manual",
+                    Some((Some(5), "L$750 (renews to L$1000 on 2026-12-08T12:00:00Z)".into()))
+                ),
+                "connected: no\navatar: Sit Bot\nmode: manual\nbalance: L$5\nlimit: L$750 (renews to L$1000 on 2026-12-08T12:00:00Z)"
+            );
+        }
+
+        #[test]
+        fn the_balance_is_asked_for_once_after_each_login_with_the_table_only() {
+            let mut with = paying("perms = []");
+            assert!(!with.balance_asked);
+            // Without a session there is nothing to ask.
+            with.ask_balance(Instant::now());
+            assert!(!with.balance_asked);
+            let mut without = bot(full(""));
+            without.ask_balance(Instant::now());
+            assert!(!without.balance_asked);
+        }
+
+        #[test]
+        fn balance_changes_reach_the_pages_status() {
+            let mut bot = paying("perms = [\"web\"]");
+            let before = bot.status(Interface::Web);
+            report(&mut bot, 1250, None);
+            let after = bot.status(Interface::Web);
+            assert_ne!(before, after);
+            assert!(after.ends_with("balance: L$1250\nlimit: unlimited"));
+        }
+
+        // ------------------------------------------------ the limit at startup
+
+        fn row(time: u64, kind: txlog::Kind, amount: u64, counted: u64) -> txlog::Transaction {
+            txlog::Transaction {
+                time,
+                kind,
+                amount,
+                balance: None,
+                counted,
+                code: TRANSACTION_GIFT,
+                party: Some(JANE),
+                party_group: false,
+                avatar_name: "Jane Doe".into(),
+                display_name: String::new(),
+                object_name: String::new(),
+                object: None,
+                text: String::new(),
+            }
+        }
+
+        fn limited(extra: &str, dir: &Path) -> Config {
+            let path = dir.join("tx.tsv");
+            full(&format!(
+                "[logs]\ntransactions = \"{}\"\n[payments]\nlimit = 1000\nperms = [\"ctl\", \"web\"]\n{extra}",
+                path.display()
+            ))
+        }
+
+        #[test]
+        fn the_limit_is_restored_from_the_file() {
+            let dir = temp_dir("restore");
+            let now = wall_clock();
+            let rows = [
+                row(now - 3600, txlog::Kind::Paid, 900, 900),
+                row(now - 60, txlog::Kind::Received, 50, 0),
+                row(now - 50, txlog::Kind::Paid, 40, 0),
+                row(now - 40, txlog::Kind::Failed, 70, 0),
+                row(now - 30, txlog::Kind::Spent, 80, 0),
+            ];
+            let text: String = std::iter::once(txlog::header()).chain(rows.iter().map(|r| r.row())).collect();
+            let config = limited("", &dir);
+            std::fs::write(&config.logs.transactions.as_ref().unwrap().path, text).unwrap();
+            let (_, back) = open_logs(&config).unwrap();
+            assert_eq!(back.rows.len(), 5);
+            let mut bot = bot(config);
+            bot.start_payments(&back, now);
+            assert!(ok(&mut bot, "status").ends_with("limit: L$100"));
+            bot.grid = Some(FakeGrid::default());
+            report(&mut bot, 10_000, None);
+            let answer = through(&mut bot, Interface::Ctl, false, &format!("pay\t101\tavatar\t{JANE}"));
+            let (id, names) = janes_names();
+            bot.names_resolved(vec![(id, names)], Vec::new(), Instant::now());
+            assert!(error(&answer).contains("L$100"));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn a_restart_keeps_what_was_paid() {
+            let dir = temp_dir("restart");
+            let config = limited("", &dir);
+            let (logs, back) = open_logs(&config).unwrap();
+            let (events, _incoming) = mpsc::channel();
+            let mut first = Bot::new(config.clone(), logs, events);
+            first.start_payments(&back, wall_clock());
+            first.grid = Some(FakeGrid::default());
+            let answer = through(&mut first, Interface::Ctl, false, &format!("pay\t900\tavatar\t{JANE}"));
+            let (id, names) = janes_names();
+            first.names_resolved(vec![(id, names)], Vec::new(), Instant::now());
+            let own = first.inventory.agent;
+            report(&mut first, 100, Some(TransactionInfo { source: own, ..gift(900) }));
+            assert!(matches!(answer.try_recv(), Ok(Response::Ok(_))));
+            // The record waits a moment for its names, and is written on the
+            // way out at the latest.
+            first.flush_messages();
+            drop(first);
+            let (logs, back) = open_logs(&config).unwrap();
+            assert_eq!(back.rows.len(), 1);
+            let (events, _incoming) = mpsc::channel();
+            let mut second = Bot::new(config, logs, events);
+            second.start_payments(&back, wall_clock());
+            assert!(ok(&mut second, "status").ends_with("limit: L$100"));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn start_line_and_the_warning_for_an_open_web_interface() {
+            let dir = temp_dir("start");
+            let now = 1_796_126_400; // 2026-12-01T12:00:00Z
+            let config = limited("limit_renew = \"7d\"\n[web]\nlisten = \"127.0.0.1:8080\"\n", &dir);
+            let back = txlog::ReadBack {
+                rows: vec![row(now - 86_400, txlog::Kind::Paid, 250, 250)],
+                skipped: 0,
+            };
+            let (ledger, lines) = payments_start(&config, &back, now);
+            assert_eq!(ledger.left(now), Some(750));
+            assert_eq!(
+                lines[0],
+                "payments: `ctl` and `web` may pay, with a limit of L$1000 every 7d, \
+                 L$750 (renews to L$1000 on 2026-12-07T12:00:00Z) left"
+            );
+            assert!(lines[1].contains("web.password"), "{lines:?}");
+            let locked = limited("[web]\nlisten = \"127.0.0.1:8080\"\npassword = \"p\"\n", &dir);
+            assert_eq!(payments_start(&locked, &back, now).1.len(), 1);
+            assert_eq!(payments_start(&full(""), &back, now).1, Vec::<String>::new());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        // ---------------------------------------------- the record of the limit
+
+        fn read_only(path: &Path, on: bool) {
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_readonly(on);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+
+        #[test]
+        fn disk_full_and_room_again() {
+            let dir = temp_dir("full");
+            let config = limited("", &dir);
+            let path = config.logs.transactions.as_ref().unwrap().path.clone();
+            let (logs, back) = open_logs(&config).unwrap();
+            let (events, _incoming) = mpsc::channel();
+            let mut bot = Bot::new(config, logs, events);
+            bot.start_payments(&back, wall_clock());
+            bot.grid = Some(FakeGrid::default());
+            report(&mut bot, 10_000, None);
+            read_only(&path, true);
+            if std::fs::OpenOptions::new().append(true).open(&path).is_ok() {
+                // Root writes whatever the permissions say.
+                read_only(&path, false);
+                return;
+            }
+            let answer = pay_jane(&mut bot, Interface::Ctl);
+            assert!(paid(&mut bot));
+            let own = bot.inventory.agent;
+            report(&mut bot, 9990, Some(TransactionInfo { source: own, ..gift(10) }));
+            assert!(matches!(answer.try_recv(), Ok(Response::Ok(_))));
+            bot.flush_messages();
+            // The row could not be written: the next payment that counts is
+            // refused, naming the file.
+            let reason = error(&pay_jane(&mut bot, Interface::Ctl));
+            assert!(reason.contains(&path.display().to_string()), "{reason}");
+            assert!(!paid(&mut bot));
+            // Room again: the waiting row goes first, then the payment.
+            read_only(&path, false);
+            pay_jane(&mut bot, Interface::Ctl);
+            assert!(paid(&mut bot));
+            assert_eq!(txlog::read(&path).unwrap().rows.len(), 1);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        #[test]
+        fn a_payment_that_waits_is_recorded_when_the_bot_stops() {
+            let dir = temp_dir("stop");
+            let config = limited("", &dir);
+            let path = config.logs.transactions.as_ref().unwrap().path.clone();
+            let (logs, back) = open_logs(&config).unwrap();
+            let (events, _incoming) = mpsc::channel();
+            let mut bot = Bot::new(config, logs, events);
+            bot.start_payments(&back, wall_clock());
+            bot.grid = Some(FakeGrid::default());
+            pay_jane(&mut bot, Interface::Ctl);
+            assert!(paid(&mut bot));
+            bot.flush_messages();
+            let rows = txlog::read(&path).unwrap().rows;
+            assert_eq!((rows.len(), rows[0].kind, rows[0].counted), (1, txlog::Kind::Unconfirmed, 10));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+
+        // ------------------------------------------------- config errors at start
+
+        fn exit_of(name: &str, config: &str) -> i32 {
+            let dir = temp_dir(name);
+            let path = dir.join("russelbot.toml");
+            std::fs::write(&path, config).unwrap();
+            let code = run_bot(&path);
+            std::fs::remove_dir_all(dir).unwrap();
+            code
+        }
+
+        #[test]
+        fn a_log_that_cannot_be_opened_stops_the_bot_before_the_network() {
+            let missing = std::env::temp_dir().join(format!("rslbot-no-such-dir-{}", std::process::id()));
+            let new = format!("{ACCOUNT}[logs]\nim = \"{}/im.tsv\"\n", missing.display());
+            let old = format!("{ACCOUNT}log_im = \"{}/im.tsv\"\n", missing.display());
+            assert_eq!(exit_of("new-key", &new), EXIT_CONFIG);
+            assert_eq!(exit_of("old-key", &old), EXIT_CONFIG);
+            let error = |text: &str| open_logs(&Config::parse(text).unwrap()).err().unwrap();
+            assert!(error(&new).starts_with("`logs.im`: cannot open"), "{}", error(&new));
+            assert!(error(&old).starts_with("`log_im`: cannot open"), "{}", error(&old));
+        }
+
+        #[test]
+        fn a_transactions_file_that_is_something_else_stops_the_bot() {
+            let dir = temp_dir("not-tx");
+            let path = dir.join("chat.tsv");
+            std::fs::write(&path, msglog::header()).unwrap();
+            let text = format!("{ACCOUNT}[logs]\ntransactions = \"{}\"\n", path.display());
+            let error = open_logs(&Config::parse(&text).unwrap()).err().unwrap();
+            assert!(error.starts_with("`logs.transactions`:") && error.contains("chat.tsv"), "{error}");
+            assert_eq!(exit_of("not-tx-run", &text), EXIT_CONFIG);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     mod web_interface {
         use super::*;
         use commands::tests::{Call, FakeGrid};
@@ -5064,12 +5830,17 @@ mod tests {
 
         impl Rig {
             fn new(grid: bool) -> Rig {
-                let mut config = full("[web]\nlisten = \"127.0.0.1:8080\"\n");
+                Rig::with("", grid)
+            }
+
+            /// The same with `more` after the `[web]` table.
+            fn with(more: &str, grid: bool) -> Rig {
+                let mut config = full(&format!("[web]\nlisten = \"127.0.0.1:8080\"\n{more}"));
                 // Any free port, which a config cannot ask for.
                 config.web.as_mut().unwrap().listen.set_port(0);
                 let (events, incoming) = mpsc::channel();
                 let server = listen_quick(config.web.as_ref().unwrap(), events.clone());
-                let mut bot = Bot::new(config, Logs::open(None, None).ok().unwrap(), events);
+                let mut bot = Bot::new(config, Logs::none(), events);
                 if grid {
                     bot.grid = Some(FakeGrid::default());
                 }
@@ -5171,7 +5942,7 @@ mod tests {
             // Between logins.
             let mut rig = Rig::new(false);
             let status = rig.page("status");
-            assert!(status.starts_with("ok\tconnected: no\\npersist: "), "{status}");
+            assert!(status.starts_with("ok\tconnected: no\\navatar: Sit Bot\\npersist: "), "{status}");
             assert_eq!(status, by_socket(&mut rig.bot, "status"));
             let refused = rig.page("sit\tground");
             assert!(refused.starts_with("error\t"), "{refused}");
@@ -5443,6 +6214,111 @@ mod tests {
                     return newest;
                 }
             }
+        }
+
+        #[test]
+        fn pages_get_transactions_while_web_may_pay() {
+            let mut rig = Rig::with("[payments]\nlimit = \"unlimited\"\nperms = [\"ctl\", \"web\"]\n", true);
+            rig.bot.start_payments(&txlog::ReadBack::default(), wall_clock());
+            let (mut page, _) = rig.open("/api/events");
+            // A payment made through the control socket.
+            let (reply, answer) = mpsc::channel();
+            let request = Request::decode(format!("pay\t25\tavatar\t{}", jane()).as_bytes()).unwrap();
+            rig.bot.control(request, reply, Instant::now());
+            let (id, names) = janes_names();
+            rig.bot.names_resolved(vec![(id, names.clone())], Vec::new(), Instant::now());
+            let own = rig.bot.inventory.agent;
+            let info = udp::messages::TransactionInfo {
+                kind: udp::messages::TRANSACTION_GIFT,
+                source: own,
+                source_group: false,
+                dest: jane(),
+                dest_group: false,
+                amount: 25,
+                item: String::new(),
+            };
+            hear(
+                &mut rig.bot,
+                SessionEvent::Money {
+                    balance: 975,
+                    success: true,
+                    description: "You paid Jane Doe L$25.".into(),
+                    info: Some(info),
+                },
+            );
+            assert!(matches!(answer.try_recv(), Ok(Response::Ok(_))));
+            // Its names are known: it is recorded at once.
+            rig.bot.service_messages();
+            let event = page.event();
+            assert!(event.starts_with("event: money\nid: "), "{event}");
+            let data = event.lines().nth(2).unwrap().strip_prefix("data: ").unwrap();
+            let fields: Vec<&str> = data.split('\t').collect();
+            assert_eq!(fields.len(), 12);
+            assert_eq!(
+                fields[1..9],
+                ["paid", "25", "975", "25", "5001", &jane().to_string(), "Jane Doe", "Janey"]
+            );
+            // The status the page gets has the money lines, and changed.
+            rig.bot.web_status();
+            let status = page.event();
+            assert!(
+                status.starts_with("event: status\n") && status.contains("balance: L$975"),
+                "{status}"
+            );
+        }
+
+        #[test]
+        fn the_page_and_its_console_are_the_interface_web() {
+            let mut rig = Rig::with("[payments]\nlimit = \"unlimited\"\nperms = [\"web\"]\n", true);
+            assert!(rig.page("status").ends_with("balance: unknown\\nlimit: unlimited\n"));
+            assert!(rig.console("status").ends_with("balance: unknown\\nlimit: unlimited\n"));
+            assert!(!ok(&mut rig.bot, "status").contains("limit"), "the control socket is `ctl`");
+            let mut ctl = Rig::with("[payments]\nlimit = \"unlimited\"\nperms = [\"ctl\"]\n", true);
+            let refused = ctl.console(&format!("pay 10 avatar \"{}\"", jane()));
+            assert!(refused.starts_with("error\t") && refused.contains("`web`"), "{refused}");
+            assert_eq!(ctl.calls(), []);
+        }
+
+        #[test]
+        fn pages_get_no_transactions_while_web_may_not_pay() {
+            let mut rig = Rig::with("[payments]\nlimit = \"unlimited\"\nperms = [\"ctl\"]\n", true);
+            rig.bot.start_payments(&txlog::ReadBack::default(), wall_clock());
+            let info = udp::messages::TransactionInfo {
+                kind: udp::messages::TRANSACTION_GIFT,
+                source: jane(),
+                source_group: false,
+                dest: rig.bot.inventory.agent,
+                dest_group: false,
+                amount: 50,
+                item: String::new(),
+            };
+            hear(
+                &mut rig.bot,
+                SessionEvent::Money {
+                    balance: 1050,
+                    success: true,
+                    description: String::new(),
+                    info: Some(info),
+                },
+            );
+            rig.bot.flush_messages();
+            let (_, kept) = rig.open("/api/events");
+            assert_eq!(kept, [] as [&str; 0]);
+            assert!(!rig.bot.status(Interface::Web).contains("balance"));
+        }
+
+        #[test]
+        fn payees_may_be_the_pages_own_and_say_may_not() {
+            let mut rig = Rig::with(
+                "[payments]\nlimit = \"unlimited\"\nperms = [\"web\"]\nwhitelist = [\"Jane Doe\"]\n",
+                true,
+            );
+            logged(&mut rig.bot);
+            assert_eq!(rig.send("/api/command", "payees", true), "ok\t?\\tJane Doe\\twhitelist\n");
+            assert_eq!(logged(&mut rig.bot), [] as [&str; 0]);
+            let refused = body(&post_to(rig.address(), "/api/command", &["X-Rslbot-Own: 1"], "say\thello")).to_string();
+            assert!(refused.contains("cannot be sent as the page's own"), "{refused}");
+            assert!(rig.incoming.try_recv().is_err(), "say reached the bot");
         }
 
         #[test]

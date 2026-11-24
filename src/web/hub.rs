@@ -5,6 +5,7 @@
 
 use crate::escape::escape;
 use crate::msglog::{Channel, Record};
+use crate::txlog::Transaction;
 use std::collections::VecDeque;
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::Arc;
@@ -47,6 +48,9 @@ pub struct Hub {
     last: u64,
     chat: Ring,
     im: Ring,
+    /// The transactions, while the web interface may pay; otherwise none
+    /// is kept or sent.
+    money: Option<Ring>,
     subscribers: Vec<SyncSender<Arc<str>>>,
     /// The status as it was last sent to everyone.
     status: Option<String>,
@@ -80,6 +84,13 @@ fn message_event(id: &str, record: &Record) -> String {
     format!("event: {kind}\nid: {id}\ndata: {}\n\n", data(&fields))
 }
 
+/// A recorded transaction as an event: the twelve fields of its row.
+fn money_event(id: &str, transaction: &Transaction) -> String {
+    let fields = transaction.fields();
+    let fields: Vec<&str> = fields.iter().map(String::as_str).collect();
+    format!("event: money\nid: {id}\ndata: {}\n\n", data(&fields))
+}
+
 /// The status text as an event.
 fn status_event(status: &str) -> String {
     format!("event: status\ndata: {}\n\n", data(&[status]))
@@ -92,6 +103,7 @@ impl Hub {
             last: 0,
             chat: Ring::default(),
             im: Ring::default(),
+            money: None,
             subscribers: Vec::new(),
             status: None,
         }
@@ -101,6 +113,30 @@ impl Hub {
     /// which closes its stream.
     fn publish(&mut self, event: &Arc<str>) {
         self.subscribers.retain(|page| page.try_send(event.clone()).is_ok());
+    }
+
+    /// The web interface may pay: transactions are kept and sent from now
+    /// on, starting with `kept`, the rows read from the transactions file.
+    pub fn allow_money(&mut self, kept: &[Transaction]) {
+        self.money = Some(Ring::default());
+        for transaction in kept {
+            self.transaction(transaction);
+        }
+    }
+
+    /// A transaction was recorded: kept and sent to every page while the
+    /// web interface may pay, dropped otherwise.
+    pub fn transaction(&mut self, transaction: &Transaction) {
+        if self.money.is_none() {
+            return;
+        }
+        self.last += 1;
+        let id = format!("{}-{}", self.start, self.last);
+        let event: Arc<str> = money_event(&id, transaction).into();
+        if let Some(ring) = &mut self.money {
+            ring.push(self.last, event.clone());
+        }
+        self.publish(&event);
     }
 
     /// A message was recorded: it is kept, and sent to every page.
@@ -120,7 +156,8 @@ impl Hub {
     fn after(&self, last: Option<&str>) -> Option<u64> {
         let (start, number) = last?.split_once('-')?;
         let (start, number) = (start.parse::<u64>().ok()?, number.parse::<u64>().ok()?);
-        let kept = number >= self.chat.dropped && number >= self.im.dropped;
+        let money = self.money.as_ref().map_or(0, |ring| ring.dropped);
+        let kept = number >= self.chat.dropped && number >= self.im.dropped && number >= money;
         (start == self.start && number <= self.last && kept).then_some(number)
     }
 
@@ -136,19 +173,13 @@ impl Hub {
             text.push_str(RESET);
         }
         let after = after.unwrap_or(0);
-        let (mut chat, mut im) = (self.chat.events.iter().peekable(), self.im.events.iter().peekable());
-        // Both are in order; merged, they are in the order of recording.
-        loop {
-            let next = match (chat.peek(), im.peek()) {
-                (Some((a, _)), Some((b, _))) if a < b => chat.next(),
-                (Some(_), None) => chat.next(),
-                (_, Some(_)) => im.next(),
-                (None, None) => break,
-            };
-            if let Some((number, event)) = next {
-                if *number > after {
-                    text.push_str(event);
-                }
+        // Each ring is in order; merged, they are in the order of recording.
+        let money = self.money.iter().flat_map(|ring| ring.events.iter());
+        let mut events: Vec<&(u64, Arc<str>)> = self.chat.events.iter().chain(&self.im.events).chain(money).collect();
+        events.sort_by_key(|(number, _)| *number);
+        for (number, event) in events {
+            if *number > after {
+                text.push_str(event);
             }
         }
         text.push_str(&status_event(status));
@@ -497,5 +528,116 @@ mod tests {
         hub.close();
         assert!(!hub.watched());
         assert!(second.recv().is_err());
+    }
+
+    // ------------------------------------------------------------ money
+
+    fn received(amount: u64) -> Transaction {
+        Transaction {
+            time: START + 9,
+            kind: crate::txlog::Kind::Received,
+            amount,
+            balance: Some(1250),
+            counted: 0,
+            code: 5001,
+            party: Some(id(1)),
+            party_group: false,
+            avatar_name: "Jane Doe".into(),
+            display_name: "Janey".into(),
+            object_name: String::new(),
+            object: None,
+            text: "Jane\tpaid".into(),
+        }
+    }
+
+    /// The `money` events in what a page was sent: their data lines.
+    fn money(sent: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut lines = sent.lines();
+        while let Some(line) = lines.next() {
+            if line == "event: money" {
+                lines.next();
+                out.push(lines.next().unwrap_or_default().trim_start_matches("data: ").to_string());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn transactions_go_to_the_pages_with_all_their_fields() {
+        let mut hub = Hub::new(START);
+        hub.allow_money(&[]);
+        let (sender, opened) = page();
+        hub.subscribe(None, sender, "connected: yes");
+        got(&opened);
+        hub.transaction(&received(50));
+        let sent = money(&got(&opened));
+        assert_eq!(sent.len(), 1);
+        let fields: Vec<&str> = sent[0].split('\t').collect();
+        assert_eq!(fields.len(), 12);
+        let time = crate::log::format_timestamp(START + 9);
+        assert_eq!(fields[..5], [time.as_str(), "received", "50", "1250", "0"]);
+        assert_eq!(fields[6], id(1).to_string());
+        assert_eq!(fields[11], "Jane\\tpaid", "escaped like the others");
+    }
+
+    #[test]
+    fn without_web_payments_no_transaction_is_kept_or_sent() {
+        let mut hub = Hub::new(START);
+        let (sender, opened) = page();
+        hub.subscribe(None, sender, "connected: yes");
+        got(&opened);
+        hub.transaction(&received(50));
+        assert_eq!(money(&got(&opened)), Vec::<String>::new());
+        let (sender, later) = super::tests::page();
+        hub.subscribe(None, sender, "connected: yes");
+        assert_eq!(money(&got(&later)), Vec::<String>::new());
+    }
+
+    #[test]
+    fn transactions_are_kept_apart_from_messages_and_replayed_in_order() {
+        let mut hub = Hub::new(START);
+        let rows: Vec<Transaction> = (1..=40).map(received).collect();
+        hub.allow_money(&rows);
+        for n in 0..2000 {
+            hub.record(&chat(&format!("line {n}")));
+        }
+        hub.transaction(&received(41));
+        hub.record(&im("after"));
+        let (sender, opened) = page();
+        hub.subscribe(None, sender, "connected: yes");
+        let sent = got(&opened);
+        let amounts: Vec<String> = money(&sent)
+            .iter()
+            .map(|line| line.split('\t').nth(2).unwrap().to_string())
+            .collect();
+        assert_eq!(amounts, (1..=41).map(|n| n.to_string()).collect::<Vec<_>>());
+        assert_eq!(texts(&sent).len(), KEPT + 1, "chat keeps its own 500, the IM its own");
+        // Catching up after the last transaction gets the IM only.
+        let (sender, again) = super::tests::page();
+        let money_id = sent
+            .split("\n\n")
+            .filter(|event| event.starts_with("event: money"))
+            .last()
+            .and_then(|event| event.lines().nth(1))
+            .and_then(|line| line.strip_prefix("id: "))
+            .unwrap()
+            .to_string();
+        hub.subscribe(Some(&money_id), sender, "connected: yes");
+        let caught = got(&again);
+        assert!(!caught.contains("event: reset"));
+        assert_eq!(texts(&caught), ["after"]);
+    }
+
+    #[test]
+    fn the_newest_transactions_are_kept() {
+        let mut hub = Hub::new(START);
+        let rows: Vec<Transaction> = (1..=(KEPT as u64 + 3)).map(received).collect();
+        hub.allow_money(&rows);
+        let (sender, opened) = page();
+        hub.subscribe(None, sender, "connected: yes");
+        let sent = money(&got(&opened));
+        assert_eq!(sent.len(), KEPT);
+        assert!(sent[0].split('\t').nth(2) == Some("4"));
     }
 }

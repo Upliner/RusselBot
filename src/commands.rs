@@ -23,6 +23,8 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+mod pay;
+
 /// How long the grid has to answer a name lookup.
 pub const LOOKUP_LIMIT: Duration = Duration::from_secs(10);
 
@@ -337,6 +339,16 @@ pub trait Grid {
     /// Asks the grid for the profile of `avatar`; the answer comes as
     /// `Commands::profile_received` or `profile_failed`.
     fn ask_profile(&mut self, avatar: Uuid, now: Instant) -> Result<(), String>;
+    /// Pays `dest`, an avatar or an object, with the transaction type
+    /// `kind`; the grid's answer comes as `Commands::money_report`.
+    fn pay(&mut self, dest: Uuid, amount: i32, kind: i32, description: &str, now: Instant) -> Result<(), String>;
+    /// Asks what `object` offers to be paid; the answer comes as
+    /// `Commands::pay_price`.
+    fn request_pay_price(&mut self, object: Uuid, now: Instant) -> Result<(), String>;
+    /// The root prim of `object`'s linkset, and whether the object or its
+    /// root takes money; `None` for an object the simulator has not
+    /// described.
+    fn money_target(&self, object: Uuid) -> Option<(Uuid, bool)>;
 }
 
 /// A `scan` command waiting for the simulator to describe and name the
@@ -682,6 +694,9 @@ pub struct Commands {
     /// Items whose `attach` was answered as not carried out in this
     /// session: one that arrives after all still gets its link.
     gave_up: Vec<Item>,
+    /// Payments: the settings, the limit, the balance, and the `pay`,
+    /// `prices` and `payees` commands that wait.
+    money: pay::Money,
     /// The lines `tell` wrote.
     #[cfg(test)]
     told: Vec<String>,
@@ -771,6 +786,7 @@ impl Commands {
             restore: Restore::Idle,
             restoring: Vec::new(),
             gave_up: Vec::new(),
+            money: pay::Money::default(),
             #[cfg(test)]
             told: Vec::new(),
         }
@@ -851,9 +867,15 @@ impl Commands {
             Request::Scan(args) => self.scan(&args, &reply, grid, now),
             Request::Friends => self.friends(&reply, grid, now),
             Request::Profile(avatar) => self.with_avatar(&avatar, After::Profile, &reply, grid, now),
-            Request::Persist { .. } | Request::Home | Request::Status | Request::Rlv(_) | Request::Autoreply(_) | Request::Quit => {
-                Err("not a command for the grid".to_string())
-            }
+            Request::Persist { .. }
+            | Request::Home
+            | Request::Status
+            | Request::Rlv(_)
+            | Request::Autoreply(_)
+            | Request::Quit
+            | Request::Pay { .. }
+            | Request::Prices(_)
+            | Request::Payees => Err("not a command for the grid".to_string()),
             Request::Inventory(args) => self.inventory(&args, &reply, grid, now),
             Request::Attach { item, part } => self.find_for_attach(&item, part.as_deref(), &reply, grid, now),
             Request::Wear(item) => {
@@ -1473,15 +1495,17 @@ impl Commands {
 
     /// The simulator has described `object`: the commands that waited for
     /// it are carried out again, by the restrictions in force now.
-    pub fn described<G: Grid>(&mut self, object: Uuid, grid: Option<&mut G>, now: Instant) {
-        self.look_again(object, grid, now);
+    pub fn described<G: Grid>(&mut self, object: Uuid, mut grid: Option<&mut G>, now: Instant) {
+        self.look_again(object, grid.as_deref_mut(), now);
+        self.money_looked(object, grid, now);
     }
 
     /// The time to look for `object` has passed, or the region or the
     /// session is gone: the commands that waited for it are carried out
     /// again, and refused as for an object that is not known.
-    pub fn not_described<G: Grid>(&mut self, object: Uuid, grid: Option<&mut G>, now: Instant) {
-        self.look_again(object, grid, now);
+    pub fn not_described<G: Grid>(&mut self, object: Uuid, mut grid: Option<&mut G>, now: Instant) {
+        self.look_again(object, grid.as_deref_mut(), now);
+        self.money_looked(object, grid, now);
     }
 
     fn look_again<G: Grid>(&mut self, object: Uuid, mut grid: Option<&mut G>, now: Instant) {
@@ -2252,6 +2276,7 @@ impl Commands {
         mut grid: Option<&mut G>,
         now: Instant,
     ) -> Vec<SentIm> {
+        self.money_found(query, avatars, grid.as_deref_mut(), now);
         let mut sent = Vec::new();
         let (answered, waiting) = std::mem::take(&mut self.waiting).into_iter().partition(|w| w.query == query);
         self.waiting = waiting;
@@ -2283,6 +2308,7 @@ impl Commands {
 
     /// A lookup came to nothing: fails the commands that waited for it.
     pub fn lookup_failed(&mut self, query: Uuid, reason: &str) {
+        self.money_lookup_failed(query, reason);
         let (failed, waiting) = std::mem::take(&mut self.waiting).into_iter().partition(|w| w.query == query);
         self.waiting = waiting;
         for command in failed {
@@ -2334,6 +2360,7 @@ impl Commands {
     /// The session is gone, and with it any answer the commands waited for
     /// and every teleport offer made to it.
     pub fn session_lost(&mut self) {
+        self.money_lost();
         for command in std::mem::take(&mut self.waiting) {
             refuse(CONTROL, command.then.command(), &command.reply, NOT_CONNECTED.to_string());
         }
@@ -2395,7 +2422,15 @@ impl Commands {
             _ => None,
         };
         let scans = self.scan_poll;
-        lookups.chain(jobs).chain(filing).chain(undecided).chain(restore).chain(scans).min()
+        let money = self.money_deadline();
+        lookups
+            .chain(jobs)
+            .chain(filing)
+            .chain(undecided)
+            .chain(restore)
+            .chain(scans)
+            .chain(money)
+            .min()
     }
 
     // ------------------------------------------- what the session reports
@@ -2885,6 +2920,7 @@ impl Commands {
     /// of these names are decided, those of avatars it does not know
     /// without a name.
     pub fn names_resolved<G: Grid>(&mut self, found: &[(Uuid, Names)], missing: &[Uuid], mut grid: Option<&mut G>, now: Instant) {
+        self.not_avatars(missing);
         for (id, names) in found {
             self.owner_named(*id, Some(names));
             let learn = |sender: &mut perms::Sender| {
@@ -2908,6 +2944,7 @@ impl Commands {
             self.owner_named(*id, None);
             self.settle(&Needs::Name(*id), |_| {}, grid.as_deref_mut(), now);
         }
+        self.money_again(grid, now);
     }
 
     /// Decides the requests the grid has not said in time who is behind,
@@ -3133,6 +3170,11 @@ pub(crate) mod tests {
         Properties(Vec<u32>),
         /// A question about the profile of this avatar.
         Profile(Uuid),
+        /// A payment: to whom, how much, the transaction type and the
+        /// description.
+        Pay(Uuid, i32, i32, String),
+        /// A question about what this object offers to be paid.
+        PayPrice(Uuid),
     }
 
     pub(crate) struct FakeGrid {
@@ -3177,6 +3219,9 @@ pub(crate) mod tests {
         /// The simulator has said who is in the region.
         pub(crate) avatars_known: bool,
         pub(crate) friends: Friends,
+        /// The objects the simulator has described as far as payments go:
+        /// the object, its root, and whether it takes money.
+        pub(crate) money: Vec<(Uuid, Uuid, bool)>,
     }
 
     impl Default for FakeGrid {
@@ -3205,6 +3250,7 @@ pub(crate) mod tests {
                 avatars: Vec::new(),
                 avatars_known: true,
                 friends: Friends::default(),
+                money: Vec::new(),
             }
         }
     }
@@ -3410,6 +3456,22 @@ pub(crate) mod tests {
         }
         fn unknown_object(&self, object: Uuid) -> String {
             format!("object {object} is not known to the bot")
+        }
+        fn pay(&mut self, dest: Uuid, amount: i32, kind: i32, description: &str, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::Pay(dest, amount, kind, description.to_string()));
+            Ok(())
+        }
+        fn request_pay_price(&mut self, object: Uuid, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::PayPrice(object));
+            Ok(())
+        }
+        fn money_target(&self, object: Uuid) -> Option<(Uuid, bool)> {
+            self.money
+                .iter()
+                .find(|(id, _, _)| *id == object)
+                .map(|(_, root, takes)| (*root, *takes))
         }
     }
 

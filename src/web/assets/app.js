@@ -22,10 +22,12 @@
 })();
 
 (function () {
-  var TABS = ['world', 'chat', 'im', 'inventory', 'console', 'settings'];
+  var TABS = ['world', 'chat', 'im', 'inventory', 'money', 'console', 'settings'];
   var NEARBY_EVERY = 15000;
   var FRIENDS_EVERY = 60000;
   var MAX_CHAT_LINES = 1000;
+  var MAX_TRANSACTIONS = 1000;
+  var OTHER_AMOUNT = 'other';
   var UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   var NUMBER = /^-?(\d+\.?\d*|\.\d+)$/;
 
@@ -48,7 +50,15 @@
       friendsBusy: false,
       inventory: { root: null, attachedOnly: false, attached: null, started: false },
       history: [],            // console lines sent
-      historyAt: -1
+      historyAt: -1,
+      money: [],              // transactions, oldest first
+      payees: null,           // the avatars of the answer of `payees`
+      payeesError: '',
+      payeesBusy: false,
+      payeesAsked: false,     // the Money tab was shown: `payees` was sent
+      payee: null,            // the payee chosen from a list: {shown, pay, id}
+      paying: false,          // the Send money form's payment is under way
+      focusAmount: false      // the amount box gets the cursor when the tab is shown
     };
   }
 
@@ -300,6 +310,10 @@
       if (event.lastEventId) { lastId = event.lastEventId; }
       addIm(record(fields(event)));
     });
+    source.addEventListener('money', function (event) {
+      if (event.lastEventId) { lastId = event.lastEventId; }
+      addTransaction(transaction(fields(event)));
+    });
     source.addEventListener('status', function (event) {
       // The status ends what a page is sent when it opens its stream.
       replaying = false;
@@ -339,7 +353,8 @@
   // The lists the page keeps up to date by itself, for the tab that is shown.
   function refreshOwn() {
     if (state.tab === 'chat') { refreshNearby(true); }
-    if (state.tab === 'im') { refreshFriends(true); }
+    if (state.tab === 'im' || state.tab === 'money') { refreshFriends(true); }
+    if (state.payeesAsked && canPay()) { refreshPayees(true); }
   }
 
   // ----------------------------------------------------------------- login
@@ -361,6 +376,7 @@
     lastId = null;
     retryIn = 1000;
     dismissAll();
+    closeDialog();
     state = freshState();
     renderEverything();
     show($('lost'), false);
@@ -428,6 +444,7 @@
 
   function tabOfAddress() {
     var name = window.location.hash.replace(/^#/, '');
+    if (name === 'money' && !canPay()) { return 'world'; }
     return TABS.indexOf(name) >= 0 ? name : 'world';
   }
 
@@ -455,6 +472,10 @@
       refreshFriends(true);
     } else if (tab === 'inventory') {
       if (!state.inventory.started) { state.inventory.started = true; reloadInventory(); }
+    } else if (tab === 'money') {
+      refreshFriends(true);
+      if (!state.payeesAsked) { state.payeesAsked = true; refreshPayees(true); }
+      if (state.focusAmount) { state.focusAmount = false; $('pay-amount').focus(); }
     }
   }
 
@@ -467,8 +488,10 @@
       if (colon > 0) { status[line.slice(0, colon)] = line.slice(colon + 2); }
     });
     var before = state.status ? state.status.region : undefined;
+    var could = canPay();
     state.status = status;
     renderStatus();
+    if (canPay() !== could) { renderPayControls(); }
     // Another region has other avatars in it.
     if (status.region !== before && state.tab === 'chat') { refreshNearby(true); }
   }
@@ -499,8 +522,11 @@
       var status = state.status;
       if (!status) {
         panel.appendChild(statusItem('Avatar', 'not known yet'));
-      } else if (status.connected !== 'yes') {
-        panel.appendChild(statusItem('Avatar', 'not connected', 'off'));
+        continue;
+      }
+      panel.appendChild(statusItem('Avatar', status.avatar || '?'));
+      if (status.connected !== 'yes') {
+        panel.appendChild(el('span', 'item off', 'not connected'));
         if (status.mode) { panel.appendChild(statusItem('Mode', status.mode)); }
       } else {
         panel.appendChild(statusItem('Region', status.region || '?'));
@@ -509,6 +535,8 @@
         panel.appendChild(statusItem('Mode', status.mode || '?'));
       }
     }
+    // The balance and the limit are the Money tab's.
+    renderMoneyHeader();
   }
 
   // ----------------------------------------------------------------- world
@@ -661,7 +689,18 @@
       acts.appendChild(rowButton('Touch', function (button) {
         act(button, 'obj-touch:' + id, 'Touch ' + name, ['touch', id], false);
       }));
+      // An object that takes money: what it offers is asked for first.
+      var area = null;
+      if (flags.split(',').indexOf('pay') >= 0) {
+        area = el('div', 'pay-area pay-control');
+        var pay = rowButton('Pay', function (button) { askPrices(button, area, id, name); });
+        pay.classList.add('pay-control');
+        show(pay, canPay());
+        show(area, canPay());
+        acts.appendChild(pay);
+      }
       row.appendChild(acts);
+      if (area) { row.appendChild(area); }
       list.appendChild(row);
     });
   }
@@ -870,6 +909,8 @@
     if (state.conv && state.convs[state.conv]) { state.convs[state.conv].draft = $('im-text').value; }
     state.chat = [];
     renderChat();
+    state.money = [];
+    renderTransactions();
     Object.keys(state.convs).forEach(function (key) {
       var conv = state.convs[key];
       conv.messages = [];
@@ -932,6 +973,7 @@
     var log = $('im-log');
     clear(log);
     $('im-title').textContent = conv ? conversationTitle(conv) : 'No conversation chosen';
+    renderImPay();
     var canAnswer = !!conv && (conv.kind === 'avatar' || conv.kind === 'name');
     show($('im-form'), canAnswer);
     show($('im-readonly'), !!conv && !canAnswer);
@@ -1030,21 +1072,35 @@
     });
   }
 
+  function friendNode(friend, onClick) {
+    var item = el('li');
+    var dot = el('span', 'dot' + (friend.status === 'online' ? ' online' : friend.status === 'offline' ? '' : ' unknown'));
+    item.appendChild(dot);
+    item.appendChild(el('span', 'label', friend.label));
+    item.appendChild(el('span', 'more', friend.status === '?' ? 'not shown' : friend.status));
+    item.addEventListener('click', onClick);
+    return item;
+  }
+
+  // The friends, on the IM tab and as payees on the Money tab.
   function renderFriends(note) {
     var list = $('im-friends');
+    var payees = $('money-friends');
     clear(list);
+    clear(payees);
     (state.friends || []).forEach(function (friend) {
-      var item = el('li');
-      var dot = el('span', 'dot' + (friend.status === 'online' ? ' online' : friend.status === 'offline' ? '' : ' unknown'));
-      item.appendChild(dot);
-      item.appendChild(el('span', 'label', friend.label));
-      item.appendChild(el('span', 'more', friend.status === '?' ? 'not shown' : friend.status));
-      item.addEventListener('click', function () { openAvatar(friend.id, friend.name, friend.display); });
-      list.appendChild(item);
+      list.appendChild(friendNode(friend, function () { openAvatar(friend.id, friend.name, friend.display); }));
+      payees.appendChild(friendNode(friend, function () { choosePayee(friend.label, friend.id, friend.id); }));
     });
-    var text = note || (state.friends && state.friends.length === 0 ? 'No friends.' : '');
+    var none = state.friends && state.friends.length === 0 ? 'No friends.' : '';
+    var text = note || none;
     $('friends-note').textContent = text;
     show($('friends-note'), text !== '');
+    var moneyText = note ? 'The friend list could not be read: ' + note : none;
+    var moneyNote = $('money-friends-note');
+    moneyNote.textContent = moneyText;
+    moneyNote.classList.toggle('error', !!note);
+    show(moneyNote, moneyText !== '');
   }
 
   function friendsAnswer(result) {
@@ -1108,6 +1164,18 @@
         seen(state.conv);
         renderConversations();
       }
+    });
+    // Pay in an avatar's conversation: the Money tab, with that avatar as
+    // the payee by its UUID and nothing sent.
+    $('im-pay').addEventListener('click', function () {
+      var conv = state.conv ? state.convs[state.conv] : null;
+      if (!conv || conv.kind !== 'avatar' || !canPay()) { return; }
+      choosePayee(conversationTitle(conv), conv.id, conv.id);
+      var amount = $('pay-amount');
+      amount.value = '';
+      amount.classList.remove('bad');
+      state.focusAmount = true;
+      window.location.hash = '#money';
     });
   }
 
@@ -1291,6 +1359,449 @@
     });
   }
 
+  // ----------------------------------------------------------------- money
+
+  // The web interface may pay while the status has a `limit` line: then
+  // there is a Money tab and there are Pay buttons, and otherwise none.
+  function canPay() {
+    return !!state.status && state.status.limit !== undefined;
+  }
+
+  function renderImPay() {
+    var conv = state.conv ? state.convs[state.conv] : null;
+    show($('im-pay'), canPay() && !!conv && conv.kind === 'avatar');
+  }
+
+  function renderPayControls() {
+    var can = canPay();
+    show($('tab-link-money'), can);
+    var controls = document.querySelectorAll('.pay-control');
+    for (var i = 0; i < controls.length; i++) { show(controls[i], can); }
+    renderImPay();
+    if (!can) { closeDialog(); }
+    // The Money tab's address shows the World tab without it, and the
+    // Money tab again once it is there.
+    if ((state.tab === 'money') !== (tabOfAddress() === 'money')) { route(); }
+  }
+
+  // `L$750 (renews to L$1000 on 2026-12-08T12:00:00Z)`, `L$1000`, `unlimited`.
+  function parseLimit(text) {
+    var found = /^(.*?) \(renews to (\S+) on (\S+)\)$/.exec(text);
+    return found ? { left: found[1], renewsTo: found[2], on: found[3] } : { left: text, renewsTo: '', on: '' };
+  }
+
+  // A time of the bot's, in UTC, as the browser's time zone has it.
+  function localTime(iso) {
+    var date = new Date(iso);
+    if (isNaN(date.getTime())) { return iso; }
+    try {
+      return date.toLocaleString(undefined, { dateStyle: 'long', timeStyle: 'short' });
+    } catch (e) {
+      return date.toLocaleString();
+    }
+  }
+
+  function renderMoneyHeader() {
+    var status = state.status || {};
+    $('money-avatar').textContent = status.avatar || 'not known yet';
+    var balance = status.balance;
+    $('money-balance').textContent = !balance || balance === 'unknown' ? 'unknown' : balance;
+    var limit = parseLimit(status.limit || '');
+    $('money-left').textContent = limit.left === 'unlimited' ? 'no limit' : (limit.left || '?');
+    var renews = $('money-renews');
+    renews.textContent = limit.renewsTo ? '(renews to ' + limit.renewsTo + ' on ' + localTime(limit.on) + ')' : '';
+    show(renews, limit.renewsTo !== '');
+  }
+
+  function setResult(node, text, kind) {
+    node.textContent = text;
+    node.className = 'result' + (kind ? ' ' + kind : '');
+    show(node, text !== '');
+  }
+
+  // An amount box: its amount, or null when it holds no whole number
+  // greater than zero written in digits, in which case the box is marked.
+  function amountOf(input) {
+    var text = input.value.trim();
+    var good = /^\d+$/.test(text) && /[1-9]/.test(text);
+    input.classList.toggle('bad', !good);
+    return good ? text.replace(/^0+/, '') : null;
+  }
+
+  // ------------------------------------------------- the confirmation
+
+  var confirming = null;  // resolves the confirmation that is open
+
+  // Asks the operator before a payment. Nothing is paid unless the paying
+  // button is pressed: cancelling, Escape and a click outside do nothing.
+  function confirmPayment(question, details, amount) {
+    var dialog = $('pay-dialog');
+    if (typeof dialog.showModal !== 'function') {
+      return Promise.resolve(window.confirm(question + '\n' + details.join('\n')));
+    }
+    closeDialog();
+    $('pay-dialog-text').textContent = question;
+    var more = $('pay-dialog-more');
+    clear(more);
+    details.forEach(function (line) { more.appendChild(el('div', null, line)); });
+    $('pay-dialog-pay').textContent = 'Pay L$' + amount;
+    return new Promise(function (resolve) {
+      confirming = resolve;
+      dialog.returnValue = '';
+      dialog.showModal();
+      $('pay-dialog-cancel').focus();
+    });
+  }
+
+  function closeDialog() {
+    var dialog = $('pay-dialog');
+    if (dialog.open) { dialog.close('cancel'); }
+  }
+
+  function wireDialog() {
+    var dialog = $('pay-dialog');
+    dialog.addEventListener('close', function () {
+      var resolve = confirming;
+      confirming = null;
+      if (resolve) { resolve(dialog.returnValue === 'pay'); }
+    });
+    $('pay-dialog-cancel').addEventListener('click', function () { dialog.close('cancel'); });
+    $('pay-dialog-pay').addEventListener('click', function () { dialog.close('pay'); });
+    // A click on the backdrop is a click on the dialog itself, outside its box.
+    dialog.addEventListener('click', function (event) {
+      if (event.target !== dialog) { return; }
+      var box = dialog.getBoundingClientRect();
+      var inside = event.clientX >= box.left && event.clientX <= box.right && event.clientY >= box.top && event.clientY <= box.bottom;
+      if (!inside) { dialog.close('cancel'); }
+    });
+  }
+
+  // ------------------------------------------------ the Send money form
+
+  // A payee chosen from a list: the box shows its name, and it is paid by
+  // `pay` (its UUID, or its name for a list entry without one).
+  function choosePayee(shown, pay, id) {
+    state.payee = { shown: shown, pay: pay, id: id || '' };
+    var box = $('pay-payee');
+    box.value = shown;
+    box.classList.remove('bad');
+    var note = $('pay-chosen');
+    note.textContent = id ? 'Pays ' + shown + ' by the UUID ' + id + '.' : 'Pays ' + shown + ' by name.';
+    show(note, true);
+    if (state.tab === 'money') { $('pay-amount').focus(); }
+  }
+
+  function sendFromForm() {
+    if (state.paying) { return; }
+    var payeeBox = $('pay-payee');
+    var amountBox = $('pay-amount');
+    var typed = payeeBox.value.trim();
+    payeeBox.classList.toggle('bad', typed === '');
+    var amount = amountOf(amountBox);
+    if (typed === '' || amount === null) { return; }
+    var chosen = state.payee && state.payee.shown === payeeBox.value ? state.payee : null;
+    var to = chosen ? chosen.pay : typed;
+    var label = chosen ? chosen.shown : typed;
+    var details = chosen ? (chosen.id ? ['UUID: ' + chosen.id] : ['By the name the list gives.']) : ['As typed.'];
+    confirmPayment('Pay L$' + amount + ' to ' + label + '?', details, amount).then(function (yes) {
+      if (!yes || state.paying) { return; }
+      var button = $('pay-button');
+      state.paying = true;
+      button.disabled = true;
+      button.classList.add('busy');
+      setResult($('pay-result'), 'Paying L$' + amount + ' to ' + label + '; the grid confirms it within 15 seconds…', 'wait');
+      run(['pay', amount, 'avatar', to], false).then(function (result) {
+        state.paying = false;
+        button.disabled = false;
+        button.classList.remove('busy');
+        if (result.ok) {
+          amountBox.value = '';
+          setResult($('pay-result'), result.text || 'Paid.', 'ok');
+        } else {
+          setResult($('pay-result'), result.text, 'error');
+        }
+      });
+    });
+  }
+
+  // ------------------------------------------------- the lists of payees
+
+  // UUID or `?`, login name, `whitelist`, `unlimited` or both.
+  function payeesAnswer(result) {
+    if (result.ok) {
+      state.payees = listing(result.text).map(function (f) {
+        var id = UUID.test(f[0] || '') ? f[0].toLowerCase() : '';
+        return { id: id, name: f[1] || id, lists: (f[2] || '').split(',') };
+      }).filter(function (payee) { return payee.name !== ''; });
+      state.payeesError = '';
+    } else {
+      state.payees = null;
+      state.payeesError = result.text;
+    }
+    renderPayees();
+  }
+
+  function loadPayees(own) {
+    state.payeesBusy = true;
+    return run(['payees'], own).then(function (result) {
+      state.payeesBusy = false;
+      payeesAnswer(result);
+    });
+  }
+
+  function refreshPayees(own) {
+    if (state.payeesBusy || !$('login').hidden) { return; }
+    loadPayees(own);
+  }
+
+  function renderPayees() {
+    ['whitelist', 'unlimited'].forEach(function (name) {
+      var list = $('money-' + name);
+      clear(list);
+      var entries = (state.payees || []).filter(function (payee) { return payee.lists.indexOf(name) >= 0; });
+      entries.forEach(function (payee) {
+        var item = el('li');
+        item.appendChild(el('span', 'label', payee.name));
+        if (!payee.id) { item.appendChild(el('span', 'more', 'by name')); }
+        item.addEventListener('click', function () { choosePayee(payee.name, payee.id || payee.name, payee.id); });
+        list.appendChild(item);
+      });
+      // No heading for a list without entries.
+      show($('money-' + name + '-heading'), entries.length > 0);
+    });
+    var note = $('money-payees-note');
+    note.textContent = state.payeesError ? 'The payment lists could not be read: ' + state.payeesError : '';
+    note.classList.toggle('error', !!state.payeesError);
+    show(note, !!state.payeesError);
+  }
+
+  // ------------------------------------------------- the transactions
+
+  var KINDS = {
+    paid: 'Paid',
+    unconfirmed: 'Sent, not confirmed by the grid',
+    failed: 'The payment failed',
+    received: 'Received',
+    spent: 'Spent'
+  };
+
+  // A row of the transactions file, as the event stream gives it.
+  function transaction(f) {
+    return {
+      time: f[0] || '',
+      kind: f[1] || '',
+      amount: f[2] || '',
+      balance: f[3] || '',
+      counted: f[4] || '',
+      type: f[5] || '',
+      partyId: f[6] || '',
+      avatarName: f[7] || '',
+      displayName: f[8] || '',
+      objectName: f[9] || '',
+      objectId: f[10] || '',
+      text: f[11] || ''
+    };
+  }
+
+  function transactionNode(tx) {
+    var odd = tx.kind === 'failed' || tx.kind === 'unconfirmed';
+    var item = el('li', 'tx' + (odd ? ' ' + tx.kind : ''));
+    var who = el('div', 'who');
+    var head = el('div', 'title');
+    head.appendChild(el('span', 'kind', KINDS[tx.kind] || tx.kind));
+    head.appendChild(document.createTextNode(odd ? ': ' : ' '));
+    head.appendChild(el('span', 'amount', 'L$' + tx.amount));
+    who.appendChild(head);
+    var parts = [];
+    var party = avatarLabel(tx.avatarName, tx.displayName) || tx.partyId;
+    if (party) { parts.push((tx.kind === 'received' ? 'from ' : tx.kind === 'failed' ? 'with ' : 'to ') + party); }
+    if (tx.objectName || tx.objectId) { parts.push('object ' + (tx.objectName || tx.objectId)); }
+    if (parts.length) { who.appendChild(el('div', null, parts.join(' · '))); }
+    if (tx.text) { who.appendChild(el('div', 'more', tx.text)); }
+    if (tx.balance !== '') { who.appendChild(el('div', 'more', 'Balance after: L$' + tx.balance)); }
+    item.appendChild(who);
+    var epoch = Date.parse(tx.time);
+    item.appendChild(isNaN(epoch) ? el('span', 'time', tx.time) : timeNode(epoch / 1000));
+    return item;
+  }
+
+  // Newest first.
+  function addTransaction(tx) {
+    var list = $('money-list');
+    state.money.push(tx);
+    list.insertBefore(transactionNode(tx), list.firstChild);
+    while (state.money.length > MAX_TRANSACTIONS) {
+      state.money.shift();
+      if (list.lastChild) { list.removeChild(list.lastChild); }
+    }
+    show($('money-none'), false);
+  }
+
+  function renderTransactions() {
+    var list = $('money-list');
+    clear(list);
+    for (var i = state.money.length - 1; i >= 0; i--) { list.appendChild(transactionNode(state.money[i])); }
+    show($('money-none'), state.money.length === 0);
+  }
+
+  // ------------------------------------------- paying from the object scan
+
+  // The answer of `prices`: `object`, `owner`, `prices` and `other amounts`.
+  function pricesOf(text) {
+    var info = { object: '', owner: '', ownerId: '', group: false, prices: [], other: false, suggested: '' };
+    text.split('\n').forEach(function (line) {
+      var colon = line.indexOf(': ');
+      if (colon < 0) { return; }
+      var name = line.slice(0, colon), value = line.slice(colon + 2).trim();
+      if (name === 'object') {
+        info.object = unescapeField(value);
+      } else if (name === 'owner') {
+        if (/^group /.test(value)) { info.group = true; info.ownerId = value.slice(6).trim(); }
+        else if (UUID.test(value)) { info.ownerId = value; }
+        else { info.owner = value; }
+      } else if (name === 'prices') {
+        info.prices = value === 'none' ? [] : value.split(/,\s*/).filter(function (amount) { return /^\d+$/.test(amount); });
+      } else if (name === 'other amounts') {
+        var other = /^yes(?:, suggested (\d+))?$/.exec(value);
+        info.other = !!other;
+        info.suggested = other && other[1] ? other[1] : '';
+      }
+    });
+    return info;
+  }
+
+  function ownerText(info) {
+    if (info.group) { return 'A group owns it: ' + info.ownerId; }
+    return 'Owner: ' + (info.owner || info.ownerId || 'unknown');
+  }
+
+  function askPrices(button, area, id, rowName) {
+    if (button.disabled) { return; }
+    button.disabled = true;
+    button.classList.add('busy');
+    clear(area);
+    area.appendChild(el('p', 'made', 'Asking the object what it takes…'));
+    run(['prices', id], false).then(function (result) {
+      button.disabled = false;
+      button.classList.remove('busy');
+      clear(area);
+      if (!result.ok) {
+        var error = el('p', 'result error', result.text);
+        error.setAttribute('role', 'alert');
+        area.appendChild(error);
+        return;
+      }
+      renderPrices(area, id, pricesOf(result.text), rowName);
+    });
+  }
+
+  function renderPrices(area, id, info, rowName) {
+    var objectName = info.object || rowName;
+    area.appendChild(el('div', 'more', ownerText(info)));
+    if (info.prices.length === 0 && !info.other) {
+      area.appendChild(el('p', 'made', 'The object offers no amount.'));
+      return;
+    }
+    var form = el('form', 'fields');
+    form.noValidate = true;
+    form.setAttribute('autocomplete', 'off');
+    var amounts = el('select', 'pay-amounts');
+    amounts.setAttribute('aria-label', 'Amount');
+    info.prices.forEach(function (amount) {
+      var option = el('option', null, 'L$' + amount);
+      option.value = amount;
+      amounts.appendChild(option);
+    });
+    if (info.other) {
+      var another = el('option', null, 'Another amount');
+      another.value = OTHER_AMOUNT;
+      amounts.appendChild(another);
+    }
+    form.appendChild(amounts);
+    // A box for another amount only for an object that takes one, shown
+    // while that entry is chosen.
+    var other = null;
+    if (info.other) {
+      var otherLabel = el('label', null, 'L$ ');
+      other = el('input', 'pay-other');
+      other.setAttribute('inputmode', 'numeric');
+      other.setAttribute('autocomplete', 'off');
+      other.setAttribute('aria-label', 'Another amount');
+      other.size = 7;
+      other.value = info.suggested;
+      otherLabel.appendChild(other);
+      form.appendChild(otherLabel);
+      var sync = function () { show(otherLabel, amounts.value === OTHER_AMOUNT); };
+      amounts.addEventListener('change', function () {
+        sync();
+        if (amounts.value === OTHER_AMOUNT) { other.focus(); }
+      });
+      other.addEventListener('input', function () { other.classList.remove('bad'); });
+      sync();
+    }
+    var send = el('button', 'pay-send', 'Pay the object');
+    send.type = 'submit';
+    form.appendChild(send);
+    area.appendChild(form);
+    var result = el('p', 'result');
+    result.setAttribute('role', 'status');
+    show(result, false);
+    area.appendChild(result);
+    form.addEventListener('submit', function (event) {
+      event.preventDefault();
+      if (send.disabled) { return; }
+      var amount = other && amounts.value === OTHER_AMOUNT ? amountOf(other) : amounts.value;
+      if (!amount) { return; }
+      var details = ['Object UUID: ' + id, ownerText(info)];
+      confirmPayment('Pay L$' + amount + ' to the object ' + objectName + '?', details, amount).then(function (yes) {
+        if (!yes || send.disabled) { return; }
+        send.disabled = true;
+        send.classList.add('busy');
+        setResult(result, 'Paying L$' + amount + '; the grid confirms it within 15 seconds…', 'wait');
+        run(['pay', amount, 'object', id], false).then(function (answer) {
+          send.disabled = false;
+          send.classList.remove('busy');
+          setResult(result, answer.ok ? (answer.text || 'Paid.') : answer.text, answer.ok ? 'ok' : 'error');
+        });
+      });
+    });
+  }
+
+  function wireMoney() {
+    wireDialog();
+    $('pay-form').addEventListener('submit', function (event) {
+      event.preventDefault();
+      sendFromForm();
+    });
+    // Typing makes what is typed the payee again.
+    $('pay-payee').addEventListener('input', function () {
+      state.payee = null;
+      show($('pay-chosen'), false);
+      $('pay-payee').classList.remove('bad');
+    });
+    $('pay-amount').addEventListener('input', function () { $('pay-amount').classList.remove('bad'); });
+    $('money-lists-refresh').addEventListener('click', function () {
+      var button = $('money-lists-refresh');
+      if (button.disabled) { return; }
+      button.disabled = true;
+      button.classList.add('busy');
+      // The operator asked: ordinary commands.
+      var jobs = [];
+      if (!state.friendsBusy) {
+        state.friendsBusy = true;
+        jobs.push(run(['friends'], false).then(function (result) {
+          state.friendsBusy = false;
+          friendsAnswer(result);
+        }));
+      }
+      if (!state.payeesBusy) { jobs.push(loadPayees(false)); }
+      Promise.all(jobs).then(function () {
+        button.disabled = false;
+        button.classList.remove('busy');
+      });
+    });
+  }
+
   // --------------------------------------------------------------- console
 
   function wireConsole() {
@@ -1361,6 +1872,8 @@
     renderConversation();
     renderFriends('');
     renderInventory();
+    renderTransactions();
+    renderPayees();
     clear($('avatars-list'));
     clear($('objects-list'));
     show($('avatars-made'), false);
@@ -1369,6 +1882,9 @@
     show($('mark-chat'), false);
     var inputs = document.querySelectorAll('#app input:not([type="radio"]):not([type="checkbox"])');
     for (var i = 0; i < inputs.length; i++) { inputs[i].value = ''; inputs[i].classList.remove('bad'); }
+    show($('pay-chosen'), false);
+    setResult($('pay-result'), '', '');
+    renderPayControls();
   }
 
   function start() {
@@ -1378,6 +1894,7 @@
     wireChat();
     wireIm();
     wireInventory();
+    wireMoney();
     wireConsole();
     wireSettings();
     renderEverything();
@@ -1387,7 +1904,7 @@
       if (state.tab === 'chat' && document.visibilityState === 'visible' && !$('app').hidden && !state.lost) { refreshNearby(true); }
     }, NEARBY_EVERY);
     window.setInterval(function () {
-      if (state.tab === 'im' && document.visibilityState === 'visible' && !$('app').hidden && !state.lost) { refreshFriends(true); }
+      if ((state.tab === 'im' || state.tab === 'money') && document.visibilityState === 'visible' && !$('app').hidden && !state.lost) { refreshFriends(true); }
     }, FRIENDS_EVERY);
     begin();
   }

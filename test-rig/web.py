@@ -26,7 +26,8 @@ until WAIT seconds (default 5) have passed. Actions:
 An answer is printed as `ok`, `ok: TEXT` or `error: TEXT`, with the
 listing's own tabs and line ends; a request the web interface refuses is
 printed as its status and text. Events are printed as `TYPE [ID] FIELDS`,
-the fields separated by ` | `.
+the fields separated by ` | `: `chat`, `im`, `money` (a transaction, the
+twelve fields of its row in the transactions file) and `status`.
 """
 
 import socket

@@ -1,0 +1,32 @@
+    <Project name="RigMoneyModule" path="addon-modules/RigMoney" type="Library">
+      <!-- The rig's money module, built as an OpenSim addon module: setup.sh
+           copies this directory to test-rig/opensim/addon-modules/RigMoney/, where
+           runprebuild.sh includes this file in the solution. -->
+      <Configuration name="Debug">
+        <Options>
+          <OutputPath>../../bin/</OutputPath>
+        </Options>
+      </Configuration>
+      <Configuration name="Release">
+        <Options>
+          <OutputPath>../../bin/</OutputPath>
+        </Options>
+      </Configuration>
+
+      <ReferencePath>../../bin/</ReferencePath>
+      <Reference name="Nini"/>
+      <Reference name="Mono.Addins"/>
+      <Reference name="log4net"/>
+      <Reference name="OpenMetaverse"/>
+      <Reference name="OpenMetaverseTypes"/>
+      <Reference name="OpenSim.Framework"/>
+      <Reference name="OpenSim.Framework.Console"/>
+      <Reference name="OpenSim.Region.Framework"/>
+      <Reference name="OpenSim.Services.Interfaces"/>
+
+      <Files>
+        <Match pattern="*.cs" recurse="true">
+          <Exclude name="obj" pattern="obj"/>
+        </Match>
+      </Files>
+    </Project>

@@ -36,6 +36,35 @@ pub fn format_timestamp(secs: u64) -> String {
     )
 }
 
+/// Reads `YYYY-MM-DDTHH:MM:SSZ` back into seconds since the Unix epoch.
+pub fn parse_timestamp(text: &str) -> Option<u64> {
+    let b = text.as_bytes();
+    if b.len() != 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z' {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        let digits = text.get(range)?;
+        digits.bytes().all(|b| b.is_ascii_digit()).then(|| digits.parse().ok())?
+    };
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // Days-from-civil, proleptic Gregorian calendar.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    let secs = u64::try_from(secs).ok()?;
+    // A day the month does not have does not read back as itself.
+    (format_timestamp(secs) == text).then_some(secs)
+}
+
 pub fn write(args: Arguments) {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     eprintln!("{} {}", format_timestamp(secs), one_line(&args.to_string()));
@@ -63,7 +92,7 @@ macro_rules! debug {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_timestamp, one_line};
+    use super::{format_timestamp, one_line, parse_timestamp};
 
     #[test]
     fn multi_line_text_becomes_one_line() {
@@ -76,5 +105,21 @@ mod tests {
         assert_eq!(format_timestamp(951_782_400), "2000-02-29T00:00:00Z");
         assert_eq!(format_timestamp(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(format_timestamp(4_102_444_799), "2099-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn reads_back_what_it_formats() {
+        for secs in [0, 951_782_400, 1_700_000_000, 1_796_126_400, 4_102_444_799] {
+            assert_eq!(parse_timestamp(&format_timestamp(secs)), Some(secs));
+        }
+        for bad in [
+            "",
+            "2026-12-01 12:00:00Z",
+            "2026-02-30T12:00:00Z",
+            "2026-13-01T12:00:00Z",
+            "+026-12-01T12:00:00Z",
+        ] {
+            assert_eq!(parse_timestamp(bad), None, "{bad}");
+        }
     }
 }

@@ -31,11 +31,8 @@ position = [128.0, 128.0, 25.0]
 sit = "00000000-0000-0000-0000-000000000000"
 # sit = "ground"
 
-# Optional: record what the avatar hears and is told. Every message is also
-# written to standard error. The files are tab-separated, appended to, and
-# created when missing; relative paths are relative to the working directory.
-# log_chat = "chat.tsv"
-# log_im = "im.tsv"
+# Optional: record what the avatar hears and is told, and its L$
+# transactions: see the table `[logs]` at the end of this file.
 
 # Optional: after each login, also fetch instant messages that were stored
 # while the avatar was offline. This removes them from the grid, so a viewer
@@ -164,6 +161,10 @@ sit = "00000000-0000-0000-0000-000000000000"
 #   [perms.except]                            perms revoke KIND WHO...
 #   [autoreply]                               autoreply message TEXT
 #                                             autoreply pause DURATION
+# The keys `log_chat` and `log_im` are the older spellings of `chat` and
+# `im` in the table `[logs]`. They still work; the bot logs, when it starts,
+# the `[logs]` table to write instead. A config may not have both spellings
+# of one file.
 
 # The XMPP (Jabber) gateway: the bot connects to an XMPP server on this host
 # as an external component and owns the domain `component` there. The
@@ -198,3 +199,47 @@ sit = "00000000-0000-0000-0000-000000000000"
 # [web]
 # listen = "127.0.0.1:8080"
 # password = "choose one"
+
+# Optional: log files. Every message and every transaction is also written
+# to standard error. The files are tab-separated, appended to, and created
+# when missing; relative paths are relative to the working directory.
+# `chat` receives local chat, `im` instant messages, and `transactions` the
+# avatar's L$ transactions: the payments the bot makes and what the grid
+# reports while the avatar is online. The transactions file is also the
+# record of the spending limit of `[payments]`: the bot reads it when it
+# starts, so moving or editing it renews the limit. This is a table: like
+# `[xmpp]`, it has to come after all the keys above.
+# [logs]
+# chat = "chat.tsv"
+# im = "im.tsv"
+# transactions = "transactions.tsv"
+
+# Optional: payments. Without this table the bot pays nothing. With it,
+# `pay`, `prices` and `payees` are carried out for the interfaces `perms`
+# lists: "ctl" (`rslbot ctl` and the startup script), "xmpp" (the control
+# contact of `[xmpp]`) and "web" (the web interface and its console); an
+# empty array lets none of them pay.
+#
+# `limit` is how many L$ the bot may pay in one period, or "unlimited". A
+# number needs `transactions` in `[logs]`: the bot counts what it paid from
+# that file, so that a restart does not renew the limit. `limit_renew` is
+# the length of a period (`7d`, `12h`, `1d12h`): it starts with the first
+# payment that counts and when it is over the whole limit is back. Without
+# it the limit never renews.
+#
+# The lists hold avatars, by login name (`First Last`, `first.last`, or one
+# word for a Resident) or UUID, and objects by UUID. A login name is the
+# account's name, never a display name, which anybody can set to anything.
+# An avatar on a list stands for the objects it owns too.
+#   whitelist        Only who is on it (or on `unlimited_list`) can be paid.
+#                    Without the key, anybody can.
+#   blacklist        Who is on it is never paid.
+#   unlimited_list   A payment to who is on it does not count against the
+#                    limit.
+# [payments]
+# limit = 1000
+# limit_renew = "7d"
+# perms = ["ctl", "web"]
+# whitelist = ["Jane Doe", "11111111-2222-3333-4444-555555555555"]
+# blacklist = ["john.roe"]
+# unlimited_list = ["Owner Resident"]

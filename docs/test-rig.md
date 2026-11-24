@@ -143,6 +143,107 @@ secret = "rigsecret"
 owners = ["owner@rig.test"]
 ```
 
+## Payments
+
+OpenSimulator has no money of its own, so the rig brings a money module,
+`test-rig/money/RigMoneyModule.cs`. `setup.sh` copies it with its
+`prebuild.xml` into `test-rig/opensim/addon-modules/RigMoney/` and builds
+it with the simulator, and the `OpenSim.ini` it creates selects it. An
+`OpenSim.ini` from before needs the line by hand, under `[Economy]` (where
+the example has `; economymodule = BetaGridLikeMoneyModule`):
+
+```ini
+[Economy]
+    economymodule = RigMoneyModule
+```
+
+and `test-rig/setup.sh` has to be run again, with the simulator stopped: it
+rebuilds the simulator when the module is missing from `bin` or has
+changed. The start log then has `[RIG MONEY]: enabled; every avatar starts
+with L$1000`.
+
+The module keeps balances in memory only: every avatar has L$1000 when the
+module first meets it, and a restart of the simulator forgets everything.
+It answers `MoneyBalanceRequest` with the balance (a `MoneyBalanceReply`
+whose `TransactionInfo` is all zeros) and `RequestPayPrice` with the root
+prim's pay price, as OpenSimulator's sample module does. A
+`MoneyTransferRequest` of type 5001 (gift to an avatar) or 5008 (pay an
+object) moves the money, and both parties, when online, get a
+`MoneyBalanceReply` with `TransactionInfo` filled in as Second Life does:
+the type, the payer as source, the avatar paid as destination (for an
+object, its owner), the amount, and as item the request's description
+(empty: `Payment` for a gift, the object's name for an object). A payment
+to an object goes to its owner and starts the `money` event of its
+scripts. A payer with too little money, an unknown avatar or object, an
+amount below L$1 or another type gets a `MoneyBalanceReply` with
+`TransactionSuccess` false and a description saying why; nothing moves. The
+simulator marks objects with a `money` event as taking money by itself.
+
+Console commands of the module:
+
+| Command | Does |
+|---|---|
+| `rigmoney show` | every balance the module knows, and whether it is silent |
+| `rigmoney show Rig Alt` | one avatar's balance |
+| `rigmoney set Rig Alt 50` | sets an avatar's balance |
+| `rigmoney silent on` | transfers still move the money, but nobody gets a `MoneyBalanceReply` about them, nor about refused ones: a payment that is never confirmed |
+| `rigmoney silent off` | back to telling both parties |
+
+A third account, `Rig Alt` (password `rigalt`), stands in for the owner's
+second avatar, so that money can go between two avatars other than the
+bot. Create it on the OpenSim console:
+
+```
+create user Rig Alt rigalt rigalt@example.com 7e570000-0000-4000-8000-0000000000a1 default
+```
+
+`test-rig/payee.py` rezzes a box that takes money: it logs in as `Rig
+Owner` (`--as alt` or `--as bot` for the others), uploads a script with
+`llSetPayPrice` and a `money` event, puts it into a box named `Payee box`
+(`--name`) at 130, 131 in `Target`, next to the bot's place, and prints
+the box's UUID and position and the pay price the simulator gives for it.
+The prices are arguments: `--price` for the price box and up to four
+buttons, each L$, `hide` or `default`; buttons not given are hidden. When
+paid, the box says in local chat (and with `--channel N` on channel N as
+well) `paid L$<amount> by <name> (<UUID>)`. `--help` has the rest.
+
+```sh
+test-rig/payee.py --price hide 100 250   # no price box; buttons L$100 and L$250
+```
+
+A box from an earlier run stays: delete it on the OpenSim console with
+`delete object name "Payee box"` and answer `y`.
+
+`test-rig/pay.py` logs in as `Rig Owner` (`--as alt`, `--as bot`), asks for
+its balance, pays and prints every `MoneyBalanceReply` and `PayPriceReply`
+it gets and what is said in local chat, for three seconds (`--wait`).
+`--hex` adds each money message sent and received as hex, from the message
+number on.
+
+```sh
+test-rig/pay.py 100                     # Rig Owner gives Sit Bot L$100 (type 5001)
+test-rig/pay.py 100 "Rig Alt"           # ... Rig Alt
+test-rig/pay.py --as alt --object 36424416-7b9e-4620-a3a0-1ec0e53bff49 100
+                                        # Rig Alt pays the box (type 5008), after RequestPayPrice
+test-rig/pay.py --balance --wait 30     # Rig Owner's balance, then 30 s of what it is told
+```
+
+The box's UUID is the one `payee.py` printed. With the box owned by `Rig
+Owner`, the third command printed for `Rig Alt` (after its balance; the
+box's line and the reply come in either order)
+
+```
+PayPriceReply: object=36424416-7b9e-4620-a3a0-1ec0e53bff49 default=-1 buttons=[100, 250, -1, -1]
+paid L$100 to 36424416-7b9e-4620-a3a0-1ec0e53bff49 (type 5008)
+MoneyBalanceReply: success=True balance=L$1000 transaction=102b7c8e-... description='You paid Payee box (Rig Owner) L$100.'
+  TransactionInfo: type=5008 (pay object) source=Rig Alt dest=Rig Owner amount=L$100 item='Payee box'
+chat: Payee box: paid L$100 by Rig Alt (7e570000-0000-4000-8000-0000000000a1)
+```
+
+while the fourth, running alongside as `Rig Owner`, got the other side of
+it, `description='Rig Alt paid you L$100.'` with the same transaction, and
+`rigmoney show` had `Rig Owner` L$100 richer.
+
 ## Failure-injection checklist
 
 Console commands are typed on the OpenSim console. The console command
@@ -992,3 +1093,77 @@ The checks of the change on the same machine:
 |---|---|---|---|
 | 281 | `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`, `openspec validate add-web-interface --strict` | All clean | Pass: 1117 tests passed, 1 ignored; the two control-socket tests that fail on macOS pass here |
 | 282 | Resident memory (`ps -o rss`, debug build) of the bot seated in `Target` 185 s after its start, with `[web]` and two pages open (Firefox and the phone of item 280), and without `[web]` | About the same | 12,276 KB and 11,580 KB |
+
+## Payments
+
+Run on 2026-11-24 with the debug build on Linux, against the rig with the
+money module of [Payments](#payments) (OpenSim 4b95147c48). In `Target`:
+`Hat Vendor` of `Rig Owner` (`payee.py --name "Hat Vendor" --price hide
+--east 4 --north 0 100 250`), `Tip Jar` of `Rig Alt` (`payee.py --name "Tip
+Jar" --as alt --east 8 --north 0`), the `Payee box` of the section above,
+and a plain prim (`rezprim.py name="Bench" east=2`). The bot's config, with
+`RUSSELBOT_SOCK` set to a scratch path:
+
+```toml
+login_url = "http://127.0.0.1:9000/"
+user = "Sit Bot"
+password = "secret"
+region = "Target"
+position = [126.0, 126.0, 25.0]
+socket = true
+
+[web]
+listen = "127.0.0.1:8088"
+
+[logs]
+transactions = "tx.tsv"
+
+[payments]
+limit = 1000
+limit_renew = "3m"
+perms = ["ctl", "web"]
+```
+
+Later items change `[payments]` as they say. `rigmoney` commands were
+typed on the simulator's console.
+
+| # | Inject | Expected | Result (2026-11-24, OpenSim 4b95147c48, Linux) |
+|---|---|---|---|
+| 283 | Start the bot | The start line naming `ctl` and `web`, L$1000 every 3m, L$1000 left; the warning naming `web.password`; with `--verbose`, one `MoneyBalanceRequest` after the login, and none with a config without `[payments]` | Pass: `payments: `ctl` and `web` may pay, with a limit of L$1000 every 3m, L$1000 left`; one request and its reply; none without the table |
+| 284 | `ctl status` | `avatar: Sit Bot` second; `balance` as `rigmoney show` has it; `limit: L$1000` | Pass: `balance: L$1100`, the module's L$1100 |
+| 285 | `ctl pay 25 avatar rig.alt`; `ctl pay 25 avatar <Rig Alt's UUID>`; `ctl pay 1 avatar Rig Owner` | Each paid, the answer naming the avatar and the new balance | Pass: `paid L$25 to Rig Alt <7e57...a1>; the balance is L$1075`, then L$1050; the name in two words read as one |
+| 286 | `ctl pay 10 object <Tip Jar>` | Paid; the jar says it was paid by `Sit Bot`; the answer names the jar and its owner | Pass: `paid L$10 to Tip Jar <b459...> of Rig Alt <7e57...a1>`; `Tip Jar: paid L$10 by Sit Bot (7e57...b0)` in the log |
+| 287 | `ctl pay 120 object <Hat Vendor>`; `ctl pay 250 object <Hat Vendor>` | Refused naming L$100 and L$250; then paid, the vendor saying so | Pass: `... does not take L$120: it offers L$100, L$250 and no other amount`; `paid L$250 to Hat Vendor ... of Rig Owner ...` |
+| 288 | `ctl prices` of the vendor and of the jar | The four lines | Pass: `object: Hat Vendor`, `owner: Rig Owner`, `prices: 100, 250`, `other amounts: no`; the jar `prices: 1, 5, 10, 20`, `other amounts: yes` |
+| 289 | `ctl scan --pay` | The three objects that take money, flags `scripted,pay`; not the Bench | Pass |
+| 290 | `ctl pay 10 object <Bench>`, `ctl prices <Bench>`; an object that does not exist; `pay 10 avatar "Sit Bot"`; `pay 10 avatar "Nobody Here"`; `pay 10 avatar <Tip Jar>` | Refused: no money; not known, with the scan distance; cannot pay itself; no such avatar; no avatar by that UUID, pointing at `pay AMOUNT object UUID` | Pass, each, with nothing paid |
+| 291 | `ctl pay 2000 avatar rig.alt` with L$790; `pay 0 ...`, `pay 10.5 ...`, `pay 10 rig.alt`, `pay 10 object "Tip Jar"` | Refused naming L$790; the amount; the two forms; the UUID | Pass |
+| 292 | `ctl pay 700 avatar rig.alt` with L$690 left; the same after the renewal time | Refused naming L$690 and the renewal; then paid, and a new period | Pass: refused at 00:23:33 naming 00:25:01; paid at 00:25:03; `limit: L$300 (renews to L$1000 on 2026-11-24T00:28:03Z)` |
+| 293 | `ctl quit` and start again before the renewal | The start line and `status` with what was left | Pass: `L$690 (renews to L$1000 on 2026-11-24T00:25:01Z) left` |
+| 294 | `rigmoney silent on`; `ctl pay 15 avatar rig.alt` | After 15 s an error saying it was sent and counts as paid; an `unconfirmed` row; L$15 less left | Pass: exit after 15.0 s; `limit: L$675`; the row with an empty balance and counted 15 |
+| 295 | `pay.py 50` (Rig Owner pays the bot) | A `received` row with the new balance; `status` shows it without asking | Pass: `received 50 825 0`, `Rig Owner paid you L$50.` |
+| 296 | `rigmoney set Sit Bot 5000`; restart with `limit = 100`, `perms = ["web"]`, `whitelist = ["Rig Owner", "<Hat Vendor>", "<Rig Alt>"]`, `blacklist = ["rig.alt"]`, `unlimited_list = ["rig.owner"]` | The start line with L$0 left (L$1025 counted without a renewal); `ctl status` without money lines and `ctl pay` refused naming `ctl`; through `web.py`: `status` with them, `payees`, Rig Alt and its jar refused for the blacklist, L$500 to Rig Owner and L$250 to the vendor paid as unlimited | Pass, each; `payees` printed `?`, `Rig Owner`, `whitelist,unlimited` and Rig Alt's UUID line |
+| 297 | `web.py --wait 3 events "cmd:pay:7:avatar:Rig Owner"` | The rows of the file as `money` events, then the payment's, then a status with the new balance | Pass: 12 kept, then `money [..-12] ... paid | 7 | 4238 | 0 ...` and `balance: L$4238` |
+| 298 | Prosody running; `perms = ["xmpp"]` and an `[xmpp]` table; `xmpp.py owner "msg:bot.rig.test:status" "msg:bot.rig.test:pay 3 avatar \"Rig Owner\""`; `ctl pay 3 avatar rig.owner` | The status with its money lines; paid over XMPP; refused over `ctl` | Pass |
+| 299 | A fresh transactions file; `ctl pay 5 ...`, at once `chmod 444` on the file, `ctl pay 6 ...`, `ctl pay 7 ...`, `chmod 644`, `ctl pay 8 ...` | The first row cannot be written: the next payments refused naming the file; then the waiting row written first and the payment made | Pass: the L$5 row was still waiting for its names when the file became read-only, so L$6 and L$7 were refused; `wrote 1 row(s) that waited`, L$8 paid; the file has the L$5 and L$8 rows |
+| 300 | `rigmoney silent on`; `ctl pay 9 ...`; two seconds later `ctl quit` | The `pay` answered as not confirmed, the bot stopped; an `unconfirmed` row in the file | Pass: `... the bot stopped before the grid confirmed it; it counts as paid ...` and the row |
+
+The page, in the built-in browser of the Claude desktop app, with the
+first config and `whitelist = ["Rig Owner", "<Rig Alt's UUID>"]`, and
+`friend.py make`:
+
+| # | Inject | Expected | Result (2026-11-24) |
+|---|---|---|---|
+| 301 | Open `/#money` | The Money tab between Inventory and Console; the header with the avatar, the balance and what is left; the friend; `Rig Owner` (by name) and `Rig Alt` under Whitelist; the transactions of the file, newest first, the unconfirmed one saying so | Pass |
+| 302 | Choose `Rig Alt`; type `5`, press Enter; "Pay L$5" | The dialog with `Pay L$5 to Rig Alt?` and the UUID, Cancel focused; paid; the amount box emptied; header and list updated without a reload; the renewal in local time | Pass: `paid L$5 to Rig Alt ...; the balance is L$4199`, `Left of the limit L$995`, `(renews to L$1000 on 24 листопада 2026 р. о 02:33)` |
+| 303 | Type `Rig Owner` and `2000`; "Pay"; "Pay L$2000" | `As typed.` in the dialog; the refusal for the limit shown; both boxes kept | Pass. A click beside the dialog before that closed it and sent nothing |
+| 304 | World: "Scan objects"; "Pay" on the vendor, `L$250`, "Pay the object", confirm; "Pay" on the jar | "Pay" on the three objects that take money only; `L$100`, `L$250` and no other amount; the dialog naming the object and its owner; the answer in the row; the jar's four amounts and "Another amount" with its box | Pass |
+| 305 | `talk.py`; IM: open `Rig Owner`; "Pay" | The Money tab with `Rig Owner` as payee by UUID, the amount empty with the cursor in it | Pass |
+| 306 | 360 by 740 pixels: World, Money, IM | No tab wider than the screen | Pass: `scrollWidth` 360 each |
+| 307 | Restart with `perms = ["ctl"]`; open `/#money`; the console line `pay 5 avatar "Rig Owner"` | Six tabs, World shown, no "Pay" anywhere; the console's refusal naming `web` | Pass |
+
+The rig's OpenSim names an avatar by UUID only after the region has looked
+it up by name: after a restart of the bot, `payees` left `Rig Alt`'s UUID
+entry out and `pay 1 avatar <Rig Alt's UUID>` was refused as no avatar,
+until `profile rig.alt` had found it by name. Second Life's name service
+knows every account; the bot reports what the service says.

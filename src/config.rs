@@ -1,5 +1,6 @@
 //! The single TOML config file: model, defaults and validation.
 
+use crate::payments::{Interface, PaymentsConfig, MAX_AMOUNT};
 use crate::perms::{Entry, Kind, Rule, Rules, KINDS};
 use crate::startup::{self, Line};
 use md5::{Digest, Md5};
@@ -98,10 +99,8 @@ pub struct Config {
     /// deprecated, and what to write instead.
     pub deprecated: Vec<String>,
     pub persist: Persist,
-    /// TSV file for local chat, if any.
-    pub log_chat: Option<PathBuf>,
-    /// TSV file for instant messages, if any.
-    pub log_im: Option<PathBuf>,
+    /// The log files, each with the key it was given under.
+    pub logs: LogPaths,
     pub fetch_offline_im: bool,
     /// Listen on the control socket.
     pub socket: bool,
@@ -130,6 +129,8 @@ pub struct Config {
     /// Autoreplies to instant messages, when the config has an
     /// `[autoreply]` table.
     pub autoreply: Option<AutoreplyConfig>,
+    /// Payments, when the config has a `[payments]` table.
+    pub payments: Option<PaymentsConfig>,
     /// The commands of the startup script, from `startup` or from the
     /// file `startup_file` names.
     pub startup: Vec<Line>,
@@ -146,6 +147,22 @@ impl Config {
             None => "startup",
         }
     }
+}
+
+/// A log file, and the key the config gave it under (`logs.im` or the
+/// deprecated `log_im`), for messages about it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogPath {
+    pub path: PathBuf,
+    pub key: &'static str,
+}
+
+/// The paths of the log files.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LogPaths {
+    pub chat: Option<LogPath>,
+    pub im: Option<LogPath>,
+    pub transactions: Option<LogPath>,
 }
 
 /// The `[autoreply]` table.
@@ -225,6 +242,7 @@ struct Raw {
     persist: Option<toml::Value>,
     log_chat: Option<toml::Value>,
     log_im: Option<toml::Value>,
+    logs: Option<toml::Value>,
     fetch_offline_im: Option<toml::Value>,
     socket: Option<toml::Value>,
     requesttp_timeout: Option<toml::Value>,
@@ -235,6 +253,7 @@ struct Raw {
     xmpp: Option<toml::Value>,
     web: Option<toml::Value>,
     autoreply: Option<toml::Value>,
+    payments: Option<toml::Value>,
     startup: Option<toml::Value>,
     startup_file: Option<toml::Value>,
 }
@@ -284,12 +303,162 @@ fn number(value: &toml::Value) -> Option<f64> {
     }
 }
 
-fn log_path(value: Option<toml::Value>, key: &str) -> Result<Option<PathBuf>, ConfigError> {
+fn log_path(value: Option<toml::Value>, key: &'static str) -> Result<Option<LogPath>, ConfigError> {
     match value {
         None => Ok(None),
-        Some(toml::Value::String(path)) if !path.is_empty() => Ok(Some(PathBuf::from(path))),
+        Some(toml::Value::String(path)) if !path.is_empty() => Ok(Some(LogPath {
+            path: PathBuf::from(path),
+            key,
+        })),
         Some(_) => err(format!("`{key}` must be a non-empty file path")),
     }
+}
+
+const LOGS_KEYS: &str = "`chat`, `im` and `transactions`";
+
+/// The `[logs]` table and the deprecated `log_chat` and `log_im`, with the
+/// note for each deprecated key the config has.
+fn logs(
+    table: Option<toml::Value>,
+    log_chat: Option<toml::Value>,
+    log_im: Option<toml::Value>,
+    deprecated: &mut Vec<String>,
+) -> Result<LogPaths, ConfigError> {
+    let (mut chat, mut im, mut transactions) = (None, None, None);
+    if let Some(value) = table {
+        let toml::Value::Table(table) = value else {
+            return err(format!("`logs` must be a table with the keys {LOGS_KEYS}"));
+        };
+        for (key, value) in table {
+            match key.as_str() {
+                "chat" => chat = log_path(Some(value), "logs.chat")?,
+                "im" => im = log_path(Some(value), "logs.im")?,
+                "transactions" => transactions = log_path(Some(value), "logs.transactions")?,
+                _ => return err(format!("`logs.{key}` is not a key of `logs`; its keys are {LOGS_KEYS}")),
+            }
+        }
+    }
+    let old_chat = log_path(log_chat, "log_chat")?;
+    let old_im = log_path(log_im, "log_im")?;
+    for (old, new, name) in [(&old_chat, &chat, "chat"), (&old_im, &im, "im")] {
+        if old.is_some() && new.is_some() {
+            return err(format!(
+                "`log_{name}` and `logs.{name}` both name the {name} log; keep only `{name}` under `[logs]`"
+            ));
+        }
+    }
+    for (old, name) in [(&old_chat, "chat"), (&old_im, "im")] {
+        if let Some(old) = old {
+            deprecated.push(format!(
+                "`log_{name}` is deprecated; write `{name} = {}` in the table `[logs]` instead \
+                 (the table goes after the keys that are not in a table)",
+                toml::Value::String(old.path.display().to_string())
+            ));
+        }
+    }
+    Ok(LogPaths {
+        chat: chat.or(old_chat),
+        im: im.or(old_im),
+        transactions,
+    })
+}
+
+const PAYMENTS_KEYS: &str = "`limit`, `perms`, `limit_renew`, `whitelist`, `blacklist` and `unlimited_list`";
+
+/// One list of `[payments]`: avatars by login name and avatars and objects
+/// by UUID, each once.
+fn payment_list(key: &str, value: toml::Value) -> Result<Vec<Entry>, ConfigError> {
+    let toml::Value::Array(values) = value else {
+        return err(format!("`{key}` must be an array of avatar login names and UUIDs"));
+    };
+    let mut entries = Vec::new();
+    for value in values {
+        let Some(text) = value.as_str() else {
+            return err(format!("`{key}` must hold avatar login names and UUIDs as strings"));
+        };
+        let entry = Entry::parse(text).map_err(|reason| ConfigError(format!("`{key}`: {reason}")))?;
+        if !entries.contains(&entry) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+/// The `[payments]` table.
+fn payments(value: Option<toml::Value>) -> Result<Option<PaymentsConfig>, ConfigError> {
+    const PERMS_FORM: &str = "an array of the interfaces that may pay: \"ctl\", \"xmpp\" and \"web\"";
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let toml::Value::Table(table) = value else {
+        return err(format!("`payments` must be a table with the keys {PAYMENTS_KEYS}"));
+    };
+    let (mut limit, mut perms, mut renew) = (None, None, None);
+    let (mut whitelist, mut blacklist, mut unlimited) = (None, Vec::new(), Vec::new());
+    for (key, value) in table {
+        match key.as_str() {
+            "limit" => limit = Some(value),
+            "perms" => perms = Some(value),
+            "limit_renew" => renew = Some(value),
+            "whitelist" => whitelist = Some(payment_list("payments.whitelist", value)?),
+            "blacklist" => blacklist = payment_list("payments.blacklist", value)?,
+            "unlimited_list" => unlimited = payment_list("payments.unlimited_list", value)?,
+            _ => return err(format!("`payments.{key}` is not a key of `payments`; its keys are {PAYMENTS_KEYS}")),
+        }
+    }
+    let limit = match required(limit, "payments.limit")? {
+        toml::Value::String(word) if word == "unlimited" => None,
+        toml::Value::Integer(n) if (0..=i64::from(MAX_AMOUNT)).contains(&n) => Some(n as u32),
+        _ => {
+            return err(format!(
+                "`payments.limit` must be a whole number of L$ from 0 to {MAX_AMOUNT}, or \"unlimited\""
+            ))
+        }
+    };
+    let toml::Value::Array(names) = required(perms, "payments.perms")? else {
+        return err(format!("`payments.perms` must be {PERMS_FORM}"));
+    };
+    let mut perms = [false; 3];
+    for name in names {
+        let Some(interface) = name.as_str().and_then(Interface::parse) else {
+            return err(format!("`payments.perms` must be {PERMS_FORM}"));
+        };
+        perms[interface as usize] = true;
+    }
+    let renew = match renew {
+        None => None,
+        Some(toml::Value::String(text)) => {
+            let duration = crate::autoreply::parse_duration(&text).map_err(|why| ConfigError(format!("`payments.limit_renew`: {why}")))?;
+            if duration.is_zero() {
+                return err(format!(
+                    "`payments.limit_renew` must be longer than zero: write {}",
+                    crate::autoreply::DURATION_FORM
+                ));
+            }
+            Some(duration)
+        }
+        Some(_) => {
+            return err(format!(
+                "`payments.limit_renew` must be a string holding a duration: {}",
+                crate::autoreply::DURATION_FORM
+            ))
+        }
+    };
+    for (key, other) in [("whitelist", whitelist.as_deref().unwrap_or(&[])), ("unlimited_list", &unlimited)] {
+        if let Some(both) = blacklist.iter().find(|entry| other.contains(entry)) {
+            return err(format!(
+                "`payments.blacklist` and `payments.{key}` both have the entry \"{both}\"; leave it out of one"
+            ));
+        }
+    }
+    Ok(Some(PaymentsConfig {
+        limit,
+        renew,
+        perms,
+        whitelist,
+        blacklist,
+        unlimited,
+    }))
 }
 
 const PERSIST_FORMS: &str = "`persist` must be \"cur\", \"cfg\", \"off\" (or false), an array \
@@ -892,8 +1061,7 @@ impl Config {
         if let Some(given) = &persist_given {
             deprecated.push(persist_note(given, persist, rlv_persist, persist_override));
         }
-        let log_chat = log_path(raw.log_chat, "log_chat")?;
-        let log_im = log_path(raw.log_im, "log_im")?;
+        let logs = logs(raw.logs, raw.log_chat, raw.log_im, &mut deprecated)?;
         let fetch_offline_im = flag(raw.fetch_offline_im, "fetch_offline_im")?;
         let socket = flag(raw.socket, "socket")?;
         let requesttp_timeout = match raw.requesttp_timeout.as_ref().map(number) {
@@ -926,6 +1094,11 @@ impl Config {
         if let (Some(given), Some(auto)) = (&autoreply_given, &autoreply) {
             deprecated.push(autoreply_note(given, auto));
         }
+        let payments = payments(raw.payments)?;
+        if payments.as_ref().is_some_and(|p| p.limit.is_some()) && logs.transactions.is_none() {
+            return err("`payments.limit` is a number, which needs `transactions` in the table `[logs]`: \
+                 the limit is kept in that file, so that a restart does not renew it");
+        }
         let (startup, startup_file) = match (raw.startup, raw.startup_file) {
             (Some(_), Some(_)) => return err("`startup` and `startup_file` are both set; use only one"),
             (None, None) => (Vec::new(), None),
@@ -944,8 +1117,7 @@ impl Config {
             sit,
             deprecated,
             persist,
-            log_chat,
-            log_im,
+            logs,
             fetch_offline_im,
             socket,
             requesttp_timeout,
@@ -958,6 +1130,7 @@ impl Config {
             xmpp,
             web,
             autoreply,
+            payments,
             startup,
             startup_file,
         })
@@ -1340,16 +1513,93 @@ mod tests {
     #[test]
     fn message_logging_is_off_by_default() {
         let cfg = Config::parse(&base()).unwrap();
-        assert_eq!((cfg.log_chat, cfg.log_im, cfg.fetch_offline_im), (None, None, false));
+        assert_eq!((cfg.logs, cfg.fetch_offline_im), (LogPaths::default(), false));
+    }
+
+    fn log(path: &str, key: &'static str) -> Option<LogPath> {
+        Some(LogPath {
+            path: PathBuf::from(path),
+            key,
+        })
     }
 
     #[test]
     fn accepts_message_logging_keys() {
         let text = base() + "log_chat = \"chat.tsv\"\nlog_im = \"/var/log/im.tsv\"\nfetch_offline_im = true\n";
         let cfg = Config::parse(&text).unwrap();
-        assert_eq!(cfg.log_chat, Some(PathBuf::from("chat.tsv")));
-        assert_eq!(cfg.log_im, Some(PathBuf::from("/var/log/im.tsv")));
+        assert_eq!(cfg.logs.chat, log("chat.tsv", "log_chat"));
+        assert_eq!(cfg.logs.im, log("/var/log/im.tsv", "log_im"));
         assert!(cfg.fetch_offline_im);
+    }
+
+    #[test]
+    fn all_three_log_files() {
+        let text = base() + "[logs]\nchat = \"chat.tsv\"\nim = \"im.tsv\"\ntransactions = \"transactions.tsv\"\n";
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(
+            cfg.logs,
+            LogPaths {
+                chat: log("chat.tsv", "logs.chat"),
+                im: log("im.tsv", "logs.im"),
+                transactions: log("transactions.tsv", "logs.transactions"),
+            }
+        );
+        assert!(cfg.deprecated.is_empty());
+    }
+
+    #[test]
+    fn old_log_keys_are_deprecated_spellings() {
+        let text = base() + "log_chat = \"chat.tsv\"\nlog_im = \"im.tsv\"\n";
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(cfg.logs.chat, log("chat.tsv", "log_chat"));
+        assert_eq!(cfg.logs.im, log("im.tsv", "log_im"));
+        assert_eq!(
+            cfg.deprecated,
+            [
+                "`log_chat` is deprecated; write `chat = \"chat.tsv\"` in the table `[logs]` instead \
+                 (the table goes after the keys that are not in a table)",
+                "`log_im` is deprecated; write `im = \"im.tsv\"` in the table `[logs]` instead \
+                 (the table goes after the keys that are not in a table)",
+            ]
+        );
+    }
+
+    #[test]
+    fn old_and_new_key_for_different_files() {
+        let text = base() + "log_chat = \"chat.tsv\"\n[logs]\nim = \"im.tsv\"\n";
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(cfg.logs.chat, log("chat.tsv", "log_chat"));
+        assert_eq!(cfg.logs.im, log("im.tsv", "logs.im"));
+        assert_eq!(cfg.deprecated.len(), 1);
+        assert!(cfg.deprecated[0].starts_with("`log_chat` is deprecated"));
+    }
+
+    #[test]
+    fn rejects_empty_log_paths() {
+        for (text, key) in [
+            ("log_chat = \"\"\n", "`log_chat`"),
+            ("[logs]\nchat = \"\"\n", "`logs.chat`"),
+            ("[logs]\nchat = 3\n", "`logs.chat`"),
+            ("[logs]\ntransactions = \"\"\n", "`logs.transactions`"),
+            ("logs = \"chat.tsv\"\n", "`logs`"),
+        ] {
+            assert!(rejected(&(base() + text)).contains(key), "{text}");
+        }
+    }
+
+    #[test]
+    fn rejects_both_spellings_of_one_log_file() {
+        let text = base() + "log_chat = \"chat.tsv\"\n[logs]\nchat = \"chat.tsv\"\n";
+        let error = rejected(&text);
+        assert!(error.contains("`log_chat`") && error.contains("`logs.chat`"), "{error}");
+        let text = base() + "log_im = \"a.tsv\"\n[logs]\nim = \"b.tsv\"\n";
+        assert!(rejected(&text).contains("`logs.im`"));
+    }
+
+    #[test]
+    fn rejects_unknown_keys_in_the_logs_table() {
+        let error = rejected(&(base() + "[logs]\npayments = \"pay.tsv\"\n"));
+        assert!(error.contains("`logs.payments`") && error.contains(LOGS_KEYS), "{error}");
     }
 
     #[test]
@@ -1405,6 +1655,160 @@ mod tests {
             let text = base() + &format!("scan_distance = {bad}\n");
             assert!(rejected(&text).contains("`scan_distance`"), "{bad}");
         }
+    }
+
+    /// The ```toml blocks of the README that hold a table this change
+    /// brought: `[logs]` or `[payments]`.
+    fn readme_fragments() -> Vec<&'static str> {
+        let readme = include_str!("../README.md");
+        readme
+            .split("```toml\n")
+            .skip(1)
+            .filter_map(|rest| rest.split_once("```").map(|(block, _)| block))
+            .filter(|block| block.contains("[logs]") || block.contains("[payments]"))
+            .collect()
+    }
+
+    #[test]
+    fn the_readmes_logs_and_payments_fragments_are_accepted() {
+        let fragments = readme_fragments();
+        assert!(fragments.len() >= 3, "{fragments:?}");
+        for fragment in fragments {
+            let cfg = Config::parse(&(base() + fragment)).unwrap_or_else(|e| panic!("{fragment}: {e}"));
+            assert!(cfg.deprecated.is_empty(), "{fragment}");
+        }
+    }
+
+    // -------------------------------------------------------------- payments
+
+    fn payments_of(table: &str) -> Result<Option<PaymentsConfig>, String> {
+        let text = format!("{}[logs]\ntransactions = \"tx.tsv\"\n[payments]\n{table}", base());
+        Config::parse(&text).map(|cfg| cfg.payments).map_err(|e| e.0)
+    }
+
+    #[test]
+    fn payments_are_off_without_their_table() {
+        assert_eq!(Config::parse(&base()).unwrap().payments, None);
+    }
+
+    #[test]
+    fn payments_table() {
+        let cfg = payments_of("limit = 1000\nlimit_renew = \"7d\"\nperms = [\"ctl\", \"web\", \"ctl\"]\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg,
+            PaymentsConfig {
+                limit: Some(1000),
+                renew: Some(Duration::from_secs(7 * 86_400)),
+                perms: [true, false, true],
+                whitelist: None,
+                blacklist: Vec::new(),
+                unlimited: Vec::new(),
+            }
+        );
+        let lists = payments_of(
+            "limit = 0\nperms = []\nwhitelist = []\nblacklist = [\"John Roe\", \"john.roe\"]\n\
+             unlimited_list = [\"Jane Doe\", \"11111111-2222-3333-4444-555555555555\"]\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(lists.limit, Some(0));
+        assert_eq!(lists.perms, [false; 3]);
+        assert_eq!(lists.whitelist, Some(Vec::new()));
+        assert_eq!(lists.blacklist, [entry("John Roe")]);
+        assert_eq!(lists.unlimited, [entry("Jane Doe"), entry(OBJECT)]);
+    }
+
+    #[test]
+    fn unlimited_needs_no_transactions_file() {
+        let text = base() + "[payments]\nlimit = \"unlimited\"\nperms = [\"ctl\"]\n";
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(cfg.payments.unwrap().limit, None);
+        assert_eq!(cfg.logs, LogPaths::default());
+    }
+
+    #[test]
+    fn an_interface_that_is_not_switched_on_may_be_listed() {
+        let cfg = payments_of("limit = 10\nperms = [\"ctl\", \"xmpp\"]\n").unwrap().unwrap();
+        assert_eq!(cfg.perms, [true, true, false]);
+    }
+
+    #[test]
+    fn rejects_a_payments_table_without_its_mandatory_keys() {
+        assert!(payments_of("perms = []\n").unwrap_err().contains("`payments.limit` is required"));
+        assert!(payments_of("limit = 10\n").unwrap_err().contains("`payments.perms` is required"));
+        assert!(payments_of("").unwrap_err().contains("is required"));
+    }
+
+    #[test]
+    fn rejects_malformed_limits() {
+        for bad in ["-1", "10.5", "\"1000\"", "\"none\"", "true", "2147483648"] {
+            let error = payments_of(&format!("limit = {bad}\nperms = []\n")).unwrap_err();
+            assert!(
+                error.contains("`payments.limit`") && error.contains("\"unlimited\""),
+                "{bad}: {error}"
+            );
+        }
+        assert!(payments_of("limit = 2147483647\nperms = []\n").is_ok());
+    }
+
+    #[test]
+    fn rejects_malformed_payment_perms() {
+        for bad in ["\"web\"", "[\"ctl\", \"socket\"]", "[1]"] {
+            let error = payments_of(&format!("limit = 10\nperms = {bad}\n")).unwrap_err();
+            assert!(
+                error.contains("`payments.perms`") && error.contains("\"ctl\", \"xmpp\" and \"web\""),
+                "{bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_limit_renewals() {
+        for bad in ["\"7 days\"", "\"0\"", "7", "\"400d\""] {
+            let error = payments_of(&format!("limit = 10\nperms = []\nlimit_renew = {bad}\n")).unwrap_err();
+            assert!(
+                error.contains("`payments.limit_renew`") && error.contains("365 days"),
+                "{bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_limit_without_a_transactions_file() {
+        let error = rejected(&(base() + "[payments]\nlimit = 1000\nperms = [\"ctl\"]\n"));
+        assert!(error.contains("`payments.limit`") && error.contains("`[logs]`") && error.contains("`transactions`"));
+    }
+
+    #[test]
+    fn rejects_malformed_payment_lists() {
+        for (bad, key) in [
+            ("whitelist = \"Jane Doe\"", "`payments.whitelist`"),
+            ("blacklist = [42]", "`payments.blacklist`"),
+            ("unlimited_list = [\"Jane Mary Doe\"]", "`payments.unlimited_list`"),
+        ] {
+            let error = payments_of(&format!("limit = 10\nperms = []\n{bad}\n")).unwrap_err();
+            assert!(error.contains(key), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn rejects_an_entry_on_the_blacklist_and_on_another_list() {
+        let error = payments_of("limit = 10\nperms = []\nblacklist = [\"Jane Doe\"]\nwhitelist = [\"jane.doe\"]\n").unwrap_err();
+        assert!(
+            error.contains("`payments.blacklist`") && error.contains("`payments.whitelist`") && error.contains("Jane Doe"),
+            "{error}"
+        );
+        let error = payments_of("limit = 10\nperms = []\nblacklist = [\"Jane Doe\"]\nunlimited_list = [\"Jane Doe\"]\n").unwrap_err();
+        assert!(error.contains("`payments.unlimited_list`"), "{error}");
+    }
+
+    #[test]
+    fn rejects_unknown_keys_in_the_payments_table() {
+        let error = payments_of("limit = 10\nperms = []\nmax = 100\n").unwrap_err();
+        assert!(error.contains("`payments.max`") && error.contains(PAYMENTS_KEYS), "{error}");
+        assert!(rejected(&(base() + "payments = 3\n")).contains("`payments`"));
     }
 
     #[test]
@@ -1908,16 +2312,54 @@ mod tests {
     #[test]
     fn example_file_is_valid_with_its_optional_keys_enabled() {
         let text = include_str!("../russelbot.example.toml");
-        let mut enabled = text.to_string();
-        for key in ["log_chat", "log_im", "fetch_offline_im"] {
-            let commented = format!("# {key} = ");
-            assert!(text.contains(&commented), "{key} is not in the example");
-            enabled = enabled.replace(&commented, &format!("{key} = "));
-        }
+        let commented = "# fetch_offline_im = ";
+        assert!(text.contains(commented), "fetch_offline_im is not in the example");
+        let enabled = text.replace(commented, "fetch_offline_im = ");
         let cfg = Config::parse(&enabled).unwrap();
-        assert_eq!(cfg.log_chat, Some(PathBuf::from("chat.tsv")));
-        assert_eq!(cfg.log_im, Some(PathBuf::from("im.tsv")));
         assert!(cfg.fetch_offline_im);
+    }
+
+    /// The example with the block from `# [table]` to the next blank line
+    /// uncommented, for each table named.
+    fn with_tables(text: &str, tables: &[&str]) -> String {
+        let mut enabled = text.to_string();
+        for table in tables {
+            let head = format!("\n# [{table}]\n");
+            let start = enabled.find(&head).unwrap_or_else(|| panic!("[{table}] is not in the example")) + 1;
+            let end = enabled[start..].find("\n\n").map_or(enabled.len(), |at| start + at);
+            let block: Vec<&str> = enabled[start..end]
+                .lines()
+                .map(|line| line.strip_prefix("# ").unwrap_or(line))
+                .collect();
+            enabled = format!("{}{}{}", &enabled[..start], block.join("\n"), &enabled[end..]);
+        }
+        enabled
+    }
+
+    #[test]
+    fn example_file_is_valid_with_its_logs_and_payments_tables() {
+        let text = include_str!("../russelbot.example.toml");
+        let cfg = Config::parse(&with_tables(text, &["logs", "payments"])).unwrap();
+        assert_eq!(
+            cfg.logs,
+            LogPaths {
+                chat: log("chat.tsv", "logs.chat"),
+                im: log("im.tsv", "logs.im"),
+                transactions: log("transactions.tsv", "logs.transactions"),
+            }
+        );
+        let payments = cfg.payments.unwrap();
+        assert_eq!(payments.limit, Some(1000));
+        assert_eq!(payments.renew, Some(Duration::from_secs(7 * 86_400)));
+        assert_eq!(payments.perms, [true, false, true]);
+        assert_eq!(payments.whitelist.map(|list| list.len()), Some(2));
+        assert_eq!(payments.blacklist, [entry("John Roe")]);
+        assert_eq!(payments.unlimited, [entry("Owner Resident")]);
+        assert!(cfg.deprecated.is_empty());
+        // The payments table alone needs the transactions file.
+        assert!(rejected(&with_tables(text, &["payments"])).contains("`payments.limit`"));
+        // All the tables at once.
+        assert!(Config::parse(&with_tables(text, &["xmpp", "web", "logs", "payments"])).is_ok());
     }
 
     // ------------------------------------------------- startup script

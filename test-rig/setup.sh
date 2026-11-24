@@ -53,7 +53,17 @@ if [ ! -d "$sim" ]; then
     git clone "$source" "$sim"
 fi
 
-if [ ! -f "$sim/bin/OpenSim.dll" ]; then
+# The rig's money module (test-rig/money) is built with the simulator as an
+# addon module. A copy that changed is copied again, which makes it newer
+# than the built dll and so rebuilds the simulator with it.
+addon=$sim/addon-modules/RigMoney
+mkdir -p "$addon"
+for file in RigMoneyModule.cs prebuild.xml; do
+    cmp -s "$rig/money/$file" "$addon/$file" || cp "$rig/money/$file" "$addon/$file"
+done
+dll=$sim/bin/RigMoneyModule.dll
+if [ ! -f "$sim/bin/OpenSim.dll" ] || [ ! -f "$dll" ] \
+    || [ -n "$(find "$addon/RigMoneyModule.cs" "$addon/prebuild.xml" -newer "$dll")" ]; then
     (cd "$sim" && ./runprebuild.sh && dotnet build --configuration Release OpenSim.sln)
 fi
 
@@ -61,13 +71,15 @@ bin=$sim/bin
 if [ ! -f "$bin/OpenSim.ini" ]; then
     # Standalone architecture is already the uncommented default in the
     # example; add a default estate so the first start asks no questions,
-    # and the profile service, without which nothing answers for profiles.
+    # the profile service, without which nothing answers for profiles, and
+    # the rig's money module.
     sed -e 's|^ *; DefaultEstateName = .*|    DefaultEstateName = Rig Estate|' \
         -e 's|^ *;; ProfileServiceURL = |  ProfileServiceURL = |' \
         -e 's|^ *; DefaultEstateOwnerName = .*|    DefaultEstateOwnerName = Rig Owner|' \
         -e 's|^ *; DefaultEstateOwnerUUID = .*|    DefaultEstateOwnerUUID = 7e570000-0000-4000-8000-0000000000aa|' \
         -e 's|^ *; DefaultEstateOwnerEMail = .*|    DefaultEstateOwnerEMail = owner@example.com|' \
         -e 's|^ *; DefaultEstateOwnerPassword = .*|    DefaultEstateOwnerPassword = rigowner|' \
+        -e 's|^ *; economymodule = BetaGridLikeMoneyModule|    economymodule = RigMoneyModule|' \
         "$bin/OpenSim.ini.example" > "$bin/OpenSim.ini"
 fi
 if [ ! -f "$bin/config-include/StandaloneCommon.ini" ]; then

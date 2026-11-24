@@ -84,6 +84,11 @@ pub const SCRIPT_CONTROL_CHANGE: MessageId = low(189);
 pub const SCRIPT_DIALOG: MessageId = low(190);
 pub const PARCEL_OVERLAY: MessageId = low(196);
 pub const AGENT_DATA_UPDATE: MessageId = low(387);
+pub const REQUEST_PAY_PRICE: MessageId = low(161);
+pub const PAY_PRICE_REPLY: MessageId = low(162);
+pub const MONEY_TRANSFER_REQUEST: MessageId = low(311);
+pub const MONEY_BALANCE_REQUEST: MessageId = low(313);
+pub const MONEY_BALANCE_REPLY: MessageId = low(314);
 
 pub type Vector3 = [f32; 3];
 
@@ -163,6 +168,11 @@ pub fn name(id: MessageId) -> String {
         AVATAR_PROPERTIES_REQUEST => "AvatarPropertiesRequest",
         AVATAR_PROPERTIES_REPLY => "AvatarPropertiesReply",
         AGENT_DATA_UPDATE => "AgentDataUpdate",
+        REQUEST_PAY_PRICE => "RequestPayPrice",
+        PAY_PRICE_REPLY => "PayPriceReply",
+        MONEY_TRANSFER_REQUEST => "MoneyTransferRequest",
+        MONEY_BALANCE_REQUEST => "MoneyBalanceRequest",
+        MONEY_BALANCE_REPLY => "MoneyBalanceReply",
         0..=0xFE => return format!("High {id}"),
         0xFF00..=0xFFFE => return format!("Medium {}", id & 0xFF),
         _ => return format!("Low {}", id & 0xFFFF),
@@ -473,6 +483,40 @@ pub fn request_object_properties_family(agent: &Agent, object: Uuid) -> Outgoing
         .u32(0) // RequestFlags
         .uuid(object)
         .finish(REQUEST_OBJECT_PROPERTIES_FAMILY, true)
+}
+
+/// The transaction type of a gift of money to an avatar.
+pub const TRANSACTION_GIFT: i32 = 5001;
+/// The transaction type of a payment to an object.
+pub const TRANSACTION_PAY_OBJECT: i32 = 5008;
+
+/// MoneyTransferRequest, Low 311, Zerocoded: SourceID, DestID, Flags U8,
+/// Amount S32, AggregatePermNextOwner U8, AggregatePermInventory U8,
+/// TransactionType S32, Description Variable 1. Pays `dest`, an avatar or
+/// an object, as a viewer's Pay does.
+pub fn money_transfer_request(agent: &Agent, dest: Uuid, amount: i32, kind: i32, description: &str) -> Outgoing {
+    Writer::agent(agent)
+        .uuid(agent.agent_id)
+        .uuid(dest)
+        .u8(0) // Flags: neither party is a group
+        .i32(amount)
+        .u8(0) // AggregatePermNextOwner
+        .u8(0) // AggregatePermInventory
+        .i32(kind)
+        .text1(description)
+        .finish(MONEY_TRANSFER_REQUEST, true)
+}
+
+/// MoneyBalanceRequest, Low 313, Zerocoded: TransactionID, null as a
+/// viewer sends it. Answered with MoneyBalanceReply.
+pub fn money_balance_request(agent: &Agent) -> Outgoing {
+    Writer::agent(agent).uuid(Uuid::nil()).finish(MONEY_BALANCE_REQUEST, true)
+}
+
+/// RequestPayPrice, Low 161: ObjectID, without the agent. Answered with
+/// PayPriceReply.
+pub fn request_pay_price(object: Uuid) -> Outgoing {
+    Writer::default().uuid(object).finish(REQUEST_PAY_PRICE, false)
 }
 
 /// AvatarPickerRequest, Low 26: QueryID LLUUID, Name Variable 1. Asks for
@@ -791,6 +835,8 @@ pub const PCODE_AVATAR: u8 = 47;
 pub const FLAG_PHYSICS: u32 = 1 << 0;
 pub const FLAG_SCRIPTED: u32 = 1 << 6;
 pub const FLAG_TOUCH: u32 = 1 << 7;
+/// The object takes money: a script in it has a `money` event.
+pub const FLAG_MONEY: u32 = 1 << 9;
 pub const FLAG_PHANTOM: u32 = 1 << 10;
 pub const FLAG_TEMPORARY: u32 = 1 << 29;
 
@@ -857,6 +903,28 @@ fn attach_item(name_values: &[u8]) -> Option<Uuid> {
     let line = list.lines().find(|line| line.split_whitespace().next() == Some("AttachItemID"))?;
     let item = Uuid::parse_str(line.split_whitespace().last()?).ok()?;
     (!item.is_nil()).then_some(item)
+}
+
+/// A MoneyBalanceReply: the balance and, for a transaction, what it was.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoneyReport {
+    pub success: bool,
+    pub balance: i32,
+    pub description: String,
+    pub info: Option<TransactionInfo>,
+}
+
+/// The TransactionInfo block of a MoneyBalanceReply. A type of 0 is a
+/// balance alone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransactionInfo {
+    pub kind: i32,
+    pub source: Uuid,
+    pub source_group: bool,
+    pub dest: Uuid,
+    pub dest_group: bool,
+    pub amount: i32,
+    pub item: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -987,6 +1055,16 @@ pub enum Incoming {
         first_life: String,
         born: String,
         flags: u32,
+    },
+    /// The avatar's balance, alone or with a transaction of the avatar.
+    MoneyBalanceReply(MoneyReport),
+    /// What an object offers to be paid, in answer to RequestPayPrice.
+    PayPriceReply {
+        object: Uuid,
+        /// -1 hides the amount field, -2 leaves it empty.
+        default: i32,
+        /// The quick-pay buttons: -1 hidden, -2 the default amount.
+        buttons: Vec<i32>,
     },
     LogoutReply,
     DisableSimulator,
@@ -1354,6 +1432,46 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
                 born,
                 flags: r.u32()?,
             }
+        }
+        // MoneyBalanceReply, Low 314, Zerocoded: AgentID, TransactionID,
+        // TransactionSuccess BOOL, MoneyBalance S32, SquareMetersCredit
+        // S32, SquareMetersCommitted S32, Description Variable 1, then
+        // TransactionInfo { TransactionType S32, SourceID, IsSourceGroup
+        // BOOL, DestID, IsDestGroup BOOL, Amount S32, ItemDescription
+        // Variable 1 }, which older simulators leave out.
+        MONEY_BALANCE_REPLY => {
+            r.skip(32)?;
+            let success = r.u8()? != 0;
+            let balance = r.u32()? as i32;
+            r.skip(8)?;
+            let description = text(r.variable1()?);
+            let info = match r.0.is_empty() {
+                true => None,
+                false => Some(TransactionInfo {
+                    kind: r.u32()? as i32,
+                    source: r.uuid()?,
+                    source_group: r.u8()? != 0,
+                    dest: r.uuid()?,
+                    dest_group: r.u8()? != 0,
+                    amount: r.u32()? as i32,
+                    item: text(r.variable1()?),
+                }),
+            };
+            Incoming::MoneyBalanceReply(MoneyReport {
+                success,
+                balance,
+                description,
+                info,
+            })
+        }
+        // PayPriceReply, Low 162: ObjectID, DefaultPayPrice S32, then
+        // ButtonData Variable { PayButton S32 }.
+        PAY_PRICE_REPLY => {
+            let object = r.uuid()?;
+            let default = r.u32()? as i32;
+            let count = r.u8()?;
+            let buttons = (0..count).map(|_| r.u32().map(|b| b as i32)).collect::<Decoded<_>>()?;
+            Incoming::PayPriceReply { object, default, buttons }
         }
         LOGOUT_REPLY => Incoming::LogoutReply,
         DISABLE_SIMULATOR => Incoming::DisableSimulator,
@@ -1754,6 +1872,37 @@ pub mod testing {
         for (related, value) in rights {
             body.extend(related.as_bytes());
             body.extend(value.to_le_bytes());
+        }
+        body
+    }
+
+    /// A MoneyBalanceReply body, before zerocoding; without the
+    /// TransactionInfo block when `info` is `None`.
+    pub fn money_balance_reply(success: bool, balance: i32, description: &str, info: Option<&TransactionInfo>) -> Vec<u8> {
+        let mut body = vec![0xA1; 16]; // AgentID
+        body.extend([0x7A; 16]); // TransactionID
+        body.push(u8::from(success));
+        body.extend(balance.to_le_bytes());
+        body.extend([0; 8]); // SquareMetersCredit, SquareMetersCommitted
+        body.extend(string1(description));
+        if let Some(info) = info {
+            body.extend(info.kind.to_le_bytes());
+            body.extend(info.source.as_bytes());
+            body.push(u8::from(info.source_group));
+            body.extend(info.dest.as_bytes());
+            body.push(u8::from(info.dest_group));
+            body.extend(info.amount.to_le_bytes());
+            body.extend(string1(&info.item));
+        }
+        body
+    }
+
+    pub fn pay_price_reply(object: Uuid, default: i32, buttons: &[i32]) -> Vec<u8> {
+        let mut body = object.as_bytes().to_vec();
+        body.extend(default.to_le_bytes());
+        body.push(buttons.len() as u8);
+        for button in buttons {
+            body.extend(button.to_le_bytes());
         }
         body
     }
@@ -3336,6 +3485,269 @@ mod tests {
         assert!(close(&rotate(QUARTER_TURN.1, [1.0, 0.0, 0.0]), &[0.0, 1.0, 0.0]));
         assert!(close(&rotate(QUARTER_TURN.1, [0.0, 1.0, 2.0]), &[-1.0, 0.0, 2.0]));
         assert!(close(&rotate([0.0, 0.0, 0.0, 1.0], [3.0, 4.0, 5.0]), &[3.0, 4.0, 5.0]));
+    }
+
+    #[test]
+    fn encodes_money_transfer_request() {
+        let dest = Uuid::from_bytes([0xD1; 16]);
+        let msg = money_transfer_request(&agent(), dest, 25, TRANSACTION_GIFT, "");
+        assert_eq!((msg.id, msg.zerocoded), (low(311), true));
+        assert_eq!(name(msg.id), "MoneyTransferRequest");
+        assert_eq!(
+            msg.body,
+            [
+                agent_prefix(),
+                vec![0xA1; 16], // SourceID: the agent
+                vec![0xD1; 16],
+                vec![0],                // Flags
+                vec![25, 0, 0, 0],      // Amount
+                vec![0, 0],             // AggregatePerm*
+                vec![0x89, 0x13, 0, 0], // TransactionType 5001
+                vec![1, 0],             // Description: empty, with its NUL
+            ]
+            .concat()
+        );
+        let msg = money_transfer_request(&agent(), dest, 250, TRANSACTION_PAY_OBJECT, "Hat Vendor");
+        assert_eq!(msg.body[32 + 32 + 1 + 4 + 2..][..4], 5008i32.to_le_bytes());
+        assert_eq!(msg.body[32 + 32 + 1 + 4 + 2 + 4..], *[&[11u8][..], b"Hat Vendor\0"].concat());
+    }
+
+    #[test]
+    fn encodes_money_balance_request() {
+        let msg = money_balance_request(&agent());
+        assert_eq!((msg.id, msg.zerocoded), (low(313), true));
+        assert_eq!(name(msg.id), "MoneyBalanceRequest");
+        assert_eq!(msg.body, [agent_prefix(), vec![0; 16]].concat());
+    }
+
+    #[test]
+    fn encodes_request_pay_price() {
+        let object = Uuid::from_bytes([0xB0; 16]);
+        let msg = request_pay_price(object);
+        assert_eq!((msg.id, msg.zerocoded), (low(161), false));
+        assert_eq!(name(msg.id), "RequestPayPrice");
+        assert_eq!(msg.body, vec![0xB0; 16]);
+    }
+
+    #[test]
+    fn decodes_money_balance_reply_with_and_without_a_transaction() {
+        let info = TransactionInfo {
+            kind: TRANSACTION_GIFT,
+            source: Uuid::from_bytes([0xA1; 16]),
+            source_group: false,
+            dest: Uuid::from_bytes([0xD1; 16]),
+            dest_group: false,
+            amount: 25,
+            item: String::new(),
+        };
+        let body = money_balance_reply(true, 975, "You paid Jane Doe L$25.", Some(&info));
+        assert_eq!(
+            decode(low(314), &body),
+            Ok(Incoming::MoneyBalanceReply(MoneyReport {
+                success: true,
+                balance: 975,
+                description: "You paid Jane Doe L$25.".into(),
+                info: Some(info),
+            }))
+        );
+        assert_eq!(name(low(314)), "MoneyBalanceReply");
+        let body = money_balance_reply(false, -3, "", None);
+        assert_eq!(
+            decode(low(314), &body),
+            Ok(Incoming::MoneyBalanceReply(MoneyReport {
+                success: false,
+                balance: -3,
+                description: String::new(),
+                info: None,
+            }))
+        );
+        assert_eq!(decode(low(314), &body[..body.len() - 2]), Err(DecodeError));
+    }
+
+    #[test]
+    fn decodes_pay_price_reply() {
+        let object = Uuid::from_bytes([0xB0; 16]);
+        let body = pay_price_reply(object, -1, &[100, 250, -1, -1]);
+        assert_eq!(
+            decode(low(162), &body),
+            Ok(Incoming::PayPriceReply {
+                object,
+                default: -1,
+                buttons: vec![100, 250, -1, -1],
+            })
+        );
+        assert_eq!(name(low(162)), "PayPriceReply");
+        assert_eq!(decode(low(162), &body[..body.len() - 1]), Err(DecodeError));
+    }
+
+    // Packets captured from the rig's simulator with its money module
+    // (test-rig/money), message number first, zerocoding undone. The
+    // outgoing ones were sent by test-rig/pay.py and taken by the
+    // simulator.
+
+    const RIG_ALT: &str = "7e570000-0000-4000-8000-0000000000a1";
+    const RIG_OWNER: &str = "7e570000-0000-4000-8000-0000000000aa";
+    const PAYEE_BOX: &str = "458f6569-74b2-4e6c-8083-1073973bd16e";
+
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// The message number and the body of a capture.
+    fn captured(text: &str) -> (MessageId, Vec<u8>) {
+        let bytes = hex(text);
+        let id = u32::from_be_bytes(bytes[..4].try_into().unwrap());
+        (id, bytes[4..].to_vec())
+    }
+
+    fn uuid(text: &str) -> Uuid {
+        Uuid::parse_str(text).unwrap()
+    }
+
+    fn rig_alt() -> Agent {
+        Agent {
+            agent_id: uuid(RIG_ALT),
+            session_id: uuid("75657546-2f67-455a-9a1d-0870fefa40f3"),
+        }
+    }
+
+    fn reply(text: &str) -> MoneyReport {
+        let (id, body) = captured(text);
+        assert_eq!(id, MONEY_BALANCE_REPLY);
+        match decode(id, &body) {
+            Ok(Incoming::MoneyBalanceReply(report)) => report,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn encodes_what_the_rig_takes() {
+        let (id, body) = captured("ffff00a1458f656974b24e6c80831073973bd16e");
+        let ours = request_pay_price(uuid(PAYEE_BOX));
+        assert_eq!((ours.id, ours.body), (id, body));
+
+        let (id, body) = captured(
+            "ffff01377e5700000000400080000000000000a1756575462f67455a9a1d0870fefa40f37e570000000040008000\
+             0000000000a1458f656974b24e6c80831073973bd16e00fa0000000000901300000a506179656520626f7800",
+        );
+        let ours = money_transfer_request(&rig_alt(), uuid(PAYEE_BOX), 250, TRANSACTION_PAY_OBJECT, "Payee box");
+        assert_eq!((ours.id, ours.body), (id, body));
+
+        // pay.py sends an empty description as nothing at all; the bot, as
+        // a viewer, with its NUL. The rest is the same.
+        let (id, body) = captured(
+            "ffff01377e5700000000400080000000000000aa8ade37f66e7a40f9b8a7db31062bd7b97e570000000040008000\
+             0000000000aa7e5700000000400080000000000000a1006400000000008913000000",
+        );
+        let owner = Agent {
+            agent_id: uuid(RIG_OWNER),
+            session_id: uuid("8ade37f6-6e7a-40f9-b8a7-db31062bd7b9"),
+        };
+        let ours = money_transfer_request(&owner, uuid(RIG_ALT), 100, TRANSACTION_GIFT, "");
+        assert_eq!(ours.id, id);
+        assert_eq!(ours.body[..body.len() - 1], body[..body.len() - 1]);
+        assert_eq!(ours.body[body.len() - 1..], [1, 0]);
+
+        // A request for the balance: pay.py names a transaction, the bot
+        // (as a viewer) none.
+        let (id, body) =
+            captured("ffff01397e5700000000400080000000000000a1756575462f67455a9a1d0870fefa40f34babf67f18ed4798b005075cc366ab08");
+        let ours = money_balance_request(&rig_alt());
+        assert_eq!((ours.id, &ours.body[..32]), (id, &body[..32]));
+        assert_eq!(ours.body.len(), body.len());
+    }
+
+    #[test]
+    fn decodes_what_the_rig_sends() {
+        // The answer to a request for the balance: a zeroed transaction.
+        let balance = reply(
+            "ffff013a7e5700000000400080000000000000a14babf67f18ed4798b005075cc366ab0801e8030000000000000000\
+             00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        );
+        assert_eq!((balance.success, balance.balance, balance.description.as_str()), (true, 1000, ""));
+        let info = balance.info.unwrap();
+        assert_eq!((info.kind, info.amount, info.source, info.dest), (0, 0, Uuid::nil(), Uuid::nil()));
+
+        // The price of a vendor.
+        let (id, body) = captured("ffff00a2458f656974b24e6c80831073973bd16effffffff0464000000fa000000ffffffffffffffff");
+        assert_eq!(
+            decode(id, &body),
+            Ok(Incoming::PayPriceReply {
+                object: uuid(PAYEE_BOX),
+                default: -1,
+                buttons: vec![100, 250, -1, -1],
+            })
+        );
+
+        // Paying the box: the payer is told, and the destination is the
+        // box's owner.
+        let paid = reply(
+            "ffff013a7e5700000000400080000000000000a1abc4bff19eb94b8b96322ac345caf40e01ee02000000000000000000\
+             0026596f75207061696420506179656520626f782028526967204f776e657229204c243235302e00901300007e5700\
+             000000400080000000000000a1007e5700000000400080000000000000aa00fa0000000a506179656520626f7800",
+        );
+        assert_eq!(
+            paid,
+            MoneyReport {
+                success: true,
+                balance: 750,
+                description: "You paid Payee box (Rig Owner) L$250.".into(),
+                info: Some(TransactionInfo {
+                    kind: TRANSACTION_PAY_OBJECT,
+                    source: uuid(RIG_ALT),
+                    source_group: false,
+                    dest: uuid(RIG_OWNER),
+                    dest_group: false,
+                    amount: 250,
+                    item: "Payee box".into(),
+                }),
+            }
+        );
+        // The owner is told as well.
+        let owner = reply(
+            "ffff013a7e5700000000400080000000000000aaabc4bff19eb94b8b96322ac345caf40e01e2040000000000000000\
+             00001852696720416c74207061696420796f75204c243235302e00901300007e5700000000400080000000000000a1\
+             007e5700000000400080000000000000aa00fa0000000a506179656520626f7800",
+        );
+        assert_eq!((owner.balance, owner.description.as_str()), (1250, "Rig Alt paid you L$250."));
+
+        // A gift, to the payer and to the payee.
+        let gave = reply(
+            "ffff013a7e5700000000400080000000000000aaeec381b73b294ca2a7227bd0265915e4018403000000000000000000\
+             0018596f7520706169642052696720416c74204c243130302e00891300007e5700000000400080000000000000aa00\
+             7e5700000000400080000000000000a10064000000085061796d656e7400",
+        );
+        let info = gave.info.unwrap();
+        assert_eq!(
+            (gave.balance, info.kind, info.source, info.dest, info.amount, info.item.as_str()),
+            (900, TRANSACTION_GIFT, uuid(RIG_OWNER), uuid(RIG_ALT), 100, "Payment")
+        );
+        let got = reply(
+            "ffff013a7e5700000000400080000000000000aa3ee6090dc6c6427692ae8d045d4244b10106040000000000000000\
+             00001752696720416c74207061696420796f75204c2433302e00891300007e5700000000400080000000000000a100\
+             7e5700000000400080000000000000aa001e000000085061796d656e7400",
+        );
+        let info = got.info.unwrap();
+        assert_eq!(
+            (got.balance, info.source, info.dest, info.amount),
+            (1030, uuid(RIG_ALT), uuid(RIG_OWNER), 30)
+        );
+
+        // A gift the money module refused.
+        let refused = reply(
+            "ffff013a7e5700000000400080000000000000a14c2aa6e037d748d1ae86e7da82cf6f970032000000000000000000\
+             00002c596f752063616e6e6f7420706179204c243130303a20796f75722062616c616e6365206973204c2435302e00\
+             891300007e5700000000400080000000000000a1007e5700000000400080000000000000aa0064000000085061796d\
+             656e7400",
+        );
+        assert_eq!(
+            (refused.success, refused.balance, refused.description.as_str()),
+            (false, 50, "You cannot pay L$100: your balance is L$50.")
+        );
+        assert_eq!(refused.info.unwrap().amount, 100);
     }
 
     #[test]

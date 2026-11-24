@@ -4,7 +4,7 @@
 
 use crate::escape::escape;
 use crate::names;
-use crate::udp::messages::{Properties, FLAG_PHANTOM, FLAG_PHYSICS, FLAG_SCRIPTED, FLAG_TEMPORARY, FLAG_TOUCH};
+use crate::udp::messages::{Properties, FLAG_MONEY, FLAG_PHANTOM, FLAG_PHYSICS, FLAG_SCRIPTED, FLAG_TEMPORARY, FLAG_TOUCH};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -33,9 +33,10 @@ pub struct Sighting {
 }
 
 /// The flags a listing names, in the order it names them.
-const FLAG_WORDS: [(u32, &str); 5] = [
+const FLAG_WORDS: [(u32, &str); 6] = [
     (FLAG_SCRIPTED, "scripted"),
     (FLAG_TOUCH, "touch"),
+    (FLAG_MONEY, "pay"),
     (FLAG_PHYSICS, "physical"),
     (FLAG_TEMPORARY, "temporary"),
     (FLAG_PHANTOM, "phantom"),
@@ -140,6 +141,7 @@ impl Query {
                 "-o" | "--owner" => query.owner = Some(whose(value("an avatar or a group's UUID")?)?),
                 "-s" | "--scripted" => query.flags |= FLAG_SCRIPTED,
                 "-t" | "--touch" => query.flags |= FLAG_TOUCH,
+                "--pay" => query.flags |= FLAG_MONEY,
                 "-p" | "--physical" => query.flags |= FLAG_PHYSICS,
                 "--temporary" => query.flags |= FLAG_TEMPORARY,
                 "--phantom" => query.flags |= FLAG_PHANTOM,
@@ -535,6 +537,15 @@ mod tests {
         // Two flags: both have to be there.
         assert!(!wants(FLAG_SCRIPTED | FLAG_PHYSICS).reachable(&scripted, 10.0));
         assert!(wants(FLAG_SCRIPTED | FLAG_PHANTOM).reachable(&scripted, 10.0));
+        // Things to pay: only what the simulator marks as taking money.
+        let jar = Sighting {
+            flags: FLAG_SCRIPTED | FLAG_MONEY,
+            ..near.clone()
+        };
+        let pay = parse(&["--pay"]).unwrap();
+        assert_eq!(pay.flags, FLAG_MONEY);
+        assert!(pay.reachable(&jar, 10.0));
+        assert!(!pay.reachable(&scripted, 10.0) && !pay.reachable(&near, 10.0));
 
         let hat = Sighting {
             attachment: true,
@@ -822,5 +833,13 @@ mod tests {
         assert_eq!(words(all, true, true), "scripted,touch,physical,temporary,phantom,attachment,child");
         assert_eq!(words(FLAG_SCRIPTED, false, true), "scripted,child");
         assert_eq!(words(0, true, false), "attachment");
+        // A tip jar.
+        assert_eq!(words(FLAG_SCRIPTED | FLAG_MONEY, false, false), "scripted,pay");
+        assert_eq!(words(FLAG_SCRIPTED | FLAG_TOUCH | FLAG_MONEY, false, false), "scripted,touch,pay");
+        let every = all | FLAG_MONEY;
+        assert_eq!(
+            words(every, true, true),
+            "scripted,touch,pay,physical,temporary,phantom,attachment,child"
+        );
     }
 }
