@@ -145,6 +145,8 @@
           <div class="fields">
             <label class="wide">Payee <input id="pay-payee" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Name or UUID"></label>
             <label>Amount L$ <input id="pay-amount" inputmode="numeric" autocomplete="off" size="7"></label>
+            <label id="pay-description-label" class="wide">Description (optional) <input id="pay-description" autocomplete="off" maxlength="127"></label>
+            <p id="pay-description-blocked" class="made" hidden>Payment description is blocked by RLV</p>
           </div>
           <p id="pay-chosen" class="made" hidden></p>
           <div class="buttons">

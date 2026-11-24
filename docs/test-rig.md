@@ -1167,3 +1167,46 @@ it up by name: after a restart of the bot, `payees` left `Rig Alt`'s UUID
 entry out and `pay 1 avatar <Rig Alt's UUID>` was refused as no avatar,
 until `profile rig.alt` had found it by name. Second Life's name service
 knows every account; the bot reports what the service says.
+
+On Second Life, by the operator, on 2026-11-24 with `--verbose`, in
+Porten Hill: an account of the operator's with L$2, `[payments]` with
+`limit = 1000`, `limit_renew = "1h"` and `perms = ["ctl", "web"]`, and the
+three files under `[logs]`. The tip jar is a scripted object of the other
+avatar's that says thanks in an IM when paid.
+
+| # | Inject | Expected | Result (2026-11-24, Second Life) |
+|---|---|---|---|
+| 308 | Start the bot | The start line; one `MoneyBalanceRequest` after the login, answered | Pass |
+| 309 | `ctl pay 1 avatar <the other avatar>` | Paid, confirmed by the grid; a `paid` row | Pass: confirmed in the second it was sent; `paid 1 1 1 5001`, text `You paid AnnaNovykova99 Resident L$1.` |
+| 310 | `ctl pay 1 object <the tip jar>` | `RequestPayPrice` answered; paid, confirmed; the jar's script told; a `paid` row with the jar and its owner | Pass: confirmed in the second it was sent; `paid 1 0 1 5008` with the jar's name and UUID and its owner as the party; the jar's IM `Thanks for the L$1 tip!`. The grid's text names the owner, not the object: `You paid AnnaNovykova99 Resident L$1.` |
+| 311 | The other avatar pays the bot L$20 | A `received` row with the new balance | Pass: `received 20 20 0 5001`, `AnnaNovykova99 Resident paid you L$20.` |
+
+The verbose log names messages and their sizes only, so the destination
+Second Life put into `TransactionInfo` for the payment to the jar was not
+read off; the grid's text points at the owner, as on the rig, and the bot
+does not compare it. A refused payment was not tried: the bot does not
+send one larger than the balance it knows, so the grid never sees an
+overdraft, and a refusal for another reason would end the payment as
+`unconfirmed` after 15 s. Confirmation works as on the rig, and the
+README's wording stands.
+
+The description of a payment, on the rig, with the config of items 301 to
+306 and `test-rig/pay.py --as alt --balance --wait 60` running alongside
+as `Rig Alt`, which prints what the module tells the payee:
+
+| # | Inject | Expected | Result (2026-11-24, OpenSim 4b95147c48, Linux) |
+|---|---|---|---|
+| 312 | The page: payee `rig.alt`, `3`, description `for the hat`; "Pay"; "Pay L$3" | `Description: for the hat` in the dialog; paid; the amount and description boxes emptied; the log line naming the description; `Rig Alt` told of it | Pass: `web: pay L$3 to Rig Alt <...>: sent, with the description "for the hat"`; `pay.py` printed `item='for the hat'` in the payee's `TransactionInfo` |
+| 313 | `ctl rlv mode on`, `ctl rlv cmd @sendim=n`; `ctl status`; the page; `ctl pay 2 avatar rig.alt -d blocked text` | `pay description: blocked by RLV` last in `status`; the page shows `Payment description is blocked by RLV` in place of the box, without a reload; paid without the description, the answer beginning with the warning | Pass: `warning: Payment description is blocked by RLV` then `paid L$2 to Rig Alt ...`; the log line `sent, without its description, which RLV holds back`; `pay.py` printed `item='Payment'`, the module's word for none |
+| 314 | `ctl rlv reset`, `ctl rlv mode off` | The line gone from `status`; the description box back on the page | Pass |
+| 315 | After the record's text became the viewer's (task 11.7): `ctl pay 2 avatar rig.alt -d rig check` | The row's text `You paid Rig Alt L$2: rig check` | Pass |
+
+Until task 11.7 the bot's own `paid` rows kept the grid's text alone
+(`You paid Rig Alt L$3.`); since then the text is the viewer's, with the
+description, as item 315 shows. Second Life: item 316.
+
+On Second Life, by the operator, the same day, as items 308 to 311:
+
+| # | Inject | Expected | Result (2026-11-24, Second Life) |
+|---|---|---|---|
+| 316 | `ctl pay 3 avatar <the other avatar> -d test payment` | Paid with the description; the log line naming it; the other avatar sees it with the payment | Pass: `sent, with the description "test payment"`, confirmed in a second; the payer's viewer showed `You paid AnnaNovykova99 Resident L$3: test payment.` The grid's text in the reply was `You paid AnnaNovykova99 Resident L$3.`, without the description, so the row of that run (before task 11.7) had only that. The verbose log names messages and sizes only, so whether the reply's `ItemDescription` carried `test payment` was not read off; the bot now composes the text from it, or from what it sent when it does not |

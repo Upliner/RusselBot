@@ -61,7 +61,15 @@ The Money tab SHALL begin with a header that shows the avatar's name, its balanc
 - **THEN** the header says that the balance is unknown
 
 ### Requirement: Send money form
-The Money tab SHALL have a form with a box for the payee, an avatar's name or UUID as `pay` takes one, a box for the amount, and a button. After the confirmation (see "Confirmation before a payment") the button SHALL send `pay` with the amount, `avatar` and the payee as one argument. The amount box SHALL be emptied on success; on an error both boxes SHALL keep their text and the error be shown.
+The Money tab SHALL have a form with a box for the payee, an avatar's name or UUID as `pay` takes one, a box for the amount, a box for an optional description, and a button. While the status the page got last has the line `pay description: blocked by RLV` (see `avatar-commands`, "Money lines of status"), the form SHALL show the text `Payment description is blocked by RLV` in place of the description box and SHALL send no description. After the confirmation (see "Confirmation before a payment") the button SHALL send `pay` with the amount, `avatar` and the payee as one argument, and, when the description box is not empty, `-d` and the description as one argument. The amount and description boxes SHALL be emptied on success; on an error all boxes SHALL keep their text and the error be shown.
+
+#### Scenario: With a description
+- **WHEN** the operator types `jane.doe`, `25` and `for the hat`, presses the button and confirms
+- **THEN** the bot is sent `pay 25 avatar jane.doe -d "for the hat"`
+
+#### Scenario: Description blocked
+- **WHEN** the status has the line `pay description: blocked by RLV`
+- **THEN** the form shows `Payment description is blocked by RLV` and no description box, and a payment sends no description
 
 #### Scenario: Typed name
 - **WHEN** the operator types `jane.doe` and `25`, presses the button and confirms
@@ -72,7 +80,7 @@ The Money tab SHALL have a form with a box for the payee, an avatar's name or UU
 - **THEN** the error is shown, and the payee and the amount are still in their boxes
 
 ### Requirement: Send money form checks
-The page SHALL NOT open the confirmation, and SHALL mark the box, when the payee is empty or the amount is not a whole number greater than zero written in digits. While the payment is under way the form SHALL show that it is and SHALL NOT send another.
+The page SHALL NOT open the confirmation, and SHALL mark the box, when the payee is empty, the amount is not a whole number greater than zero written in digits, or the description is longer than 127 bytes. While the payment is under way the form SHALL show that it is and SHALL NOT send another.
 
 #### Scenario: Not an amount
 - **WHEN** the operator types `10.5` or nothing as the amount and presses the button
@@ -167,7 +175,7 @@ Before the page sends a `pay` from the Send money form or from the object scan, 
 - **THEN** the dialog opens with the cancelling button focused, so that a second Enter pays nothing
 
 ### Requirement: What the confirmation names
-For a payment to an avatar the dialog SHALL name the amount and the payee: a chosen avatar by its name and UUID, a typed one as typed. For a payment to an object it SHALL name the amount, the object's name and the owner's name, as the answer of `prices` gave them.
+For a payment to an avatar the dialog SHALL name the amount and the payee: a chosen avatar by its name and UUID, a typed one as typed; and the description, when there is one. For a payment to an object it SHALL name the amount, the object's name and the owner's name, as the answer of `prices` gave them.
 
 #### Scenario: Object
 - **WHEN** the operator pays L$250 from the row of `Hat Vendor`, owned by Jane Doe

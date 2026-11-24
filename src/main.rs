@@ -1053,12 +1053,10 @@ impl Bot {
     /// money lines for an interface that may pay.
     fn status(&self, via: Interface) -> String {
         let avatar = format!("{} {}", self.config.first_name, self.config.last_name);
-        let money = self
-            .config
-            .payments
-            .as_ref()
-            .filter(|payments| payments.may(via))
-            .map(|_| (self.commands.balance(), self.commands.limit_text()));
+        let money = self.config.payments.as_ref().filter(|payments| payments.may(via)).map(|_| {
+            let blocked = commands::descriptions_blocked(self.rlv.in_force());
+            (self.commands.balance(), self.commands.limit_text(), blocked)
+        });
         status_answer(&avatar, &self.place_status(), money)
     }
 
@@ -1198,7 +1196,7 @@ impl Bot {
         };
         if let Some(reason) = refusal {
             let what = match &request {
-                Request::Pay { amount, payee } => format!("pay L${amount} to {}", payee_words(payee)),
+                Request::Pay { amount, payee, .. } => format!("pay L${amount} to {}", payee_words(payee)),
                 _ => command.to_string(),
             };
             if !own {
@@ -2268,15 +2266,19 @@ fn status_text(here: Option<Whereabouts>, held: &Placement, manual: bool) -> Str
 
 /// The answer to `status`: `connected`, then the avatar's name, then the
 /// rest of `place`, and the money lines when given: the balance as far as
-/// known and the `limit` line's value.
-fn status_answer(avatar: &str, place: &str, money: Option<(Option<i64>, String)>) -> String {
+/// known, the `limit` line's value, and whether RLV holds back the
+/// descriptions of payments.
+fn status_answer(avatar: &str, place: &str, money: Option<(Option<i64>, String, bool)>) -> String {
     let (connected, rest) = place.split_once('\n').unwrap_or((place, ""));
     let mut lines = vec![connected.to_string(), format!("avatar: {avatar}")];
     lines.extend(rest.lines().map(String::from));
-    if let Some((balance, limit)) = money {
+    if let Some((balance, limit, blocked)) = money {
         let balance = balance.map_or("unknown".to_string(), |balance| format!("L${balance}"));
         lines.push(format!("balance: {balance}"));
         lines.push(format!("limit: {limit}"));
+        if blocked {
+            lines.push("pay description: blocked by RLV".to_string());
+        }
     }
     lines.join("\n")
 }
@@ -5519,6 +5521,19 @@ mod tests {
         }
 
         #[test]
+        fn status_says_when_rlv_holds_back_descriptions() {
+            let mut bot = paying("perms = [\"ctl\"]");
+            assert!(!ok(&mut bot, "status").contains("pay description"));
+            ok(&mut bot, "rlv\tmode\ton");
+            ok(&mut bot, "rlv\tcmd\t@sendim=n");
+            assert!(ok(&mut bot, "status").ends_with("limit: unlimited\npay description: blocked by RLV"));
+            // Not for an interface that may not pay, and not while RLV is off.
+            assert!(!bot.status(Interface::Web).contains("pay description"));
+            ok(&mut bot, "rlv\tmode\toff");
+            assert!(!ok(&mut bot, "status").contains("pay description"));
+        }
+
+        #[test]
         fn a_single_word_user_is_named_as_resident() {
             let mut bot = bot(Config::parse("user = \"sitbot\"\npassword = \"x\"\n").unwrap());
             assert_eq!(ok(&mut bot, "status").lines().nth(1), Some("avatar: sitbot Resident"));
@@ -5539,7 +5554,7 @@ mod tests {
             let mut ledger = Ledger::new(Some(1000), Some(Duration::from_secs(7 * 86_400)));
             let paid = 1_796_126_400; // 2026-12-01T12:00:00Z
             ledger.reserve(250, paid).unwrap();
-            let money = (Some(1200), crate::payments::limit_text(&ledger, paid + 60));
+            let money = (Some(1200), crate::payments::limit_text(&ledger, paid + 60), false);
             let text = status_answer("Sit Bot", &status_text(Some(here), &held, false), Some(money));
             assert!(include_str!("../README.md").contains(&format!("```\n{text}\n```")), "{text}");
         }
@@ -5554,7 +5569,7 @@ mod tests {
                 status_answer(
                     "Sit Bot",
                     "connected: no\nmode: manual",
-                    Some((Some(5), "L$750 (renews to L$1000 on 2026-12-08T12:00:00Z)".into()))
+                    Some((Some(5), "L$750 (renews to L$1000 on 2026-12-08T12:00:00Z)".into(), false))
                 ),
                 "connected: no\navatar: Sit Bot\nmode: manual\nbalance: L$5\nlimit: L$750 (renews to L$1000 on 2026-12-08T12:00:00Z)"
             );

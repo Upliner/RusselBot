@@ -649,7 +649,7 @@ time	kind	amount	balance	counted	type	party_uuid	avatar_name	display_name	object
 | `party_uuid` | The avatar or group that paid or was paid; for a payment to an object, its owner |
 | `avatar_name`, `display_name` | That avatar's names, looked up as for messages; empty for a group |
 | `object_name`, `object_uuid` | For a payment of the bot to an object: the object |
-| `text` | What the grid said about it |
+| `text` | What the grid said about it. For a gift with a description, as a viewer shows it: `You paid Jane Doe L$3: test payment`, `Jane Doe paid you L$5: for the hat`; for the bot's own payment, the description it sent when the grid does not repeat it |
 
 A payment of the bot and the grid's confirmation of it are one row. The
 grid has no request by which a viewer, or the bot, can fetch past
@@ -729,7 +729,7 @@ target/release/rslbot ctl rlv cmd @versionnum=5     # an RLV command, by hand
 | `rlv reset` | Forget every restriction |
 | `rlv cmd COMMAND...` | Carry out RLV commands as if an object had sent them, and print what became of each. Restrictions given this way are held apart from every object's |
 | `status` | Print where the avatar is and what it sits on |
-| `pay AMOUNT avatar AVATAR...`, `pay AMOUNT object UUID` | Pay an avatar or an object nearby. Only with a `[payments]` table; see [Payments](#payments) |
+| `pay AMOUNT avatar AVATAR... [-d DESCRIPTION...]`, `pay AMOUNT object UUID` | Pay an avatar, with a description if you like, or an object nearby. Only with a `[payments]` table; see [Payments](#payments) |
 | `prices UUID` | Print what an object offers to be paid |
 | `payees` | List the avatars the whitelist and the unlimited list name |
 | `quit` | Log out and stop the bot, like Ctrl-C |
@@ -894,7 +894,9 @@ without `position`. `mode` is `holding` or `manual`.
 `unknown` before it has; `limit` is what is left of the limit, `unlimited`,
 and, while part of a renewing limit is used, when it renews. Without a
 `[payments]` table, and for `rslbot ctl` when `perms` does not list
-`ctl`, neither line is printed.
+`ctl`, neither line is printed. With them, while RLV holds `sendim`, a
+third line `pay description: blocked by RLV` follows, which is what the
+web page goes by.
 While the avatar is not in a region, only `connected: no`, `avatar`,
 `persist`, `mode` and the money lines are printed.
 
@@ -2097,6 +2099,7 @@ whose the payee or the object is, the payment is refused.
 ```sh
 rslbot ctl pay 25 avatar jane.doe          # an avatar, by name or UUID
 rslbot ctl pay 25 avatar Jane Doe          # the words of a name may be separate
+rslbot ctl pay 25 avatar Jane Doe -d for the hat   # with a description
 rslbot ctl prices <uuid>                   # what an object offers
 rslbot ctl pay 250 object <uuid>           # pay a vendor one of its prices
 rslbot ctl scan --pay                      # what takes money nearby
@@ -2112,6 +2115,17 @@ root prim of its linkset) so, and `scan` shows it with the flag `pay`. It
 takes only an amount it offers: one of its quick-pay amounts, or any
 amount when it has a box for one. `AMOUNT` is a whole number of L$, at
 least 1.
+
+`-d DESCRIPTION...` (or `--desc`) after the avatar sends a description
+with the payment, as a viewer's Pay Resident dialog does: everything after
+it, the words joined by single spaces, one line of at most 127 bytes. The
+payee sees it with the payment. It is for avatars only: for an object,
+that field carries the object's name. The payee reads it as a message, so
+while the [RLV restrictions](#restrictions) hold back an instant message to
+that avatar (`sendim`, `sendimto`, `startim` for a new conversation), the
+payment is made without the description, and the answer begins with
+`warning: Payment description is blocked by RLV`. Nothing else of RLV
+applies to payments.
 
 Before it sends a payment the bot checks, in this order: the object's
 amounts, the lists, the balance (it does not pay more than the avatar has,
@@ -2154,7 +2168,7 @@ warns when `web` may pay and the `[web]` table has no `password`.
 None of the three commands moves the avatar or touches the place the bot
 holds, no RLV restriction applies to them, and `rlv mode override` is not
 used up by them. Not there: paying groups, buying objects, land or
-passes, a message with a payment, letting a script take money from the
+passes, a description with a payment to an object, letting a script take money from the
 avatar (always refused), the transaction history of the Second Life web
 site, transactions over XMPP, and changing the limit or the lists while
 the bot runs.
@@ -2449,7 +2463,9 @@ wears now, in place of the tree.
 otherwise the page has no Money tab and no "Pay" button anywhere. At the
 top: the avatar, its "Balance", and what is "Left of the limit", with when
 it renews, in your time zone. "Send money" takes a "Payee", a name or a
-UUID as `pay` takes one, and an "Amount L$". Beside it, the "Friends" and
+UUID as `pay` takes one, an "Amount L$", and an optional "Description
+(optional)" sent with the payment; while RLV holds `sendim` the form says
+"Payment description is blocked by RLV" in its place. Beside it, the "Friends" and
 the avatars of the config's "Whitelist" and "Unlimited list" (what
 `payees` lists); choosing one makes it the payee, paid by its UUID, or by
 name for a list entry given by name. Below, the "Transactions": the ones

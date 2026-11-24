@@ -83,7 +83,14 @@ impl Rig {
     }
 
     fn pay(&mut self, amount: u32, payee: PayTo) -> Receiver<Response> {
-        self.run(Interface::Ctl, Request::Pay { amount, payee })
+        self.run(
+            Interface::Ctl,
+            Request::Pay {
+                amount,
+                payee,
+                description: None,
+            },
+        )
     }
 
     fn pay_avatar(&mut self, amount: u32, who: &str) -> Receiver<Response> {
@@ -384,6 +391,7 @@ fn a_refusal_for_the_limit_is_logged_with_the_interface() {
     let request = Request::Pay {
         amount: 500,
         payee: PayTo::Avatar(jane().to_string()),
+        description: None,
     };
     rig.commands
         .money_command(Origin::Operator, Interface::Web, request, reply, Some(&mut rig.grid), rig.now);
@@ -766,4 +774,83 @@ fn received_payments_are_recorded() {
     let records = rig.commands.take_transactions();
     assert_eq!((records[0].kind, records[0].party), (Kind::Received, Some(jane())));
     assert_eq!(rig.commands.balance(), Some(1250));
+}
+
+// ------------------------------------------------- description of a payment
+
+fn hold(rig: &mut Rig, behaviour: &str, option: Option<&str>) {
+    rig.grid.kept.set(crate::rlv::Who::Object(id(0xCC)), "Collar", behaviour, option);
+}
+
+/// A payment of `amount` to `to` by UUID, with `description`, sent.
+fn paid_with(rig: &mut Rig, to: Uuid, name: &str, amount: u32, description: &str) -> Receiver<Response> {
+    let request = Request::Pay {
+        amount,
+        payee: PayTo::Avatar(to.to_string()),
+        description: Some(description.to_string()),
+    };
+    let answer = rig.run(Interface::Ctl, request);
+    rig.named(&[(to, names(name, ""))], &[]);
+    answer
+}
+
+#[test]
+fn a_description_goes_with_the_payment() {
+    let mut rig = Rig::new(config());
+    let answer = paid_with(&mut rig, jane(), "Jane Doe", 25, "for the hat");
+    assert_eq!(rig.calls(), [Call::Pay(jane(), 25, TRANSACTION_GIFT, "for the hat".into())]);
+    rig.confirm(jane(), 25, 975);
+    let text = ok(&answer);
+    assert!(text.starts_with("paid L$25"), "{text}");
+    let told = rig.commands.take_told();
+    assert!(told[0].contains("with the description \"for the hat\""), "{told:?}");
+    // The record says what was sent, as a viewer shows the payment.
+    assert_eq!(rig.commands.take_transactions()[0].text, "You paid: for the hat");
+}
+
+#[test]
+fn rlv_holds_the_description_back_and_the_answer_warns() {
+    let mut rig = Rig::new(config());
+    hold(&mut rig, "sendim", None);
+    let answer = paid_with(&mut rig, jane(), "Jane Doe", 25, "for the hat");
+    assert_eq!(rig.calls(), [Call::Pay(jane(), 25, TRANSACTION_GIFT, String::new())]);
+    rig.confirm(jane(), 25, 975);
+    let text = ok(&answer);
+    assert!(
+        text.starts_with("warning: Payment description is blocked by RLV\npaid L$25"),
+        "{text}"
+    );
+    assert!(rig.commands.take_told()[0].contains("without its description, which RLV holds back"));
+    // Whatever the answer is: here, not confirmed.
+    let answer = paid_with(&mut rig, jane(), "Jane Doe", 5, "again");
+    rig.calls();
+    rig.wait(CONFIRM_LIMIT);
+    assert!(error(&answer).starts_with(DESCRIPTION_BLOCKED));
+    // Without a description there is nothing to warn about.
+    let answer = rig.paid_jane(1);
+    rig.confirm(jane(), 1, 969);
+    assert!(ok(&answer).starts_with("paid"));
+}
+
+#[test]
+fn sendimto_and_exceptions_count_for_the_payee() {
+    // Barred from Jane only.
+    let mut rig = Rig::new(config());
+    hold(&mut rig, "sendimto", Some(&jane().to_string()));
+    paid_with(&mut rig, jane(), "Jane Doe", 5, "hi");
+    assert_eq!(rig.calls(), [Call::Pay(jane(), 5, TRANSACTION_GIFT, String::new())]);
+    rig.confirm(jane(), 5, 995);
+    paid_with(&mut rig, john(), "John Roe", 5, "hi");
+    assert_eq!(rig.calls(), [Call::Pay(john(), 5, TRANSACTION_GIFT, "hi".into())]);
+    assert!(!descriptions_blocked(rig.grid.restrictions()));
+    // Everyone but Jane: the command sends hers, though the page is told
+    // that descriptions are blocked.
+    let mut rig = Rig::new(config());
+    hold(&mut rig, "sendim", None);
+    hold(&mut rig, "sendim", Some(&jane().to_string()));
+    paid_with(&mut rig, jane(), "Jane Doe", 5, "hi");
+    assert_eq!(rig.calls(), [Call::Pay(jane(), 5, TRANSACTION_GIFT, "hi".into())]);
+    assert!(descriptions_blocked(rig.grid.restrictions()));
+    // RLV off: nothing is in force.
+    assert!(!descriptions_blocked(None));
 }

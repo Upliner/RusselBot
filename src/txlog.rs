@@ -278,6 +278,8 @@ pub struct InFlight {
     pub avatar_name: String,
     pub object_name: String,
     pub object: Option<Uuid>,
+    /// The description sent with it; empty for none.
+    pub description: String,
 }
 
 impl InFlight {
@@ -296,8 +298,21 @@ impl InFlight {
             display_name: String::new(),
             object_name: self.object_name.clone(),
             object: self.object,
-            text: String::new(),
+            text: self.description.clone(),
         }
+    }
+}
+
+/// The simulator's item description of a gift that has none of the payer's.
+const NO_DESCRIPTION: &str = "Payment";
+
+/// `text` with the payer's description, as a viewer shows a gift with one:
+/// `You paid Jane Doe L$3: test payment`.
+fn described(text: &str, description: &str) -> String {
+    let text = text.trim_end();
+    match text.is_empty() {
+        true => description.to_string(),
+        false => format!("{}: {description}", text.strip_suffix('.').unwrap_or(text)),
     }
 }
 
@@ -328,12 +343,26 @@ pub fn from_report(
     let Some(info) = info.filter(|info| info.amount > 0 && !(info.source.is_nil() && info.dest.is_nil())) else {
         return Outcome::Balance;
     };
-    let text = match description.is_empty() {
-        true => info.item.clone(),
-        false => description.to_string(),
+    // A gift's description of the payer's comes as the item description;
+    // the grid's own text never holds it.
+    let gift = info.kind == crate::udp::messages::TRANSACTION_GIFT;
+    let payers = Some(info.item.trim()).filter(|item| gift && !item.is_empty() && *item != NO_DESCRIPTION);
+    let grid_text = match (description.is_empty(), payers) {
+        (true, Some(_)) => String::new(),
+        (true, None) => info.item.clone(),
+        (false, _) => description.to_string(),
+    };
+    let text = match payers {
+        Some(payers) => described(&grid_text, payers),
+        None => grid_text.clone(),
     };
     let amount = u64::from(info.amount.unsigned_abs());
     if let Some(ours) = in_flight.filter(|ours| info.source == own && u64::from(ours.amount) == amount) {
+        // The description sent stands in for one the report does not carry.
+        let text = match (payers, ours.description.is_empty()) {
+            (None, false) => described(&grid_text, &ours.description),
+            _ => text,
+        };
         return Outcome::Ours(Transaction {
             kind: if success { Kind::Paid } else { Kind::Failed },
             balance: Some(i64::from(balance)),
@@ -430,6 +459,7 @@ mod tests {
             avatar_name: "Jane Doe".into(),
             object_name: String::new(),
             object: None,
+            description: String::new(),
         }
     }
 
@@ -599,6 +629,69 @@ mod tests {
             (failed.kind, failed.counted, failed.text.as_str()),
             (Kind::Failed, 0, "Insufficient funds")
         );
+    }
+
+    #[test]
+    fn a_payment_with_a_description_reads_as_a_viewer_shows_it() {
+        // The grid's text lacks it; the item description holds it.
+        let report = TransactionInfo {
+            item: "test payment".into(),
+            ..info(own(), jane(), 3)
+        };
+        let ours = InFlight {
+            description: "test payment".into(),
+            ..to_jane(3, 3)
+        };
+        let Outcome::Ours(tx) = from_report(17, true, "You paid Jane Doe L$3.", Some(&report), own(), Some(&ours), T0) else {
+            panic!("not ours")
+        };
+        assert_eq!(tx.text, "You paid Jane Doe L$3: test payment");
+        // A report without it: the description sent stands in.
+        let bare = TransactionInfo {
+            item: String::new(),
+            ..report.clone()
+        };
+        let Outcome::Ours(tx) = from_report(17, true, "You paid Jane Doe L$3.", Some(&bare), own(), Some(&ours), T0) else {
+            panic!("not ours")
+        };
+        assert_eq!(tx.text, "You paid Jane Doe L$3: test payment");
+        // And so does an unconfirmed one.
+        assert_eq!(ours.unconfirmed(T0).text, "test payment");
+    }
+
+    #[test]
+    fn a_payment_received_with_a_description() {
+        let report = TransactionInfo {
+            item: "for the hat".into(),
+            ..info(jane(), own(), 5)
+        };
+        let Outcome::Other(tx) = from_report(25, true, "Jane Doe paid you L$5.", Some(&report), own(), None, T0) else {
+            panic!("not a transaction")
+        };
+        assert_eq!(tx.text, "Jane Doe paid you L$5: for the hat");
+    }
+
+    #[test]
+    fn a_gift_without_a_description_keeps_the_grids_text() {
+        // As the rig's module reports a gift: the item is `Payment`.
+        let report = TransactionInfo {
+            item: "Payment".into(),
+            ..info(jane(), own(), 30)
+        };
+        let Outcome::Other(tx) = from_report(1030, true, "Rig Alt paid you L$30.", Some(&report), own(), None, T0) else {
+            panic!("not a transaction")
+        };
+        assert_eq!(tx.text, "Rig Alt paid you L$30.");
+        // An object's item description is its name, not a description.
+        let object = TransactionInfo {
+            kind: TRANSACTION_PAY_OBJECT,
+            item: "Tip Jar".into(),
+            ..info(own(), jane(), 10)
+        };
+        let Outcome::Other(tx) = from_report(990, true, "You paid Tip Jar L$10.", Some(&object), own(), None, T0) else {
+            panic!("not a transaction")
+        };
+        assert_eq!(tx.text, "You paid Tip Jar L$10.");
     }
 
     #[test]

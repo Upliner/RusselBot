@@ -25,6 +25,8 @@ use uuid::Uuid;
 
 mod pay;
 
+pub use pay::descriptions_blocked;
+
 /// How long the grid has to answer a name lookup.
 pub const LOOKUP_LIMIT: Duration = Duration::from_secs(10);
 

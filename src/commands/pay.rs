@@ -126,7 +126,14 @@ struct Wait {
     target: Target,
     stage: Stage,
     deadline: Instant,
+    /// The description to send with a payment to an avatar.
+    description: Option<String>,
+    /// RLV held the description back: the answer warns about it.
+    held_back: bool,
 }
+
+/// What a payment's answer begins with when RLV held its description back.
+pub const DESCRIPTION_BLOCKED: &str = "warning: Payment description is blocked by RLV";
 
 /// A `payees` command waiting for the names of the UUID entries.
 struct PayeesWait {
@@ -202,7 +209,11 @@ impl Commands {
     ) {
         let command = request.name();
         let result = match request {
-            Request::Pay { amount, payee } => self.pay(origin, via, amount, payee, &reply, grid, now),
+            Request::Pay {
+                amount,
+                payee,
+                description,
+            } => self.pay(origin, via, amount, (payee, description), &reply, grid, now),
             Request::Prices(object) => self.prices(origin, via, &object, &reply, grid, now),
             Request::Payees => self.payees(origin, via, &reply, grid, now),
             _ => Err("not a payment command".to_string()),
@@ -221,7 +232,7 @@ impl Commands {
         origin: Origin,
         via: Interface,
         amount: u32,
-        payee: PayTo,
+        (payee, description): (PayTo, Option<String>),
         reply: &Sender<Response>,
         grid: Option<&mut G>,
         now: Instant,
@@ -260,6 +271,8 @@ impl Commands {
             target,
             stage: Stage::Start,
             deadline: now,
+            description,
+            held_back: false,
         };
         let mut wait = wait;
         if self.begin(&mut wait, grid, now)? {
@@ -298,6 +311,8 @@ impl Commands {
             },
             stage: Stage::Start,
             deadline: now,
+            description: None,
+            held_back: false,
         };
         let mut wait = wait;
         if self.begin(&mut wait, grid, now)? {
@@ -632,8 +647,28 @@ impl Commands {
                     avatar_name: name.clone().unwrap_or_default(),
                     object_name: String::new(),
                     object: None,
+                    description: String::new(),
                 };
-                (payee, flight, id, TRANSACTION_GIFT, String::new())
+                // The description is a message to the payee: RLV holds it
+                // back as it would an instant message.
+                let description = match wait.description.clone() {
+                    Some(text) => {
+                        let talking = self.talking.contains(&id);
+                        match Origin::Operator.limits(grid.restrictions()).im(id, talking) {
+                            Ok(()) => text,
+                            Err(_) => {
+                                wait.held_back = true;
+                                String::new()
+                            }
+                        }
+                    }
+                    None => String::new(),
+                };
+                let flight = InFlight {
+                    description: description.clone(),
+                    ..flight
+                };
+                (payee, flight, id, TRANSACTION_GIFT, description)
             }
             Target::Object {
                 object,
@@ -672,6 +707,7 @@ impl Commands {
                     avatar_name: owner_name.clone().unwrap_or_default(),
                     object_name: name.clone().unwrap_or_default(),
                     object: Some(*object),
+                    description: String::new(),
                 };
                 let description = name.clone().unwrap_or_default();
                 (payee, flight, *object, TRANSACTION_PAY_OBJECT, description)
@@ -728,7 +764,12 @@ impl Commands {
             true => format!(", counted against the limit (left: {})", limit_text(&self.money.ledger, wall)),
             false => ", not counted against the limit".to_string(),
         };
-        self.tell(format!("{}: pay L${amount} to {shown}: sent{counted}", wait.via));
+        let described = match (&wait.description, wait.held_back) {
+            (Some(_), true) => ", without its description, which RLV holds back".to_string(),
+            (Some(text), false) => format!(", with the description \"{}\"", escape(text)),
+            (None, _) => String::new(),
+        };
+        self.tell(format!("{}: pay L${amount} to {shown}: sent{described}{counted}", wait.via));
         wait.stage = Stage::Sent(in_flight);
         wait.deadline = now + CONFIRM_LIMIT;
         Ok(())
@@ -912,7 +953,7 @@ impl Commands {
                     txlog::Kind::Paid => {
                         self.tell(format!("{}: pay L${amount} to {shown}: made, balance L${balance}", wait.via));
                         let answer = format!("paid L${amount} to {shown}; the balance is L${balance}");
-                        let _ = wait.reply.send(Response::Ok(Some(answer)));
+                        let _ = wait.reply.send(Response::Ok(Some(warned(&wait, answer))));
                     }
                     _ => {
                         if let Some(Stage::Sent(flight)) = Some(&wait.stage) {
@@ -926,7 +967,7 @@ impl Commands {
                         };
                         self.tell(format!("{}: pay L${amount} to {shown}: failed: {reason}", wait.via));
                         let answer = format!("the grid refused the payment of L${amount} to {shown}: {reason}");
-                        let _ = wait.reply.send(Response::Error(answer));
+                        let _ = wait.reply.send(Response::Error(warned(&wait, answer)));
                     }
                 }
                 self.money.records.push(tx);
@@ -947,7 +988,7 @@ impl Commands {
             "the payment of L${amount} to {shown} was sent, but {why}; it counts as paid. \
              Check the balance with `status` before paying again"
         );
-        let _ = wait.reply.send(Response::Error(answer));
+        let _ = wait.reply.send(Response::Error(warned(&wait, answer)));
         let wall = (self.money.clock)();
         self.money.records.push(in_flight.unconfirmed(wall));
     }
@@ -1051,6 +1092,21 @@ impl Commands {
             }
         }
     }
+}
+
+/// The answer to a payment that was sent, with the warning first when
+/// RLV held its description back.
+fn warned(wait: &Wait, answer: String) -> String {
+    match wait.held_back {
+        true => format!("{DESCRIPTION_BLOCKED}\n{answer}"),
+        false => answer,
+    }
+}
+
+/// Whether the RLV restrictions in force hold back every payment's
+/// description: `sendim` is held, with or without exceptions.
+pub fn descriptions_blocked(restrictions: Option<&crate::rlv::Restrictions>) -> bool {
+    Limits::new(restrictions, None).in_force("sendim").is_some()
 }
 
 /// What the grid has said about an avatar's name.

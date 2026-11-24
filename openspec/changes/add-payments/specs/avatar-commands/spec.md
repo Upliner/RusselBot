@@ -50,7 +50,11 @@ The `seat name` line SHALL be printed while `seat` is `target`, `object <uuid>` 
 ## ADDED Requirements
 
 ### Requirement: Money lines of status
-For an interface that may pay (see `payments`, "Interfaces that may pay"), the text of `status` SHALL end with two lines: `balance`, the avatar's balance as `L$<amount>`, or `unknown` while the grid has not reported one; and `limit`, `unlimited` or what is left of the limit as `L$<amount>`. For an interface that may not pay, and without a `[payments]` table, the text SHALL have neither line.
+For an interface that may pay (see `payments`, "Interfaces that may pay"), the text of `status` SHALL end with two lines: `balance`, the avatar's balance as `L$<amount>`, or `unknown` while the grid has not reported one; and `limit`, `unlimited` or what is left of the limit as `L$<amount>`; and, while RLV is on and holds the restriction `sendim` from any object or from `rlv cmd`, with or without exceptions, a third line `pay description: blocked by RLV`. For an interface that may not pay, and without a `[payments]` table, the text SHALL have none of these lines.
+
+#### Scenario: Description blocked
+- **WHEN** `payments.perms` has `ctl`, RLV is on, and an object has said `@sendim=n` to its owner
+- **THEN** `rslbot ctl status` ends with the `balance` and `limit` lines and `pay description: blocked by RLV`
 
 #### Scenario: Interface that may pay
 - **WHEN** `payments.perms` has `ctl`, the avatar has L$1200, `limit = 1000` and nothing is counted

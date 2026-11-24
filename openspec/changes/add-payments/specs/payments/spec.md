@@ -33,11 +33,19 @@ A command reaches the bot through one of three interfaces: `ctl`, the control so
 - **THEN** `pay` is refused from every interface, as without the table
 
 ### Requirement: Forms of the pay command
-`pay` SHALL take `<amount> avatar <avatar>`, where the words of the avatar's name may be separate arguments, or `<amount> object <uuid>`. Any other form SHALL be refused with an error that shows both forms, and nothing SHALL be sent.
+`pay` SHALL take `<amount> avatar <avatar>`, where the words of the avatar's name may be separate arguments, optionally followed by `-d` or `--desc` and a description (see "Description of a payment to an avatar"), or `<amount> object <uuid>`. Any other form, `-d` with `object` included, SHALL be refused with an error that shows both forms, and nothing SHALL be sent.
 
 #### Scenario: Name in two words
 - **WHEN** `rslbot ctl pay 10 avatar Jane Doe` is run
 - **THEN** it is read as a payment of L$10 to the avatar `Jane Doe`
+
+#### Scenario: Name in two words and a description
+- **WHEN** `rslbot ctl pay 10 avatar Jane Doe -d for the hat` is run
+- **THEN** it is read as a payment of L$10 to the avatar `Jane Doe` with the description `for the hat`
+
+#### Scenario: Description for an object
+- **WHEN** `rslbot ctl pay 10 object <uuid> -d thanks` is run
+- **THEN** the command exits with status 1 with an error showing the forms, and nothing is paid
 
 #### Scenario: No kind of payee
 - **WHEN** `rslbot ctl pay 10 "Jane Doe"` or `rslbot ctl pay 10` is run
@@ -75,6 +83,21 @@ An amount SHALL be a whole number of L$ from 1 to 2147483647, written in digits 
 #### Scenario: Unknown name
 - **WHEN** `rslbot ctl pay 25 avatar "Nobody Here"` is run and the grid has no such avatar
 - **THEN** the command exits with status 1 naming `Nobody Here`, and nothing is paid
+
+### Requirement: Description of a payment to an avatar
+A description SHALL be the words after `-d` or `--desc`, joined by single spaces, and SHALL be sent with the payment as a viewer's Pay Resident dialog sends one. A description that is empty, is longer than 127 bytes or holds a line break SHALL be refused with an error naming the limit, and nothing SHALL be sent. When, at the moment the payment is sent, the RLV restrictions in force would refuse an `im` to the payee (see `rlv-restrictions`), the payment SHALL be sent without the description, and the answer, whatever it is, SHALL begin with the line `warning: Payment description is blocked by RLV`.
+
+#### Scenario: With a description
+- **WHEN** `rslbot ctl pay 25 avatar jane.doe -d for the hat` is run
+- **THEN** Jane Doe receives L$25 with the description `for the hat`
+
+#### Scenario: Too long
+- **WHEN** the description is 128 bytes long
+- **THEN** the command exits with status 1 naming 127 bytes, and nothing is paid
+
+#### Scenario: Blocked by RLV
+- **WHEN** an object has said `@sendim=n` to its owner, RLV is on, and `rslbot ctl pay 25 avatar jane.doe -d for the hat` is run
+- **THEN** Jane Doe receives L$25 without a description, and the answer begins with `warning: Payment description is blocked by RLV`
 
 ### Requirement: Payees that cannot be paid as avatars
 `pay <amount> avatar` SHALL be refused, and nothing SHALL be sent, when the avatar is the bot's own, when the grid knows no avatar by the UUID given, and when the grid has not said within 5 seconds whether it knows one.
@@ -349,7 +372,7 @@ When the config has a `[payments]` table the bot SHALL ask the grid for the avat
 - **THEN** the bot sends no request for the balance
 
 ### Requirement: Paying leaves the placement and RLV alone
-`pay`, `prices` and `payees` SHALL NOT move the avatar and SHALL NOT change the bot's placement mode or the held placement. No RLV restriction SHALL be applied to them, and none of them SHALL be the exempt command of an RLV override (see `rlv-restrictions`, "Override exempts one command").
+`pay`, `prices` and `payees` SHALL NOT move the avatar and SHALL NOT change the bot's placement mode or the held placement. No RLV restriction SHALL be applied to them, but for the description of a payment (see "Description of a payment to an avatar"), and none of them SHALL be the exempt command of an RLV override (see `rlv-restrictions`, "Override exempts one command").
 
 #### Scenario: Seated
 - **WHEN** `rslbot ctl pay 10 object <uuid>` is run while the avatar is seated on the held object
@@ -360,7 +383,7 @@ When the config has a `[payments]` table the bot SHALL ask the grid for the avat
 - **THEN** the prices are printed and `rlv status` still prints `rlv: override`
 
 ### Requirement: Payments appear in the operator log
-The bot SHALL write a line to its operator log for every `pay` command: the interface it came through, the amount, the payee by name and UUID, and what became of it: refused and why, sent, made, failed with the grid's reason, or not confirmed.
+The bot SHALL write a line to its operator log for every `pay` command: the interface it came through, the amount, the payee by name and UUID, the description when one was given and whether RLV held it back, and what became of it: refused and why, sent, made, failed with the grid's reason, or not confirmed.
 
 #### Scenario: Refused for the limit
 - **WHEN** the page's console sends `pay 500 avatar "Jane Doe"` and L$100 are left

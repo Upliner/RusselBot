@@ -492,6 +492,7 @@
     state.status = status;
     renderStatus();
     if (canPay() !== could) { renderPayControls(); }
+    renderDescription();
     // Another region has other avatars in it.
     if (status.region !== before && state.tab === 'chat') { refreshNearby(true); }
   }
@@ -1367,6 +1368,23 @@
     return !!state.status && state.status.limit !== undefined;
   }
 
+  // While RLV holds back the descriptions of payments the status says so,
+  // and the form says so in place of the description box.
+  function descriptionBlocked() {
+    return !!state.status && state.status['pay description'] !== undefined;
+  }
+
+  function renderDescription() {
+    var blocked = descriptionBlocked();
+    show($('pay-description-label'), !blocked);
+    show($('pay-description-blocked'), blocked);
+  }
+
+  // The bytes `text` takes in UTF-8.
+  function utf8Length(text) {
+    return new TextEncoder().encode(text).length;
+  }
+
   function renderImPay() {
     var conv = state.conv ? state.convs[state.conv] : null;
     show($('im-pay'), canPay() && !!conv && conv.kind === 'avatar');
@@ -1495,14 +1513,19 @@
     if (state.paying) { return; }
     var payeeBox = $('pay-payee');
     var amountBox = $('pay-amount');
+    var descriptionBox = $('pay-description');
     var typed = payeeBox.value.trim();
     payeeBox.classList.toggle('bad', typed === '');
     var amount = amountOf(amountBox);
-    if (typed === '' || amount === null) { return; }
+    var description = descriptionBlocked() ? '' : descriptionBox.value.trim();
+    var tooLong = utf8Length(description) > 127;
+    descriptionBox.classList.toggle('bad', tooLong);
+    if (typed === '' || amount === null || tooLong) { return; }
     var chosen = state.payee && state.payee.shown === payeeBox.value ? state.payee : null;
     var to = chosen ? chosen.pay : typed;
     var label = chosen ? chosen.shown : typed;
     var details = chosen ? (chosen.id ? ['UUID: ' + chosen.id] : ['By the name the list gives.']) : ['As typed.'];
+    if (description !== '') { details.push('Description: ' + description); }
     confirmPayment('Pay L$' + amount + ' to ' + label + '?', details, amount).then(function (yes) {
       if (!yes || state.paying) { return; }
       var button = $('pay-button');
@@ -1510,12 +1533,15 @@
       button.disabled = true;
       button.classList.add('busy');
       setResult($('pay-result'), 'Paying L$' + amount + ' to ' + label + '; the grid confirms it within 15 seconds…', 'wait');
-      run(['pay', amount, 'avatar', to], false).then(function (result) {
+      var args = ['pay', amount, 'avatar', to];
+      if (description !== '') { args.push('-d', description); }
+      run(args, false).then(function (result) {
         state.paying = false;
         button.disabled = false;
         button.classList.remove('busy');
         if (result.ok) {
           amountBox.value = '';
+          descriptionBox.value = '';
           setResult($('pay-result'), result.text || 'Paid.', 'ok');
         } else {
           setResult($('pay-result'), result.text, 'error');
@@ -1780,6 +1806,7 @@
       $('pay-payee').classList.remove('bad');
     });
     $('pay-amount').addEventListener('input', function () { $('pay-amount').classList.remove('bad'); });
+    $('pay-description').addEventListener('input', function () { $('pay-description').classList.remove('bad'); });
     $('money-lists-refresh').addEventListener('click', function () {
       var button = $('money-lists-refresh');
       if (button.disabled) { return; }
@@ -1874,6 +1901,7 @@
     renderInventory();
     renderTransactions();
     renderPayees();
+    renderDescription();
     clear($('avatars-list'));
     clear($('objects-list'));
     show($('avatars-made'), false);

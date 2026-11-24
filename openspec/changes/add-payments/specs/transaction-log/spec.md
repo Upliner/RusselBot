@@ -59,7 +59,19 @@ Each record SHALL have one of these kinds:
 - **THEN** the report is recorded as `spent`, and the amount is not counted against the limit a second time
 
 ### Requirement: Money fields of a record
-Each record SHALL carry: `time`, when the bot learned the outcome; `amount`, in whole L$; `balance`, the avatar's balance as the grid reported it with the transaction, empty when it reported none; `counted`, how much of the amount counts against the limit (see `payments`, "When a payment counts"), 0 for all but a `paid` or `unconfirmed` payment that counts; `type`, the grid's number for the kind of transaction; and `text`, the description the grid gave.
+Each record SHALL carry: `time`, when the bot learned the outcome; `amount`, in whole L$; `balance`, the avatar's balance as the grid reported it with the transaction, empty when it reported none; `counted`, how much of the amount counts against the limit (see `payments`, "When a payment counts"), 0 for all but a `paid` or `unconfirmed` payment that counts; `type`, the grid's number for the kind of transaction; and `text`, the description the grid gave. For a gift between avatars (type 5001) that carries a description of the payer's, that is an item description other than the simulator's word `Payment`, `text` SHALL be as a viewer shows the payment: the grid's description without its final full stop, then `: ` and the payment's description. For the bot's own payment whose report carries no such description, and for an `unconfirmed` one, the description the bot sent SHALL take its place.
+
+#### Scenario: Payment with a description
+- **WHEN** the bot pays Jane Doe L$3 with the description `test payment` and the grid reports `You paid Jane Doe L$3.`
+- **THEN** the record's text is `You paid Jane Doe L$3: test payment`
+
+#### Scenario: Payment received with a description
+- **WHEN** Jane Doe pays the avatar L$5 with the description `for the hat`
+- **THEN** the record's text is `Jane Doe paid you L$5: for the hat`
+
+#### Scenario: Gift without a description
+- **WHEN** the grid reports a gift whose item description is `Payment`
+- **THEN** the record's text is the grid's description as it is
 
 #### Scenario: Payment to someone on the unlimited list
 - **WHEN** the bot pays L$500 to an avatar that `unlimited_list` names
