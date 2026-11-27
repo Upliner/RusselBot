@@ -42,7 +42,7 @@ The Groups tab SHALL show, from top to bottom or side by side as the width allow
 - **THEN** the tab lists both groups and nothing about invitations
 
 ### Requirement: List of groups
-The Groups tab SHALL list the avatar's groups, from `group list`: each with its name, in the order of the answer, the active group marked as such. Choosing a group SHALL show its chat and notices. A group the page has got a group message of and that the answer does not list SHALL stay in the list, set apart as one the avatar is not in, and SHALL be shown without the box for a message and without the Activate and Invite buttons. While the avatar is not connected the list SHALL say so and SHALL keep the groups the page has messages of.
+The Groups tab SHALL list the avatar's groups, from `group list`: each with its name, in the order of the answer, the active group marked as such. Choosing a group SHALL show its chat and notices. A group the page has got a group message of and that the answer does not list SHALL stay in the list, set apart as one the avatar is not in, and SHALL be shown without the box for a message and without the Activate, Invite and Leave buttons. While the avatar is not connected the list SHALL say so and SHALL keep the groups the page has messages of.
 
 #### Scenario: Active group
 - **WHEN** `Builders` is the active group
@@ -120,6 +120,21 @@ A group's view SHALL have a button that sends `group info` with the group's UUID
 #### Scenario: Info
 - **WHEN** the operator presses Info in the view of `Builders`
 - **THEN** the view shows the group's name, founder, fee, enrollment, numbers of members and roles, the avatar's title and the charter, the charter on as many lines as it has
+
+### Requirement: Leave button
+The view of a group the avatar is in SHALL have a button that leaves the group. Pressing it SHALL first show a dialog that asks whether to leave the group, names it by name and UUID, and says that joining it again may take an invitation or a fee, with a button that leaves and one that cancels, the cancelling button focused. Cancelling, the Escape key and closing the dialog SHALL send nothing. Only the leaving button SHALL send `group leave` with the group's UUID; the view SHALL show that the command is under way and then its answer or its error, and the list SHALL show the group as one the avatar is not in, or not at all, when the bot says that the groups have changed.
+
+#### Scenario: Leaving
+- **WHEN** the operator presses Leave in the view of `Dancers` and then the dialog's leaving button
+- **THEN** the bot is sent `group leave` with the UUID of `Dancers`, the view shows the answer, and the list no longer has `Dancers` as a group the avatar is in
+
+#### Scenario: Cancel
+- **WHEN** the operator presses Leave in the view of `Dancers` and then the dialog's cancel button, or the Escape key
+- **THEN** nothing is sent and the avatar is still in `Dancers`
+
+#### Scenario: Group the avatar is no longer in
+- **WHEN** the list keeps `Builders` as a group the avatar is not in
+- **THEN** the view of `Builders` has no Leave button
 
 ### Requirement: Invitations on the Groups tab
 While invitations wait, the top of the Groups tab SHALL show a row for each line of the answer of `group invitations`, in its order: the group's name, or its UUID where the answer gives `?`, the inviter's name, the fee as `L$` and the amount when it is greater than zero, a button that accepts and a button that rejects. The Groups tab's label SHALL show that an invitation waits, on every tab, for as long as one does.

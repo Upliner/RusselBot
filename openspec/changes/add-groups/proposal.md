@@ -14,6 +14,7 @@ The bot's avatar is deaf and mute where groups are concerned: group chat and gro
   - `group chat <group> <message>` says a line in a group's chat.
   - `group info <group>` prints a group's name, founder, fee, enrollment, numbers of members and roles, the avatar's own title in it, and its charter. It works for any group by UUID, a group the avatar is not in included.
   - `group join <uuid> [--pay <sum>]` joins a group that is open to join. A group with a fee is joined only with `--pay` and a sum that is not less than the fee.
+  - `group leave <group>` leaves a group the avatar is in, as a viewer's Leave does.
   - `group invitations` lists the invitations that wait.
   - `accept group [<who>] [--pay <sum>]` accepts a waiting invitation and `decline group [<who>]` declines one. `<who>` is the group's name or UUID or the inviter's name or UUID, and has to name exactly one waiting invitation.
 - **Naming a group.** `<group>` is one argument: a UUID, or the name of a group the avatar is in, compared without regard to letter case. When two of the avatar's groups have that name the command fails and lists their UUIDs.
@@ -25,17 +26,17 @@ The bot's avatar is deaf and mute where groups are concerned: group chat and gro
   - the invitations that wait, on top, each with the group, the inviter, the fee when there is one, and Accept and Reject buttons; accepting one with a fee opens the confirmation dialog of the Money tab first;
   - the avatar's groups, the active one marked, each with the number of new lines;
   - the chosen group's chat with its notices in the same list, the notices set apart in bold on a tinted background with their subject as a heading, and a box to say a line;
-  - buttons to activate the group, to invite someone into it (a name, a UUID or a friend) and to show its info.
+  - buttons to activate the group, to invite someone into it (a name, a UUID or a friend), to show its info and to leave it, the last after a confirmation dialog.
 - **RLV:** `sendim` and `sendimto` hold back `group chat` and `recvim` and `recvimfrom` hide group chat that is received, with groups named in their options and `allgroups` as RLV viewers read them; `setgroup` refuses `group activate`.
 - The rig gets groups: an in-memory store for OpenSim's groups module, a money module that charges and reports the fee of a join, and a helper that creates a group, invites, chats and sends a notice.
 
-Not in this change: leaving a group, creating one, ejecting members, roles and titles; sending notices and taking a notice's attachment; conferences (ad-hoc sessions) and who is in a session; searching groups by name; `group join` and `group info` by the name of a group the avatar is not in; group chat, notices and invitations over the XMPP gateway (the commands work there, the messages are not passed on); accepting by itself an invitation that costs L$; paying L$ to a group other than its fee; the RLV commands `@setgroup:<name>=force` and `@getgroup`; group chat that was said while the avatar was offline, which no grid keeps.
+Not in this change: creating a group, ejecting members, roles and titles; sending notices and taking a notice's attachment; conferences (ad-hoc sessions) and who is in a session; searching groups by name; `group join` and `group info` by the name of a group the avatar is not in; group chat, notices and invitations over the XMPP gateway (the commands work there, the messages are not passed on); accepting by itself an invitation that costs L$; paying L$ to a group other than its fee; the RLV commands `@setgroup:<name>=force` and `@getgroup`; group chat that was said while the avatar was offline, which no grid keeps.
 
 ## Capabilities
 
 ### New Capabilities
 
-- `groups`: the avatar's groups and the active one as the grid tells them; how a command names a group and what happens when the name is ambiguous; the commands `group list`, `group activate`, `group invite`, `group info`, `group join` and `group invitations`; joining with a fee; what the operator log says.
+- `groups`: the avatar's groups and the active one as the grid tells them; how a command names a group and what happens when the name is ambiguous; the commands `group list`, `group activate`, `group invite`, `group info`, `group join`, `group leave` and `group invitations`; joining with a fee; what the operator log says.
 - `group-chat`: reading group chat and group notices, saying a line with `group chat`, the record of a group message and its names, the line on standard error and the `logs.group` file.
 
 ### Modified Capabilities
@@ -47,12 +48,12 @@ Not in this change: leaving a group, creating one, ejecting members, roles and t
 - `bot-config`: `group` under `[logs]`; `group` as a kind under the deprecated `[perms.autoaccept]` and `[perms.except]`.
 - `rlv-restrictions`: `setgroup` gets an effect; `sendim`, `sendimto`, `recvim` and `recvimfrom` apply to group chat.
 - `web-server`: group messages on the event stream, kept and replayed as messages are; an event that says the groups or the invitations changed; `group list` and `group invitations` as requests the page makes by itself.
-- `web-ui`: the Groups tab: invitations, the list of groups, a group's chat and notices, the box, the three buttons, the confirmation for a fee, the marks for new lines.
+- `web-ui`: the Groups tab: invitations, the list of groups, a group's chat and notices, the box, the four buttons, the confirmation for a fee and for leaving, the marks for new lines.
 
 ## Impact
 
 - New `src/groups.rs`: the membership list and the active group, naming a group, the texts of `group list` and `group info`, the session state of group chat; all without I/O. New `src/grouplog.rs`: the record of a group message, its row and its log line. New `src/commands/group.rs`: the `group` commands and what waits for the grid.
-- `src/udp/messages.rs`: `AgentDataUpdateRequest`, `AgentDataUpdate`, `AgentGroupDataUpdate`, `AgentDropGroup`, `ActivateGroup`, `InviteGroupRequest`, `GroupProfileRequest`, `GroupProfileReply`, `JoinGroupRequest`, `JoinGroupReply`; the instant-message dialogs for an invitation and its two answers, a notice, and the start and the lines of a session; the recipient of an instant message.
+- `src/udp/messages.rs`: `AgentDataUpdateRequest`, `AgentDataUpdate`, `AgentGroupDataUpdate`, `AgentDropGroup`, `ActivateGroup`, `InviteGroupRequest`, `GroupProfileRequest`, `GroupProfileReply`, `JoinGroupRequest`, `JoinGroupReply`, `LeaveGroupRequest`, `LeaveGroupReply`; the instant-message dialogs for an invitation and its two answers, a notice, and the start and the lines of a session; the recipient of an instant message.
 - `src/caps.rs`, `src/session.rs`: the event-queue forms of the membership list, of a dropped group, of the first line of a session and of the answer to starting one; the `ChatSessionRequest` capability; session events for all of these; the `Grid` trait and its fakes.
 - `src/perms.rs`, `src/commands.rs`, `src/control.rs`, `src/main.rs`: the kind `group`, `accept group` and `decline group`, the `group` request and its usage text, dispatch.
 - `src/payments.rs`, `src/commands/pay.rs`, `src/txlog.rs`: a group as a payee, the fee in the one slot of a payment, transaction type 1004.

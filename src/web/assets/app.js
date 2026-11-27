@@ -22,7 +22,7 @@
 })();
 
 (function () {
-  var TABS = ['world', 'chat', 'im', 'inventory', 'money', 'console', 'settings'];
+  var TABS = ['world', 'chat', 'im', 'groups', 'inventory', 'money', 'console', 'settings'];
   var NEARBY_EVERY = 15000;
   var FRIENDS_EVERY = 60000;
   var MAX_CHAT_LINES = 1000;
@@ -48,6 +48,7 @@
       nearbyBusy: false,
       friends: null,
       friendsBusy: false,
+      groups: freshGroups(),  // the Groups tab
       inventory: { root: null, attachedOnly: false, attached: null, started: false },
       history: [],            // console lines sent
       historyAt: -1,
@@ -248,6 +249,7 @@
   var retryIn = 1000;
   var retryTimer = null;
   var replaying = false;  // what arrives is from before the page was opened
+  var freshStream = false;  // no status has come over the stream yet
 
   function setLost(lost) {
     if (state.lost === lost) { return; }
@@ -297,6 +299,7 @@
     var url = '/api/events' + (lastId ? '?last=' + encodeURIComponent(lastId) : '');
     var source = new window.EventSource(url);
     stream = source;
+    freshStream = true;
     source.addEventListener('reset', function () {
       // What follows is everything the bot kept: start over.
       replaying = true;
@@ -310,6 +313,14 @@
       if (event.lastEventId) { lastId = event.lastEventId; }
       addIm(record(fields(event)));
     });
+    source.addEventListener('group', function (event) {
+      if (event.lastEventId) { lastId = event.lastEventId; }
+      addGroupMessage(groupRecord(fields(event)));
+    });
+    source.addEventListener('groups', function () {
+      // The groups or the invitations changed: not kept, not replayed.
+      refreshGroups(true);
+    });
     source.addEventListener('money', function (event) {
       if (event.lastEventId) { lastId = event.lastEventId; }
       addTransaction(transaction(fields(event)));
@@ -317,8 +328,14 @@
     source.addEventListener('status', function (event) {
       // The status ends what a page is sent when it opens its stream.
       replaying = false;
+      var first = freshStream;
+      freshStream = false;
+      var wasLost = state.lost;
       setStatus(unescapeField(event.data));
       found();
+      // The bot is there now: what waits may have changed meanwhile. Once
+      // found again, `refreshOwn` asks already.
+      if (first && !wasLost && !groupsState().busy) { refreshGroups(true); }
     });
     source.onerror = function () {
       // The browser would try again at a pace of its own, and without
@@ -355,6 +372,7 @@
     if (state.tab === 'chat') { refreshNearby(true); }
     if (state.tab === 'im' || state.tab === 'money') { refreshFriends(true); }
     if (state.payeesAsked && canPay()) { refreshPayees(true); }
+    refreshGroups(true);
   }
 
   // ----------------------------------------------------------------- login
@@ -470,6 +488,11 @@
       renderConversations();
       scrollToEnd($('im-log'));
       refreshFriends(true);
+    } else if (tab === 'groups') {
+      if (!state.groups.asked) { state.groups.asked = true; refreshGroups(true); }
+      groupSeen();
+      renderGroupList();
+      if (state.groups.follow) { scrollToEnd($('group-log')); }
     } else if (tab === 'inventory') {
       if (!state.inventory.started) { state.inventory.started = true; reloadInventory(); }
     } else if (tab === 'money') {
@@ -489,9 +512,11 @@
     });
     var before = state.status ? state.status.region : undefined;
     var could = canPay();
+    var wasConnected = connected();
     state.status = status;
     renderStatus();
     if (canPay() !== could) { renderPayControls(); }
+    if (connected() !== wasConnected) { renderGroupList(); renderInvitations(); }
     renderDescription();
     // Another region has other avatars in it.
     if (status.region !== before && state.tab === 'chat') { refreshNearby(true); }
@@ -921,6 +946,16 @@
     });
     renderConversations();
     renderConversation();
+    var groups = groupsState();
+    saveGroupDrafts();
+    Object.keys(groups.known).forEach(function (id) {
+      var group = groups.known[id];
+      group.messages = [];
+      group.unread = 0;
+      group.last = 0;
+    });
+    renderGroupList();
+    renderGroupView();
   }
 
   function seen(key) {
@@ -1102,6 +1137,7 @@
     moneyNote.textContent = moneyText;
     moneyNote.classList.toggle('error', !!note);
     show(moneyNote, moneyText !== '');
+    renderInviteFriends();
   }
 
   function friendsAnswer(result) {
@@ -1177,6 +1213,670 @@
       amount.classList.remove('bad');
       state.focusAmount = true;
       window.location.hash = '#money';
+    });
+  }
+
+  // ---------------------------------------------------------------- groups
+
+  function freshGroups() {
+    return {
+      asked: false,           // the tab was shown: the lists were asked for
+      list: null,             // the answer of `group list`: [{id, name, flags}]
+      listError: '',
+      invites: null,          // the answer of `group invitations`
+      invitesError: '',
+      busy: false,            // the two are being asked for
+      again: false,           // and are to be asked for once more after
+      known: {},              // by UUID: the groups the page has anything of
+      chosen: null,           // the UUID of the group shown
+      follow: true,           // the group's view is at its end
+      answering: {}           // invitations being answered, by group UUID: {text, kind}
+    };
+  }
+
+  function groupsState() {
+    if (!state.groups) { state.groups = freshGroups(); }
+    return state.groups;
+  }
+
+  function ensureGroup(id) {
+    var groups = groupsState();
+    var group = groups.known[id];
+    if (!group) {
+      group = {
+        id: id, name: '', messages: [], unread: 0, last: 0, draft: '',
+        info: null,           // {busy, error, lines}
+        invite: null          // the Invite form: {text, chosen, result}
+      };
+      groups.known[id] = group;
+    }
+    return group;
+  }
+
+  function listedGroup(id) {
+    var list = groupsState().list;
+    if (!list) { return null; }
+    for (var i = 0; i < list.length; i++) { if (list[i].id === id) { return list[i]; } }
+    return null;
+  }
+
+  function groupName(id) {
+    var listed = listedGroup(id);
+    if (listed && listed.name) { return listed.name; }
+    var group = groupsState().known[id];
+    return group && group.name ? group.name : id;
+  }
+
+  function connected() {
+    return !!state.status && state.status.connected === 'yes';
+  }
+
+  // A group message as the event stream gives it.
+  function groupRecord(f) {
+    return {
+      time: parseInt(f[0], 10) || 0,
+      kind: f[1] || '',
+      groupId: (f[2] || '').toLowerCase(),
+      groupName: f[3] || '',
+      avatarId: (f[4] || '').toLowerCase(),
+      avatarName: f[5] || '',
+      displayName: f[6] || '',
+      subject: f[7] || '',
+      attachment: f[8] || '',
+      offline: f[9] === '1',
+      text: f[10] || ''
+    };
+  }
+
+  function lookingAtGroup(id) {
+    return state.tab === 'groups' && groupsState().chosen === id && document.visibilityState === 'visible';
+  }
+
+  function addGroupMessage(rec) {
+    if (!rec.groupId) { return; }
+    var group = ensureGroup(rec.groupId);
+    if (rec.groupName && !unknown(rec.groupName)) { group.name = rec.groupName; }
+    group.messages.push(rec);
+    while (group.messages.length > MAX_CHAT_LINES) { group.messages.shift(); }
+    group.last = Math.max(group.last, rec.time);
+    if (rec.kind !== 'chat_out' && !replaying && !lookingAtGroup(group.id)) { group.unread++; }
+    renderGroupList();
+    if (groupsState().chosen !== group.id) { return; }
+    var log = $('group-log');
+    log.appendChild(groupMessageNode(rec));
+    while (log.childNodes.length > MAX_CHAT_LINES) { log.removeChild(log.firstChild); }
+    if (state.tab !== 'groups') { return; }
+    if (groupsState().follow || rec.kind === 'chat_out') { scrollToEnd(log); }
+    else if (!replaying) { show($('group-new'), true); }
+  }
+
+  // Who wrote a group message: as the Local chat tab names a speaker.
+  function groupSpeaker(rec) {
+    return speaker({ objectName: '', objectId: '', avatarId: rec.avatarId, avatarName: rec.avatarName, displayName: rec.displayName });
+  }
+
+  function groupMessageNode(rec) {
+    if (rec.kind === 'notice') {
+      var node = el('div', 'gnotice');
+      var head = el('div', 'head');
+      head.appendChild(el('span', 'badge', 'Notice'));
+      head.appendChild(timeNode(rec.time));
+      head.appendChild(el('span', 'from', groupSpeaker(rec)));
+      if (rec.offline) { head.appendChild(el('span', 'stored', 'stored while offline')); }
+      node.appendChild(head);
+      node.appendChild(el('div', 'subject', rec.subject || '(no subject)'));
+      if (rec.text !== '') { node.appendChild(el('div', 'body', rec.text)); }
+      if (rec.attachment !== '') {
+        var attached = el('div', 'attachment');
+        attached.appendChild(document.createTextNode('Attached: '));
+        attached.appendChild(el('span', 'item', rec.attachment));
+        attached.appendChild(document.createTextNode(' (cannot be taken from the page)'));
+        node.appendChild(attached);
+      }
+      return node;
+    }
+    var own = rec.kind === 'chat_out';
+    var line = el('div', 'line' + (own ? ' own' : '') + (rec.kind !== 'chat' && !own ? ' other' : ''));
+    line.appendChild(timeNode(rec.time));
+    if (own) {
+      line.appendChild(el('span', 'you', 'you'));
+      line.appendChild(document.createTextNode(rec.text));
+    } else {
+      var how = rec.kind === 'chat' ? '' : ' [' + rec.kind + ']';
+      line.appendChild(document.createTextNode(groupSpeaker(rec) + how + ': ' + rec.text));
+    }
+    if (rec.offline) { line.appendChild(el('span', 'stored', 'stored while offline')); }
+    return line;
+  }
+
+  // The groups the list shows: the avatar's in the order of the answer,
+  // then those the page has messages of, newest first.
+  function shownGroups() {
+    var groups = groupsState();
+    var out = [];
+    var seenIds = {};
+    (groups.list || []).forEach(function (listed) {
+      seenIds[listed.id] = true;
+      out.push({ id: listed.id, listed: listed });
+    });
+    var others = Object.keys(groups.known).filter(function (id) {
+      return !seenIds[id] && (groups.known[id].messages.length > 0 || groups.chosen === id);
+    }).map(function (id) { return groups.known[id]; });
+    others.sort(function (a, b) { return b.last - a.last; });
+    others.forEach(function (group) { out.push({ id: group.id, listed: null }); });
+    return out;
+  }
+
+  function groupsMark() {
+    var groups = groupsState();
+    var unread = 0;
+    Object.keys(groups.known).forEach(function (id) { unread += groups.known[id].unread; });
+    var waiting = !!groups.invites && groups.invites.length > 0;
+    var mark = $('mark-groups');
+    mark.title = waiting && unread > 0 ? 'An invitation waits; new messages' : waiting ? 'An invitation waits' : 'New messages';
+    show(mark, waiting || unread > 0);
+  }
+
+  function renderGroupList() {
+    var groups = groupsState();
+    var list = $('groups-list');
+    clear(list);
+    var note = '';
+    var isError = false;
+    if (!connected() && state.status) { note = 'The avatar is not connected.'; }
+    else if (groups.listError) { note = groups.listError; isError = true; }
+    else if (groups.list && groups.list.length === 0) { note = 'The avatar is in no group.'; }
+    else if (!groups.list && groups.busy) { note = 'Asking for the groups…'; }
+    var noteNode = $('groups-note');
+    noteNode.textContent = note;
+    noteNode.classList.toggle('error', isError);
+    show(noteNode, note !== '');
+    shownGroups().forEach(function (entry) {
+      var group = groups.known[entry.id];
+      var item = el('li', (entry.id === groups.chosen ? 'current' : '') + (entry.listed ? '' : ' gone'));
+      item.appendChild(el('span', 'label', groupName(entry.id)));
+      if (entry.listed && entry.listed.flags.indexOf('active') >= 0) { item.appendChild(el('span', 'active', 'active')); }
+      if (!entry.listed && groups.list) { item.appendChild(el('span', 'more', 'not a member')); }
+      if (group && group.unread > 0) { item.appendChild(el('span', 'count', String(group.unread))); }
+      item.tabIndex = 0;
+      item.setAttribute('role', 'button');
+      item.addEventListener('click', function () { chooseGroup(entry.id); });
+      item.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); chooseGroup(entry.id); }
+      });
+      list.appendChild(item);
+    });
+    groupsMark();
+  }
+
+  // The chosen group's messages were seen.
+  function groupSeen() {
+    var groups = groupsState();
+    var group = groups.chosen ? groups.known[groups.chosen] : null;
+    if (group && state.tab === 'groups' && document.visibilityState === 'visible') { group.unread = 0; }
+  }
+
+  function saveGroupDrafts() {
+    var groups = groupsState();
+    var group = groups.chosen ? groups.known[groups.chosen] : null;
+    if (!group) { return; }
+    group.draft = $('group-text').value;
+    if (group.invite) { group.invite.text = $('group-invite-who').value; }
+  }
+
+  function chooseGroup(id) {
+    var groups = groupsState();
+    saveGroupDrafts();
+    groups.chosen = id;
+    ensureGroup(id);
+    groups.follow = true;
+    groupSeen();
+    renderGroupList();
+    renderGroupView();
+    if (listedGroup(id) && state.tab === 'groups') { $('group-text').focus(); }
+  }
+
+  function renderGroupView() {
+    var groups = groupsState();
+    var id = groups.chosen;
+    var group = id ? ensureGroup(id) : null;
+    var listed = id ? listedGroup(id) : null;
+    var flags = listed ? listed.flags : [];
+    var log = $('group-log');
+    clear(log);
+    show($('group-new'), false);
+    $('group-title').textContent = group ? groupName(id) : 'No group chosen';
+    show($('group-active'), !!listed && flags.indexOf('active') >= 0);
+    show($('group-activate'), !!listed && flags.indexOf('active') < 0);
+    show($('group-invite'), !!listed && flags.indexOf('invite') >= 0);
+    show($('group-info'), !!group);
+    show($('group-leave'), !!listed);
+    var gone = $('group-gone');
+    gone.textContent = !group || listed ? '' : groups.list ? 'The avatar is not in this group.' : 'The avatar\'s groups are not known right now.';
+    show(gone, gone.textContent !== '');
+    show($('group-form'), !!listed);
+    show(log, !!group);
+    renderGroupInfo();
+    renderGroupInvite();
+    if (!group) { return; }
+    group.messages.forEach(function (rec) { log.appendChild(groupMessageNode(rec)); });
+    if (group.messages.length === 0) { log.appendChild(el('div', 'made', 'No messages yet.')); }
+    $('group-text').value = group.draft;
+    scrollToEnd(log);
+  }
+
+  // ------------------------------------------------ refreshing the lists
+
+  function groupsListAnswer(result) {
+    var groups = groupsState();
+    if (result.ok) {
+      // UUID, flags, name.
+      groups.list = listing(result.text).map(function (f) {
+        var id = (f[0] || '').toLowerCase();
+        return { id: id, name: f[2] || '', flags: !f[1] || f[1] === '-' ? [] : f[1].split(',') };
+      }).filter(function (listed) { return listed.id !== ''; });
+      // The name stays known for a group the avatar leaves.
+      groups.list.forEach(function (listed) {
+        var group = ensureGroup(listed.id);
+        if (listed.name) { group.name = listed.name; }
+      });
+      groups.listError = '';
+    } else {
+      groups.list = null;
+      groups.listError = result.text;
+    }
+  }
+
+  function invitationsAnswer(result) {
+    var groups = groupsState();
+    if (result.ok) {
+      // Group's UUID, fee, inviter's UUID or `?`, inviter's name, group's name or `?`.
+      groups.invites = listing(result.text).map(function (f) {
+        var fee = parseInt(f[1], 10);
+        return {
+          id: (f[0] || '').toLowerCase(),
+          fee: isNaN(fee) || fee < 0 ? 0 : fee,
+          inviterId: unknown(f[2]) ? '' : f[2],
+          inviter: f[3] || '',
+          name: unknown(f[4]) ? '' : f[4]
+        };
+      });
+      groups.invitesError = '';
+    } else {
+      groups.invites = null;
+      groups.invitesError = result.text;
+    }
+  }
+
+  // Asks for the groups and the invitations. While they are being asked
+  // for, another ask is made once they are answered.
+  function loadGroups(own) {
+    var groups = groupsState();
+    groups.busy = true;
+    renderGroupList();
+    return Promise.all([run(['group', 'list'], own), run(['group', 'invitations'], own)]).then(function (results) {
+      if (state.groups !== groups) { return; }
+      groups.busy = false;
+      groupsListAnswer(results[0]);
+      invitationsAnswer(results[1]);
+      renderGroupList();
+      renderGroupView();
+      renderInvitations();
+      if (groups.again) {
+        groups.again = false;
+        refreshGroups(true);
+      }
+    });
+  }
+
+  function refreshGroups(own) {
+    if (!$('login').hidden) { return; }
+    var groups = groupsState();
+    if (groups.busy) { groups.again = true; return; }
+    loadGroups(own);
+  }
+
+  // ---------------------------------------------------- the invitations
+
+  function renderInvitations() {
+    var groups = groupsState();
+    var panel = $('groups-invitations');
+    var list = $('groups-invitations-list');
+    clear(list);
+    var note = $('groups-invitations-note');
+    // Not connected: nothing can be answered, and the list says so.
+    var error = connected() ? groups.invitesError : '';
+    note.textContent = error;
+    show(note, error !== '');
+    var invites = groups.invites || [];
+    invites.forEach(function (invite) { list.appendChild(invitationNode(invite)); });
+    show(panel, error !== '' || invites.length > 0);
+    groupsMark();
+  }
+
+  function invitationNode(invite) {
+    var groups = groupsState();
+    var label = invite.name || invite.id;
+    var row = el('li', 'invitation');
+    var who = el('div', 'who');
+    var title = el('div', 'title', label);
+    if (invite.fee > 0) {
+      title.appendChild(document.createTextNode(' '));
+      title.appendChild(el('span', 'fee', 'L$' + invite.fee));
+    }
+    who.appendChild(title);
+    who.appendChild(el('div', 'more', 'invited by ' + (invite.inviter || invite.inviterId || 'someone unknown') + (invite.name ? ' · ' + invite.id : '')));
+    var payless = invite.fee > 0 && !canPay();
+    if (payless) { who.appendChild(el('div', 'more error', 'Payments are not enabled for the web interface, so it cannot be accepted here.')); }
+    row.appendChild(who);
+    var acts = el('div', 'acts');
+    var answer = groups.answering[invite.id];
+    var busy = !!answer && answer.kind === 'wait';
+    var buttons = [];
+    if (!payless) {
+      buttons.push(rowButton('Accept', function () { acceptInvitation(invite, label); }));
+    }
+    buttons.push(rowButton('Reject', function () { answerInvitation(invite, label, ['decline', 'group', invite.id], 'Rejecting…'); }));
+    buttons.forEach(function (button) {
+      button.disabled = busy;
+      acts.appendChild(button);
+    });
+    row.appendChild(acts);
+    if (answer) {
+      var result = el('p', 'result' + (answer.kind ? ' ' + answer.kind : ''), answer.text);
+      result.setAttribute('role', answer.kind === 'error' ? 'alert' : 'status');
+      row.appendChild(result);
+    }
+    return row;
+  }
+
+  function acceptInvitation(invite, label) {
+    if (invite.fee <= 0) {
+      answerInvitation(invite, label, ['accept', 'group', invite.id], 'Accepting…');
+      return;
+    }
+    if (!canPay()) { return; }
+    var fee = String(invite.fee);
+    var details = [
+      'Group: ' + (invite.name || '(name not known)'),
+      'Group UUID: ' + invite.id,
+      'Invited by: ' + (invite.inviter || invite.inviterId || 'someone unknown')
+    ];
+    confirmPayment('Pay the fee of L$' + fee + ' to join ' + label + '?', details, fee).then(function (yes) {
+      if (!yes) { return; }
+      answerInvitation(invite, label, ['accept', 'group', invite.id, '--pay', fee], 'Paying L$' + fee + ' and joining…');
+    });
+  }
+
+  // Accepts or rejects: the row says so, then shows the answer or the
+  // error; the lists are asked for again.
+  function answerInvitation(invite, label, args, doing) {
+    var groups = groupsState();
+    var now = groups.answering[invite.id];
+    if (now && now.kind === 'wait') { return; }
+    groups.answering[invite.id] = { text: doing, kind: 'wait' };
+    renderInvitations();
+    run(args, false).then(function (result) {
+      if (state.groups !== groups) { return; }
+      if (result.ok) {
+        delete groups.answering[invite.id];
+        // The row goes once the invitation no longer waits: the answer
+        // is shown where answers are.
+        notify('ginv:' + invite.id, (args[0] === 'accept' ? 'Accept ' : 'Reject ') + label, result.text || 'done', false);
+      } else {
+        groups.answering[invite.id] = { text: result.text, kind: 'error' };
+      }
+      renderInvitations();
+      refreshGroups(true);
+    });
+  }
+
+  // --------------------------------------------------------------- Leave
+
+  // Leaves the chosen group once the operator has confirmed it; the list
+  // shows the change when the bot says the groups changed.
+  function leaveGroup() {
+    var id = groupsState().chosen;
+    if (!id || !listedGroup(id)) { return; }
+    var button = $('group-leave');
+    if (button.disabled) { return; }
+    var label = groupName(id);
+    var details = [
+      'Group: ' + label,
+      'Group UUID: ' + id,
+      'Joining it again may take an invitation or a fee.'
+    ];
+    confirmAction('Leave the group', 'Leave ' + label + '?', details, 'Leave').then(function (yes) {
+      if (!yes) { return; }
+      act(button, 'gleave:' + id, 'Leave ' + label, ['group', 'leave', id], false).then(function (result) {
+        if (result && result.ok) { refreshGroups(true); }
+      });
+    });
+  }
+
+  // --------------------------------------------------- Info and Invite
+
+  var INFO_NAMES = {
+    name: 'Name', group: 'UUID', founder: 'Founder', fee: 'Fee', enrollment: 'Enrollment',
+    members: 'Members', roles: 'Roles', listed: 'Listed', mature: 'Mature', member: 'Member',
+    title: 'Title', charter: 'Charter'
+  };
+
+  // `name: value` lines, each value escaped.
+  function infoLines(text) {
+    return text.split('\n').filter(function (line) { return line !== ''; }).map(function (line) {
+      var colon = line.indexOf(': ');
+      if (colon < 0) { return [line.replace(/:$/, ''), '']; }
+      return [line.slice(0, colon), unescapeField(line.slice(colon + 2))];
+    });
+  }
+
+  function renderGroupInfo() {
+    var groups = groupsState();
+    var group = groups.chosen ? groups.known[groups.chosen] : null;
+    var box = $('group-info-box');
+    clear(box);
+    var info = group ? group.info : null;
+    show(box, !!info);
+    if (!info) { return; }
+    var head = el('div', 'head');
+    head.appendChild(el('strong', null, 'Group info'));
+    var close = rowButton('Close', function () {
+      group.info = null;
+      renderGroupInfo();
+    });
+    close.classList.add('small');
+    head.appendChild(close);
+    box.appendChild(head);
+    if (info.busy) { box.appendChild(el('p', 'made', 'Asking the grid…')); return; }
+    if (info.error) {
+      var error = el('p', 'result error', info.error);
+      error.setAttribute('role', 'alert');
+      box.appendChild(error);
+      return;
+    }
+    var list = el('dl');
+    info.lines.forEach(function (pair) {
+      list.appendChild(el('dt', null, INFO_NAMES[pair[0]] || pair[0]));
+      list.appendChild(el('dd', pair[0] === 'charter' ? 'charter' : null, pair[1]));
+    });
+    box.appendChild(list);
+  }
+
+  function askGroupInfo() {
+    var groups = groupsState();
+    var id = groups.chosen;
+    var button = $('group-info');
+    if (!id || button.disabled) { return; }
+    var group = ensureGroup(id);
+    button.disabled = true;
+    button.classList.add('busy');
+    group.info = { busy: true, error: '', lines: [] };
+    renderGroupInfo();
+    run(['group', 'info', id], false).then(function (result) {
+      button.disabled = false;
+      button.classList.remove('busy');
+      if (state.groups !== groups) { return; }
+      group.info = result.ok ? { busy: false, error: '', lines: infoLines(result.text) } : { busy: false, error: result.text, lines: [] };
+      if (groups.chosen === id) { renderGroupInfo(); }
+    });
+  }
+
+  function renderGroupInvite() {
+    var groups = groupsState();
+    var group = groups.chosen ? groups.known[groups.chosen] : null;
+    var listed = group ? listedGroup(group.id) : null;
+    var invite = group && listed && listed.flags.indexOf('invite') >= 0 ? group.invite : null;
+    var form = $('group-invite-form');
+    show(form, !!invite);
+    if (!invite) { return; }
+    var box = $('group-invite-who');
+    box.value = invite.text;
+    box.classList.remove('bad');
+    var chosen = $('group-invite-chosen');
+    var isChosen = invite.chosen && invite.chosen.shown === invite.text;
+    chosen.textContent = isChosen ? 'Invites ' + invite.chosen.shown + ' by the UUID ' + invite.chosen.id + '.' : '';
+    show(chosen, !!isChosen);
+    var result = $('group-invite-result');
+    setResult(result, invite.result ? invite.result.text : '', invite.result ? invite.result.kind : '');
+    renderInviteFriends();
+  }
+
+  function renderInviteFriends() {
+    var list = $('group-invite-friends');
+    clear(list);
+    var groups = groupsState();
+    var group = groups.chosen ? groups.known[groups.chosen] : null;
+    (state.friends || []).forEach(function (friend) {
+      list.appendChild(friendNode(friend, function () {
+        if (!group || !group.invite) { return; }
+        group.invite.text = friend.label;
+        group.invite.chosen = { shown: friend.label, id: friend.id };
+        renderGroupInvite();
+        $('group-invite-send').focus();
+      }));
+    });
+    var note = $('group-invite-friends-note');
+    var text = state.friends && state.friends.length === 0 ? 'No friends.' : !state.friends ? 'Reading the friend list…' : '';
+    note.textContent = text;
+    show(note, text !== '');
+  }
+
+  function sendGroupInvite() {
+    var groups = groupsState();
+    var id = groups.chosen;
+    var group = id ? groups.known[id] : null;
+    if (!group || !group.invite) { return; }
+    var box = $('group-invite-who');
+    var typed = box.value.trim();
+    box.classList.toggle('bad', typed === '');
+    if (typed === '') { box.focus(); return; }
+    group.invite.text = box.value;
+    var chosen = group.invite.chosen && group.invite.chosen.shown === box.value ? group.invite.chosen : null;
+    var who = chosen ? chosen.id : typed;
+    var label = chosen ? chosen.shown : typed;
+    var button = $('group-invite-send');
+    if (button.disabled) { return; }
+    button.disabled = true;
+    button.classList.add('busy');
+    group.invite.result = { text: 'Inviting ' + label + '…', kind: 'wait' };
+    renderGroupInvite();
+    run(['group', 'invite', id, who], false).then(function (result) {
+      button.disabled = false;
+      button.classList.remove('busy');
+      if (state.groups !== groups || !group.invite) { return; }
+      group.invite.result = { text: result.ok ? (result.text || 'Invited.') : result.text, kind: result.ok ? 'ok' : 'error' };
+      if (groups.chosen === id) {
+        group.invite.text = $('group-invite-who').value;
+        renderGroupInvite();
+      }
+    });
+  }
+
+  function sendGroupChat() {
+    var groups = groupsState();
+    var id = groups.chosen;
+    var input = $('group-text');
+    var text = input.value;
+    if (!id || !listedGroup(id) || text.trim() === '') { return; }
+    act($('group-button'), 'gchat:' + id, 'Message to ' + groupName(id), ['group', 'chat', id, text], true).then(function (result) {
+      if (!result || !result.ok) { input.focus(); return; }
+      // The line shows when its record arrives.
+      var group = groups.known[id];
+      if (groups.chosen === id && input.value === text) { input.value = ''; }
+      if (group && group.draft === text) { group.draft = ''; }
+      if (groups.chosen === id) { input.focus(); }
+    });
+  }
+
+  function wireGroups() {
+    $('groups-refresh').addEventListener('click', function () {
+      var button = $('groups-refresh');
+      var groups = groupsState();
+      if (button.disabled || groups.busy) { return; }
+      button.disabled = true;
+      button.classList.add('busy');
+      // The operator asked: ordinary commands.
+      loadGroups(false).then(function () {
+        button.disabled = false;
+        button.classList.remove('busy');
+      });
+    });
+    $('group-form').addEventListener('submit', function (event) {
+      event.preventDefault();
+      sendGroupChat();
+    });
+    $('group-activate').addEventListener('click', function () {
+      var id = groupsState().chosen;
+      if (!id) { return; }
+      act($('group-activate'), 'gact:' + id, 'Activate ' + groupName(id), ['group', 'activate', id], false);
+    });
+    $('group-info').addEventListener('click', askGroupInfo);
+    $('group-leave').addEventListener('click', leaveGroup);
+    $('group-invite').addEventListener('click', function () {
+      var groups = groupsState();
+      var group = groups.chosen ? groups.known[groups.chosen] : null;
+      if (!group) { return; }
+      if (group.invite) { group.invite.text = $('group-invite-who').value; }
+      else { group.invite = { text: '', chosen: null, result: null }; }
+      renderGroupInvite();
+      $('group-invite-who').focus();
+      refreshFriends(true);
+    });
+    $('group-invite-close').addEventListener('click', function () {
+      var groups = groupsState();
+      var group = groups.chosen ? groups.known[groups.chosen] : null;
+      if (group) { group.invite = null; }
+      renderGroupInvite();
+    });
+    $('group-invite-form').addEventListener('submit', function (event) {
+      event.preventDefault();
+      sendGroupInvite();
+    });
+    $('group-invite-who').addEventListener('input', function () {
+      var groups = groupsState();
+      var group = groups.chosen ? groups.known[groups.chosen] : null;
+      var box = $('group-invite-who');
+      box.classList.remove('bad');
+      if (group && group.invite) { group.invite.text = box.value; }
+      show($('group-invite-chosen'), !!(group && group.invite && group.invite.chosen && group.invite.chosen.shown === box.value));
+    });
+    var log = $('group-log');
+    log.addEventListener('scroll', function () {
+      if (state.tab !== 'groups') { return; }
+      groupsState().follow = atEnd(log);
+      if (groupsState().follow) { show($('group-new'), false); }
+    });
+    $('group-new').addEventListener('click', function () {
+      groupsState().follow = true;
+      scrollToEnd(log);
+      show($('group-new'), false);
+    });
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible' && state.tab === 'groups') {
+        groupSeen();
+        renderGroupList();
+      }
     });
   }
 
@@ -1396,6 +2096,7 @@
     var controls = document.querySelectorAll('.pay-control');
     for (var i = 0; i < controls.length; i++) { show(controls[i], can); }
     renderImPay();
+    renderInvitations();
     if (!can) { closeDialog(); }
     // The Money tab's address shows the World tab without it, and the
     // Money tab again once it is there.
@@ -1450,41 +2151,49 @@
 
   var confirming = null;  // resolves the confirmation that is open
 
-  // Asks the operator before a payment. Nothing is paid unless the paying
-  // button is pressed: cancelling, Escape and a click outside do nothing.
-  function confirmPayment(question, details, amount) {
-    var dialog = $('pay-dialog');
+  // Asks the operator before an action: true only when the button that
+  // does it is pressed; cancelling, Escape and a click outside do nothing.
+  // The cancelling button has the focus.
+  function confirmAction(title, question, details, yes) {
+    var dialog = $('confirm-dialog');
     if (typeof dialog.showModal !== 'function') {
       return Promise.resolve(window.confirm(question + '\n' + details.join('\n')));
     }
     closeDialog();
-    $('pay-dialog-text').textContent = question;
-    var more = $('pay-dialog-more');
+    $('confirm-dialog-title').textContent = title;
+    $('confirm-dialog-text').textContent = question;
+    var more = $('confirm-dialog-more');
     clear(more);
     details.forEach(function (line) { more.appendChild(el('div', null, line)); });
-    $('pay-dialog-pay').textContent = 'Pay L$' + amount;
+    $('confirm-dialog-yes').textContent = yes;
     return new Promise(function (resolve) {
       confirming = resolve;
       dialog.returnValue = '';
       dialog.showModal();
-      $('pay-dialog-cancel').focus();
+      $('confirm-dialog-cancel').focus();
     });
   }
 
+  // Asks the operator before a payment. Nothing is paid unless the paying
+  // button is pressed.
+  function confirmPayment(question, details, amount) {
+    return confirmAction('Confirm the payment', question, details, 'Pay L$' + amount);
+  }
+
   function closeDialog() {
-    var dialog = $('pay-dialog');
+    var dialog = $('confirm-dialog');
     if (dialog.open) { dialog.close('cancel'); }
   }
 
   function wireDialog() {
-    var dialog = $('pay-dialog');
+    var dialog = $('confirm-dialog');
     dialog.addEventListener('close', function () {
       var resolve = confirming;
       confirming = null;
-      if (resolve) { resolve(dialog.returnValue === 'pay'); }
+      if (resolve) { resolve(dialog.returnValue === 'yes'); }
     });
-    $('pay-dialog-cancel').addEventListener('click', function () { dialog.close('cancel'); });
-    $('pay-dialog-pay').addEventListener('click', function () { dialog.close('pay'); });
+    $('confirm-dialog-cancel').addEventListener('click', function () { dialog.close('cancel'); });
+    $('confirm-dialog-yes').addEventListener('click', function () { dialog.close('yes'); });
     // A click on the backdrop is a click on the dialog itself, outside its box.
     dialog.addEventListener('click', function (event) {
       if (event.target !== dialog) { return; }
@@ -1898,6 +2607,9 @@
     renderConversations();
     renderConversation();
     renderFriends('');
+    renderGroupList();
+    renderGroupView();
+    renderInvitations();
     renderInventory();
     renderTransactions();
     renderPayees();
@@ -1921,6 +2633,7 @@
     wireWorld();
     wireChat();
     wireIm();
+    wireGroups();
     wireInventory();
     wireMoney();
     wireConsole();

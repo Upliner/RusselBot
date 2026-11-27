@@ -97,7 +97,22 @@ enum Target {
         /// The object scan has looked for it.
         looked: bool,
     },
+    /// The fee for joining a group, which the grid takes when it gets the
+    /// join or the acceptance.
+    Group { group: Uuid, name: String, how: FeeFor },
 }
+
+/// What the avatar pays a group's fee for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FeeFor {
+    /// `group join`.
+    Join,
+    /// `accept group`, of the invitation `id`.
+    Accept { id: Uuid },
+}
+
+/// The transaction type of a fee for joining a group (`TRANS_GROUP_JOIN`).
+pub const TRANSACTION_GROUP_JOIN: i32 = 1004;
 
 #[derive(Debug, Clone, PartialEq)]
 enum Stage {
@@ -172,6 +187,12 @@ impl Commands {
     #[cfg(test)]
     pub fn set_clock(&mut self, clock: impl Fn() -> u64 + 'static) {
         self.money.clock = Box::new(clock);
+    }
+
+    /// The wall clock payments are counted by, in seconds since the Unix
+    /// epoch.
+    pub(super) fn wall(&self) -> u64 {
+        (self.money.clock)()
     }
 
     pub fn balance(&self) -> Option<i64> {
@@ -563,6 +584,7 @@ impl Commands {
                     return Ok(Advance::Done);
                 }
             }
+            Target::Group { .. } => {}
         }
         self.send_payment(wait, grid, now)?;
         Ok(Advance::Wait)
@@ -617,6 +639,7 @@ impl Commands {
                     (None, _) => object,
                 }
             }
+            Target::Group { group, name, .. } => format!("the group \"{name}\" <{group}>"),
         }
     }
 
@@ -648,6 +671,7 @@ impl Commands {
                     object_name: String::new(),
                     object: None,
                     description: String::new(),
+                    fallback: String::new(),
                 };
                 // The description is a message to the payee: RLV holds it
                 // back as it would an instant message.
@@ -708,9 +732,26 @@ impl Commands {
                     object_name: name.clone().unwrap_or_default(),
                     object: Some(*object),
                     description: String::new(),
+                    fallback: String::new(),
                 };
                 let description = name.clone().unwrap_or_default();
                 (payee, flight, *object, TRANSACTION_PAY_OBJECT, description)
+            }
+            Target::Group { group, name, .. } => {
+                // Only the group's UUID matches an entry of the lists.
+                let payee = Payee {
+                    avatar: None,
+                    object: Some(*group),
+                };
+                let flight = InFlight {
+                    amount,
+                    code: TRANSACTION_GROUP_JOIN,
+                    party: Some(*group),
+                    party_group: true,
+                    fallback: format!("Fee to join {name}"),
+                    ..InFlight::default()
+                };
+                (payee, flight, *group, TRANSACTION_GROUP_JOIN, String::new())
             }
         };
         let named = payee.avatar.as_ref().is_none_or(|(_, name)| name.is_some());
@@ -754,7 +795,16 @@ impl Commands {
             counted: if counts { amount } else { 0 },
             ..in_flight
         };
-        if let Err(e) = grid.pay(dest, amount as i32, kind, &description, now) {
+        let sent = match &wait.target {
+            // The grid takes the fee itself: the bot sends the join or the
+            // acceptance and no payment of its own.
+            Target::Group { group, how, .. } => match how {
+                FeeFor::Join => grid.join_group(*group, now),
+                FeeFor::Accept { id } => grid.answer_invitation(*group, *id, true, now),
+            },
+            _ => grid.pay(dest, amount as i32, kind, &description, now),
+        };
+        if let Err(e) = sent {
             if counts {
                 self.money.ledger.release(amount);
             }
@@ -769,7 +819,12 @@ impl Commands {
             (Some(text), false) => format!(", with the description \"{}\"", escape(text)),
             (None, _) => String::new(),
         };
-        self.tell(format!("{}: pay L${amount} to {shown}: sent{described}{counted}", wait.via));
+        let verb = match wait.target {
+            Target::Group { how: FeeFor::Join, .. } => "join, paying",
+            Target::Group { .. } => "accept the invitation, paying",
+            _ => "pay",
+        };
+        self.tell(format!("{}: {verb} L${amount} to {shown}: sent{described}{counted}", wait.via));
         wait.stage = Stage::Sent(in_flight);
         wait.deadline = now + CONFIRM_LIMIT;
         Ok(())
@@ -809,6 +864,9 @@ impl Commands {
     fn refuse_wait(&mut self, wait: &Wait, reason: String) {
         if !wait.origin.quiet() {
             let what = match wait.amount {
+                Some(amount) if matches!(wait.target, Target::Group { .. }) => {
+                    format!("fee of L${amount} to {}", self.target_words(&wait.target))
+                }
                 Some(amount) => format!("pay L${amount} to {}", self.target_words(&wait.target)),
                 None => format!("prices of {}", self.target_words(&wait.target)),
             };
@@ -947,6 +1005,9 @@ impl Commands {
             Outcome::Other(tx) => self.money.records.push(tx),
             Outcome::Ours(tx) => {
                 let wait = self.money.pay.take().expect("a payment in flight");
+                if let Target::Group { group, .. } = wait.target {
+                    return self.fee_reported(wait, group, tx, balance, description);
+                }
                 let shown = self.target_words(&wait.target);
                 let amount = wait.amount.unwrap_or(0);
                 match tx.kind {
@@ -983,6 +1044,16 @@ impl Commands {
         };
         let shown = self.target_words(&wait.target);
         let amount = wait.amount.unwrap_or(0);
+        if let Target::Group { .. } = wait.target {
+            // The command is answered by what the grid says of the join.
+            self.tell(format!(
+                "{}: fee of L${amount} to {shown}: not reported: {why}; it counts as paid",
+                wait.via
+            ));
+            let wall = (self.money.clock)();
+            self.money.records.push(in_flight.unconfirmed(wall));
+            return;
+        }
         self.tell(format!("{}: pay L${amount} to {shown}: not confirmed: {why}", wait.via));
         let answer = format!(
             "the payment of L${amount} to {shown} was sent, but {why}; it counts as paid. \
@@ -999,7 +1070,10 @@ impl Commands {
             match (&wait.stage, now >= wait.deadline) {
                 (_, false) => self.money.pay = Some(wait),
                 (Stage::Sent(_), true) => {
-                    let why = format!("the grid has not confirmed it within {} s", CONFIRM_LIMIT.as_secs());
+                    let why = match wait.target {
+                        Target::Group { .. } => format!("the grid has not reported it within {} s", CONFIRM_LIMIT.as_secs()),
+                        _ => format!("the grid has not confirmed it within {} s", CONFIRM_LIMIT.as_secs()),
+                    };
                     self.unconfirmed(wait, &why);
                 }
                 (stage, true) => {
@@ -1040,7 +1114,7 @@ impl Commands {
                     "the grid has not said within {} s whether it knows an avatar {id}",
                     NAME_LIMIT.as_secs()
                 )),
-                Target::Object { .. } => None,
+                Target::Object { .. } | Target::Group { .. } => None,
             },
             Stage::Looking => {
                 let Target::Object { object, .. } = &wait.target else { return None };
@@ -1081,6 +1155,117 @@ impl Commands {
             }
             let _ = wait.reply.send(Response::Error(NOT_CONNECTED.to_string()));
         }
+    }
+
+    // ------------------------------------------------------- group fees
+
+    /// Pays `fee` to `group` by sending the join or the acceptance `how`
+    /// names, with every check of a payment first. Errors refuse it, and
+    /// nothing is sent then.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn pay_fee<G: Grid>(
+        &mut self,
+        fee: u32,
+        group: Uuid,
+        name: &str,
+        how: FeeFor,
+        via: Interface,
+        reply: &Sender<Response>,
+        grid: &mut G,
+        now: Instant,
+    ) -> Result<(), String> {
+        let config = match &self.money.config {
+            None => return Err("payments are not enabled: the config has no `[payments]` table".to_string()),
+            Some(config) => config,
+        };
+        if !config.may(via) {
+            return Err(format!(
+                "payments are not enabled for `{via}`: `perms` in the config's `[payments]` table does not list it"
+            ));
+        }
+        if let Some(waiting) = &self.money.pay {
+            return Err(format!(
+                "a payment is under way: L${} to {}; wait for its answer",
+                waiting.amount.unwrap_or(0),
+                self.target_words(&waiting.target)
+            ));
+        }
+        // A row the limit needs is written first, if it can be now; the
+        // bot says whether one still waits before every command.
+        let mut wait = Wait {
+            amount: Some(fee),
+            origin: self.origin,
+            via,
+            reply: reply.clone(),
+            target: Target::Group {
+                group,
+                name: name.to_string(),
+                how,
+            },
+            stage: Stage::Start,
+            deadline: now,
+            description: None,
+            held_back: false,
+        };
+        self.send_payment(&mut wait, grid, now)?;
+        self.money.pay = Some(wait);
+        Ok(())
+    }
+
+    /// The grid reported the fee of a join it was sent: recorded, and the
+    /// command that waits for the join is told.
+    fn fee_reported(&mut self, wait: Wait, group: Uuid, tx: Transaction, balance: i32, description: &str) {
+        let shown = self.target_words(&wait.target);
+        let amount = wait.amount.unwrap_or(0);
+        match tx.kind {
+            txlog::Kind::Paid => {
+                self.tell(format!("{}: fee of L${amount} to {shown}: made, balance L${balance}", wait.via));
+                self.fee_paid(group, i64::from(balance));
+            }
+            _ => {
+                if let Stage::Sent(flight) = &wait.stage {
+                    if flight.counted > 0 {
+                        self.money.ledger.release(flight.counted);
+                    }
+                }
+                let reason = match description.trim() {
+                    "" => "the grid gave no reason".to_string(),
+                    reason => reason.to_string(),
+                };
+                self.tell(format!("{}: fee of L${amount} to {shown}: failed: {reason}", wait.via));
+                self.fee_failed(group, &reason);
+            }
+        }
+        self.money.records.push(tx);
+    }
+
+    /// The grid refused the join a fee was sent with: the fee is recorded
+    /// as failed and stops counting.
+    pub(super) fn fee_refused(&mut self, group: Uuid, reason: &str) {
+        let ours =
+            matches!(&self.money.pay, Some(Wait { target: Target::Group { group: g, .. }, stage: Stage::Sent(_), .. }) if *g == group);
+        if !ours {
+            return;
+        }
+        let wait = self.money.pay.take().expect("checked");
+        let Stage::Sent(flight) = &wait.stage else { return };
+        if flight.counted > 0 {
+            self.money.ledger.release(flight.counted);
+        }
+        let shown = self.target_words(&wait.target);
+        self.tell(format!(
+            "{}: fee of L${} to {shown}: failed: {reason}",
+            wait.via,
+            wait.amount.unwrap_or(0)
+        ));
+        let wall = (self.money.clock)();
+        let record = Transaction {
+            kind: txlog::Kind::Failed,
+            counted: 0,
+            text: format!("{}: {reason}", flight.fallback),
+            ..flight.unconfirmed(wall)
+        };
+        self.money.records.push(record);
     }
 
     /// The bot stops: a payment that was sent is recorded as unconfirmed.

@@ -24,6 +24,7 @@
       <a href="#world" data-tab="world">World</a>
       <a href="#chat" data-tab="chat">Local chat<span class="mark" id="mark-chat" hidden title="New lines"></span></a>
       <a href="#im" data-tab="im">IM<span class="mark" id="mark-im" hidden title="New messages"></span></a>
+      <a href="#groups" data-tab="groups">Groups<span class="mark" id="mark-groups" hidden title="New messages"></span></a>
       <a href="#inventory" data-tab="inventory">Inventory</a>
       <a href="#money" data-tab="money" id="tab-link-money" hidden>Money</a>
       <a href="#console" data-tab="console">Console</a>
@@ -119,6 +120,53 @@
       </div>
     </section>
 
+    <!-- Groups -->
+    <section id="tab-groups" class="tab" hidden>
+      <div id="groups-invitations" class="panel invitations" hidden>
+        <h2>Invitations</h2>
+        <p id="groups-invitations-note" class="result error" role="alert" hidden></p>
+        <ul id="groups-invitations-list" class="rows"></ul>
+      </div>
+      <div class="im">
+        <div class="im-side">
+          <h2>Groups <button id="groups-refresh" type="button" class="small">Refresh</button></h2>
+          <p id="groups-note" class="made" hidden></p>
+          <ul id="groups-list" class="picks"></ul>
+        </div>
+        <div class="im-main panel group-main">
+          <h2><span id="group-title">No group chosen</span>
+            <span id="group-active" class="active" hidden>active group</span>
+            <button id="group-activate" type="button" class="small" hidden>Activate</button>
+            <button id="group-invite" type="button" class="small" hidden>Invite</button>
+            <button id="group-info" type="button" class="small" hidden>Info</button>
+            <button id="group-leave" type="button" class="small" hidden>Leave</button>
+          </h2>
+          <div id="group-info-box" class="group-box" hidden></div>
+          <form id="group-invite-form" class="group-box" hidden novalidate autocomplete="off">
+            <div class="send">
+              <input id="group-invite-who" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Avatar to invite, name or UUID" placeholder="Name or UUID">
+              <button id="group-invite-send" type="submit">Invite</button>
+              <button id="group-invite-close" type="button" class="small">Close</button>
+            </div>
+            <p id="group-invite-chosen" class="made" hidden></p>
+            <p class="made">Or choose a friend:</p>
+            <p id="group-invite-friends-note" class="made" hidden></p>
+            <ul id="group-invite-friends" class="picks"></ul>
+            <p id="group-invite-result" class="result" role="status" hidden></p>
+          </form>
+          <div class="chat">
+            <div id="group-log" class="log" tabindex="0" aria-label="Group chat and notices" hidden></div>
+            <button id="group-new" type="button" class="new" hidden>New lines ↓</button>
+          </div>
+          <p id="group-gone" class="made" hidden></p>
+          <form id="group-form" class="send" hidden>
+            <input id="group-text" autocomplete="off" aria-label="Message to the group" placeholder="Message to the group">
+            <button id="group-button" type="submit">Send</button>
+          </form>
+        </div>
+      </div>
+    </section>
+
     <!-- Inventory -->
     <section id="tab-inventory" class="tab" hidden>
       <div class="panel">
@@ -204,13 +252,13 @@
   </main>
 </div>
 
-<dialog id="pay-dialog" class="dialog" aria-labelledby="pay-dialog-title" aria-describedby="pay-dialog-text">
-  <h2 id="pay-dialog-title">Confirm the payment</h2>
-  <p id="pay-dialog-text"></p>
-  <div id="pay-dialog-more" class="made"></div>
+<dialog id="confirm-dialog" class="dialog" aria-labelledby="confirm-dialog-title" aria-describedby="confirm-dialog-text">
+  <h2 id="confirm-dialog-title">Confirm the payment</h2>
+  <p id="confirm-dialog-text"></p>
+  <div id="confirm-dialog-more" class="made"></div>
   <div class="buttons">
-    <button id="pay-dialog-cancel" type="button" class="secondary" autofocus>Cancel</button>
-    <button id="pay-dialog-pay" type="button">Pay</button>
+    <button id="confirm-dialog-cancel" type="button" class="secondary" autofocus>Cancel</button>
+    <button id="confirm-dialog-yes" type="button">Pay</button>
   </div>
 </dialog>
 

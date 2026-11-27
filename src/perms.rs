@@ -21,14 +21,23 @@ pub enum Kind {
     Attach,
     Controls,
     Camera,
+    Group,
 }
 
 /// The kinds, as an error lists them.
-pub const KINDS: &str = "`tp`, `inventory`, `anim`, `attach`, `controls` and `camera`";
+pub const KINDS: &str = "`tp`, `inventory`, `anim`, `attach`, `controls`, `camera` and `group`";
 
 impl Kind {
     /// In the order `perms status` prints them.
-    pub const ALL: [Kind; 6] = [Kind::Tp, Kind::Inventory, Kind::Anim, Kind::Attach, Kind::Controls, Kind::Camera];
+    pub const ALL: [Kind; 7] = [
+        Kind::Tp,
+        Kind::Inventory,
+        Kind::Anim,
+        Kind::Attach,
+        Kind::Controls,
+        Kind::Camera,
+        Kind::Group,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -38,6 +47,7 @@ impl Kind {
             Kind::Attach => "attach",
             Kind::Controls => "controls",
             Kind::Camera => "camera",
+            Kind::Group => "group",
         }
     }
 
@@ -160,6 +170,8 @@ impl Entry {
     pub fn matches(&self, sender: &Sender) -> bool {
         let (avatar, object) = match sender {
             Sender::Avatar { id, name } => (Some((Some(*id), Some(name.as_str()))), None),
+            // The group is entered by its UUID; its name matches nothing.
+            Sender::Inviter { name, id, group } => (Some((*id, Some(name.as_str()))), Some(*group)),
             Sender::Object { id, owner, .. } => {
                 let owner = match owner {
                     Owner::Avatar { id, name } => Some((*id, name.as_deref())),
@@ -205,6 +217,13 @@ pub enum Sender {
         name: String,
         owner: Owner,
     },
+    /// The member of `group` who invites the avatar into it. An
+    /// invitation names the inviter by name only; the UUID is looked up.
+    Inviter {
+        name: String,
+        id: Option<Uuid>,
+        group: Uuid,
+    },
 }
 
 impl fmt::Display for Sender {
@@ -212,6 +231,8 @@ impl fmt::Display for Sender {
         match self {
             Sender::Avatar { id, name } if name.is_empty() => write!(f, "{id}"),
             Sender::Avatar { id, name } => write!(f, "{name} <{id}>"),
+            Sender::Inviter { name, id: Some(id), .. } => write!(f, "{name} <{id}>"),
+            Sender::Inviter { name, id: None, .. } => f.write_str(name),
             Sender::Object { id, name, owner } => {
                 match id {
                     Some(id) => write!(f, "{name} <{id}>")?,
@@ -269,8 +290,8 @@ fn listed(entries: &[Entry]) -> String {
 /// The auto-accept rule and the exceptions of every kind.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rules {
-    rules: [Rule; 6],
-    exceptions: [Vec<Entry>; 6],
+    rules: [Rule; 7],
+    exceptions: [Vec<Entry>; 7],
 }
 
 impl Default for Rules {
@@ -415,6 +436,15 @@ pub enum Ask {
     },
     /// A script permission request for the permission bits `mask`.
     Script { object: Uuid, item: Uuid, mask: i32 },
+    /// An invitation into `group`; `id` is what the answer names, `fee`
+    /// what joining costs as the invitation says, `name` the group's name
+    /// once the grid has told it.
+    Group {
+        group: Uuid,
+        id: Uuid,
+        fee: i32,
+        name: Option<String>,
+    },
 }
 
 /// A request as the bot read it.
@@ -437,6 +467,35 @@ impl Request {
             Ask::Inventory { .. } => vec![Kind::Inventory],
             // Requests with other permissions are never made into one.
             Ask::Script { mask, .. } => script_kinds(*mask).unwrap_or_default(),
+            Ask::Group { .. } => vec![Kind::Group],
+        }
+    }
+
+    /// The group of an invitation, as the log and the lists name it:
+    /// `"Builders" <uuid>`, or the UUID alone while its name is not known.
+    pub fn group_words(&self) -> Option<String> {
+        match &self.ask {
+            Ask::Group {
+                group, name: Some(name), ..
+            } => Some(format!("\"{name}\" <{group}>")),
+            Ask::Group { group, name: None, .. } => Some(format!("the group {group}")),
+            _ => None,
+        }
+    }
+
+    /// The fee of an invitation, when it has one.
+    pub fn fee(&self) -> Option<u32> {
+        match self.ask {
+            Ask::Group { fee, .. } if fee > 0 => Some(fee as u32),
+            _ => None,
+        }
+    }
+
+    /// The inviter of an invitation: name and UUID, as far as known.
+    pub fn inviter(&self) -> Option<(&str, Option<Uuid>)> {
+        match &self.sender {
+            Sender::Inviter { name, id, .. } => Some((name, *id)),
+            _ => None,
         }
     }
 
@@ -456,6 +515,10 @@ impl Request {
             Ask::Tp { .. } => format!("teleport offer from {sender}"),
             Ask::Inventory { .. } => format!("inventory offer from {sender} ({})", self.offered().unwrap_or_default()),
             Ask::Script { .. } => format!("permission request ({}) from {sender}", self.kind_names()),
+            Ask::Group { .. } => {
+                let fee = self.fee().map(|fee| format!(", which costs L${fee} to join")).unwrap_or_default();
+                format!("invitation from {sender} into {}{fee}", self.group_words().unwrap_or_default())
+            }
         }
     }
 
@@ -466,12 +529,20 @@ impl Request {
 
     /// The command that accepts the request while it waits.
     pub fn accept_command(&self) -> String {
+        if let Ask::Group { group, .. } = &self.ask {
+            let pay = self.fee().map(|fee| format!(" --pay {fee}")).unwrap_or_default();
+            return format!("rslbot ctl accept group {group}{pay}");
+        }
         let kind = self.kinds().first().map_or("", |kind| kind.name());
         format!("rslbot ctl accept {kind}")
     }
 
     /// The request as `perms status` shows it.
     fn status_line(&self) -> String {
+        if let Some(group) = self.group_words() {
+            let fee = self.fee().map(|fee| format!(", L${fee}")).unwrap_or_default();
+            return format!("waiting: group from {}: {group}{fee}", self.sender);
+        }
         let what = self.offered().map(|what| format!(": {what}")).unwrap_or_default();
         format!("waiting: {} from {}{what}", self.kind_names(), self.sender)
     }
@@ -482,6 +553,7 @@ impl Request {
             Ask::Tp { .. } => 0,
             Ask::Inventory { .. } => 1,
             Ask::Script { .. } => 2,
+            Ask::Group { .. } => 3,
         }
     }
 
@@ -501,6 +573,7 @@ impl Request {
                     ..
                 },
             ) => object == other && item == other_item,
+            (Ask::Group { group, .. }, Ask::Group { group: other, .. }) => group == other,
             _ => false,
         }
     }
@@ -540,6 +613,52 @@ impl Waiting {
         let wanted = |request: &Request| request.kinds().contains(&kind) && who.is_none_or(|who| who.matches(&request.sender));
         let found = self.requests.iter().rposition(wanted)?;
         Some(self.requests.remove(found))
+    }
+
+    /// The invitations `who` names, oldest first: by the UUID of the group
+    /// or of the inviter, by the group's whole name in any letter case, or
+    /// by the inviter's name in one of the forms of an entry. Every
+    /// invitation without `who`.
+    pub fn invitations(&self, who: Option<&str>) -> Vec<&Request> {
+        let named = |request: &&Request| {
+            let (Ask::Group { group, name, .. }, Sender::Inviter { name: inviter, id, .. }) = (&request.ask, &request.sender) else {
+                return false;
+            };
+            let Some(who) = who.map(str::trim) else {
+                return true;
+            };
+            if let Ok(wanted) = Uuid::parse_str(who) {
+                return *group == wanted || *id == Some(wanted);
+            }
+            let by_group = name.as_ref().is_some_and(|name| name.to_lowercase() == who.to_lowercase());
+            let by_inviter = full_name(who).is_some_and(|key| full_name(inviter) == Some(key));
+            by_group || by_inviter
+        };
+        self.requests.iter().filter(named).collect()
+    }
+
+    /// Takes out the invitation into `group`.
+    pub fn take_invitation(&mut self, group: Uuid) -> Option<Request> {
+        let at = self
+            .requests
+            .iter()
+            .position(|request| matches!(request.ask, Ask::Group { group: g, .. } if g == group))?;
+        Some(self.requests.remove(at))
+    }
+
+    /// The avatar is in these groups: their invitations are of no use.
+    /// Returns the ones forgotten.
+    pub fn forget_invitations(&mut self, groups: &[Uuid]) -> Vec<Request> {
+        let (gone, kept) = std::mem::take(&mut self.requests)
+            .into_iter()
+            .partition(|request| matches!(request.ask, Ask::Group { group, .. } if groups.contains(&group)));
+        self.requests = kept;
+        gone
+    }
+
+    /// The waiting invitations, oldest first.
+    pub fn all_invitations(&self) -> Vec<&Request> {
+        self.invitations(None)
     }
 
     /// A script asks anew: what it asked before is no longer open.
@@ -621,10 +740,89 @@ pub(crate) mod tests {
         rules
     }
 
+    fn builders() -> Uuid {
+        Uuid::from_bytes([0xB1; 16])
+    }
+
+    fn inviter(name: &str, id: Option<Uuid>) -> Sender {
+        Sender::Inviter {
+            name: name.to_string(),
+            id,
+            group: builders(),
+        }
+    }
+
+    fn invitation(name: &str, id: Option<Uuid>, group_name: Option<&str>, fee: i32) -> Request {
+        let ask = Ask::Group {
+            group: builders(),
+            id: Uuid::from_bytes([0x1D; 16]),
+            fee,
+            name: group_name.map(str::to_string),
+        };
+        Request::new(inviter(name, id), ask)
+    }
+
+    #[test]
+    fn an_invitation_is_matched_by_its_group_or_its_inviter() {
+        let john = Uuid::from_bytes([0x34; 16]);
+        // The group by UUID, whoever invites.
+        assert!(entry(&builders().to_string()).matches(&inviter("John Roe", Some(john))));
+        assert!(entry(&builders().to_string()).matches(&inviter("John Roe", None)));
+        // The inviter by UUID, once known, and by name.
+        assert!(entry(&jane().to_string()).matches(&inviter("Jane Doe", Some(jane()))));
+        assert!(!entry(&jane().to_string()).matches(&inviter("Jane Doe", None)));
+        assert!(entry("jane.doe").matches(&inviter("Jane Doe", None)));
+        assert!(entry("sitbot").matches(&inviter("sitbot Resident", None)));
+        // A group named like an avatar matches nothing of that name.
+        assert!(!entry("Jane Doe").matches(&inviter("John Roe", Some(john))));
+        assert_eq!(invitation("Jane Doe", None, None, 0).kinds(), [Kind::Group]);
+    }
+
+    #[test]
+    fn an_invitation_is_described_with_its_group_inviter_and_fee() {
+        let request = invitation("Jane Doe", Some(jane()), Some("Builders"), 250);
+        let described = request.describe();
+        assert!(described.contains("Jane Doe") && described.contains("\"Builders\"") && described.contains("L$250"));
+        assert_eq!(
+            request.accept_command(),
+            format!("rslbot ctl accept group {} --pay 250", builders())
+        );
+        assert_eq!(
+            request.status_line(),
+            format!("waiting: group from Jane Doe <{}>: \"Builders\" <{}>, L$250", jane(), builders())
+        );
+        let free = invitation("Jane Doe", None, None, 0);
+        assert_eq!(free.accept_command(), format!("rslbot ctl accept group {}", builders()));
+        assert_eq!(
+            free.status_line(),
+            format!("waiting: group from Jane Doe: the group {}", builders())
+        );
+    }
+
+    #[test]
+    fn invitations_are_found_by_what_names_them() {
+        let mut waiting = Waiting::default();
+        waiting.push(invitation("Jane Doe", Some(jane()), Some("Builders"), 0));
+        let named = |waiting: &Waiting, who: Option<&str>| waiting.invitations(who).len();
+        assert_eq!(named(&waiting, None), 1);
+        assert_eq!(named(&waiting, Some("builders")), 1);
+        assert_eq!(named(&waiting, Some("Build")), 0);
+        assert_eq!(named(&waiting, Some(&builders().to_string())), 1);
+        assert_eq!(named(&waiting, Some(&jane().to_string())), 1);
+        assert_eq!(named(&waiting, Some("jane.doe")), 1);
+        assert_eq!(named(&waiting, Some("John Roe")), 0);
+        // A newer invitation into the same group takes its place.
+        waiting.push(invitation("John Roe", None, Some("Builders"), 0));
+        assert_eq!(named(&waiting, None), 1);
+        assert_eq!(named(&waiting, Some("John Roe")), 1);
+        assert_eq!(waiting.forget_invitations(&[builders()]).len(), 1);
+        assert_eq!(waiting.len(), 0);
+    }
+
     #[test]
     fn kinds_have_names_and_an_order() {
         let names: Vec<&str> = Kind::ALL.into_iter().map(Kind::name).collect();
-        assert_eq!(names, ["tp", "inventory", "anim", "attach", "controls", "camera"]);
+        assert_eq!(names, ["tp", "inventory", "anim", "attach", "controls", "camera", "group"]);
         assert_eq!(Kind::parse("anim"), Some(Kind::Anim));
         assert_eq!(Kind::parse("money"), None);
         assert_eq!(Kind::parse("Anim"), None);
@@ -832,7 +1030,7 @@ pub(crate) mod tests {
              anim: all except 01234567-9abc-defe-dcba-987654321000\n\
              attach: none\n\
              controls: none\n\
-             camera: none"
+             camera: none\ngroup: none"
         );
         rules.set_rule(Kind::Tp, Rule::List(vec![entry("Jane Doe"), Entry::Id(ball())]));
         rules.set_exceptions(Kind::Tp, vec![entry("John Roe"), entry("sitbot")]);

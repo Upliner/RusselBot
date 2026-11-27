@@ -3,6 +3,7 @@
 //! little-endian; strings are `Variable 1` with a trailing NUL.
 
 use super::packet::{high, low, medium, MessageId};
+use crate::groups::{Membership, Profile};
 use std::fmt;
 use uuid::Uuid;
 
@@ -89,6 +90,17 @@ pub const PAY_PRICE_REPLY: MessageId = low(162);
 pub const MONEY_TRANSFER_REQUEST: MessageId = low(311);
 pub const MONEY_BALANCE_REQUEST: MessageId = low(313);
 pub const MONEY_BALANCE_REPLY: MessageId = low(314);
+pub const JOIN_GROUP_REQUEST: MessageId = low(343);
+pub const JOIN_GROUP_REPLY: MessageId = low(344);
+pub const LEAVE_GROUP_REQUEST: MessageId = low(347);
+pub const LEAVE_GROUP_REPLY: MessageId = low(348);
+pub const INVITE_GROUP_REQUEST: MessageId = low(349);
+pub const GROUP_PROFILE_REQUEST: MessageId = low(351);
+pub const GROUP_PROFILE_REPLY: MessageId = low(352);
+pub const ACTIVATE_GROUP: MessageId = low(368);
+pub const AGENT_DATA_UPDATE_REQUEST: MessageId = low(386);
+pub const AGENT_GROUP_DATA_UPDATE: MessageId = low(389);
+pub const AGENT_DROP_GROUP: MessageId = low(390);
 
 pub type Vector3 = [f32; 3];
 
@@ -173,6 +185,17 @@ pub fn name(id: MessageId) -> String {
         MONEY_TRANSFER_REQUEST => "MoneyTransferRequest",
         MONEY_BALANCE_REQUEST => "MoneyBalanceRequest",
         MONEY_BALANCE_REPLY => "MoneyBalanceReply",
+        JOIN_GROUP_REQUEST => "JoinGroupRequest",
+        JOIN_GROUP_REPLY => "JoinGroupReply",
+        LEAVE_GROUP_REQUEST => "LeaveGroupRequest",
+        LEAVE_GROUP_REPLY => "LeaveGroupReply",
+        INVITE_GROUP_REQUEST => "InviteGroupRequest",
+        GROUP_PROFILE_REQUEST => "GroupProfileRequest",
+        GROUP_PROFILE_REPLY => "GroupProfileReply",
+        ACTIVATE_GROUP => "ActivateGroup",
+        AGENT_DATA_UPDATE_REQUEST => "AgentDataUpdateRequest",
+        AGENT_GROUP_DATA_UPDATE => "AgentGroupDataUpdate",
+        AGENT_DROP_GROUP => "AgentDropGroup",
         0..=0xFE => return format!("High {id}"),
         0xFF00..=0xFFFE => return format!("Medium {}", id & 0xFF),
         _ => return format!("Low {}", id & 0xFFFF),
@@ -403,6 +426,19 @@ pub const IM_TELEPORT_REQUEST: u8 = 26;
 pub const IM_INVENTORY_OFFERED: u8 = 4;
 /// Instant-message dialog: an object offers an inventory item or folder.
 pub const IM_TASK_INVENTORY_OFFERED: u8 = 9;
+/// Instant-message dialog: an invitation to join a group. `AgentID` is the
+/// group, `ID` what the answer names, the bucket the fee and the role.
+pub const IM_GROUP_INVITATION: u8 = 3;
+/// Instant-message dialog: the viewer starts a group's chat session.
+pub const IM_SESSION_GROUP_START: u8 = 15;
+/// Instant-message dialog: a line of a group's or a conference's chat.
+pub const IM_SESSION_SEND: u8 = 17;
+/// Instant-message dialog: a group notice.
+pub const IM_GROUP_NOTICE: u8 = 32;
+/// Instant-message dialog: the answer that accepts a group invitation.
+pub const IM_GROUP_INVITATION_ACCEPT: u8 = 35;
+/// Instant-message dialog: the answer that declines a group invitation.
+pub const IM_GROUP_INVITATION_DECLINE: u8 = 36;
 /// TeleportFlags: the teleport answers an offer.
 const TELEPORT_VIA_LURE: u32 = 1 << 2;
 
@@ -432,6 +468,14 @@ pub fn inventory_accepted(
     folder: Uuid,
 ) -> Outgoing {
     instant_message_with(agent, from_name, to, position, offered + 1, transaction, "", folder.as_bytes())
+}
+
+/// ImprovedInstantMessage, Low 254, Zerocoded, to a group: the recipient
+/// is the group, as a viewer sends the start of a group's chat session
+/// (with the group as `id`), a line in it, and the answers to an
+/// invitation (with the invitation's `id`); the bucket is empty.
+pub fn group_instant_message(agent: &Agent, from_name: &str, group: Uuid, position: Vector3, dialog: u8, id: Uuid, text: &str) -> Outgoing {
+    instant_message_with(agent, from_name, group, position, dialog, id, text, &[0])
 }
 
 /// ImprovedInstantMessage with the id and the binary bucket given.
@@ -483,6 +527,44 @@ pub fn request_object_properties_family(agent: &Agent, object: Uuid) -> Outgoing
         .u32(0) // RequestFlags
         .uuid(object)
         .finish(REQUEST_OBJECT_PROPERTIES_FAMILY, true)
+}
+
+/// AgentDataUpdateRequest, Low 386: asks for the active group and the
+/// list of the avatar's groups, as a viewer does after login and a join.
+pub fn agent_data_update_request(agent: &Agent) -> Outgoing {
+    Writer::agent(agent).finish(AGENT_DATA_UPDATE_REQUEST, false)
+}
+
+/// ActivateGroup, Low 368, Zerocoded: GroupID, nil for none.
+pub fn activate_group(agent: &Agent, group: Uuid) -> Outgoing {
+    Writer::agent(agent).uuid(group).finish(ACTIVATE_GROUP, true)
+}
+
+/// InviteGroupRequest, Low 349: GroupID, then InviteData Variable
+/// { InviteeID, RoleID }, one block, the role nil for Everyone.
+pub fn invite_group_request(agent: &Agent, group: Uuid, invitee: Uuid) -> Outgoing {
+    Writer::agent(agent)
+        .uuid(group)
+        .u8(1)
+        .uuid(invitee)
+        .uuid(Uuid::nil())
+        .finish(INVITE_GROUP_REQUEST, false)
+}
+
+/// GroupProfileRequest, Low 351: GroupID. Answered with GroupProfileReply.
+pub fn group_profile_request(agent: &Agent, group: Uuid) -> Outgoing {
+    Writer::agent(agent).uuid(group).finish(GROUP_PROFILE_REQUEST, false)
+}
+
+/// JoinGroupRequest, Low 343, Zerocoded: GroupID. Answered with
+/// JoinGroupReply.
+pub fn join_group_request(agent: &Agent, group: Uuid) -> Outgoing {
+    Writer::agent(agent).uuid(group).finish(JOIN_GROUP_REQUEST, true)
+}
+
+/// LeaveGroupRequest, Low 347: GroupID. Answered with LeaveGroupReply.
+pub fn leave_group_request(agent: &Agent, group: Uuid) -> Outgoing {
+    Writer::agent(agent).uuid(group).finish(LEAVE_GROUP_REQUEST, false)
 }
 
 /// The transaction type of a gift of money to an avatar.
@@ -989,6 +1071,8 @@ pub enum Incoming {
         from_agent: Uuid,
         /// The sender is a group: the owner of the object that sent it.
         from_group: bool,
+        /// The recipient: the avatar, or the group of a group's session.
+        to: Uuid,
         from_name: String,
         dialog: u8,
         /// Meaning depends on `dialog`; the object for an object's IM.
@@ -1058,6 +1142,29 @@ pub enum Incoming {
     },
     /// The avatar's balance, alone or with a transaction of the avatar.
     MoneyBalanceReply(MoneyReport),
+    /// The avatar's active group, with its title and the group's name;
+    /// a nil group for none.
+    AgentDataUpdate {
+        active: Uuid,
+        title: String,
+        group_name: String,
+    },
+    /// The groups the avatar is in.
+    AgentGroupDataUpdate(Vec<Membership>),
+    /// The avatar is no longer in this group.
+    AgentDropGroup(Uuid),
+    /// A group's profile, in answer to GroupProfileRequest.
+    GroupProfileReply(Profile),
+    /// The answer to JoinGroupRequest.
+    JoinGroupReply {
+        group: Uuid,
+        success: bool,
+    },
+    /// The answer to LeaveGroupRequest.
+    LeaveGroupReply {
+        group: Uuid,
+        success: bool,
+    },
     /// What an object offers to be paid, in answer to RequestPayPrice.
     PayPriceReply {
         object: Uuid,
@@ -1276,7 +1383,8 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
             let from_agent = r.uuid()?;
             r.skip(16)?;
             let from_group = r.u8()? != 0;
-            r.skip(16 + 4 + 16 + 12)?;
+            let to = r.uuid()?;
+            r.skip(4 + 16 + 12)?;
             let (offline, dialog) = (r.u8()? != 0, r.u8()?);
             let (id, timestamp) = (r.uuid()?, r.u32()?);
             let from_name = text(r.variable1()?);
@@ -1284,6 +1392,7 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
             Incoming::InstantMessage {
                 from_agent,
                 from_group,
+                to,
                 from_name,
                 dialog,
                 id,
@@ -1463,6 +1572,96 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
                 description,
                 info,
             })
+        }
+        // AgentDataUpdate, Low 387: AgentID, FirstName Variable 1,
+        // LastName Variable 1, GroupTitle Variable 1, ActiveGroupID,
+        // GroupPowers U64, GroupName Variable 1.
+        AGENT_DATA_UPDATE => {
+            r.skip(16)?;
+            r.variable1()?;
+            r.variable1()?;
+            let title = text(r.variable1()?);
+            let active = r.uuid()?;
+            r.skip(8)?;
+            Incoming::AgentDataUpdate {
+                active,
+                title,
+                group_name: text(r.variable1()?),
+            }
+        }
+        // AgentGroupDataUpdate, Low 389: AgentID, then GroupData Variable
+        // { GroupID, GroupPowers U64, AcceptNotices BOOL, GroupInsigniaID,
+        //   Contribution S32, GroupName Variable 1 }.
+        AGENT_GROUP_DATA_UPDATE => {
+            r.skip(16)?;
+            let count = r.u8()?;
+            let mut groups = Vec::with_capacity(usize::from(count));
+            for _ in 0..count {
+                let id = r.uuid()?;
+                let powers = r.u64()?;
+                let notices = r.u8()? != 0;
+                r.skip(16 + 4)?;
+                let name = text(r.variable1()?);
+                groups.push(Membership { id, name, powers, notices });
+            }
+            Incoming::AgentGroupDataUpdate(groups)
+        }
+        // AgentDropGroup, Low 390: AgentID, GroupID.
+        AGENT_DROP_GROUP => {
+            r.skip(16)?;
+            Incoming::AgentDropGroup(r.uuid()?)
+        }
+        // GroupProfileReply, Low 352: AgentID, then GroupID, Name Variable
+        // 1, Charter Variable 2, ShowInList BOOL, MemberTitle Variable 1,
+        // PowersMask U64, InsigniaID, FounderID, MembershipFee S32,
+        // OpenEnrollment BOOL, Money S32, GroupMembershipCount S32,
+        // GroupRolesCount S32, AllowPublish BOOL, MaturePublish BOOL,
+        // OwnerRole.
+        GROUP_PROFILE_REPLY => {
+            r.skip(16)?;
+            let id = r.uuid()?;
+            let name = text(r.variable1()?);
+            let charter = text(r.variable2()?);
+            let listed = r.u8()? != 0;
+            let title = text(r.variable1()?);
+            r.skip(8 + 16)?;
+            let founder = r.uuid()?;
+            let fee = r.u32()? as i32;
+            let open = r.u8()? != 0;
+            r.skip(4)?;
+            let members = r.u32()? as i32;
+            let roles = r.u32()? as i32;
+            r.skip(1)?;
+            let mature = r.u8()? != 0;
+            Incoming::GroupProfileReply(Profile {
+                id,
+                name,
+                charter,
+                listed,
+                title,
+                founder,
+                fee,
+                open,
+                members,
+                roles,
+                mature,
+            })
+        }
+        // JoinGroupReply, Low 344: AgentID, then GroupID, Success BOOL.
+        JOIN_GROUP_REPLY => {
+            r.skip(16)?;
+            Incoming::JoinGroupReply {
+                group: r.uuid()?,
+                success: r.u8()? != 0,
+            }
+        }
+        // LeaveGroupReply, Low 348: AgentID, then GroupID, Success BOOL.
+        LEAVE_GROUP_REPLY => {
+            r.skip(16)?;
+            Incoming::LeaveGroupReply {
+                group: r.uuid()?,
+                success: r.u8()? != 0,
+            }
         }
         // PayPriceReply, Low 162: ObjectID, DefaultPayPrice S32, then
         // ButtonData Variable { PayButton S32 }.
@@ -1755,6 +1954,114 @@ pub mod testing {
         message: &str,
     ) -> Vec<u8> {
         instant_message_with_bucket(from_agent, false, from_name, dialog, id, stored, message, &[0])
+    }
+
+    /// An ImprovedInstantMessage to `to`, as a group's session line, an
+    /// invitation or a notice comes: the sender's group flag, the id and
+    /// the binary bucket given.
+    #[allow(clippy::too_many_arguments)]
+    pub fn group_im(
+        from_agent: Uuid,
+        from_group: bool,
+        to: Uuid,
+        from_name: &str,
+        dialog: u8,
+        id: Uuid,
+        message: &str,
+        bucket: &[u8],
+    ) -> Vec<u8> {
+        let mut body = instant_message_with_bucket(from_agent, from_group, from_name, dialog, id, None, message, bucket);
+        body[33..49].copy_from_slice(to.as_bytes());
+        body
+    }
+
+    /// The capture under the heading that starts with `heading` in
+    /// test-rig/captures/groups.txt: hex for a UDP body, LLSD for an event.
+    pub fn capture(heading: &str) -> &'static str {
+        let file = include_str!("../../test-rig/captures/groups.txt");
+        let start = file
+            .find(&format!("## {heading}"))
+            .unwrap_or_else(|| panic!("no capture {heading}"));
+        let after = &file[start..];
+        after.lines().nth(1).expect("a capture under its heading")
+    }
+
+    /// A hex capture as bytes.
+    pub fn captured_bytes(heading: &str) -> Vec<u8> {
+        let hex = capture(heading);
+        (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// AgentDataUpdate: the active group, its title and name.
+    pub fn agent_data_update(agent: Uuid, active: Uuid, title: &str, group_name: &str) -> Vec<u8> {
+        let mut body = agent.as_bytes().to_vec();
+        body.extend(string1("Sit"));
+        body.extend(string1("Bot"));
+        body.extend(string1(title));
+        body.extend(active.as_bytes());
+        body.extend(0x1234u64.to_le_bytes());
+        body.extend(string1(group_name));
+        body
+    }
+
+    /// AgentGroupDataUpdate with these groups.
+    pub fn agent_group_data_update(agent: Uuid, groups: &[crate::groups::Membership]) -> Vec<u8> {
+        let mut body = agent.as_bytes().to_vec();
+        body.push(groups.len() as u8);
+        for group in groups {
+            body.extend(group.id.as_bytes());
+            body.extend(group.powers.to_le_bytes());
+            body.push(u8::from(group.notices));
+            body.extend([0x11; 16]); // GroupInsigniaID
+            body.extend(0i32.to_le_bytes()); // Contribution
+            body.extend(string1(&group.name));
+        }
+        body
+    }
+
+    /// AgentDropGroup.
+    pub fn agent_drop_group(agent: Uuid, group: Uuid) -> Vec<u8> {
+        let mut body = agent.as_bytes().to_vec();
+        body.extend(group.as_bytes());
+        body
+    }
+
+    /// GroupProfileReply for this profile.
+    pub fn group_profile_reply(agent: Uuid, profile: &crate::groups::Profile) -> Vec<u8> {
+        let mut body = agent.as_bytes().to_vec();
+        body.extend(profile.id.as_bytes());
+        body.extend(string1(&profile.name));
+        body.extend(string2(&profile.charter));
+        body.push(u8::from(profile.listed));
+        body.extend(string1(&profile.title));
+        body.extend(0xFFu64.to_le_bytes()); // PowersMask
+        body.extend([0x22; 16]); // InsigniaID
+        body.extend(profile.founder.as_bytes());
+        body.extend(profile.fee.to_le_bytes());
+        body.push(u8::from(profile.open));
+        body.extend(0i32.to_le_bytes()); // Money
+        body.extend(profile.members.to_le_bytes());
+        body.extend(profile.roles.to_le_bytes());
+        body.push(1); // AllowPublish
+        body.push(u8::from(profile.mature));
+        body.extend([0x33; 16]); // OwnerRole
+        body
+    }
+
+    /// JoinGroupReply.
+    pub fn join_group_reply(agent: Uuid, group: Uuid, success: bool) -> Vec<u8> {
+        let mut body = agent.as_bytes().to_vec();
+        body.extend(group.as_bytes());
+        body.push(u8::from(success));
+        body
+    }
+
+    /// LeaveGroupReply, laid out as JoinGroupReply is.
+    pub fn leave_group_reply(agent: Uuid, group: Uuid, success: bool) -> Vec<u8> {
+        join_group_reply(agent, group, success)
     }
 
     /// An ImprovedInstantMessage with the sender's group flag and the
@@ -2810,12 +3117,342 @@ mod tests {
         assert_eq!(decode(low(139), &body[..body.len() - 1]), Err(DecodeError));
     }
 
+    fn group_agent() -> Agent {
+        Agent {
+            agent_id: Uuid::from_bytes([0xA1; 16]),
+            session_id: Uuid::from_bytes([0x5E; 16]),
+        }
+    }
+
+    #[test]
+    fn group_requests_have_their_templates_layout() {
+        let agent = group_agent();
+        let (group, jane) = (Uuid::from_bytes([0xB1; 16]), Uuid::from_bytes([0x33; 16]));
+        let head = [agent.agent_id.as_bytes().as_slice(), agent.session_id.as_bytes()].concat();
+        let request = agent_data_update_request(&agent);
+        assert_eq!((request.id, request.zerocoded, &request.body), (low(386), false, &head));
+        let activate = activate_group(&agent, group);
+        assert_eq!((activate.id, activate.zerocoded), (low(368), true));
+        assert_eq!(activate.body, [head.as_slice(), group.as_bytes()].concat());
+        assert_eq!(activate_group(&agent, Uuid::nil()).body[32..], [0; 16]);
+        let invite = invite_group_request(&agent, group, jane);
+        assert_eq!((invite.id, invite.zerocoded), (low(349), false));
+        let mut wanted = head.clone();
+        wanted.extend(group.as_bytes());
+        wanted.push(1);
+        wanted.extend(jane.as_bytes());
+        wanted.extend([0; 16]); // Everyone
+        assert_eq!(invite.body, wanted);
+        let profile = group_profile_request(&agent, group);
+        assert_eq!((profile.id, profile.zerocoded), (low(351), false));
+        assert_eq!(profile.body, [head.as_slice(), group.as_bytes()].concat());
+        let join = join_group_request(&agent, group);
+        assert_eq!((join.id, join.zerocoded), (low(343), true));
+        assert_eq!(join.body, [head.as_slice(), group.as_bytes()].concat());
+        let leave = leave_group_request(&agent, group);
+        assert_eq!((leave.id, leave.zerocoded), (low(347), false));
+        assert_eq!(leave.body, [head.as_slice(), group.as_bytes()].concat());
+        for id in [
+            low(343),
+            low(344),
+            low(347),
+            low(348),
+            low(349),
+            low(351),
+            low(352),
+            low(368),
+            low(386),
+            low(387),
+            low(389),
+            low(390),
+        ] {
+            assert!(!name(id).starts_with("Low "), "{id:#x} has no name");
+        }
+    }
+
+    #[test]
+    fn a_group_instant_message_goes_to_the_group() {
+        let agent = group_agent();
+        let (group, invitation) = (Uuid::from_bytes([0xB1; 16]), Uuid::from_bytes([0x1D; 16]));
+        let start = group_instant_message(&agent, "Sit Bot", group, [1.0, 2.0, 3.0], IM_SESSION_GROUP_START, group, "");
+        assert_eq!((start.id, start.zerocoded), (IMPROVED_INSTANT_MESSAGE, true));
+        // As the simulator delivers it, the recipient and id are the group.
+        let Ok(Incoming::InstantMessage {
+            from_agent,
+            from_group,
+            to,
+            dialog,
+            id,
+            text,
+            bucket,
+            from_name,
+            ..
+        }) = decode(IMPROVED_INSTANT_MESSAGE, &start.body)
+        else {
+            panic!("not an instant message")
+        };
+        assert_eq!((from_agent, from_group, to, dialog, id), (agent.agent_id, false, group, 15, group));
+        assert_eq!((from_name.as_str(), text.as_str(), bucket), ("Sit Bot", "", vec![0]));
+        let line = group_instant_message(&agent, "Sit Bot", group, [0.0; 3], IM_SESSION_SEND, group, "hello");
+        assert!(matches!(
+            decode(IMPROVED_INSTANT_MESSAGE, &line.body),
+            Ok(Incoming::InstantMessage { dialog: 17, ref text, .. }) if text == "hello"
+        ));
+        for (dialog, wanted) in [(IM_GROUP_INVITATION_ACCEPT, 35), (IM_GROUP_INVITATION_DECLINE, 36)] {
+            let answer = group_instant_message(&agent, "name", group, [0.0; 3], dialog, invitation, "message");
+            let Ok(Incoming::InstantMessage {
+                to,
+                dialog,
+                id,
+                from_name,
+                text,
+                ..
+            }) = decode(IMPROVED_INSTANT_MESSAGE, &answer.body)
+            else {
+                panic!("not an instant message")
+            };
+            assert_eq!((to, dialog, id), (group, wanted, invitation));
+            assert_eq!((from_name.as_str(), text.as_str()), ("name", "message"));
+        }
+        assert_eq!((IM_GROUP_INVITATION, IM_GROUP_NOTICE), (3, 32));
+    }
+
+    #[test]
+    fn decodes_the_groups_of_the_avatar() {
+        use crate::groups::Membership;
+        let agent = Uuid::from_bytes([0xA1; 16]);
+        let groups = vec![
+            Membership {
+                id: Uuid::from_bytes([0xB1; 16]),
+                name: "Builders".into(),
+                powers: 0x0000_0001_0000_0002,
+                notices: true,
+            },
+            Membership {
+                id: Uuid::from_bytes([0xD1; 16]),
+                name: "Dancers".into(),
+                powers: 0,
+                notices: false,
+            },
+        ];
+        let body = agent_group_data_update(agent, &groups);
+        assert_eq!(
+            decode(AGENT_GROUP_DATA_UPDATE, &body),
+            Ok(Incoming::AgentGroupDataUpdate(groups.clone()))
+        );
+        assert_eq!(
+            decode(AGENT_GROUP_DATA_UPDATE, &agent_group_data_update(agent, &[])),
+            Ok(Incoming::AgentGroupDataUpdate(vec![]))
+        );
+        assert_eq!(decode(AGENT_GROUP_DATA_UPDATE, &body[..40]), Err(DecodeError));
+        assert_eq!(
+            decode(AGENT_DROP_GROUP, &agent_drop_group(agent, groups[1].id)),
+            Ok(Incoming::AgentDropGroup(groups[1].id))
+        );
+        assert_eq!(
+            decode(
+                AGENT_DATA_UPDATE,
+                &agent_data_update(agent, groups[0].id, "Master builder", "Builders")
+            ),
+            Ok(Incoming::AgentDataUpdate {
+                active: groups[0].id,
+                title: "Master builder".into(),
+                group_name: "Builders".into(),
+            })
+        );
+        assert_eq!(
+            decode(AGENT_DATA_UPDATE, &agent_data_update(agent, Uuid::nil(), "", "")),
+            Ok(Incoming::AgentDataUpdate {
+                active: Uuid::nil(),
+                title: String::new(),
+                group_name: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn decodes_a_groups_profile_and_a_join() {
+        let agent = Uuid::from_bytes([0xA1; 16]);
+        let profile = crate::groups::Profile {
+            id: Uuid::from_bytes([0xB1; 16]),
+            name: "Builders".into(),
+            charter: "We build.\nTogether.".into(),
+            listed: true,
+            title: "Officer".into(),
+            founder: Uuid::from_bytes([0x33; 16]),
+            fee: 250,
+            open: true,
+            members: 12,
+            roles: 3,
+            mature: false,
+        };
+        let body = group_profile_reply(agent, &profile);
+        assert_eq!(decode(GROUP_PROFILE_REPLY, &body), Ok(Incoming::GroupProfileReply(profile.clone())));
+        assert_eq!(decode(GROUP_PROFILE_REPLY, &body[..body.len() - 20]), Err(DecodeError));
+        assert_eq!(
+            decode(JOIN_GROUP_REPLY, &join_group_reply(agent, profile.id, true)),
+            Ok(Incoming::JoinGroupReply {
+                group: profile.id,
+                success: true
+            })
+        );
+        assert_eq!(
+            decode(JOIN_GROUP_REPLY, &join_group_reply(agent, profile.id, false)),
+            Ok(Incoming::JoinGroupReply {
+                group: profile.id,
+                success: false
+            })
+        );
+        assert_eq!(
+            decode(LEAVE_GROUP_REPLY, &leave_group_reply(agent, profile.id, false)),
+            Ok(Incoming::LeaveGroupReply {
+                group: profile.id,
+                success: false
+            })
+        );
+        assert_eq!(decode(LEAVE_GROUP_REPLY, &[0; 32]), Err(DecodeError));
+    }
+
+    #[test]
+    fn an_instant_message_keeps_its_recipient() {
+        let (group, jane) = (Uuid::from_bytes([0xB1; 16]), Uuid::from_bytes([0x33; 16]));
+        let body = group_im(jane, false, group, "Jane Doe", IM_SESSION_SEND, group, "hello", b"Builders\0");
+        let Ok(Incoming::InstantMessage { to, from_agent, id, .. }) = decode(IMPROVED_INSTANT_MESSAGE, &body) else {
+            panic!("not an instant message")
+        };
+        assert_eq!((to, from_agent, id), (group, jane, group));
+    }
+
+    fn rig_uuid(text: &str) -> Uuid {
+        Uuid::parse_str(text).unwrap()
+    }
+
+    #[test]
+    fn decodes_the_group_messages_captured_on_the_rig() {
+        let free = rig_uuid("4328d03e-69ce-4e18-81f4-ccf63ad9607e");
+        let closed = rig_uuid("bb72b94c-49d2-4ec7-a3c3-289e6f828c78");
+        let (owner, alt) = (
+            rig_uuid("7e570000-0000-4000-8000-0000000000aa"),
+            rig_uuid("7e570000-0000-4000-8000-0000000000a1"),
+        );
+        assert_eq!(
+            decode(
+                AGENT_DATA_UPDATE,
+                &captured_bytes("AgentDataUpdate (Low 387), UDP: Alt's active group")
+            ),
+            Ok(Incoming::AgentDataUpdate {
+                active: free,
+                title: "Member of Free".into(),
+                group_name: "Free".into(),
+            })
+        );
+        assert_eq!(
+            decode(
+                AGENT_DATA_UPDATE,
+                &captured_bytes("AgentDataUpdate (Low 387), UDP: no active group")
+            ),
+            Ok(Incoming::AgentDataUpdate {
+                active: Uuid::nil(),
+                title: String::new(),
+                group_name: String::new(),
+            })
+        );
+        let Ok(Incoming::InstantMessage {
+            from_agent,
+            from_group,
+            to,
+            from_name,
+            dialog,
+            id,
+            text,
+            ..
+        }) = decode(
+            IMPROVED_INSTANT_MESSAGE,
+            &captured_bytes("ImprovedInstantMessage (Low 254), UDP, dialog 17:"),
+        )
+        else {
+            panic!("not an instant message")
+        };
+        // OpenSim marks a group's line as from the group, from its speaker.
+        assert_eq!((from_agent, from_group, to, dialog, id), (owner, true, alt, IM_SESSION_SEND, free));
+        assert_eq!((from_name.as_str(), text.as_str()), ("Rig Owner", "capture line two"));
+        let Ok(Incoming::InstantMessage {
+            from_agent,
+            from_group,
+            dialog,
+            text,
+            bucket,
+            ..
+        }) = decode(
+            IMPROVED_INSTANT_MESSAGE,
+            &captured_bytes("ImprovedInstantMessage (Low 254), UDP, dialog 32:"),
+        )
+        else {
+            panic!("not an instant message")
+        };
+        // OpenSim sends a notice from the group, the sender by name only.
+        assert_eq!((from_agent, from_group, dialog), (free, true, IM_GROUP_NOTICE));
+        assert_eq!(Uuid::from_slice(&bucket[2..18]).unwrap(), free);
+        let notice = crate::grouplog::notice(&text, &bucket);
+        assert_eq!(
+            (notice.subject.as_str(), notice.text.as_str(), notice.attachment.as_str()),
+            ("Meeting", "Tonight at eight", "Agenda")
+        );
+        let Ok(Incoming::InstantMessage {
+            from_agent,
+            dialog,
+            id,
+            bucket,
+            from_name,
+            ..
+        }) = decode(
+            IMPROVED_INSTANT_MESSAGE,
+            &captured_bytes("ImprovedInstantMessage (Low 254), UDP, dialog 3:"),
+        )
+        else {
+            panic!("not an instant message")
+        };
+        assert_eq!((from_agent, dialog, from_name.as_str()), (closed, IM_GROUP_INVITATION, "Rig Owner"));
+        assert!(!id.is_nil());
+        // The fee, nothing for Groups V2, and the role.
+        assert_eq!((bucket.len(), &bucket[..4]), (20, &[0u8; 4][..]));
+        assert_eq!(
+            decode(AGENT_DROP_GROUP, &captured_bytes("AgentDropGroup (Low 390)")),
+            Ok(Incoming::AgentDropGroup(free))
+        );
+        let Ok(Incoming::GroupProfileReply(profile)) = decode(GROUP_PROFILE_REPLY, &captured_bytes("GroupProfileReply (Low 352)")) else {
+            panic!("not a profile")
+        };
+        assert_eq!((profile.id, profile.name.as_str(), profile.founder), (free, "Free", owner));
+        assert_eq!((profile.fee, profile.open, profile.members, profile.roles), (0, true, 3, 3));
+        assert_eq!(
+            (profile.title.as_str(), profile.charter.as_str(), profile.listed),
+            ("Member of Free", "A group of the rig.", true)
+        );
+        assert_eq!(
+            decode(JOIN_GROUP_REPLY, &captured_bytes("JoinGroupReply (Low 344)")),
+            Ok(Incoming::JoinGroupReply {
+                group: free,
+                success: true
+            })
+        );
+        let leavers = Uuid::parse_str("e5fb4ab5-efcb-4c4a-9b58-656d65bbaaf1").unwrap();
+        assert_eq!(
+            decode(LEAVE_GROUP_REPLY, &captured_bytes("LeaveGroupReply (Low 348)")),
+            Ok(Incoming::LeaveGroupReply {
+                group: leavers,
+                success: true
+            })
+        );
+    }
+
     #[test]
     fn decodes_improved_instant_message() {
         let (sender, session, object) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]), Uuid::from_bytes([3; 16]));
         let im = |dialog, id, offline, timestamp, from_name: &str, text: &str| Incoming::InstantMessage {
             from_agent: sender,
             from_group: false,
+            to: Uuid::nil(),
             from_name: from_name.into(),
             dialog,
             id,

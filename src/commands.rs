@@ -23,6 +23,7 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+mod group;
 mod pay;
 
 pub use pay::descriptions_blocked;
@@ -351,6 +352,31 @@ pub trait Grid {
     /// root takes money; `None` for an object the simulator has not
     /// described.
     fn money_target(&self, object: Uuid) -> Option<(Uuid, bool)>;
+    /// Makes `group` the active group, nil for none; the grid's answer
+    /// comes as `Commands::active_group`.
+    fn activate_group(&mut self, group: Uuid, now: Instant) -> Result<(), String>;
+    /// Invites `avatar` into `group`, into its role Everyone.
+    fn invite_to_group(&mut self, group: Uuid, avatar: Uuid, now: Instant) -> Result<(), String>;
+    /// Asks for `group`'s profile; the answer comes as
+    /// `Commands::group_profile`.
+    fn ask_group_profile(&mut self, group: Uuid, now: Instant) -> Result<(), String>;
+    /// Asks to join `group`; the answer comes as `Commands::joined`.
+    fn join_group(&mut self, group: Uuid, now: Instant) -> Result<(), String>;
+    /// Asks to leave `group`; the answer comes as `Commands::left`.
+    fn leave_group(&mut self, group: Uuid, now: Instant) -> Result<(), String>;
+    /// Asks for the avatar's groups; the list comes as
+    /// `Commands::groups_listed`.
+    fn ask_groups(&mut self, now: Instant) -> Result<(), String>;
+    /// Accepts or declines the invitation `id` into `group`.
+    fn answer_invitation(&mut self, group: Uuid, id: Uuid, accept: bool, now: Instant) -> Result<(), String>;
+    /// Asks to enter `group`'s chat session; the answer comes as
+    /// `Commands::group_session`.
+    fn start_group_session(&mut self, group: Uuid, now: Instant) -> Result<(), String>;
+    /// Says `text` in `group`'s chat session.
+    fn group_chat(&mut self, group: Uuid, text: &str, now: Instant) -> Result<(), String>;
+    /// Takes up `group`'s chat session, where the grid has a service for
+    /// that; whether it has.
+    fn take_up_session(&mut self, group: Uuid) -> bool;
 }
 
 /// A `scan` command waiting for the simulator to describe and name the
@@ -558,6 +584,11 @@ enum After {
     RequestTp(String),
     SendTp(String),
     Profile,
+    /// `group invite` into this group, named so.
+    Invite {
+        group: Uuid,
+        words: String,
+    },
 }
 
 impl After {
@@ -567,6 +598,7 @@ impl After {
             After::RequestTp(_) => "requesttp",
             After::SendTp(_) => "sendtp",
             After::Profile => "profile",
+            After::Invite { .. } => "group invite",
         }
     }
 }
@@ -699,6 +731,10 @@ pub struct Commands {
     /// Payments: the settings, the limit, the balance, and the `pay`,
     /// `prices` and `payees` commands that wait.
     money: pay::Money,
+    /// The avatar's groups and what waits for the grid about them.
+    group: group::GroupState,
+    /// The interface the command being carried out came through.
+    via: crate::payments::Interface,
     /// The lines `tell` wrote.
     #[cfg(test)]
     told: Vec<String>,
@@ -789,6 +825,8 @@ impl Commands {
             restoring: Vec::new(),
             gave_up: Vec::new(),
             money: pay::Money::default(),
+            group: group::GroupState::default(),
+            via: crate::payments::Interface::Ctl,
             #[cfg(test)]
             told: Vec::new(),
         }
@@ -847,7 +885,22 @@ impl Commands {
         grid: Option<&mut G>,
         now: Instant,
     ) -> Option<SentIm> {
+        self.handle_through(origin, crate::payments::Interface::Ctl, request, reply, grid, now)
+    }
+
+    /// `handle_from` for a command that came through `via`, which decides
+    /// whether the fee of a group may be paid.
+    pub fn handle_through<G: Grid>(
+        &mut self,
+        origin: Origin,
+        via: crate::payments::Interface,
+        request: Request,
+        reply: Sender<Response>,
+        grid: Option<&mut G>,
+        now: Instant,
+    ) -> Option<SentIm> {
         self.origin = origin;
+        self.via = via;
         let command = request.name();
         let done = match request {
             Request::Say(message) => self.say(&message, grid, now),
@@ -860,7 +913,10 @@ impl Commands {
             Request::AskTp { to, message } => {
                 check_length(&message, MAX_TEXT).and_then(|()| self.with_avatar(&to, After::RequestTp(message), &reply, grid, now))
             }
-            Request::Accept { kind, who } => self.accept_command(&kind, who.as_deref(), &reply, grid, now),
+            Request::Accept { kind, who, pay } if kind == "group" => self.accept_group(who.as_deref(), pay, &reply, grid, now),
+            Request::Accept { kind, who, .. } => self.accept_command(&kind, who.as_deref(), &reply, grid, now),
+            Request::Decline { who } => self.decline_group(who.as_deref(), grid, now),
+            Request::Group(request) => self.group_command(request, &reply, grid, now),
             Request::Perms(request) => self.perms(request),
             Request::SendTp { to, message } => {
                 check_length(&message, MAX_OFFER_TEXT).and_then(|()| self.with_avatar(&to, After::SendTp(message), &reply, grid, now))
@@ -899,6 +955,7 @@ impl Commands {
         };
         let sent = finish(origin, command, done, &reply);
         self.origin = Origin::Operator;
+        self.via = crate::payments::Interface::Ctl;
         sent
     }
 
@@ -2253,6 +2310,7 @@ impl Commands {
                 crate::info!("control: offered {who} a teleport");
                 Ok(Done::Answer(Some(format!("offered {who} a teleport"))))
             }
+            After::Invite { group, words } => self.invite(grid, group, &words, id, &name),
             After::Profile => {
                 grid.ask_profile(id, now)?;
                 self.named(id);
@@ -2279,6 +2337,7 @@ impl Commands {
         now: Instant,
     ) -> Vec<SentIm> {
         self.money_found(query, avatars, grid.as_deref_mut(), now);
+        self.inviter_found(query, avatars, grid.as_deref_mut(), now);
         let mut sent = Vec::new();
         let (answered, waiting) = std::mem::take(&mut self.waiting).into_iter().partition(|w| w.query == query);
         self.waiting = waiting;
@@ -2311,6 +2370,7 @@ impl Commands {
     /// A lookup came to nothing: fails the commands that waited for it.
     pub fn lookup_failed(&mut self, query: Uuid, reason: &str) {
         self.money_lookup_failed(query, reason);
+        self.inviter_lookup_failed(query);
         let (failed, waiting) = std::mem::take(&mut self.waiting).into_iter().partition(|w| w.query == query);
         self.waiting = waiting;
         for command in failed {
@@ -2363,6 +2423,7 @@ impl Commands {
     /// and every teleport offer made to it.
     pub fn session_lost(&mut self) {
         self.money_lost();
+        self.groups_lost();
         for command in std::mem::take(&mut self.waiting) {
             refuse(CONTROL, command.then.command(), &command.reply, NOT_CONNECTED.to_string());
         }
@@ -2425,7 +2486,9 @@ impl Commands {
         };
         let scans = self.scan_poll;
         let money = self.money_deadline();
+        let groups = self.groups_deadline();
         lookups
+            .chain(groups)
             .chain(jobs)
             .chain(filing)
             .chain(undecided)
@@ -2625,6 +2688,7 @@ impl Commands {
                 let granted = perms::permission_names(*mask);
                 Ok(Done::Answer(Some(format!("granted {}: {granted}", request.sender))))
             }
+            Ask::Group { .. } => self.accept_invitation_by_itself(request, grid, now),
             Ask::Inventory { asset_type, .. } => {
                 self.job_ids += 1;
                 let deadline = now + inventory::LIMIT;
@@ -2680,6 +2744,10 @@ impl Commands {
         }
         if granted && script {
             kinds.retain(|kind| !matches!(kind, Kind::Attach | Kind::Controls));
+        }
+        // An invitation that costs L$ is never accepted by itself.
+        if let Some(fee) = request.fee() {
+            return self.wait(request, &format!("waits, as joining costs L${fee}"));
         }
         if let Err(kind) = self.rules.decide(&kinds, &request.sender) {
             let why = match kinds.len() {
@@ -2946,7 +3014,8 @@ impl Commands {
             self.owner_named(*id, None);
             self.settle(&Needs::Name(*id), |_| {}, grid.as_deref_mut(), now);
         }
-        self.money_again(grid, now);
+        self.money_again(grid.as_deref_mut(), now);
+        self.groups_due(grid, now);
     }
 
     /// Decides the requests the grid has not said in time who is behind,
@@ -2959,6 +3028,7 @@ impl Commands {
         for waiting in late {
             self.decide(waiting.request, grid.as_deref_mut(), now);
         }
+        self.groups_due(grid, now);
     }
 }
 
@@ -3177,6 +3247,27 @@ pub(crate) mod tests {
         Pay(Uuid, i32, i32, String),
         /// A question about what this object offers to be paid.
         PayPrice(Uuid),
+        /// `ActivateGroup` with this group, nil for none.
+        Activate(Uuid),
+        /// An invitation into this group of this avatar.
+        Invite(Uuid, Uuid),
+        /// A question about this group's profile.
+        GroupProfile(Uuid),
+        /// `JoinGroupRequest` for this group.
+        Join(Uuid),
+        /// `LeaveGroupRequest` for this group.
+        Leave(Uuid),
+        /// `AgentDataUpdateRequest`, asking for the avatar's groups.
+        AskGroups,
+        /// The answer to an invitation into this group: its id and whether
+        /// it accepts.
+        Answer(Uuid, Uuid, bool),
+        /// The start of this group's chat session.
+        StartSession(Uuid),
+        /// A line said in this group.
+        GroupChat(Uuid, String),
+        /// This group's session taken up.
+        TakeUp(Uuid),
     }
 
     pub(crate) struct FakeGrid {
@@ -3224,6 +3315,8 @@ pub(crate) mod tests {
         /// The objects the simulator has described as far as payments go:
         /// the object, its root, and whether it takes money.
         pub(crate) money: Vec<(Uuid, Uuid, bool)>,
+        /// The simulator has no service for taking chat sessions up.
+        pub(crate) no_chat_sessions: bool,
     }
 
     impl Default for FakeGrid {
@@ -3253,6 +3346,7 @@ pub(crate) mod tests {
                 avatars_known: true,
                 friends: Friends::default(),
                 money: Vec::new(),
+                no_chat_sessions: false,
             }
         }
     }
@@ -3463,6 +3557,58 @@ pub(crate) mod tests {
             self.check()?;
             self.calls.push(Call::Pay(dest, amount, kind, description.to_string()));
             Ok(())
+        }
+        fn activate_group(&mut self, group: Uuid, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::Activate(group));
+            Ok(())
+        }
+        fn invite_to_group(&mut self, group: Uuid, avatar: Uuid, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::Invite(group, avatar));
+            Ok(())
+        }
+        fn ask_group_profile(&mut self, group: Uuid, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::GroupProfile(group));
+            Ok(())
+        }
+        fn join_group(&mut self, group: Uuid, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::Join(group));
+            Ok(())
+        }
+        fn leave_group(&mut self, group: Uuid, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::Leave(group));
+            Ok(())
+        }
+        fn ask_groups(&mut self, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::AskGroups);
+            Ok(())
+        }
+        fn answer_invitation(&mut self, group: Uuid, id: Uuid, accept: bool, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::Answer(group, id, accept));
+            Ok(())
+        }
+        fn start_group_session(&mut self, group: Uuid, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::StartSession(group));
+            Ok(())
+        }
+        fn group_chat(&mut self, group: Uuid, text: &str, _: Instant) -> Result<(), String> {
+            self.check()?;
+            self.calls.push(Call::GroupChat(group, text.to_string()));
+            Ok(())
+        }
+        fn take_up_session(&mut self, group: Uuid) -> bool {
+            if self.no_chat_sessions {
+                return false;
+            }
+            self.calls.push(Call::TakeUp(group));
+            true
         }
         fn request_pay_price(&mut self, object: Uuid, _: Instant) -> Result<(), String> {
             self.check()?;
@@ -3835,6 +3981,7 @@ pub(crate) mod tests {
             self.command(Request::Accept {
                 kind: kind.to_string(),
                 who: who.map(str::to_string),
+                pay: None,
             })
         }
     }
@@ -4667,6 +4814,7 @@ pub(crate) mod tests {
         let request = Request::Accept {
             kind: "anim".to_string(),
             who: None,
+            pay: None,
         };
         rig.commands.handle(request, reply, None::<&mut FakeGrid>, rig.now);
         assert_eq!(error(&answer), NOT_CONNECTED);
@@ -4973,7 +5121,8 @@ pub(crate) mod tests {
                 "anim: none",
                 "attach: none",
                 "controls: none",
-                "camera: none"
+                "camera: none",
+                "group: none"
             ]
         );
         assert!(!rig.commands.take_manual());
@@ -4998,7 +5147,7 @@ pub(crate) mod tests {
         assert_eq!(added, "tp: Jane Doe is auto-accepted");
         let status = run(&mut commands, Request::Perms(PermsRequest::Status));
         assert!(status.starts_with("tp: Jane Doe\ninventory: none\n"), "{status}");
-        assert_eq!(status.lines().count(), 6);
+        assert_eq!(status.lines().count(), 7);
         // The rules outlive a session.
         commands.session_lost();
         assert!(run(&mut commands, Request::Perms(PermsRequest::Status)).starts_with("tp: Jane Doe\n"));
@@ -5023,7 +5172,8 @@ pub(crate) mod tests {
                 "anim: all except 01234567-9abc-defe-dcba-987654321000",
                 "attach: none",
                 "controls: none",
-                "camera: none"
+                "camera: none",
+                "group: none"
             ]
         );
         rig.offer(jane(), "Jane Doe", lure(1));

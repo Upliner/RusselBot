@@ -101,7 +101,7 @@ An option SHALL name a group as "Group chat the avatar sends" says. A blocked li
 - **THEN** the notice is recorded with its subject and text
 
 ### Requirement: Active group under setgroup
-While `setgroup` is in force, `group activate` (see `groups`), with a group or with `none`, SHALL be refused. The restriction SHALL change nothing else: the bot still reads the avatar's groups and their chat, invitations are still accepted and joins still made, and an active group the grid changes by itself, as some grids do when the avatar joins a group, is not undone.
+While `setgroup` is in force, `group activate` (see `groups`), with a group or with `none`, SHALL be refused. The restriction SHALL change nothing else: the bot still reads the avatar's groups and their chat, invitations are still accepted, joins still made and groups still left, the active one included, as viewers allow, and an active group the grid changes by itself, as some grids do when the avatar joins a group, is not undone.
 
 #### Scenario: Group tag locked
 - **WHEN** a collar holds `setgroup` and `rslbot ctl group activate Dancers` is run while `Builders` is active

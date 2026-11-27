@@ -3,7 +3,7 @@
 //! limits on everything. No sockets here: a request is read from any
 //! `Read` and a response is a byte vector, so that all of it can be tested.
 
-use crate::control::Request as Command;
+use crate::control::{GroupRequest, Request as Command};
 use std::io::{ErrorKind, Read};
 use std::time::Duration;
 
@@ -273,6 +273,7 @@ Open it by its IP address, or set `password` in the `[web]` table of the bot's c
 pub fn may_be_own(command: &Command) -> bool {
     match command {
         Command::Friends | Command::Payees => true,
+        Command::Group(GroupRequest::List | GroupRequest::Invitations) => true,
         Command::Scan(args) => args.first().is_some_and(|first| first == "avatars"),
         _ => false,
     }
@@ -643,6 +644,13 @@ mod tests {
         assert!(!may_be_own(&Command::Say("hello".into())));
         assert!(!may_be_own(&Command::Status));
         assert!(!may_be_own(&Command::Quit));
+        assert!(may_be_own(&Command::Group(GroupRequest::List)));
+        assert!(may_be_own(&Command::Group(GroupRequest::Invitations)));
+        assert!(!may_be_own(&Command::Group(GroupRequest::Chat {
+            group: "Builders".into(),
+            text: "hello".into()
+        })));
+        assert!(!may_be_own(&Command::Group(GroupRequest::Info("Builders".into()))));
     }
 
     fn text(response: &Response) -> String {

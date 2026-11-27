@@ -10,6 +10,8 @@ mod config;
 mod control;
 mod escape;
 mod friends;
+mod grouplog;
+mod groups;
 mod inventory;
 mod log;
 mod login;
@@ -38,7 +40,7 @@ mod xmpp;
 use autoreply::Autoreply;
 use commands::{Commands, Grid, SentIm};
 use config::{Config, Persist, PersistOverride, Place, RlvPersist, Sit, Source};
-use control::{AutoreplyRequest, PayTo, Request, Response, RlvRequest};
+use control::{AutoreplyRequest, GroupRequest, PayTo, Request, Response, RlvRequest};
 use login::Outcome;
 use msglog::{Channel, Logs, Recorded, Recorder};
 use names::{Lookup, Search};
@@ -272,6 +274,10 @@ struct Lookups {
     profiles: Sender<profile::Fetch>,
     /// The current simulator's profile service, if it has one.
     profile_url: Option<String>,
+    /// The worker that takes chat sessions up.
+    take_up: Sender<caps::TakeUp>,
+    /// The current simulator's chat-session service, if it has one.
+    chat_sessions_url: Option<String>,
 }
 
 /// The session as commands see it. A simulator with an avatar search or
@@ -295,6 +301,47 @@ fn sitting(session: &Session<RealNet>) -> Sitting {
 }
 
 impl Grid for Live<'_> {
+    fn activate_group(&mut self, group: Uuid, now: Instant) -> Result<(), String> {
+        self.session.activate_group(group, now)
+    }
+    fn invite_to_group(&mut self, group: Uuid, avatar: Uuid, now: Instant) -> Result<(), String> {
+        self.session.invite_to_group(group, avatar, now)
+    }
+    fn ask_group_profile(&mut self, group: Uuid, now: Instant) -> Result<(), String> {
+        self.session.ask_group_profile(group, now)
+    }
+    fn join_group(&mut self, group: Uuid, now: Instant) -> Result<(), String> {
+        self.session.join_group(group, now)
+    }
+    fn leave_group(&mut self, group: Uuid, now: Instant) -> Result<(), String> {
+        self.session.leave_group(group, now)
+    }
+    fn ask_groups(&mut self, now: Instant) -> Result<(), String> {
+        self.session.ask_groups(now)
+    }
+    fn answer_invitation(&mut self, group: Uuid, id: Uuid, accept: bool, now: Instant) -> Result<(), String> {
+        self.session.answer_invitation(group, id, accept, now)
+    }
+    fn start_group_session(&mut self, group: Uuid, now: Instant) -> Result<(), String> {
+        self.session.start_group_session(group, now)
+    }
+    fn group_chat(&mut self, group: Uuid, text: &str, now: Instant) -> Result<(), String> {
+        self.session.group_chat(group, text, now)
+    }
+    fn take_up_session(&mut self, group: Uuid) -> bool {
+        match &self.lookups.chat_sessions_url {
+            Some(url) => {
+                let take_up = caps::TakeUp {
+                    url: url.clone(),
+                    session: group,
+                };
+                // The worker lives as long as the bot.
+                let _ = self.lookups.take_up.send(take_up);
+                true
+            }
+            None => false,
+        }
+    }
     fn pay(&mut self, dest: Uuid, amount: i32, kind: i32, description: &str, now: Instant) -> Result<(), String> {
         self.session.pay(dest, amount, kind, description, now)
     }
@@ -558,6 +605,8 @@ impl Bot {
                 search_url: None,
                 profiles: profile::spawn(events.clone()),
                 profile_url: None,
+                take_up: caps::spawn_take_up(),
+                chat_sessions_url: None,
             },
             inventory: Inventory {
                 jobs: inventory::spawn(events.clone()),
@@ -716,6 +765,7 @@ impl Bot {
                 let session = Session::new(net, &info, &name, cfg.scan_distance, cfg.fetch_offline_im, generation, now);
                 self.session = Some(session);
                 self.balance_asked = false;
+                self.commands.groups_session_began();
             }
             Outcome::NeedsOperator(failure) => {
                 info!("login needs the operator ({}): {}", failure.reason, failure.message);
@@ -742,6 +792,7 @@ impl Bot {
         self.names_url = None;
         self.lookups.search_url = None;
         self.lookups.profile_url = None;
+        self.lookups.chat_sessions_url = None;
         self.inventory.urls = None;
         self.inventory.generation = None;
         self.commands.session_lost();
@@ -1102,6 +1153,7 @@ impl Bot {
                 | Request::Pay { .. }
                 | Request::Prices(_)
                 | Request::Payees
+                | Request::Group(GroupRequest::List | GroupRequest::Info(_) | GroupRequest::Invitations)
         );
         let exempt = !never && !own && self.rlv.take_override(request.name());
         match request {
@@ -1165,19 +1217,31 @@ impl Bot {
                 } else {
                     commands::Origin::Operator
                 };
+                // A join or an acceptance may pay a fee: a row the limit
+                // needs is written first, if it can be now.
+                let pays = matches!(
+                    &request,
+                    Request::Group(GroupRequest::Join { pay: Some(_), .. }) | Request::Accept { pay: Some(_), .. }
+                );
+                if pays {
+                    let unwritten = self.logs.retry_transactions();
+                    self.commands.set_unwritten(unwritten);
+                }
                 #[cfg(test)]
                 if let Some(grid) = self.grid.as_mut() {
-                    if let Some(sent) = self.commands.handle_from(origin, request, reply, Some(grid), now) {
+                    if let Some(sent) = self.commands.handle_through(origin, via, request, reply, Some(grid), now) {
                         self.record_sent(sent, now);
                     }
                     self.follow_commands();
+                    self.take_transactions(now);
                     return Flow::Continue;
                 }
                 let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
-                if let Some(sent) = self.commands.handle_from(origin, request, reply, live.as_mut(), now) {
+                if let Some(sent) = self.commands.handle_through(origin, via, request, reply, live.as_mut(), now) {
                     self.record_sent(sent, now);
                 }
                 self.follow_commands();
+                self.take_transactions(now);
             }
         }
         Flow::Continue
@@ -1599,14 +1663,29 @@ impl Bot {
                         hub.transaction(&transaction);
                     }
                 }
+                // Not for the owners of the XMPP gateway.
+                Recorded::Group(message) => {
+                    self.logs.write_group(&message);
+                    if let Some(hub) = &mut self.web {
+                        hub.group(&message);
+                    }
+                }
             }
         }
     }
 
-    /// Queues the transactions the payment commands recorded.
+    /// Queues the transactions the payment commands recorded, and the
+    /// group messages.
     fn take_transactions(&mut self, now: Instant) {
         for transaction in self.commands.take_transactions() {
             self.recorder.push_transaction(transaction, now);
+        }
+        for mut message in self.commands.take_group_records() {
+            // A line the bot said carries the avatar's own name.
+            if message.kind == grouplog::Kind::ChatOut && message.avatar_name.is_empty() {
+                message.avatar_name = format!("{} {}", self.config.first_name, self.config.last_name);
+            }
+            self.recorder.push_group(message, now);
         }
     }
 
@@ -1706,9 +1785,15 @@ impl Bot {
         }
     }
 
-    /// Sends the open pages the status when it has changed. Nothing is
-    /// put together while no page is open.
+    /// Sends the open pages the status when it has changed, and the word
+    /// that the groups changed. Nothing is put together while no page is
+    /// open.
     fn web_status(&mut self) {
+        if self.commands.take_groups_changed() {
+            if let Some(hub) = &mut self.web {
+                hub.groups_changed();
+            }
+        }
         if self.web.as_ref().is_some_and(web::hub::Hub::watched) {
             let status = self.status(Interface::Web);
             if let Some(hub) = &mut self.web {
@@ -1938,6 +2023,23 @@ impl Bot {
                 self.lookups.profile_url = url;
             }
             SessionEvent::Profile(profile) => self.commands.profile_received(profile),
+            event @ (SessionEvent::Groups(_)
+            | SessionEvent::GroupDropped(_)
+            | SessionEvent::ActiveGroup { .. }
+            | SessionEvent::GroupProfile(_)
+            | SessionEvent::Joined { .. }
+            | SessionEvent::Left { .. }
+            | SessionEvent::GroupInvitation { .. }
+            | SessionEvent::GroupSessionOffered(_)
+            | SessionEvent::GroupChat { .. }
+            | SessionEvent::GroupNotice { .. }
+            | SessionEvent::GroupSession { .. }) => self.group_event(event, now),
+            SessionEvent::ChatSessionsUrl(url) => {
+                if url.is_none() {
+                    debug!("the simulator has no service for taking chat sessions up");
+                }
+                self.lookups.chat_sessions_url = url;
+            }
             SessionEvent::FriendshipEnded(id) => info!("{id} ended the friendship with the avatar"),
             SessionEvent::FriendshipBegun(id) => info!("{id} accepted the avatar's offer of friendship"),
             SessionEvent::LoggedOut => {
@@ -1946,6 +2048,52 @@ impl Bot {
             }
         }
         Flow::Continue
+    }
+
+    /// What the grid says about the avatar's groups, group chat, notices
+    /// and invitations. Group messages are recorded; none is answered.
+    fn group_event(&mut self, event: SessionEvent, now: Instant) {
+        #[cfg(test)]
+        if let Some(grid) = self.grid.as_mut() {
+            Bot::group_event_on(&mut self.commands, Some(grid), event, now);
+            return self.take_transactions(now);
+        }
+        let mut live = live(&mut self.session, &self.lookups, &self.inventory, &self.rlv);
+        Bot::group_event_on(&mut self.commands, live.as_mut(), event, now);
+        self.take_transactions(now);
+    }
+
+    fn group_event_on<G: Grid>(commands: &mut Commands, grid: Option<&mut G>, event: SessionEvent, now: Instant) {
+        match event {
+            SessionEvent::Groups(list) => commands.groups_listed(list, grid, now),
+            SessionEvent::GroupDropped(group) => commands.group_dropped(group, now),
+            SessionEvent::ActiveGroup { group, title, name } => commands.active_group(group, &title, &name),
+            SessionEvent::GroupProfile(profile) => commands.group_profile(profile, grid, now),
+            SessionEvent::Joined { group, success } => commands.joined(group, success),
+            SessionEvent::Left { group, success } => commands.left(group, success, now),
+            SessionEvent::GroupInvitation {
+                group,
+                id,
+                inviter,
+                fee,
+                text,
+            } => {
+                debug!("invitation from {inviter} into the group {group}: {text}");
+                commands.group_invitation(group, id, &inviter, fee, grid, now);
+            }
+            SessionEvent::GroupSessionOffered(session) => commands.session_offered(session, grid),
+            SessionEvent::GroupChat { session, from, name, text } => commands.group_line(session, from, &name, &text, grid),
+            SessionEvent::GroupNotice {
+                group,
+                sender,
+                name,
+                text,
+                bucket,
+                sent_at,
+            } => commands.group_notice(group, sender, &name, &text, &bucket, sent_at),
+            SessionEvent::GroupSession { group, ok, error } => commands.group_session(group, ok, &error, grid, now),
+            _ => {}
+        }
     }
 
     /// Runs timers and applies whatever the session has to report.
@@ -4457,6 +4605,89 @@ mod tests {
         (kind.to_string(), text.to_string())
     }
 
+    fn in_builders(bot: &mut Bot) -> Uuid {
+        let builders = crate::groups::tests::builders();
+        let groups = vec![crate::groups::tests::member(builders, "Builders", 0, true)];
+        hear(bot, SessionEvent::Groups(groups));
+        builders
+    }
+
+    fn group_line(group: Uuid, text: &str) -> SessionEvent {
+        SessionEvent::GroupChat {
+            session: group,
+            from: jane_id(),
+            name: "Jane Doe".into(),
+            text: text.into(),
+        }
+    }
+
+    /// The group messages recorded since the last call: kind and text.
+    fn group_records(bot: &mut Bot) -> Vec<(String, String)> {
+        bot.take_transactions(Instant::now());
+        bot.recorder
+            .flush_all(Instant::now())
+            .into_iter()
+            .filter_map(|recorded| match recorded {
+                Recorded::Group(message) => Some((message.kind.name().to_string(), message.text)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_line_of_group_chat_gets_no_autoreply_and_changes_no_pause() {
+        let mut bot = answering("");
+        let builders = in_builders(&mut bot);
+        hear(&mut bot, group_line(builders, "say hello"));
+        assert_eq!(answers(&mut bot), []);
+        assert_eq!(group_records(&mut bot), [pair("chat", "say hello")]);
+        // Her pause has not begun: her instant message is answered.
+        hear(&mut bot, janes("hi"));
+        assert_eq!(answers(&mut bot), [(jane_id(), "Away".to_string())]);
+    }
+
+    #[test]
+    fn a_line_the_bot_says_carries_its_own_name() {
+        let mut bot = answering("");
+        let builders = in_builders(&mut bot);
+        hear(&mut bot, group_line(builders, "first"));
+        let answer = send(&mut bot, "group\tchat\tBuilders\thi");
+        hear(
+            &mut bot,
+            SessionEvent::GroupSession {
+                group: builders,
+                ok: true,
+                error: String::new(),
+            },
+        );
+        assert_eq!(
+            answer.try_recv().unwrap(),
+            Response::Ok(Some(format!("said in \"Builders\" <{builders}>")))
+        );
+        bot.take_transactions(Instant::now());
+        let records = bot.recorder.flush_all(Instant::now());
+        let Some(Recorded::Group(said)) = records.last() else {
+            panic!("{records:?}")
+        };
+        assert_eq!(said.kind, grouplog::Kind::ChatOut);
+        assert_eq!(said.avatar_name, format!("{} {}", bot.config.first_name, bot.config.last_name));
+    }
+
+    #[test]
+    fn group_list_info_and_invitations_never_use_up_an_override() {
+        let mut bot = answering("rlv = true\n");
+        in_builders(&mut bot);
+        ok(&mut bot, "rlv\tmode\toverride");
+        for line in ["group\tlist", "group\tinvitations"] {
+            command(&mut bot, line);
+            assert!(ok(&mut bot, "rlv\tstatus").contains("rlv: override"), "{line}");
+        }
+        send(&mut bot, "group\tinfo\tBuilders");
+        assert!(ok(&mut bot, "rlv\tstatus").contains("rlv: override"));
+        send(&mut bot, "group\tactivate\tBuilders");
+        assert!(ok(&mut bot, "rlv\tstatus").contains("rlv: on"));
+    }
+
     #[test]
     fn an_instant_message_is_answered_once_within_the_pause() {
         let mut bot = answering("");
@@ -4711,7 +4942,7 @@ mod tests {
         assert_eq!(
             ok(&mut bot, "perms\tstatus"),
             "tp: Jane Doe\ninventory: none\nanim: all except 01234567-9abc-defe-dcba-987654321000\n\
-             attach: none\ncontrols: none\ncamera: none"
+             attach: none\ncontrols: none\ncamera: none\ngroup: none"
         );
         // Without the table nothing is accepted by itself.
         let mut bot = holder("");
@@ -4747,7 +4978,7 @@ mod tests {
         );
         // The session's end takes the offer with it.
         bot.drop_session();
-        assert_eq!(ok(&mut bot, "perms\tstatus").lines().count(), 6);
+        assert_eq!(ok(&mut bot, "perms\tstatus").lines().count(), 7);
     }
 
     #[test]
@@ -5275,6 +5506,39 @@ mod tests {
                 .fake
                 .expect("</message>")
                 .contains(&format!("from='jane.doe@{DOMAIN}' to='{OWNER}'><body>say hello</body>")));
+            assert_eq!(rig.calls(), []);
+        }
+
+        #[test]
+        fn group_messages_are_not_passed_on() {
+            let mut rig = Rig::connected(true);
+            let builders = crate::groups::tests::builders();
+            let groups = vec![crate::groups::tests::member(builders, "Builders", 0, true)];
+            hear(&mut rig.bot, SessionEvent::Groups(groups));
+            rig.bot.names_resolved(vec![janes_names()], vec![], Instant::now());
+            hear(
+                &mut rig.bot,
+                SessionEvent::GroupChat {
+                    session: builders,
+                    from: jane(),
+                    name: "Jane Doe".into(),
+                    text: "hello all".into(),
+                },
+            );
+            hear(
+                &mut rig.bot,
+                SessionEvent::GroupNotice {
+                    group: builders,
+                    sender: None,
+                    name: "Jane Doe".into(),
+                    text: "Meeting|Tonight".into(),
+                    bucket: Vec::new(),
+                    sent_at: None,
+                },
+            );
+            rig.bot.service_messages();
+            rig.bot.flush_messages();
+            assert_eq!(rig.quiet(), "");
             assert_eq!(rig.calls(), []);
         }
 

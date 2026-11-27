@@ -19,6 +19,8 @@
   --sent: #e3edfb;
   --online: #1a7f37;
   --mark: #cf222e;
+  --notice-bg: #fff3d1;
+  --notice-line: #9a6700;
   color-scheme: light;
 }
 
@@ -40,6 +42,8 @@
     --sent: #1c2c44;
     --online: #56d364;
     --mark: #ff7b72;
+    --notice-bg: #33290f;
+    --notice-line: #d29922;
     color-scheme: dark;
   }
 }
@@ -61,6 +65,8 @@
   --sent: #1c2c44;
   --online: #56d364;
   --mark: #ff7b72;
+  --notice-bg: #33290f;
+  --notice-line: #d29922;
   color-scheme: dark;
 }
 
@@ -371,6 +377,84 @@ ul { list-style: none; margin: 0; padding: 0; }
 .msg.sent { justify-content: flex-end; }
 .msg.sent .bubble { background: var(--sent); }
 .msg .tag { color: var(--muted); font-size: .75rem; display: block; }
+
+/* --------------------------------------------------------------- groups */
+
+.im-side > h2:first-child { margin-top: 0; }
+.picks li.gone .label { color: var(--muted); font-style: italic; }
+.picks .active, .group-main h2 .active {
+  color: var(--online);
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  padding: 0 .4rem;
+  font-size: .75rem;
+  font-weight: 600;
+}
+.group-main .new { bottom: 1.2rem; }
+
+.log .line.own {
+  background: var(--sent);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding-left: .4rem;
+  margin: .1rem 0;
+}
+.log .you, .log .stored {
+  color: var(--muted);
+  font-size: .75rem;
+  margin-right: .4rem;
+}
+.log .stored { margin: 0 0 0 .4rem; font-style: italic; }
+
+/* A notice stands out from chat at a glance, in both themes. */
+.log .gnotice {
+  margin: .4rem 0;
+  padding: .4rem .6rem;
+  background: var(--notice-bg);
+  border: 1px solid var(--notice-line);
+  border-left-width: 4px;
+  border-radius: 6px;
+  font-weight: 600;
+}
+.gnotice .head { display: flex; flex-wrap: wrap; align-items: baseline; gap: .1rem .5rem; }
+.gnotice .badge {
+  background: var(--notice-line);
+  color: var(--panel);
+  border-radius: 4px;
+  padding: 0 .35rem;
+  font-size: .75rem;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+}
+.gnotice .time { margin-right: 0; }
+.gnotice .stored { font-weight: normal; }
+.gnotice .subject { font-size: 1.05rem; margin-top: .15rem; }
+.gnotice .body { white-space: pre-wrap; margin-top: .2rem; }
+.gnotice .attachment { margin-top: .3rem; color: var(--muted); font-size: .85rem; }
+.gnotice .attachment .item { color: var(--text); }
+
+.group-box {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: .5rem .6rem;
+  margin-bottom: .5rem;
+  background: var(--field);
+}
+.group-box .head { display: flex; justify-content: space-between; align-items: center; gap: .5rem; margin-bottom: .3rem; }
+.group-box dl {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: .15rem .8rem;
+  margin: 0;
+}
+.group-box dt { color: var(--muted); }
+.group-box dd { margin: 0; min-width: 0; }
+.group-box dd.charter { white-space: pre-wrap; }
+.group-box ul { max-height: 12rem; overflow-y: auto; }
+
+.invitations .fee { font-weight: 700; white-space: nowrap; }
+.invitations .result { flex: 1 1 100%; margin: 0; }
+.invitations .more.error { color: var(--error); }
 
 /* ------------------------------------------------------------ inventory */
 

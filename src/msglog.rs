@@ -5,6 +5,7 @@
 
 use crate::config::{LogPath, LogPaths};
 use crate::escape::escape;
+use crate::grouplog::GroupMessage;
 use crate::log::format_timestamp;
 use crate::names::Names;
 use crate::session::{Message, Source};
@@ -57,6 +58,7 @@ pub struct Record {
 enum Item {
     Message(Channel, Message),
     Transaction(Transaction),
+    Group(GroupMessage),
 }
 
 /// What leaves the queue, in arrival order.
@@ -64,6 +66,7 @@ enum Item {
 pub enum Recorded {
     Message(Record),
     Transaction(Transaction),
+    Group(GroupMessage),
 }
 
 #[cfg(test)]
@@ -73,6 +76,7 @@ impl Recorded {
         match self {
             Recorded::Message(record) => record,
             Recorded::Transaction(tx) => panic!("a transaction, not a message: {tx:?}"),
+            Recorded::Group(group) => panic!("a group message, not a message: {group:?}"),
         }
     }
 }
@@ -157,6 +161,24 @@ impl Recorder {
         });
     }
 
+    /// Queues a group message; it waits for the display name of who said
+    /// or sent it, when its UUID is known, as a message waits for its
+    /// sender's.
+    pub fn push_group(&mut self, message: GroupMessage, now: Instant) {
+        let needs = message.avatar.filter(|id| !id.is_nil() && self.pending.len() < MAX_PENDING);
+        if let Some(id) = needs {
+            if self.cached(id, now).is_none() && !self.awaited(id) {
+                self.wanted.push(id);
+            }
+        }
+        self.pending.push_back(Entry {
+            time: message.time,
+            item: Item::Group(message),
+            needs,
+            deadline: now + NAME_WAIT,
+        });
+    }
+
     /// Whether any ids are waiting to be looked up.
     #[cfg(test)]
     pub fn has_lookups(&self) -> bool {
@@ -208,6 +230,16 @@ impl Recorder {
                     transaction.display_name = names.display;
                 }
                 return Recorded::Transaction(transaction);
+            }
+            Item::Group(mut message) => {
+                // The name the message carries; the display name looked up.
+                if let Some(names) = names {
+                    if message.avatar_name.is_empty() {
+                        message.avatar_name = names.legacy;
+                    }
+                    message.display_name = names.display;
+                }
+                return Recorded::Group(message);
             }
         };
         let (legacy, display) = names.map(|n| (n.legacy, n.display)).unwrap_or_default();
@@ -374,6 +406,7 @@ impl TransactionsFile {
 pub struct Logs {
     chat: Option<LogFile>,
     im: Option<LogFile>,
+    group: Option<LogFile>,
     transactions: Option<TransactionsFile>,
 }
 
@@ -392,11 +425,12 @@ impl Logs {
             key: log.key,
             message: format!("cannot open {}: {e}", log.path.display()),
         };
-        let open = |log: &Option<LogPath>| {
+        let open_with = |log: &Option<LogPath>, header: &str| {
             log.as_ref()
-                .map(|log| LogFile::open(&log.path, &header()).map_err(|e| error(log, e)))
+                .map(|log| LogFile::open(&log.path, header).map_err(|e| error(log, e)))
                 .transpose()
         };
+        let open = |log: &Option<LogPath>| open_with(log, &header());
         let transactions = match &paths.transactions {
             None => None,
             Some(log) => {
@@ -410,6 +444,7 @@ impl Logs {
         Ok(Logs {
             chat: open(&paths.chat)?,
             im: open(&paths.im)?,
+            group: open_with(&paths.group, &crate::grouplog::header())?,
             transactions,
         })
     }
@@ -420,6 +455,7 @@ impl Logs {
         Logs {
             chat: None,
             im: None,
+            group: None,
             transactions: None,
         }
     }
@@ -432,6 +468,15 @@ impl Logs {
         };
         if let Some(file) = file {
             file.append(&record.row());
+        }
+    }
+
+    /// Writes a group message to standard error and, when one is
+    /// configured, to the group file.
+    pub fn write_group(&mut self, message: &GroupMessage) {
+        crate::info!("{}", message.log_line());
+        if let Some(file) = &mut self.group {
+            file.append(&message.row());
         }
     }
 
@@ -556,6 +601,7 @@ mod tests {
             .map(|r| match r {
                 Recorded::Message(record) => record.text.as_str(),
                 Recorded::Transaction(tx) => tx.text.as_str(),
+                Recorded::Group(message) => message.text.as_str(),
             })
             .collect()
     }
@@ -570,6 +616,7 @@ mod tests {
         LogPaths {
             chat: log(chat, "logs.chat"),
             im: log(im, "logs.im"),
+            group: None,
             transactions: log(transactions, "logs.transactions"),
         }
     }
@@ -1155,6 +1202,110 @@ mod tests {
         set_read_only(&path, false);
         logs.write_transaction(&received_from(1, 6));
         assert_eq!(crate::txlog::read(&path).unwrap().rows.len(), 4);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn group_chat(by: u8, text: &str) -> GroupMessage {
+        GroupMessage {
+            avatar: Some(id(by)),
+            display_name: String::new(),
+            time: T0,
+            ..crate::grouplog::tests::chat(text)
+        }
+    }
+
+    #[test]
+    fn messages_group_messages_and_transactions_leave_in_arrival_order() {
+        let now = Instant::now();
+        let mut rec = Recorder::default();
+        rec.push(Channel::Chat, said(1, "Jane Doe", "first"), T0, now);
+        rec.push_group(group_chat(1, "second"), now);
+        let tx = Transaction {
+            time: T0,
+            kind: crate::txlog::Kind::Received,
+            amount: 5,
+            balance: Some(10),
+            counted: 0,
+            code: 5001,
+            party: Some(id(1)),
+            party_group: false,
+            avatar_name: String::new(),
+            display_name: String::new(),
+            object_name: String::new(),
+            object: None,
+            text: "third".into(),
+        };
+        rec.push_transaction(tx, now);
+        assert_eq!(rec.take_lookups(), [id(1)], "one lookup serves all three");
+        rec.names_resolved(vec![(id(1), jane())], vec![], now);
+        let out = rec.flush(now);
+        assert_eq!(all_texts(&out), ["first", "second", "third"]);
+        let Recorded::Group(group) = &out[1] else {
+            panic!("not a group message: {:?}", out[1])
+        };
+        // The name the message carries; the display name looked up.
+        assert_eq!((group.avatar_name.as_str(), group.display_name.as_str()), ("Jane Doe", "JD"));
+    }
+
+    #[test]
+    fn a_group_message_waits_at_most_five_seconds_for_its_name() {
+        let now = Instant::now();
+        let mut rec = Recorder::default();
+        rec.push_group(group_chat(2, "hello"), now);
+        assert!(rec.flush(now + NAME_WAIT - Duration::from_millis(1)).is_empty());
+        let out = rec.flush(now + NAME_WAIT);
+        let Recorded::Group(group) = &out[0] else {
+            panic!("not a group message")
+        };
+        assert_eq!((group.text.as_str(), group.display_name.as_str()), ("hello", ""));
+        // A notice that does not give its sender's UUID waits for nothing.
+        let notice = GroupMessage {
+            avatar: None,
+            ..group_chat(2, "notice")
+        };
+        rec.push_group(notice, now);
+        assert_eq!(rec.flush(now).len(), 1);
+    }
+
+    #[test]
+    fn group_messages_go_only_to_the_group_file() {
+        let dir = temp_dir("group");
+        let (group_path, im_path) = (dir.join("group.tsv"), dir.join("im.tsv"));
+        let paths = LogPaths {
+            group: Some(LogPath {
+                path: group_path.clone(),
+                key: "logs.group",
+            }),
+            ..LogPaths::default()
+        };
+        let mut logs = Logs::open(&paths).unwrap();
+        let line = group_chat(1, "hello");
+        logs.write_group(&line);
+        logs.write(&Record {
+            channel: Channel::Im,
+            kind: "im".into(),
+            ..record("Jane Doe", "JD", "psst")
+        });
+        assert_eq!(read(&group_path), crate::grouplog::header() + &line.row());
+        assert!(!im_path.exists());
+        // A restart keeps the rows and writes no second header.
+        drop(logs);
+        Logs::open(&paths).unwrap().write_group(&line);
+        assert_eq!(read(&group_path), crate::grouplog::header() + &line.row() + &line.row());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_group_file_that_cannot_be_opened_names_its_key() {
+        let dir = temp_dir("group-missing");
+        let paths = LogPaths {
+            group: Some(LogPath {
+                path: dir.join("no-such-dir").join("group.tsv"),
+                key: "logs.group",
+            }),
+            ..LogPaths::default()
+        };
+        assert_eq!(Logs::open(&paths).err().unwrap().key, "logs.group");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -244,6 +244,75 @@ while the fourth, running alongside as `Rig Owner`, got the other side of
 it, `description='Rig Alt paid you L$100.'` with the same transaction, and
 `rigmoney show` had `Rig Owner` L$100 richer.
 
+## Groups
+
+The rig runs OpenSim's Groups V2 with a store of its own,
+`test-rig/groups/RigGroupsData.cs`, which keeps the groups in memory (the
+rig is on SQLite, for which OpenSim has no groups store): **groups are
+gone when the simulator stops**, and `test-rig/group.py` makes them again.
+`setup.sh` builds the store as an addon module next to the money module
+and writes the lines below into a new `OpenSim.ini`. A rig set up before
+needs `setup.sh` run again and these lines added by hand to
+`test-rig/opensim/bin/OpenSim.ini`, which `setup.sh` never overwrites:
+right under the line `[Groups]`,
+
+```ini
+    Enabled = true
+    Module = "Groups Module V2"
+    StorageProvider = "RigGroupsData.dll"
+    ServicesConnectorModule = "Groups Local Service Connector"
+    LocalService = local
+    MessagingEnabled = true
+    MessagingModule = "Groups Messaging Module V2"
+    MessageOnlineUsersOnly = true
+    NoticesEnabled = true
+```
+
+and at the end of the file (the groups service otherwise looks for the
+grid-user store in the groups store):
+
+```ini
+[GridUserService]
+    StorageProvider = "OpenSim.Data.SQLite.dll"
+```
+
+The start log then has `Initializing Groups Module V2` and
+`GroupsMessagingModule enabled`. The money module takes a group's fee
+when Groups V2 lets an avatar join (`ApplyCharge`), and reports it as
+transaction type 1004 with the avatar as payer.
+
+`test-rig/group.py` logs in as `Rig Owner` (`as=alt` for `Rig Alt`) and
+does one thing; `group.py` alone prints its usage:
+
+```sh
+test-rig/group.py create Builders open             # prints the new group's UUID
+test-rig/group.py create Dancers fee=250 open      # with a fee of L$250
+test-rig/group.py invite Builders                  # invites the bot; `invite Builders alt` Rig Alt
+test-rig/group.py say Builders hello all           # starts the session and says a line
+test-rig/group.py notice Builders Meeting "Tonight at eight" item   # with the item Agenda attached
+test-rig/group.py eject Builders                   # ejects the bot
+test-rig/group.py as=alt join <uuid>               # Rig Alt joins, and prints the fee's MoneyBalanceReply
+test-rig/group.py as=alt leave Builders            # Rig Alt leaves, and prints the LeaveGroupReply
+test-rig/group.py profile Builders
+test-rig/group.py listen 60                        # prints the group chat, notices and IMs it gets
+```
+
+Only one run per account at a time: a second login of the same account
+is refused while the first lasts. `dump` prints the group messages as hex
+and the events as LLSD; `test-rig/captures/groups.txt` holds such
+captures, which the unit tests read.
+
+What Groups V2 does not do, so the rig cannot show it: an invitation with
+a fee (it always says there is no cost, and takes none on acceptance),
+refusing a join for closed enrollment (it checks neither enrollment nor
+an invitation; the bot refuses that itself), and stored notices. OpenSim
+also sends every notice marked as stored, with the time it was sent (the
+bot counts one that is less than a minute old as live), marks the lines
+of a group's chat as from the group, delivers a speaker's own line back,
+has no `ChatSessionRequest`, and makes a group the avatar joins its
+active group. Every group member starts in the role Everyone, without the
+right to invite.
+
 ## Failure-injection checklist
 
 Console commands are typed on the OpenSim console. The console command
@@ -626,7 +695,7 @@ anim = ["<box 2>"]
 | 140 | With a script's request and an inventory offer waiting: `kick user Sit Bot` on the console | The bot logs in again and sits; `perms status` shows the rules as the commands left them and no `waiting:` line | Pass |
 | 141 | With a script's request and an inventory offer waiting: `tp 100 100 25 Home`; `perms status`; `accept inventory`; `home` | The script's request is gone; the inventory offer still waits and is accepted from `Home` | Pass |
 
-Not covered here: an object owned by a group (the rig has no group), a
+Not covered here: an object owned by a group (no rig helper deeds one), a
 simulator that does not answer the question about an object's owner, a
 grid that does not know or does not give the owner's name, a simulator
 without an inventory service, more than 100 requests waiting, and the
@@ -817,7 +886,8 @@ session. That is fixed since; see "Teleports next door" below.
 Not covered on this rig: Second Life, where the distance decides what the
 simulator describes at all; a region with more objects than fit one
 `ObjectSelect`; the 30 second limit; an owner the name service does not
-know and objects owned by a group (unit tests only).
+know and objects owned by a group (unit tests only; the rig has groups
+now, see [Groups](#groups), but no helper deeds an object to one).
 
 ## Teleports next door
 
@@ -1210,3 +1280,53 @@ On Second Life, by the operator, the same day, as items 308 to 311:
 | # | Inject | Expected | Result (2026-11-24, Second Life) |
 |---|---|---|---|
 | 316 | `ctl pay 3 avatar <the other avatar> -d test payment` | Paid with the description; the log line naming it; the other avatar sees it with the payment | Pass: `sent, with the description "test payment"`, confirmed in a second; the payer's viewer showed `You paid AnnaNovykova99 Resident L$3: test payment.` The grid's text in the reply was `You paid AnnaNovykova99 Resident L$3.`, without the description, so the row of that run (before task 11.7) had only that. The verbose log names messages and sizes only, so whether the reply's `ItemDescription` carried `test payment` was not read off; the bot now composes the text from it, or from what it sent when it does not |
+
+## Groups
+
+On the rig with groups (see [Groups](#groups)), the bot `Sit Bot` with
+`[logs]` including `group`, `[payments]` with `limit = 1000` and
+`perms = ["ctl", "web"]`, and `[web]`. `Rig Owner` created `Builders` (open,
+free) with `group.py`.
+
+| # | Inject | Expected | Result (2026-11-24, rig) |
+|---|---|---|---|
+| 317 | Start the bot | The list after login in the log; `ctl group list` | Pass: `groups: the grid lists 0 groups of the avatar`; empty answer |
+| 318 | `group.py invite Builders` | The invitation waits, with the group's name and the inviter's UUID; `group invitations`, `perms status` | Pass: `invitation from Rig Owner <...aa> into "Builders" <...>: waits; ...accept group <uuid>...`; the line `<uuid> 0 <...aa> Rig Owner Builders`; `group: none` and the `waiting:` line |
+| 319 | `ctl accept group builders`; `group list` | Joined; the list | Pass: `joined "Builders" <...>, invited by Rig Owner <...aa>`; Builders `active,notices` (OpenSim made it active) |
+| 320 | `ctl group activate Builders`; `ctl group info Builders` | Confirmed with the title; the profile lines | Pass: `... is the active group now, with the title "Member of Builders"`; `founder: Rig Owner`, `fee: none`, `enrollment: open`, `member: yes`, the charter (`members: 1`: the profile kept from the invitation) |
+| 321 | `group.py listen`; `ctl group chat Builders hello from the bot`, then `second line` | The bot enters the session; the listener gets both lines; two `chat_out` rows | Pass: the first line reached the listener as `ChatterBoxInvitation`, the second over UDP; `chat_out` rows with `Sit Bot` |
+| 322 | `group.py as=alt join` Builders; `as=alt say Builders anyone around?`, then `say hello` | Two `chat` rows of Rig Alt, the first line an event; nothing said back | Pass: both recorded; nothing said |
+| 323 | `group.py notice Builders Meeting "Tonight at eight"`; then with `item` | Two `notice` rows, the second naming `Agenda`; nothing accepted | Pass: `group [notice] Builders: Rig Owner, subject "Meeting": Tonight at eight`, then `... attachment "Agenda": See the notecard`; not marked stored |
+| 324 | `group.py create Dancers fee=250 open`; `as=alt join` it | `MoneyBalanceReply` type 1004, L$250, balance lower by the fee | Pass: `balance=L$750 description='You paid L$250 to join the group Dancers.'`, `type=1004 source=Rig Alt amount=L$250` |
+| 325 | `ctl group join Dancers`; `ctl group join <uuid>`; `--pay 100`; `--pay 300` | By name refused; the fee and `--pay` named; too little refused; the last joins and pays | Pass: `a group is joined by its UUID`; `costs L$250; give --pay 250`; `more than the L$100`; `joined "Dancers" <...>; the fee of L$250 counts as paid, as the grid has not reported it yet`, the report arriving in the same second: a `paid` row `250 750 250 1004 <Dancers>`, `limit: L$750` |
+| 326 | `ctl group join <Fishers, L$900> --pay 900`; `<Closed>`; `<Dancers>` | The balance refuses; enrollment refuses; already a member | Pass: `the avatar has L$750, less than L$900`; `takes an invitation`; `already` |
+| 327 | `ctl perms autoaccept group "Rig Owner"`; `group.py invite Free` | Accepted by itself, confirmed by the list | Pass: `bot: accepted by itself: invitation from Rig Owner ... into "Free" <...>: confirmed` |
+| 328 | `ctl perms revoke group all`; `group.py invite Closed`; `ctl decline group closed` | Waits; declined; none waits | Pass |
+| 329 | `group.py eject Builders` | The list without Builders; the log line | Pass: `groups: the avatar is no longer in "Builders" <...>` |
+| 330 | `ctl group invite Free "Rig Alt"`; `ctl group chat Nonexistent hi` | Refused for the right to invite; refused naming the group | Pass |
+| 331 | `ctl quit`, start again; `group list` | The groups from the grid | Pass: Dancers `active,notices`, Free `notices` |
+| 332 | The page at `/#groups` with an invitation waiting, a line `hello <b>bold</b> & co` and a two-line notice in Free | The tab between IM and Inventory, marked; the invitation row; the list with the active one and Builders set apart; Free's chat with the markup as text and the notice set apart with its lines | Pass |
+| 333 | Type `hi from the page`, Enter; "Info"; "Reject" on the row; 360 px wide; "Activate" on Dancers | The line as the avatar's own; the info with the title; the row gone and the mark with it; no sideways scroll; Dancers marked active | Pass |
+
+Not on the rig: an invitation with a fee, and the fee rows of the page
+(tried against a stand-in server with the page); a join the grid refuses;
+the limit refusing a fee (the bot's balance is the one the grid last
+reported); the bot inviting someone, as no rig group gives it the right.
+
+### Leaving groups
+
+The same bot and rig, with a simulator started for this run; `Rig Owner`
+created `Builders` and `Dancers` (open, free) and `Leavers` (open, free).
+
+| # | Inject | Expected | Result (2026-11-27, rig) |
+|---|---|---|---|
+| 334 | `group.py as=alt join <Leavers>`; `group.py as=alt dump leave Leavers` | `LeaveGroupReply` with success, then the drop, no active group and an empty list | Pass: in that order (OpenSim had made `Leavers` active on the join); the reply is in `test-rig/captures/groups.txt` |
+| 335 | `ctl group join` Builders and Dancers; the page at `/#groups`, Dancers active: "Leave", then Escape; "Leave", then "Cancel"; "Leave" and the dialog's "Leave" | The dialog names the group and its UUID, says that joining again may take an invitation or a fee, and has "Cancel" focused; Escape and "Cancel" send nothing; then the notice of the answer, Dancers set apart as not a member, without "Leave" | Pass: no `group leave` line in the log until the dialog's "Leave", then `control: group leave "Dancers" <...>: sent` and `confirmed` in the same second. The first build showed the group by its UUID once it was left, as the page knew its name only from messages; it now keeps the name from the list |
+| 336 | `group.py invite Dancers`; `ctl accept group Dancers` | Joined again, by invitation | Pass: `joined "Dancers" <...>, invited by Rig Owner <...aa>` |
+| 337 | The page 360 px wide in the light theme: "Leave" on Builders and the dialog's "Leave"; then the Money tab's form, L$5 to `Rig Alt`, and Escape | The dialog fits without sideways scroll; Builders kept by its name as not a member; the payment dialog with its own title and "Pay L$5", "Cancel" focused, and nothing paid | Pass: page width 360; `Confirm the payment`, `Pay L$5 to Rig Alt?`; no `pay` line in the log |
+| 338 | `ctl group join <Builders>` (OpenSim makes it active); `group chat Builders before leaving`; `group leave Builders`; at once `group list` | `left "Builders" <...>`; the list without Builders and with no `active` | Pass. With the first build the list right after the answer still had Builders `active`: OpenSim sends `LeaveGroupReply` before the drop, and the bot now takes a successful reply as the drop, as a viewer does. `listen.py` does not show group tags; the grid's update with no active group (item 334) stands for the tag being gone |
+| 339 | `group.py say Builders said after the leave`; `ctl group join <Builders>`; `ctl group chat Builders back again` | No row for the line in `group.tsv`; joined; the session entered anew | Pass: no row; `entering the chat session of "Builders"` a second time, then `in the chat session` |
+| 340 | `ctl group leave Build`; `ctl group leave <a UUID of no group>`; `ctl group leave` | Status 1 each | Pass: `no group named "Build"`; `not in the group <uuid>`; `` `group leave` takes a group `` |
+| 341 | `ctl rlv mode on`; `ctl rlv cmd @setgroup=n`; `ctl group activate none`; `ctl group leave Dancers` | The activation refused naming `setgroup`; the leave carried out | Pass |
+| 342 | `ctl group join <Dancers> && ctl group activate Dancers`, a few seconds after the last group command | The activation finds the group | Pass. Before, `group join` was answered on the `JoinGroupReply`, which OpenSim sends before the new list, and an activation straight after a join (in a second run of item 338) was refused with `no group named "Builders"`; the join is now answered by the list |
+| 343 | Three times in a row, with no pause: `ctl group join <Dancers>`; `group activate Dancers`; `group leave Dancers` | Each command finds the group | Fail at first, in the second round: the join was confirmed, then `groups: the avatar is no longer in "Dancers"`, `... is in ... now` and `... no longer in` again within the same second, and the activation and the leave were refused. A leave and a join given within milliseconds of each other make OpenSim send lists and drops that arrive out of order. The bot now keeps to a confirmed join or leave for 5 seconds and then asks for the list again: five rounds in a row with `--verbose` passed, with four late lists and drops held back (`... which the grid confirmed otherwise a moment ago; asking for the list again`), `AgentDataUpdateRequest` sent 5 s after the last leave, and `group list` then with Builders alone and nothing active, as on the grid |

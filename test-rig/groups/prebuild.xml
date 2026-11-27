@@ -1,0 +1,28 @@
+    <Project name="RigGroupsData" path="addon-modules/RigGroups" type="Library">
+      <!-- The rig's in-memory store for Groups V2, built as an OpenSim
+           addon module: setup.sh copies this directory to
+           test-rig/opensim/addon-modules/RigGroups/, where runprebuild.sh
+           includes this file in the solution. -->
+      <Configuration name="Debug">
+        <Options>
+          <OutputPath>../../bin/</OutputPath>
+        </Options>
+      </Configuration>
+      <Configuration name="Release">
+        <Options>
+          <OutputPath>../../bin/</OutputPath>
+        </Options>
+      </Configuration>
+
+      <ReferencePath>../../bin/</ReferencePath>
+      <Reference name="OpenMetaverse"/>
+      <Reference name="OpenMetaverseTypes"/>
+      <Reference name="OpenSim.Framework"/>
+      <Reference name="OpenSim.Data"/>
+
+      <Files>
+        <Match pattern="*.cs" recurse="true">
+          <Exclude name="obj" pattern="obj"/>
+        </Match>
+      </Files>
+    </Project>

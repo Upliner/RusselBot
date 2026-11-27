@@ -2,12 +2,12 @@
 
 ## Purpose
 
-The groups of the bot's avatar: learning from the grid which groups the avatar is in and which one is active, and the commands by which an operator lists them, activates one, invites an avatar into one, reads a group's profile and joins a group, with or without a fee. Group chat and notices are `group-chat`; invitations the avatar receives are `permission-requests`.
+The groups of the bot's avatar: learning from the grid which groups the avatar is in and which one is active, and the commands by which an operator lists them, activates one, invites an avatar into one, reads a group's profile, joins a group, with or without a fee, and leaves one. Group chat and notices are `group-chat`; invitations the avatar receives are `permission-requests`.
 
 ## ADDED Requirements
 
 ### Requirement: The avatar's groups
-While connected, the bot SHALL know the groups the avatar is in, each with its UUID, its name, whether the avatar may invite into it and whether the avatar gets its notices, and which of them, if any, is the active group. It SHALL ask the grid for them once after each login, as a viewer does, SHALL take them in whichever of the two ways the grid sends them, as a message of the simulator connection or as an event of the simulator's event queue, and SHALL follow every later word of the grid about them: a new list, a group the avatar was dropped from, and a change of the active group. What the bot knows of the groups SHALL be forgotten when the session ends.
+While connected, the bot SHALL know the groups the avatar is in, each with its UUID, its name, whether the avatar may invite into it and whether the avatar gets its notices, and which of them, if any, is the active group. It SHALL ask the grid for them once after each login, as a viewer does, SHALL take them in whichever of the two ways the grid sends them, as a message of the simulator connection or as an event of the simulator's event queue, and SHALL follow every later word of the grid about them: a new list, a group the avatar was dropped from, and a change of the active group. For 5 seconds after the grid has confirmed that the avatar joined or left a group, a list or a drop that says otherwise about that group SHALL be taken as one the grid made before, and SHALL NOT change what the bot knows of that group, unless the bot is joining or leaving it again; when those 5 seconds are over the bot SHALL ask the grid for the groups again and take its answer. What the bot knows of the groups SHALL be forgotten when the session ends.
 
 #### Scenario: After login
 - **WHEN** the avatar is in the groups `Builders` and `Dancers`, `Builders` being active, and the bot has logged in
@@ -21,12 +21,16 @@ While connected, the bot SHALL know the groups the avatar is in, each with its U
 - **WHEN** an officer of `Dancers` ejects the avatar while the bot runs
 - **THEN** `group list` no longer lists `Dancers`
 
+#### Scenario: Left and joined again at once
+- **WHEN** `group leave Dancers` and `group join <uuid of Dancers>` are run one right after the other, and the grid's list and drop from the leave arrive after the join was confirmed
+- **THEN** `group list` still lists `Dancers`, `group activate Dancers` finds it, and 5 seconds later the bot asks the grid for the groups again
+
 #### Scenario: Joined from a viewer earlier
 - **WHEN** the avatar joined a group from a viewer yesterday and the bot logs in today
 - **THEN** the group is in `group list`
 
 ### Requirement: Naming a group
-Where a command takes `<group>`, it SHALL be one argument: a UUID, or the name of a group the avatar is in. A name SHALL be compared with the names of the avatar's groups without regard to letter case and SHALL match as a whole only. When no group of the avatar has that name the command SHALL be answered with an error naming it. When more than one has it the command SHALL be answered with an error that says so and lists each of them with its UUID, so that the command can be given again with a UUID, and SHALL do nothing else. A UUID SHALL name the group with that UUID; for `group activate`, `group invite` and `group chat` it SHALL be answered with an error when the avatar is in no such group.
+Where a command takes `<group>`, it SHALL be one argument: a UUID, or the name of a group the avatar is in. A name SHALL be compared with the names of the avatar's groups without regard to letter case and SHALL match as a whole only. When no group of the avatar has that name the command SHALL be answered with an error naming it. When more than one has it the command SHALL be answered with an error that says so and lists each of them with its UUID, so that the command can be given again with a UUID, and SHALL do nothing else. A UUID SHALL name the group with that UUID; for `group activate`, `group invite`, `group chat` and `group leave` it SHALL be answered with an error when the avatar is in no such group.
 
 #### Scenario: By name
 - **WHEN** the avatar is in `Builders` and `rslbot ctl group activate builders` is run
@@ -127,7 +131,7 @@ For `group info`, for `group join` and for an invitation (see `permission-reques
 - **THEN** the join is decided on the answer the bot has, without a second request for the profile
 
 ### Requirement: Group join command
-`group join <uuid>` SHALL make the avatar a member of the group with that UUID, as a viewer's Join does, and SHALL take the group by its UUID only. Before it sends anything it SHALL ask for the group's profile (see "Asking the grid for a group's profile") and SHALL refuse the command with an error, sending nothing, when the avatar is in that group already, and when the group is not open to join, saying that joining it takes an invitation. A group without a fee SHALL be joined whether or not the config has a `[payments]` table. The command SHALL be answered with success, naming the group, when the grid says that the avatar has joined; with an error holding the grid's reason, when it gives one, when the grid refuses; and with an error saying that the grid has not confirmed the join when the grid has said neither within 15 seconds.
+`group join <uuid>` SHALL make the avatar a member of the group with that UUID, as a viewer's Join does, and SHALL take the group by its UUID only. Before it sends anything it SHALL ask for the group's profile (see "Asking the grid for a group's profile") and SHALL refuse the command with an error, sending nothing, when the avatar is in that group already, and when the group is not open to join, saying that joining it takes an invitation. A group without a fee SHALL be joined whether or not the config has a `[payments]` table. The command SHALL be answered with success, naming the group, when the grid lists the group among the avatar's (see "The avatar's groups"), so that a command naming the group right after the answer finds it; with an error holding the grid's reason, when it gives one, when the grid refuses; and with an error saying that the grid has not confirmed the join when the grid has said neither within 15 seconds.
 
 #### Scenario: Free group
 - **WHEN** `rslbot ctl group join <uuid>` names the open group `Dancers`, which has no fee
@@ -168,8 +172,27 @@ For `group info`, for `group join` and for an invitation (see `permission-reques
 - **WHEN** the config has no `[payments]` table and `rslbot ctl group join <uuid> --pay 100` names a group without a fee
 - **THEN** the avatar joins and pays nothing
 
+### Requirement: Group leave command
+`group leave <group>` SHALL make the avatar leave that group, as a viewer's Leave does. The words of a name MAY be given as separate arguments and SHALL then be joined by single spaces. The command SHALL be answered with success, naming the group, when the grid says that the avatar has left it or sends a list of the avatar's groups without it; with an error saying that the grid refused, when the grid refuses; and with an error saying that the grid has not confirmed it when neither has happened within 15 seconds. Nothing SHALL be paid or refunded. When the group left was the active one, the active group SHALL be the one the grid then says. Once the avatar has left a group, its chat and notices are no longer recorded (see `group-chat`) and the bot's session of its chat SHALL be forgotten.
+
+#### Scenario: Leave
+- **WHEN** the avatar is in `Dancers` and `rslbot ctl group leave Dancers` is run
+- **THEN** `group list` no longer lists `Dancers`, and the command exits with status 0 naming `Dancers`
+
+#### Scenario: Group the avatar is not in
+- **WHEN** `rslbot ctl group leave <uuid>` names a group the avatar is not in
+- **THEN** the command exits with status 1 saying that the avatar is not in that group, and nothing is sent
+
+#### Scenario: Active group
+- **WHEN** `Builders` is the active group and `rslbot ctl group leave Builders` is run
+- **THEN** `group list` no longer lists `Builders` and no line of it has `active`
+
+#### Scenario: Refused
+- **WHEN** the grid refuses to let the avatar leave `Builders`, as it does for a group's only owner
+- **THEN** the command exits with status 1 saying that the grid refused, and `group list` still lists `Builders`
+
 ### Requirement: Group commands leave the placement alone
-No `group` command SHALL move the avatar or change the bot's placement mode or the held placement. `group list`, `group info` and `group invitations` SHALL only read: no RLV restriction SHALL be applied to them, and none of them SHALL be the exempt command of an RLV override (see `rlv-restrictions`, "Override exempts one command"). No RLV restriction SHALL be applied to `group invite` or `group join`. What RLV does to `group activate` and `group chat` is said in `rlv-restrictions`.
+No `group` command SHALL move the avatar or change the bot's placement mode or the held placement. `group list`, `group info` and `group invitations` SHALL only read: no RLV restriction SHALL be applied to them, and none of them SHALL be the exempt command of an RLV override (see `rlv-restrictions`, "Override exempts one command"). No RLV restriction SHALL be applied to `group invite`, `group join` or `group leave`. What RLV does to `group activate` and `group chat` is said in `rlv-restrictions`.
 
 #### Scenario: Seated
 - **WHEN** `rslbot ctl group activate Builders` is run while the avatar is seated on the held object
@@ -180,7 +203,7 @@ No `group` command SHALL move the avatar or change the bot's placement mode or t
 - **THEN** the list is printed and `rlv status` still prints `rlv: override`
 
 ### Requirement: Group commands appear in the operator log
-The bot SHALL write a line to its operator log for every `group activate`, `group invite` and `group join` command: the group by name and UUID as far as known, for `group invite` the avatar by name and UUID, and what became of it: refused and why, sent, confirmed, or not confirmed. A join with a fee is logged as `payments`, "Payments appear in the operator log", says in addition. It SHALL write a line when the grid tells the avatar's groups after a login, with their number and the active group, and when the avatar joins or is dropped from a group while the bot runs. `group list`, `group info` and `group invitations` that are carried out SHALL leave no line.
+The bot SHALL write a line to its operator log for every `group activate`, `group invite`, `group join` and `group leave` command: the group by name and UUID as far as known, for `group invite` the avatar by name and UUID, and what became of it: refused and why, sent, confirmed, or not confirmed. A join with a fee is logged as `payments`, "Payments appear in the operator log", says in addition. It SHALL write a line when the grid tells the avatar's groups after a login, with their number and the active group, and when the avatar joins or is dropped from a group while the bot runs. `group list`, `group info` and `group invitations` that are carried out SHALL leave no line.
 
 #### Scenario: Activation logged
 - **WHEN** `rslbot ctl group activate Builders` is carried out

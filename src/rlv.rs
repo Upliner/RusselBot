@@ -227,6 +227,7 @@ const ENFORCED: &[&str] = &[
     "recvim",
     "recvim_sec",
     "recvimfrom",
+    "setgroup",
     "unsit",
     "sit",
     "sittp",
@@ -327,7 +328,6 @@ const KEPT: &[&str] = &[
     "showhovertext",
     "showhovertexthud",
     "showhovertextworld",
-    "setgroup",
     "setdebug",
     "setenv",
     "allowidle",
@@ -691,14 +691,26 @@ impl From<Result<(), Refusal>> for Check {
 
 /// What an option of a restriction may name.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Target {
+pub enum Target<'n> {
     Id(Uuid),
     Channel(i32),
     Point(u8),
     Kind(u8),
+    /// A group, named by its UUID, by its name without commas and
+    /// semicolons in any letter case, or by `allgroups`.
+    Group {
+        id: Uuid,
+        name: &'n str,
+    },
 }
 
-impl Target {
+/// A group's name as an option of a restriction names it: without commas
+/// and semicolons, which separate options, in lower case.
+fn group_key(name: &str) -> String {
+    name.chars().filter(|c| *c != ',' && *c != ';').collect::<String>().to_lowercase()
+}
+
+impl Target<'_> {
     /// Whether `option` names this. One that cannot be read names nothing.
     fn named_by(self, option: &str) -> bool {
         match self {
@@ -706,6 +718,12 @@ impl Target {
             Target::Channel(channel) => option.trim().parse() == Ok(channel),
             Target::Point(wanted) => point(option) == Some(wanted),
             Target::Kind(kind) => inventory::parse_kind(option) == Some(kind),
+            Target::Group { id, name } => {
+                let option = option.trim();
+                Uuid::parse_str(option) == Ok(id)
+                    || option.eq_ignore_ascii_case("allgroups")
+                    || (!name.is_empty() && group_key(option) == group_key(name))
+            }
         }
     }
 }
@@ -992,6 +1010,38 @@ impl<'a> Limits<'a> {
         let from = Target::Id(from);
         Limits::ok(self.against("recvim", from))?;
         Limits::ok(self.names("recvimfrom", from))
+    }
+
+    /// A line said in the chat of `group`: refused by `sendim`, unless an
+    /// exception names the group or all groups, and by `sendimto` naming
+    /// it. `startim` and `startimto` are about avatars only.
+    pub fn group_chat(&self, group: Uuid, name: &str) -> Result<(), Refusal> {
+        let target = Target::Group { id: group, name };
+        Limits::ok(self.against("sendim", target))?;
+        Limits::ok(self.names("sendimto", target))
+    }
+
+    /// A line of `speaker` in the chat of `group`: whether the avatar may
+    /// read it. `recvim` hides it unless an exception names the group or
+    /// all groups, or names the speaker when `recvimfrom` does not;
+    /// `recvimfrom` naming the group hides it too.
+    pub fn recv_group(&self, speaker: Uuid, group: Uuid, name: &str) -> Result<(), Refusal> {
+        let target = Target::Group { id: group, name };
+        if let Some(refusal) = self.against("recvim", target) {
+            let speaker = Target::Id(speaker);
+            if self.against("recvim", speaker).is_some() {
+                return Err(refusal);
+            }
+            if let Some(from) = self.names("recvimfrom", speaker) {
+                return Err(from);
+            }
+        }
+        Limits::ok(self.names("recvimfrom", target))
+    }
+
+    /// Changing the active group: `setgroup` forbids it.
+    pub fn set_group(&self) -> Result<(), Refusal> {
+        Limits::ok(self.in_force("setgroup"))
     }
 
     pub fn inventory(&self) -> Result<(), Refusal> {
@@ -2605,7 +2655,7 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), count, "a behaviour is listed twice");
-        assert_eq!((ENFORCED.len(), KEPT.len()), (56, 61));
+        assert_eq!((ENFORCED.len(), KEPT.len()), (57, 60));
         for behaviour in [
             "sendchat",
             "unsit",
@@ -2836,6 +2886,70 @@ mod tests {
             limits(&store).against("sendim", jane).unwrap().holder,
             format!("Collar <{}>", id(COLLAR))
         );
+    }
+
+    #[test]
+    fn group_chat_the_avatar_sends() {
+        let (builders, dancers) = (id(0xB1), id(0xD1));
+        let chat = |store: &Restrictions, group: Uuid, name: &str| limits(store).group_chat(group, name);
+        assert!(chat(&collared(&[]), builders, "Builders").is_ok());
+        // `sendim` holds every group back but those it excepts.
+        let store = collared(&["sendim"]);
+        assert_eq!(chat(&store, builders, "Builders").unwrap_err().rule, "sendim");
+        let store = collared(&["sendim", "sendim:Builders"]);
+        assert!(chat(&store, builders, "Builders").is_ok());
+        assert!(chat(&store, dancers, "Dancers").is_err());
+        let store = collared(&["sendim", &format!("sendim:{dancers}")]);
+        assert!(chat(&store, dancers, "Dancers").is_ok());
+        // A name is compared without commas, semicolons and letter case.
+        let store = collared(&["sendim", "sendim:night owls"]);
+        assert!(chat(&store, builders, "Night, Owls;").is_ok());
+        // All groups, and not an avatar's instant message.
+        let store = collared(&["sendim", "sendim:allgroups"]);
+        assert!(chat(&store, dancers, "Dancers").is_ok());
+        assert!(limits(&store).im(id(1), false).is_err());
+        // `sendimto` holds back the group it names, or all.
+        let store = collared(&["sendimto:Builders"]);
+        assert_eq!(chat(&store, builders, "Builders").unwrap_err().rule, "sendimto:Builders");
+        assert!(chat(&store, dancers, "Dancers").is_ok());
+        assert!(chat(&collared(&["sendimto:allgroups"]), dancers, "Dancers").is_err());
+        // `startim` is about avatars.
+        assert!(chat(&collared(&["startim", "startimto:allgroups"]), dancers, "Dancers").is_ok());
+        // A group option does nothing to an avatar's instant message.
+        let store = collared(&["sendim", "sendim:allgroups", "recvim", "recvim:allgroups"]);
+        assert!(limits(&store).im(id(1), true).is_err());
+        assert!(limits(&store).recvim(id(1)).is_err());
+    }
+
+    #[test]
+    fn group_chat_the_avatar_receives() {
+        let (builders, dancers, jane, john) = (id(0xB1), id(0xD1), id(1), id(2));
+        let read = |store: &Restrictions, speaker: Uuid, group: Uuid, name: &str| limits(store).recv_group(speaker, group, name);
+        assert!(read(&collared(&[]), jane, builders, "Builders").is_ok());
+        let store = collared(&["recvim"]);
+        assert_eq!(read(&store, jane, builders, "Builders").unwrap_err().rule, "recvim");
+        // The group excepted, or all groups.
+        assert!(read(&collared(&["recvim", "recvim:allgroups"]), jane, builders, "Builders").is_ok());
+        assert!(read(&collared(&["recvim", "recvim:Builders"]), jane, builders, "Builders").is_ok());
+        // The speaker excepted, unless `recvimfrom` names them.
+        let excepted = format!("recvim:{jane}");
+        let store = collared(&["recvim", &excepted]);
+        assert!(read(&store, jane, builders, "Builders").is_ok());
+        assert!(read(&store, john, builders, "Builders").is_err());
+        let store = collared(&["recvim", &excepted, &format!("recvimfrom:{jane}")]);
+        assert!(read(&store, jane, builders, "Builders").is_err());
+        // `recvimfrom` naming the group, or all of them.
+        let store = collared(&["recvimfrom:Builders"]);
+        assert_eq!(read(&store, jane, builders, "Builders").unwrap_err().rule, "recvimfrom:Builders");
+        assert!(read(&store, jane, dancers, "Dancers").is_ok());
+        assert!(read(&collared(&["recvimfrom:allgroups"]), jane, dancers, "Dancers").is_err());
+    }
+
+    #[test]
+    fn setgroup_keeps_the_active_group() {
+        assert!(limits(&collared(&[])).set_group().is_ok());
+        assert_eq!(limits(&collared(&["setgroup"])).set_group().unwrap_err().rule, "setgroup");
+        assert_eq!(effect("setgroup"), Some(Effect::Enforced));
     }
 
     #[test]
@@ -3803,6 +3917,7 @@ mod tests {
             "camdrawalphamax:1",
             "camdrawmin:1",
             "showloc",
+            "setgroup",
         ]);
         let lines = store.lines();
         let effectless: Vec<&String> = lines.iter().filter(|line| line.ends_with("(no effect)")).collect();

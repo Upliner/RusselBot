@@ -42,6 +42,8 @@ Usage: rslbot ctl say MESSAGE...
        rslbot ctl tp X Y [Z] [REGION...]
        rslbot ctl requesttp AVATAR [MESSAGE...]
        rslbot ctl accept KIND [WHO]
+       rslbot ctl accept group [WHO] [--pay SUM]
+       rslbot ctl decline group [WHO]
        rslbot ctl accepttp [AVATAR]
        rslbot ctl sendtp AVATAR [MESSAGE...]
        rslbot ctl touch UUID
@@ -49,6 +51,13 @@ Usage: rslbot ctl say MESSAGE...
        rslbot ctl scan avatars [DISTANCE]
        rslbot ctl friends
        rslbot ctl profile AVATAR
+       rslbot ctl group list | invitations
+       rslbot ctl group activate GROUP | none
+       rslbot ctl group invite GROUP AVATAR
+       rslbot ctl group chat GROUP MESSAGE...
+       rslbot ctl group info GROUP
+       rslbot ctl group join UUID [--pay SUM]
+       rslbot ctl group leave GROUP
        rslbot ctl inventory [-a] [-n] [FOLDER]
        rslbot ctl attach ITEM [BODY PART...]
        rslbot ctl wear ITEM
@@ -110,13 +119,28 @@ position, name and display name.
 friend that does not show it), name and display name. `profile` prints the
 profile of AVATAR as `name: value` lines.
 
+`group list` lists the avatar's groups: UUID, flags (`active`, `invite`,
+`notices`) and name. GROUP is one argument: a UUID, or the name of one of
+the avatar's groups in any letter case; when two have that name, give the
+UUID. `group activate` makes GROUP the one whose tag the avatar wears.
+`group invite` invites AVATAR into GROUP; the grid does not say whether
+the invitation arrived. `group chat` says a line in GROUP's chat, and
+`group info` prints a group's profile, of any group by its UUID. `group
+join` joins an open group by its UUID; one that costs L$ is joined only
+with `--pay` and a SUM not below the fee, and only as `pay` may pay. `group
+leave` leaves GROUP; joining it again may take an invitation or a fee.
+`group invitations` lists the invitations that wait.
+
 `accept` accepts a request that waits because the bot did not accept it by
 itself. KIND is what was asked: `tp` (a teleport offer), `inventory` (an
-inventory offer), or what a script asked permission for: `anim`, `attach`,
-`controls`, `camera`. Without WHO the request received last is accepted,
-with WHO the last one from that avatar, that object, or an object of that
-avatar. WHO is one argument, an avatar as above or an object's UUID. A
-script that asked for several permissions is granted all of them.
+inventory offer), what a script asked permission for: `anim`, `attach`,
+`controls`, `camera`, or `group` (an invitation). Without WHO the request
+received last is accepted, with WHO the last one from that avatar, that
+object, or an object of that avatar. WHO is one argument, an avatar as
+above or an object's UUID. A script that asked for several permissions is
+granted all of them. `accept group` and `decline group` take the one
+invitation WHO names: its group by name or UUID, or its inviter; when WHO
+names more than one, or is left out while several wait, they list them.
 `accepttp [AVATAR]` is the older name of `accept tp [AVATAR]` and is
 deprecated.
 
@@ -226,7 +250,14 @@ pub enum Request {
     Accept {
         kind: String,
         who: Option<String>,
+        /// `--pay SUM`, for an invitation with a fee.
+        pay: Option<u32>,
     },
+    /// `decline group [WHO]`, WHO still to be read.
+    Decline {
+        who: Option<String>,
+    },
+    Group(GroupRequest),
     SendTp {
         to: String,
         message: String,
@@ -296,6 +327,8 @@ impl Request {
             Request::Tp(_) => "tp",
             Request::AskTp { .. } => "requesttp",
             Request::Accept { .. } => "accept",
+            Request::Decline { .. } => "decline",
+            Request::Group(group) => group.name(),
             Request::Perms(_) => "perms",
             Request::Autoreply(_) => "autoreply",
             Request::SendTp { .. } => "sendtp",
@@ -320,6 +353,77 @@ impl Request {
             Request::Sound(_) => "sound",
         }
     }
+}
+
+/// The `group` commands, with their arguments as far as they can be read
+/// without the avatar's groups.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GroupRequest {
+    List,
+    /// A group, or `none`.
+    Activate(String),
+    Invite {
+        group: String,
+        avatar: String,
+    },
+    Chat {
+        group: String,
+        text: String,
+    },
+    Info(String),
+    Join {
+        group: uuid::Uuid,
+        pay: Option<u32>,
+    },
+    Leave(String),
+    Invitations,
+}
+
+impl GroupRequest {
+    pub fn name(&self) -> &'static str {
+        match self {
+            GroupRequest::List => "group list",
+            GroupRequest::Activate(_) => "group activate",
+            GroupRequest::Invite { .. } => "group invite",
+            GroupRequest::Chat { .. } => "group chat",
+            GroupRequest::Info(_) => "group info",
+            GroupRequest::Join { .. } => "group join",
+            GroupRequest::Leave(_) => "group leave",
+            GroupRequest::Invitations => "group invitations",
+        }
+    }
+}
+
+/// The forms of `group`, for its errors.
+const GROUP_FORMS: &str = "`group list`, `group activate GROUP|none`, `group invite GROUP AVATAR`, \
+                           `group chat GROUP MESSAGE...`, `group info GROUP`, `group join UUID [--pay SUM]`, \
+                           `group leave GROUP` or `group invitations`";
+
+/// Reads the sum of `--pay`: digits only, from 0 to the most the grid
+/// takes.
+pub fn parse_sum(text: &str) -> Result<u32, String> {
+    let max = crate::payments::MAX_AMOUNT;
+    let digits = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    match text.parse::<u32>() {
+        Ok(sum) if digits && sum <= max => Ok(sum),
+        _ => Err(format!("the sum \"{text}\" of `--pay` is not a whole number of L$ from 0 to {max}")),
+    }
+}
+
+/// Takes `--pay SUM` out of `args`, wherever it is.
+fn take_pay(command: &str, args: &mut Vec<String>) -> Result<Option<u32>, String> {
+    let Some(at) = args.iter().position(|arg| arg == "--pay") else {
+        return Ok(None);
+    };
+    if at + 1 >= args.len() {
+        return Err(format!("`{command}`: `--pay` needs the sum of L$ after it"));
+    }
+    let sum = parse_sum(&args[at + 1]).map_err(|e| format!("`{command}`: {e}"))?;
+    args.drain(at..at + 2);
+    if args.iter().any(|arg| arg == "--pay") {
+        return Err(format!("`{command}`: `--pay` is given once"));
+    }
+    Ok(Some(sum))
 }
 
 /// Whom `pay` pays.
@@ -500,6 +604,22 @@ impl Request {
                 let (to, message) = avatar_and_message(fields);
                 Ok(Request::AskTp { to, message })
             }
+            "accept" if fields.first().map(String::as_str) == Some("group") => {
+                let mut rest: Vec<String> = fields[1..].to_vec();
+                let pay = take_pay("accept group", &mut rest)?;
+                if rest.len() > 1 {
+                    return Err(
+                        "`accept group` takes, if wanted, who sent the invitation or its group, and `--pay SUM`: \
+                         `accept group [WHO] [--pay SUM]`; a name of two words has to be quoted"
+                            .to_string(),
+                    );
+                }
+                Ok(Request::Accept {
+                    kind: "group".to_string(),
+                    who: rest.pop(),
+                    pay,
+                })
+            }
             "accept" => {
                 if given == 0 || given > 2 {
                     return Err(
@@ -512,7 +632,68 @@ impl Request {
                 Ok(Request::Accept {
                     kind: fields.next().unwrap_or_default(),
                     who: fields.next(),
+                    pay: None,
                 })
+            }
+            "decline" => match fields.first().map(String::as_str) {
+                None => Err("`decline` takes `group` and, if wanted, who sent the invitation: `decline group [WHO]`".to_string()),
+                Some("group") if fields.iter().any(|arg| arg == "--pay") => {
+                    Err("`decline group` pays nothing and takes no `--pay`".to_string())
+                }
+                Some("group") if given <= 2 => Ok(Request::Decline {
+                    who: fields.get(1).cloned(),
+                }),
+                Some("group") => Err(
+                    "`decline group` takes, if wanted, who sent the invitation or its group: `decline group [WHO]`; \
+                     a name of two words has to be quoted"
+                        .to_string(),
+                ),
+                Some(_) => Err("only invitations to groups can be declined: `decline group [WHO]`".to_string()),
+            },
+            "group" => {
+                let mut rest: Vec<String> = fields.iter().skip(1).cloned().collect();
+                let form = fields.first().map(String::as_str);
+                let bare = |request: GroupRequest, name: &str, rest: &[String]| match rest.is_empty() {
+                    true => Ok(Request::Group(request)),
+                    false => Err(format!("`group {name}` takes no arguments")),
+                };
+                match form {
+                    Some("list") => bare(GroupRequest::List, "list", &rest),
+                    Some("invitations") => bare(GroupRequest::Invitations, "invitations", &rest),
+                    Some("activate") if !rest.is_empty() => Ok(Request::Group(GroupRequest::Activate(rest.join(" ")))),
+                    Some("activate") => Err("`group activate` takes a group, or `none`".to_string()),
+                    Some("info") if !rest.is_empty() => Ok(Request::Group(GroupRequest::Info(rest.join(" ")))),
+                    Some("info") => Err("`group info` takes a group".to_string()),
+                    Some("leave") if !rest.is_empty() => Ok(Request::Group(GroupRequest::Leave(rest.join(" ")))),
+                    Some("leave") => Err("`group leave` takes a group".to_string()),
+                    Some("invite") => match <[String; 2]>::try_from(rest) {
+                        Ok([group, avatar]) => Ok(Request::Group(GroupRequest::Invite { group, avatar })),
+                        Err(_) => Err("`group invite` takes a group and an avatar: `group invite GROUP AVATAR`; \
+                             a name with spaces has to be quoted"
+                            .to_string()),
+                    },
+                    Some("chat") if rest.len() >= 2 => {
+                        let group = rest.remove(0);
+                        Ok(Request::Group(GroupRequest::Chat {
+                            group,
+                            text: rest.join(" "),
+                        }))
+                    }
+                    Some("chat") => Err("`group chat` takes a group and a message: `group chat GROUP MESSAGE...`; \
+                         a group's name with spaces has to be quoted"
+                        .to_string()),
+                    Some("join") => {
+                        let pay = take_pay("group join", &mut rest)?;
+                        let group = match &rest[..] {
+                            [one] => uuid::Uuid::parse_str(one.trim()).map_err(|_| {
+                                format!("a group is joined by its UUID, not \"{one}\"; `group info UUID` shows a group's profile")
+                            })?,
+                            _ => return Err("`group join` takes a group's UUID and, if wanted, `--pay SUM`".to_string()),
+                        };
+                        Ok(Request::Group(GroupRequest::Join { group, pay }))
+                    }
+                    _ => Err(format!("`group` takes {GROUP_FORMS}")),
+                }
             }
             // The older name of `accept tp`.
             "accepttp" => {
@@ -524,6 +705,7 @@ impl Request {
                 Ok(Request::Accept {
                     kind: "tp".to_string(),
                     who: fields.pop(),
+                    pay: None,
                 })
             }
             "perms" => {
@@ -748,6 +930,9 @@ pub fn request_line(args: &[String]) -> String {
     match args.first().map(String::as_str) {
         Some("say") if args.len() > 1 => fields.extend([args[0].clone(), args[1..].join(" ")]),
         Some("im") if args.len() > 2 => fields.extend([args[0].clone(), args[1].clone(), args[2..].join(" ")]),
+        Some("group") if args.len() > 3 && args[1] == "chat" => {
+            fields.extend([args[0].clone(), args[1].clone(), args[2].clone(), args[3..].join(" ")])
+        }
         _ => fields.extend(args.iter().cloned()),
     }
     encode_line(&fields.iter().map(String::as_str).collect::<Vec<_>>())
@@ -1117,7 +1302,8 @@ mod tests {
             Request::decode(b"accepttp\tjane.doe"),
             Ok(Request::Accept {
                 kind: text("tp"),
-                who: Some(text("jane.doe"))
+                who: Some(text("jane.doe")),
+                pay: None,
             })
         );
         assert_eq!(Request::decode(b"touch\tabc"), Ok(Request::Touch(text("abc"))));
@@ -1490,6 +1676,7 @@ mod tests {
             Ok(Request::Accept {
                 kind: kind.to_string(),
                 who: who.map(str::to_string),
+                pay: None,
             })
         };
         assert_eq!(read("accept\ttp"), accept("tp", None));
@@ -1519,6 +1706,133 @@ mod tests {
                 who: strings(&["all"]),
             }))
         );
+    }
+
+    #[test]
+    fn group_requests_are_read_from_their_lines() {
+        let read = |line: &str| Request::decode(line.as_bytes());
+        let group = |request| Ok(Request::Group(request));
+        let uuid = "01234567-9abc-defe-dcba-987654321000";
+        let id = uuid::Uuid::parse_str(uuid).unwrap();
+        assert_eq!(read("group\tlist"), group(GroupRequest::List));
+        assert_eq!(read("group\tinvitations"), group(GroupRequest::Invitations));
+        assert_eq!(
+            read("group\tactivate\tNight\tOwls"),
+            group(GroupRequest::Activate("Night Owls".into()))
+        );
+        assert_eq!(
+            read("group\tactivate\tNight Owls"),
+            group(GroupRequest::Activate("Night Owls".into()))
+        );
+        assert_eq!(read("group\tactivate\tnone"), group(GroupRequest::Activate("none".into())));
+        assert_eq!(
+            read("group\tinvite\tBuilders\tJane Doe"),
+            group(GroupRequest::Invite {
+                group: "Builders".into(),
+                avatar: "Jane Doe".into()
+            })
+        );
+        assert_eq!(
+            read("group\tchat\tNight Owls\tsee\tyou"),
+            group(GroupRequest::Chat {
+                group: "Night Owls".into(),
+                text: "see you".into()
+            })
+        );
+        assert_eq!(read("group\tinfo\tNight\tOwls"), group(GroupRequest::Info("Night Owls".into())));
+        assert_eq!(read("group\tleave\tNight\tOwls"), group(GroupRequest::Leave("Night Owls".into())));
+        assert_eq!(read("group\tleave\tNight Owls"), group(GroupRequest::Leave("Night Owls".into())));
+        assert_eq!(read("group\tleave\tDancers").unwrap().name(), "group leave");
+        assert_eq!(
+            read(&format!("group\tjoin\t{uuid}")),
+            group(GroupRequest::Join { group: id, pay: None })
+        );
+        assert_eq!(
+            read(&format!("group\tjoin\t{uuid}\t--pay\t300")),
+            group(GroupRequest::Join { group: id, pay: Some(300) })
+        );
+        assert_eq!(
+            read(&format!("group\tjoin\t--pay\t0\t{uuid}")),
+            group(GroupRequest::Join { group: id, pay: Some(0) })
+        );
+        assert!(read("group\tjoin\tx").unwrap_err().contains("by its UUID"));
+        assert_eq!(read("group\tlist").unwrap().name(), "group list");
+        // `ctl` makes one argument of a message's words, as for `im`.
+        let line = request_line(&strings(&["group", "chat", "Night Owls", "see", "you"]));
+        assert_eq!(line, "group\tchat\tNight Owls\tsee you\n");
+    }
+
+    #[test]
+    fn malformed_group_requests_are_refused() {
+        let refused = |line: &str| Request::decode(line.as_bytes()).unwrap_err();
+        for line in ["group", "group\tfly", "group\tList"] {
+            assert!(refused(line).contains("`group list`"), "{line}: {}", refused(line));
+        }
+        let uuid = "01234567-9abc-defe-dcba-987654321000";
+        assert!(refused("group\tjoin\tDancers").contains("a group is joined by its UUID, not \"Dancers\""));
+        assert!(refused(&format!("group\tjoin\t{uuid}\t--pay")).contains("`--pay` needs the sum"));
+        let reason = refused(&format!("group\tjoin\t{uuid}\t--pay\t10.5"));
+        assert!(reason.contains("\"10.5\""), "{reason}");
+        assert!(refused(&format!("group\tjoin\t{uuid}\t--pay\t2147483648")).contains("2147483648"));
+        assert!(refused("group\tchat\tBuilders").contains("a group and a message"));
+        assert!(refused("group\tlist\tnow").contains("takes no arguments"));
+        assert!(refused("group\tinvite\tBuilders").contains("a group and an avatar"));
+        assert!(refused("group\tactivate").contains("a group"));
+        assert!(refused("group\tinfo").contains("a group"));
+        assert!(refused("group\tleave").contains("`group leave` takes a group"));
+        assert!(refused("group\tfly").contains("`group leave GROUP`"));
+    }
+
+    #[test]
+    fn accept_group_and_decline_are_read() {
+        let read = |line: &str| Request::decode(line.as_bytes());
+        let accept = |who: Option<&str>, pay| {
+            Ok(Request::Accept {
+                kind: "group".into(),
+                who: who.map(str::to_string),
+                pay,
+            })
+        };
+        assert_eq!(read("accept\tgroup"), accept(None, None));
+        assert_eq!(read("accept\tgroup\tBuilders"), accept(Some("Builders"), None));
+        assert_eq!(read("accept\tgroup\tBuilders\t--pay\t250"), accept(Some("Builders"), Some(250)));
+        assert_eq!(read("accept\tgroup\t--pay\t250\tJane Doe"), accept(Some("Jane Doe"), Some(250)));
+        assert_eq!(read("accept\tgroup\t--pay\t250"), accept(None, Some(250)));
+        assert!(read("accept\tgroup\ta\tb")
+            .unwrap_err()
+            .contains("`accept group [WHO] [--pay SUM]`"));
+        assert!(read("accept\tgroup\t--pay\tlots").unwrap_err().contains("\"lots\""));
+        assert_eq!(read("decline\tgroup"), Ok(Request::Decline { who: None }));
+        assert_eq!(
+            read("decline\tgroup\tJane Doe"),
+            Ok(Request::Decline {
+                who: Some("Jane Doe".into())
+            })
+        );
+        assert!(read("decline\ttp\tJane Doe")
+            .unwrap_err()
+            .contains("only invitations to groups can be declined"));
+        assert!(read("decline\tgroup\t--pay\t5").unwrap_err().contains("no `--pay`"));
+        assert!(read("decline").unwrap_err().contains("`decline group [WHO]`"));
+        assert_eq!(read("decline\tgroup").unwrap().name(), "decline");
+    }
+
+    #[test]
+    fn help_lists_the_group_lines() {
+        let help = help();
+        for line in [
+            "group list | invitations",
+            "group activate GROUP | none",
+            "group invite GROUP AVATAR",
+            "group chat GROUP MESSAGE...",
+            "group info GROUP",
+            "group join UUID [--pay SUM]",
+            "group leave GROUP",
+            "accept group [WHO] [--pay SUM]",
+            "decline group [WHO]",
+        ] {
+            assert!(help.contains(&format!("{line}\n")), "{line}");
+        }
     }
 
     #[test]

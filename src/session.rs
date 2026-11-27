@@ -4,8 +4,9 @@
 //! a fake clock and a recording network.
 
 use crate::avatars::Seen;
-use crate::caps::{CapsEvent, EqEvent, InventoryUrls, TeleportFinish};
+use crate::caps::{CapsEvent, EqEvent, InventoryUrls, SessionLine, TeleportFinish};
 use crate::friends::Friends;
+use crate::groups::{Membership, Profile};
 use crate::login::SessionInfo;
 use crate::persist::{Location, Sitting, World};
 use crate::reconciler::same_region;
@@ -207,6 +208,70 @@ pub enum SessionEvent {
     FriendshipEnded(Uuid),
     /// An avatar accepted the avatar's offer of friendship.
     FriendshipBegun(Uuid),
+    /// The groups the avatar is in, as the grid listed them, in either of
+    /// the ways it lists them.
+    Groups(Vec<Membership>),
+    /// The avatar is no longer in this group.
+    GroupDropped(Uuid),
+    /// The grid says which group is active, nil for none, with the title
+    /// the avatar wears and the group's name.
+    ActiveGroup {
+        group: Uuid,
+        title: String,
+        name: String,
+    },
+    /// A group's profile, in answer to `ask_group_profile`.
+    GroupProfile(Profile),
+    /// The answer to `join_group`.
+    Joined {
+        group: Uuid,
+        success: bool,
+    },
+    /// The answer to `leave_group`.
+    Left {
+        group: Uuid,
+        success: bool,
+    },
+    /// An invitation to join a group. `id` is what the answer names; `fee`
+    /// what joining costs, as the invitation says; `inviter` the name it
+    /// gives.
+    GroupInvitation {
+        group: Uuid,
+        id: Uuid,
+        inviter: String,
+        fee: i32,
+        text: String,
+    },
+    /// The grid offered the avatar this chat session with its first line,
+    /// which follows as a `GroupChat`: a viewer takes the session up.
+    GroupSessionOffered(Uuid),
+    /// A line of a chat session: a group's, when `session` is one of the
+    /// avatar's groups, else a conference's. Never one of the avatar's own.
+    GroupChat {
+        session: Uuid,
+        from: Uuid,
+        name: String,
+        text: String,
+    },
+    /// A group notice: its text (`subject|body`) and its bucket, which
+    /// names the group and the attachment. `sender` when the notice gives
+    /// the sender's UUID; `sent_at` for one stored while offline.
+    GroupNotice {
+        group: Uuid,
+        sender: Option<Uuid>,
+        name: String,
+        text: String,
+        bucket: Vec<u8>,
+        sent_at: Option<u32>,
+    },
+    /// The grid's answer to `start_group_session`.
+    GroupSession {
+        group: Uuid,
+        ok: bool,
+        error: String,
+    },
+    /// Where the current simulator takes chat sessions up, if it does.
+    ChatSessionsUrl(Option<String>),
     /// The avatar has left a region for another. `worn` are the objects
     /// the old simulator had described that were on the avatar, the prims
     /// of its attachments: they come along, everything else stays behind.
@@ -321,6 +386,19 @@ const IM_NOTHING_SPECIAL: u8 = messages::IM_PLAIN;
 const IM_FROM_TASK: u8 = 19;
 /// An avatar accepted the avatar's offer of friendship.
 const IM_FRIENDSHIP_ACCEPTED: u8 = 39;
+
+/// An instant message's fields, however it came.
+struct Im {
+    from_agent: Uuid,
+    from_group: bool,
+    from_name: String,
+    dialog: u8,
+    id: Uuid,
+    offline: bool,
+    timestamp: u32,
+    text: String,
+    bucket: Vec<u8>,
+}
 
 /// The asset type an inventory offer's binary bucket names. An avatar's
 /// offer carries the type and the item's UUID; an object's the type alone,
@@ -536,6 +614,8 @@ pub struct Session<N: Net> {
     logout_deadline: Option<Instant>,
     /// Ask for the IMs stored while offline, once, on entering the first region.
     fetch_offline_im: bool,
+    /// Ask for the avatar's groups, once, on entering the first region.
+    groups_due: bool,
     /// The avatar's friends and who of them is online, for this login.
     friends: Friends,
     /// The avatars whose profiles the simulator has been asked for and has
@@ -578,6 +658,7 @@ impl<N: Net> Session<N> {
             teleport: None,
             logout_deadline: None,
             fetch_offline_im,
+            groups_due: true,
             friends: Friends::new(&info.friends),
             profiles_asked: HashSet::new(),
             lost: false,
@@ -978,6 +1059,83 @@ impl<N: Net> Session<N> {
             false => messages::IM_INVENTORY_OFFERED,
         };
         let message = messages::inventory_accepted(&self.agent, &self.agent_name, to, position, offered, transaction, folder);
+        self.send(message, true, now);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------- groups
+
+    /// Makes `group` the active group, nil for none. Answered with an
+    /// `ActiveGroup`.
+    pub fn activate_group(&mut self, group: Uuid, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::activate_group(&self.agent, group), true, now);
+        Ok(())
+    }
+
+    /// Invites `avatar` into `group`, into its role Everyone.
+    pub fn invite_to_group(&mut self, group: Uuid, avatar: Uuid, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::invite_group_request(&self.agent, group, avatar), true, now);
+        Ok(())
+    }
+
+    /// Asks for `group`'s profile; a `GroupProfile` follows if the grid
+    /// knows the group.
+    pub fn ask_group_profile(&mut self, group: Uuid, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::group_profile_request(&self.agent, group), true, now);
+        Ok(())
+    }
+
+    /// Asks to join `group`; a `Joined` follows.
+    pub fn join_group(&mut self, group: Uuid, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::join_group_request(&self.agent, group), true, now);
+        Ok(())
+    }
+
+    /// Asks for the avatar's groups again; a `Groups` follows.
+    pub fn ask_groups(&mut self, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::agent_data_update_request(&self.agent), true, now);
+        Ok(())
+    }
+
+    /// Asks to leave `group`; a `Left` follows.
+    pub fn leave_group(&mut self, group: Uuid, now: Instant) -> Result<(), String> {
+        self.present()?;
+        self.send(messages::leave_group_request(&self.agent, group), true, now);
+        Ok(())
+    }
+
+    /// Answers the invitation `id` into `group` as a viewer's Join or
+    /// Decline does.
+    pub fn answer_invitation(&mut self, group: Uuid, id: Uuid, accept: bool, now: Instant) -> Result<(), String> {
+        let dialog = match accept {
+            true => messages::IM_GROUP_INVITATION_ACCEPT,
+            false => messages::IM_GROUP_INVITATION_DECLINE,
+        };
+        self.send_to_group(group, dialog, id, "name", "message", now)
+    }
+
+    /// Asks to enter `group`'s chat session, as a viewer does that opens
+    /// it; a `GroupSession` follows.
+    pub fn start_group_session(&mut self, group: Uuid, now: Instant) -> Result<(), String> {
+        let name = self.agent_name.clone();
+        self.send_to_group(group, messages::IM_SESSION_GROUP_START, group, &name, "", now)
+    }
+
+    /// Says `text` in `group`'s chat session.
+    pub fn group_chat(&mut self, group: Uuid, text: &str, now: Instant) -> Result<(), String> {
+        let name = self.agent_name.clone();
+        self.send_to_group(group, messages::IM_SESSION_SEND, group, &name, text, now)
+    }
+
+    fn send_to_group(&mut self, group: Uuid, dialog: u8, id: Uuid, name: &str, text: &str, now: Instant) -> Result<(), String> {
+        self.present()?;
+        let position = self.sim.position.unwrap_or_default();
+        let message = messages::group_instant_message(&self.agent, name, group, position, dialog, id, text);
         self.send(message, true, now);
         Ok(())
     }
@@ -1658,6 +1816,36 @@ impl<N: Net> Session<N> {
         match event {
             CapsEvent::Gone(reason) => self.lose(reason),
             CapsEvent::Event(EqEvent::TeleportFinish(finish)) => self.hand_over(finish, now),
+            CapsEvent::Event(EqEvent::Groups(groups)) => self.events.push(SessionEvent::Groups(groups)),
+            CapsEvent::Event(EqEvent::GroupDropped(group)) => self.group_dropped(group, now),
+            CapsEvent::Event(EqEvent::SessionInvite(line)) => {
+                let SessionLine {
+                    session,
+                    from,
+                    from_name,
+                    dialog,
+                    text,
+                    bucket,
+                    offline,
+                    timestamp,
+                } = line;
+                let im = Im {
+                    from_agent: from,
+                    from_group: false,
+                    from_name,
+                    dialog,
+                    id: session,
+                    offline,
+                    timestamp,
+                    text,
+                    bucket,
+                };
+                self.instant_message_in(im, true);
+            }
+            CapsEvent::Event(EqEvent::SessionStarted { session, ok, error }) => {
+                self.events.push(SessionEvent::GroupSession { group: session, ok, error });
+            }
+            CapsEvent::ChatSessions(url) => self.events.push(SessionEvent::ChatSessionsUrl(url)),
             CapsEvent::Event(EqEvent::Other(name)) => crate::debug!("event queue: ignoring {name}"),
             CapsEvent::DisplayNames(url) => self.events.push(SessionEvent::DisplayNamesUrl(url)),
             CapsEvent::AvatarSearch(url) => self.events.push(SessionEvent::AvatarSearchUrl(url)),
@@ -1963,6 +2151,7 @@ impl<N: Net> Session<N> {
             Incoming::InstantMessage {
                 from_agent,
                 from_group,
+                to: _,
                 from_name,
                 dialog,
                 id,
@@ -1971,75 +2160,40 @@ impl<N: Net> Session<N> {
                 text,
                 bucket,
             } => {
-                let (kind, source) = match dialog {
-                    IM_NOTHING_SPECIAL if from_agent.is_nil() => ("im", Source::System { name: from_name }),
-                    IM_NOTHING_SPECIAL => (
-                        "im",
-                        Source::Avatar {
-                            id: from_agent,
-                            name: from_name,
-                        },
-                    ),
-                    // The sender is the object's owner and the id is the object.
-                    IM_FROM_TASK => {
-                        let id = (!id.is_nil()).then_some(id);
-                        (
-                            "object",
-                            Source::Object {
-                                id,
-                                name: from_name,
-                                owner: from_agent,
-                            },
-                        )
-                    }
-                    messages::IM_TELEPORT_OFFER => {
-                        let offer = SessionEvent::TeleportOffer {
-                            from: from_agent,
-                            name: from_name,
-                            lure: id,
-                        };
-                        return self.events.push(offer);
-                    }
-                    messages::IM_TELEPORT_REQUEST => {
-                        let request = SessionEvent::TeleportRequested {
-                            from: from_agent,
-                            name: from_name,
-                            text,
-                        };
-                        return self.events.push(request);
-                    }
-                    messages::IM_INVENTORY_OFFERED | messages::IM_TASK_INVENTORY_OFFERED => {
-                        let from_object = dialog == messages::IM_TASK_INVENTORY_OFFERED;
-                        let Some(asset_type) = offered_type(&bucket, from_object) else {
-                            return crate::debug!("ignoring a malformed inventory offer from {from_name} <{from_agent}>");
-                        };
-                        let offer = InventoryOffer {
-                            from: from_agent,
-                            name: from_name,
-                            from_group,
-                            from_object,
-                            transaction: id,
-                            asset_type,
-                            text,
-                        };
-                        return self.events.push(SessionEvent::InventoryOffer(offer));
-                    }
-                    IM_FRIENDSHIP_ACCEPTED => {
-                        if self.friends.accepted(from_agent) {
-                            self.events.push(SessionEvent::FriendshipBegun(from_agent));
-                        }
-                        return;
-                    }
-                    other => return crate::debug!("ignoring instant message with dialog {other}"),
-                };
-                let sent_at = (offline && timestamp != 0).then_some(timestamp);
-                let message = Message {
-                    kind: kind.to_string(),
-                    source,
-                    sent_at,
+                let im = Im {
+                    from_agent,
+                    from_group,
+                    from_name,
+                    dialog,
+                    id,
+                    offline,
+                    timestamp,
                     text,
+                    bucket,
                 };
-                self.events.push(SessionEvent::InstantMessage(message));
+                self.instant_message_in(im, false);
+            }
+            Incoming::AgentDataUpdate { active, title, group_name } => self.events.push(SessionEvent::ActiveGroup {
+                group: active,
+                title,
+                name: group_name,
+            }),
+            Incoming::AgentGroupDataUpdate(groups) => self.events.push(SessionEvent::Groups(groups)),
+            Incoming::AgentDropGroup(group) => self.group_dropped(group, now),
+            Incoming::GroupProfileReply(profile) => self.events.push(SessionEvent::GroupProfile(profile)),
+            Incoming::JoinGroupReply { group, success } => {
+                if success {
+                    // As a viewer does: the list with the new group follows.
+                    self.send(messages::agent_data_update_request(&self.agent), true, now);
+                }
+                self.events.push(SessionEvent::Joined { group, success });
+            }
+            Incoming::LeaveGroupReply { group, success } => {
+                if success {
+                    // As a viewer does: the list without the group follows.
+                    self.send(messages::agent_data_update_request(&self.agent), true, now);
+                }
+                self.events.push(SessionEvent::Left { group, success });
             }
             Incoming::AvatarPickerReply { query, avatars } => {
                 self.events.push(SessionEvent::AvatarsFound { query, avatars });
@@ -2131,6 +2285,158 @@ impl<N: Net> Session<N> {
         }
     }
 
+    /// An instant message, as the simulator connection or, for the line
+    /// that opens a session, the event queue delivered it.
+    fn instant_message_in(&mut self, im: Im, opened: bool) {
+        let Im {
+            from_agent,
+            from_group,
+            from_name,
+            dialog,
+            id,
+            offline,
+            timestamp,
+            text,
+            bucket,
+        } = im;
+        let (kind, source) = match dialog {
+            IM_NOTHING_SPECIAL if from_agent.is_nil() => ("im", Source::System { name: from_name }),
+            IM_NOTHING_SPECIAL => (
+                "im",
+                Source::Avatar {
+                    id: from_agent,
+                    name: from_name,
+                },
+            ),
+            // The sender is the object's owner and the id is the object.
+            IM_FROM_TASK => {
+                let id = (!id.is_nil()).then_some(id);
+                (
+                    "object",
+                    Source::Object {
+                        id,
+                        name: from_name,
+                        owner: from_agent,
+                    },
+                )
+            }
+            messages::IM_TELEPORT_OFFER => {
+                let offer = SessionEvent::TeleportOffer {
+                    from: from_agent,
+                    name: from_name,
+                    lure: id,
+                };
+                return self.events.push(offer);
+            }
+            messages::IM_TELEPORT_REQUEST => {
+                let request = SessionEvent::TeleportRequested {
+                    from: from_agent,
+                    name: from_name,
+                    text,
+                };
+                return self.events.push(request);
+            }
+            messages::IM_INVENTORY_OFFERED | messages::IM_TASK_INVENTORY_OFFERED => {
+                let from_object = dialog == messages::IM_TASK_INVENTORY_OFFERED;
+                let Some(asset_type) = offered_type(&bucket, from_object) else {
+                    return crate::debug!("ignoring a malformed inventory offer from {from_name} <{from_agent}>");
+                };
+                let offer = InventoryOffer {
+                    from: from_agent,
+                    name: from_name,
+                    from_group,
+                    from_object,
+                    transaction: id,
+                    asset_type,
+                    text,
+                };
+                return self.events.push(SessionEvent::InventoryOffer(offer));
+            }
+            messages::IM_GROUP_INVITATION => {
+                // The fee as a big-endian S32, then the role.
+                let fee = match bucket.as_slice() {
+                    [a, b, c, d, _role @ ..] if bucket.len() == 20 => i32::from_be_bytes([*a, *b, *c, *d]),
+                    _ => {
+                        return crate::info!(
+                            "invitation from {from_name} into the group {from_agent} not kept: \
+                             it carries no fee and role that can be read ({} bytes)",
+                            bucket.len()
+                        )
+                    }
+                };
+                if id.is_nil() || from_agent.is_nil() {
+                    return crate::info!("invitation from {from_name} not kept: it carries nothing to answer it by");
+                }
+                let invitation = SessionEvent::GroupInvitation {
+                    group: from_agent,
+                    id,
+                    inviter: from_name,
+                    fee,
+                    text,
+                };
+                return self.events.push(invitation);
+            }
+            messages::IM_SESSION_SEND => {
+                // The avatar's own line, which some grids deliver back, is
+                // recorded when it is sent.
+                if from_agent == self.agent.agent_id || text.is_empty() {
+                    return;
+                }
+                if opened {
+                    self.events.push(SessionEvent::GroupSessionOffered(id));
+                }
+                let line = SessionEvent::GroupChat {
+                    session: id,
+                    from: from_agent,
+                    name: from_name,
+                    text,
+                };
+                return self.events.push(line);
+            }
+            messages::IM_GROUP_NOTICE => {
+                // The bucket names the group after two bytes of what is
+                // attached; the sender is `AgentID` where it is not the group.
+                let Some(group) = bucket.get(2..18).map(|group| Uuid::from_slice(group).unwrap_or_default()) else {
+                    return crate::debug!("ignoring a group notice from {from_name} without a group");
+                };
+                let sender = (!from_group && from_agent != group && !from_agent.is_nil()).then_some(from_agent);
+                let notice = SessionEvent::GroupNotice {
+                    group,
+                    sender,
+                    name: from_name,
+                    text,
+                    bucket,
+                    sent_at: (offline && timestamp != 0).then_some(timestamp),
+                };
+                return self.events.push(notice);
+            }
+            IM_FRIENDSHIP_ACCEPTED => {
+                if self.friends.accepted(from_agent) {
+                    self.events.push(SessionEvent::FriendshipBegun(from_agent));
+                }
+                return;
+            }
+            other => return crate::debug!("ignoring instant message with dialog {other}"),
+        };
+        let sent_at = (offline && timestamp != 0).then_some(timestamp);
+        let message = Message {
+            kind: kind.to_string(),
+            source,
+            sent_at,
+            text,
+        };
+        self.events.push(SessionEvent::InstantMessage(message));
+    }
+
+    /// The grid says the avatar left a group: the list is asked for again,
+    /// as a viewer does.
+    fn group_dropped(&mut self, group: Uuid, now: Instant) {
+        self.events.push(SessionEvent::GroupDropped(group));
+        if self.present().is_ok() {
+            self.send(messages::agent_data_update_request(&self.agent), true, now);
+        }
+    }
+
     fn check_entered(&mut self, now: Instant) {
         if self.sim.entered || self.sim.position.is_none() {
             return;
@@ -2144,6 +2450,9 @@ impl<N: Net> Session<N> {
             }
             if std::mem::take(&mut self.fetch_offline_im) {
                 self.send(messages::retrieve_instant_messages(&self.agent), true, now);
+            }
+            if std::mem::take(&mut self.groups_due) {
+                self.send(messages::agent_data_update_request(&self.agent), true, now);
             }
         }
     }
@@ -3517,12 +3826,328 @@ mod tests {
         assert_eq!(rig.events(), [SessionEvent::InstantMessage(expected)]);
     }
 
+    fn builders() -> Uuid {
+        Uuid::from_bytes([0xB1; 16])
+    }
+
+    fn jane_id() -> Uuid {
+        Uuid::from_bytes([0x33; 16])
+    }
+
+    fn requests_for_groups(rig: &mut Rig) -> usize {
+        rig.sent_ids()
+            .iter()
+            .filter(|id| **id == messages::AGENT_DATA_UPDATE_REQUEST)
+            .count()
+    }
+
+    #[test]
+    fn the_groups_are_asked_for_once_per_session_and_after_a_join_or_a_drop() {
+        let mut rig = Rig::new();
+        rig.receive(messages::REGION_HANDSHAKE, &wire::region_handshake("Home"));
+        let body = wire::agent_movement_complete(&rig.agent(), [1.0, 2.0, 3.0], HOME_HANDLE);
+        rig.receive(messages::AGENT_MOVEMENT_COMPLETE, &body);
+        assert_eq!(requests_for_groups(&mut rig), 1);
+        rig.ack_all();
+        // Not again in the next region.
+        rig.session.handle_caps(1, finish(), rig.now);
+        rig.receive(messages::REGION_HANDSHAKE, &wire::region_handshake("Target"));
+        let body = wire::agent_movement_complete(&rig.agent(), [1.0, 2.0, 3.0], HOME_HANDLE);
+        rig.receive(messages::AGENT_MOVEMENT_COMPLETE, &body);
+        assert_eq!(requests_for_groups(&mut rig), 0);
+        rig.events();
+        // After a join the grid said yes to, and after a drop in either form.
+        rig.receive(messages::JOIN_GROUP_REPLY, &wire::join_group_reply(agent_id(), builders(), true));
+        assert_eq!(requests_for_groups(&mut rig), 1);
+        rig.receive(messages::JOIN_GROUP_REPLY, &wire::join_group_reply(agent_id(), builders(), false));
+        assert_eq!(requests_for_groups(&mut rig), 0);
+        assert_eq!(
+            rig.events(),
+            [
+                SessionEvent::Joined {
+                    group: builders(),
+                    success: true
+                },
+                SessionEvent::Joined {
+                    group: builders(),
+                    success: false
+                }
+            ]
+        );
+        // After a leave the grid said yes to, as after a join.
+        rig.receive(messages::LEAVE_GROUP_REPLY, &wire::leave_group_reply(agent_id(), builders(), true));
+        assert_eq!(requests_for_groups(&mut rig), 1);
+        rig.receive(messages::LEAVE_GROUP_REPLY, &wire::leave_group_reply(agent_id(), builders(), false));
+        assert_eq!(requests_for_groups(&mut rig), 0);
+        assert_eq!(
+            rig.events(),
+            [
+                SessionEvent::Left {
+                    group: builders(),
+                    success: true
+                },
+                SessionEvent::Left {
+                    group: builders(),
+                    success: false
+                }
+            ]
+        );
+        rig.receive(messages::AGENT_DROP_GROUP, &wire::agent_drop_group(agent_id(), builders()));
+        assert_eq!(requests_for_groups(&mut rig), 1);
+        let generation = rig.generation();
+        rig.session
+            .handle_caps(generation, CapsEvent::Event(EqEvent::GroupDropped(builders())), rig.now);
+        assert_eq!(requests_for_groups(&mut rig), 1);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::GroupDropped(builders()), SessionEvent::GroupDropped(builders())]
+        );
+    }
+
+    #[test]
+    fn both_forms_of_the_list_give_the_same_event() {
+        let mut rig = Rig::entered();
+        let groups = vec![Membership {
+            id: builders(),
+            name: "Builders".into(),
+            powers: 2,
+            notices: true,
+        }];
+        rig.receive(
+            messages::AGENT_GROUP_DATA_UPDATE,
+            &wire::agent_group_data_update(agent_id(), &groups),
+        );
+        let generation = rig.generation();
+        rig.session
+            .handle_caps(generation, CapsEvent::Event(EqEvent::Groups(groups.clone())), rig.now);
+        assert_eq!(rig.events(), [SessionEvent::Groups(groups.clone()), SessionEvent::Groups(groups)]);
+        rig.receive(
+            messages::AGENT_DATA_UPDATE,
+            &wire::agent_data_update(agent_id(), builders(), "Officer", "Builders"),
+        );
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::ActiveGroup {
+                group: builders(),
+                title: "Officer".into(),
+                name: "Builders".into()
+            }]
+        );
+    }
+
+    fn group_line(rig: &mut Rig, from: Uuid, text: &str) {
+        let body = wire::group_im(from, false, agent_id(), "Jane Doe", 17, builders(), text, b"Builders\0");
+        rig.receive(messages::IMPROVED_INSTANT_MESSAGE, &body);
+    }
+
+    #[test]
+    fn both_forms_of_a_first_chat_line_give_the_same_event() {
+        let mut rig = Rig::entered();
+        let line = crate::caps::SessionLine {
+            session: builders(),
+            from: jane_id(),
+            from_name: "Jane Doe".into(),
+            dialog: 17,
+            text: "hello".into(),
+            bucket: b"Builders\0".to_vec(),
+            offline: false,
+            timestamp: 0,
+        };
+        let generation = rig.generation();
+        rig.session
+            .handle_caps(generation, CapsEvent::Event(EqEvent::SessionInvite(line)), rig.now);
+        group_line(&mut rig, jane_id(), "hello");
+        let chat = SessionEvent::GroupChat {
+            session: builders(),
+            from: jane_id(),
+            name: "Jane Doe".into(),
+            text: "hello".into(),
+        };
+        assert_eq!(rig.events(), [SessionEvent::GroupSessionOffered(builders()), chat.clone(), chat]);
+    }
+
+    #[test]
+    fn the_avatars_own_line_and_empty_lines_are_dropped() {
+        let mut rig = Rig::entered();
+        group_line(&mut rig, agent_id(), "hi");
+        group_line(&mut rig, jane_id(), "");
+        assert_eq!(rig.events(), []);
+    }
+
+    fn invitation(rig: &mut Rig, id: Uuid, bucket: &[u8]) {
+        let body = wire::group_im(
+            builders(),
+            true,
+            agent_id(),
+            "Jane Doe",
+            3,
+            id,
+            "Jane Doe has invited you to join a group.",
+            bucket,
+        );
+        rig.receive(messages::IMPROVED_INSTANT_MESSAGE, &body);
+    }
+
+    #[test]
+    fn an_invitation_names_the_group_its_id_and_its_fee() {
+        let mut rig = Rig::entered();
+        let mut bucket = 250i32.to_be_bytes().to_vec();
+        bucket.extend([0; 16]);
+        let id = Uuid::from_bytes([0x1D; 16]);
+        invitation(&mut rig, id, &bucket);
+        assert_eq!(
+            rig.events(),
+            [SessionEvent::GroupInvitation {
+                group: builders(),
+                id,
+                inviter: "Jane Doe".into(),
+                fee: 250,
+                text: "Jane Doe has invited you to join a group.".into(),
+            }]
+        );
+        // Nothing that cannot be answered, or whose fee cannot be read.
+        invitation(&mut rig, Uuid::nil(), &bucket);
+        invitation(&mut rig, id, &bucket[..19]);
+        invitation(&mut rig, id, &[bucket.as_slice(), &[0]].concat());
+        invitation(&mut rig, id, &[0]);
+        assert_eq!(rig.events(), []);
+    }
+
+    #[test]
+    fn a_notice_names_its_group_from_its_bucket() {
+        let mut rig = Rig::entered();
+        let mut bucket = vec![1, 7];
+        bucket.extend(builders().as_bytes());
+        bucket.extend(b"Agenda\0");
+        let notice = Uuid::from_bytes([0x40; 16]);
+        // As OpenSim sends it: from the group, by the sender's name.
+        let body = wire::group_im(builders(), true, agent_id(), "Jane Doe", 32, notice, "Meeting|Tonight", &bucket);
+        rig.receive(messages::IMPROVED_INSTANT_MESSAGE, &body);
+        // As Second Life does: from the sender.
+        let body = wire::group_im(jane_id(), false, agent_id(), "Jane Doe", 32, notice, "Meeting|Tonight", &bucket);
+        rig.receive(messages::IMPROVED_INSTANT_MESSAGE, &body);
+        let notice = |sender| SessionEvent::GroupNotice {
+            group: builders(),
+            sender,
+            name: "Jane Doe".into(),
+            text: "Meeting|Tonight".into(),
+            bucket: bucket.clone(),
+            sent_at: None,
+        };
+        assert_eq!(rig.events(), [notice(None), notice(Some(jane_id()))]);
+        // A notice without a group in its bucket is dropped.
+        let body = wire::group_im(jane_id(), false, agent_id(), "Jane Doe", 32, Uuid::nil(), "x", &[0]);
+        rig.receive(messages::IMPROVED_INSTANT_MESSAGE, &body);
+        assert_eq!(rig.events(), []);
+    }
+
+    #[test]
+    fn profiles_and_session_answers_become_events() {
+        let mut rig = Rig::entered();
+        let profile = crate::groups::Profile {
+            id: builders(),
+            name: "Builders".into(),
+            charter: String::new(),
+            listed: true,
+            title: String::new(),
+            founder: jane_id(),
+            fee: 0,
+            open: true,
+            members: 2,
+            roles: 1,
+            mature: false,
+        };
+        rig.receive(messages::GROUP_PROFILE_REPLY, &wire::group_profile_reply(agent_id(), &profile));
+        let generation = rig.generation();
+        let started = EqEvent::SessionStarted {
+            session: builders(),
+            ok: false,
+            error: "no".into(),
+        };
+        rig.session.handle_caps(generation, CapsEvent::Event(started), rig.now);
+        rig.session
+            .handle_caps(generation, CapsEvent::ChatSessions(Some("http://sim/chat".into())), rig.now);
+        assert_eq!(
+            rig.events(),
+            [
+                SessionEvent::GroupProfile(profile),
+                SessionEvent::GroupSession {
+                    group: builders(),
+                    ok: false,
+                    error: "no".into()
+                },
+                SessionEvent::ChatSessionsUrl(Some("http://sim/chat".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn group_calls_send_one_message_each() {
+        let mut rig = Rig::entered();
+        rig.sent();
+        let now = rig.now;
+        let agent = rig.agent();
+        let invitation = Uuid::from_bytes([0x1D; 16]);
+        let one = |rig: &mut Rig, expected: Outgoing| {
+            let sent = rig.sent();
+            assert_eq!(sent.len(), 1);
+            assert!(sent[0].is_reliable());
+            assert_eq!((sent[0].id, &sent[0].body), (expected.id, &expected.body));
+        };
+        assert_eq!(rig.session.activate_group(builders(), now), Ok(()));
+        one(&mut rig, messages::activate_group(&agent, builders()));
+        assert_eq!(rig.session.invite_to_group(builders(), jane_id(), now), Ok(()));
+        one(&mut rig, messages::invite_group_request(&agent, builders(), jane_id()));
+        assert_eq!(rig.session.ask_group_profile(builders(), now), Ok(()));
+        one(&mut rig, messages::group_profile_request(&agent, builders()));
+        assert_eq!(rig.session.join_group(builders(), now), Ok(()));
+        one(&mut rig, messages::join_group_request(&agent, builders()));
+        assert_eq!(rig.session.leave_group(builders(), now), Ok(()));
+        one(&mut rig, messages::leave_group_request(&agent, builders()));
+        assert_eq!(rig.session.ask_groups(now), Ok(()));
+        one(&mut rig, messages::agent_data_update_request(&agent));
+        let position = [10.0, 20.0, 30.0];
+        assert_eq!(rig.session.answer_invitation(builders(), invitation, true, now), Ok(()));
+        one(
+            &mut rig,
+            messages::group_instant_message(&agent, "name", builders(), position, 35, invitation, "message"),
+        );
+        assert_eq!(rig.session.answer_invitation(builders(), invitation, false, now), Ok(()));
+        one(
+            &mut rig,
+            messages::group_instant_message(&agent, "name", builders(), position, 36, invitation, "message"),
+        );
+        assert_eq!(rig.session.start_group_session(builders(), now), Ok(()));
+        one(
+            &mut rig,
+            messages::group_instant_message(&agent, "Sit Bot", builders(), position, 15, builders(), ""),
+        );
+        assert_eq!(rig.session.group_chat(builders(), "hello", now), Ok(()));
+        one(
+            &mut rig,
+            messages::group_instant_message(&agent, "Sit Bot", builders(), position, 17, builders(), "hello"),
+        );
+        // None of them without a region.
+        let mut lost = Rig::new();
+        lost.sent();
+        assert!(lost.session.activate_group(builders(), now).is_err());
+        assert!(lost.session.invite_to_group(builders(), jane_id(), now).is_err());
+        assert!(lost.session.ask_group_profile(builders(), now).is_err());
+        assert!(lost.session.join_group(builders(), now).is_err());
+        assert!(lost.session.leave_group(builders(), now).is_err());
+        assert!(lost.session.ask_groups(now).is_err());
+        assert!(lost.session.answer_invitation(builders(), invitation, true, now).is_err());
+        assert!(lost.session.start_group_session(builders(), now).is_err());
+        assert!(lost.session.group_chat(builders(), "x", now).is_err());
+        assert_eq!(lost.sent_ids(), []);
+    }
+
     #[test]
     fn other_instant_message_traffic_is_dropped() {
         let mut rig = Rig::entered();
-        // Group notice, session message, auto response, typing, and the
-        // answers to offers the bot does not make.
-        for dialog in [5, 6, 32, 17, 20, 41, 42] {
+        // Auto response, typing, and the answers to offers the bot does
+        // not make. (Group notices and session lines are read now.)
+        for dialog in [5, 6, 20, 41, 42] {
             rig.im(Uuid::from_bytes([0x77; 16]), dialog, Uuid::nil(), None, "x");
         }
         assert_eq!(rig.events(), []);

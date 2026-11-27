@@ -265,7 +265,7 @@ pub fn read(path: &Path) -> Result<ReadBack, String> {
 // ------------------------------------------------- what the grid reports
 
 /// A payment of the bot that waits for the grid's answer.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct InFlight {
     pub amount: u32,
     /// What counts against the limit: the amount, or 0.
@@ -280,6 +280,9 @@ pub struct InFlight {
     pub object: Option<Uuid>,
     /// The description sent with it; empty for none.
     pub description: String,
+    /// The text of its record when neither the grid nor `description`
+    /// gives one: `Fee to join Builders` for a group's fee.
+    pub fallback: String,
 }
 
 impl InFlight {
@@ -298,7 +301,10 @@ impl InFlight {
             display_name: String::new(),
             object_name: self.object_name.clone(),
             object: self.object,
-            text: self.description.clone(),
+            text: match self.description.is_empty() {
+                true => self.fallback.clone(),
+                false => self.description.clone(),
+            },
         }
     }
 }
@@ -361,6 +367,7 @@ pub fn from_report(
         // The description sent stands in for one the report does not carry.
         let text = match (payers, ours.description.is_empty()) {
             (None, false) => described(&grid_text, &ours.description),
+            _ if text.trim().is_empty() => ours.fallback.clone(),
             _ => text,
         };
         return Outcome::Ours(Transaction {
@@ -460,6 +467,7 @@ mod tests {
             object_name: String::new(),
             object: None,
             description: String::new(),
+            fallback: String::new(),
         }
     }
 
@@ -804,6 +812,82 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         assert_eq!(read(&path), Ok(ReadBack::default()));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn group_fees_read_back_count_as_payments_do() {
+        let dir = temp_dir("fees");
+        let path = dir.join("tx.tsv");
+        let builders = id(0xB1);
+        let fee = |kind, counted| Transaction {
+            kind,
+            amount: 250,
+            balance: None,
+            counted,
+            code: 1004,
+            party: Some(builders),
+            party_group: true,
+            avatar_name: String::new(),
+            display_name: String::new(),
+            object_name: String::new(),
+            object: None,
+            text: "Fee to join Builders".into(),
+            ..paid_jane()
+        };
+        let rows = [fee(Kind::Paid, 250), fee(Kind::Unconfirmed, 250), fee(Kind::Failed, 0)];
+        let text = header() + &rows.iter().map(Transaction::row).collect::<String>();
+        std::fs::write(&path, text).unwrap();
+        let back = read(&path).unwrap();
+        let kinds: Vec<(Kind, u64, i32)> = back.rows.iter().map(|tx| (tx.kind, tx.counted, tx.code)).collect();
+        assert_eq!(
+            kinds,
+            [(Kind::Paid, 250, 1004), (Kind::Unconfirmed, 250, 1004), (Kind::Failed, 0, 1004)]
+        );
+        // A paid and an unconfirmed fee count against the limit; a failed one does not.
+        assert_eq!(back.counted().map(|(_, counted)| counted).sum::<u64>(), 500);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_fee_is_recorded_with_the_grids_text_or_its_own() {
+        let builders = id(0xB1);
+        let ours = InFlight {
+            amount: 250,
+            counted: 250,
+            code: 1004,
+            party: Some(builders),
+            party_group: true,
+            fallback: "Fee to join Builders".into(),
+            ..InFlight::default()
+        };
+        let unconfirmed = ours.unconfirmed(T0);
+        assert_eq!(
+            (unconfirmed.kind, unconfirmed.counted, unconfirmed.code, unconfirmed.text.as_str()),
+            (Kind::Unconfirmed, 250, 1004, "Fee to join Builders")
+        );
+        assert_eq!(unconfirmed.balance, None);
+        let report = TransactionInfo {
+            kind: 1004,
+            dest_group: true,
+            ..info(own(), builders, 250)
+        };
+        let Outcome::Ours(tx) = from_report(750, true, "", Some(&report), own(), Some(&ours), T0) else {
+            panic!("not ours")
+        };
+        assert_eq!(
+            (tx.kind, tx.balance, tx.text.as_str()),
+            (Kind::Paid, Some(750), "Fee to join Builders")
+        );
+        assert_eq!((tx.party, tx.party_group, tx.avatar_name.as_str()), (Some(builders), true, ""));
+        let Outcome::Ours(tx) = from_report(750, true, "You paid to join a group.", Some(&report), own(), Some(&ours), T0) else {
+            panic!("not ours")
+        };
+        assert_eq!(tx.text, "You paid to join a group.");
+        // A fee taken for a join the bot did not send.
+        let Outcome::Other(tx) = from_report(750, true, "", Some(&report), own(), None, T0) else {
+            panic!("not another's")
+        };
+        assert_eq!(tx.kind, Kind::Spent);
     }
 
     #[test]

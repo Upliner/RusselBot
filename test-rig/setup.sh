@@ -53,17 +53,25 @@ if [ ! -d "$sim" ]; then
     git clone "$source" "$sim"
 fi
 
-# The rig's money module (test-rig/money) is built with the simulator as an
-# addon module. A copy that changed is copied again, which makes it newer
-# than the built dll and so rebuilds the simulator with it.
-addon=$sim/addon-modules/RigMoney
-mkdir -p "$addon"
-for file in RigMoneyModule.cs prebuild.xml; do
-    cmp -s "$rig/money/$file" "$addon/$file" || cp "$rig/money/$file" "$addon/$file"
+# The rig's money module (test-rig/money) and its in-memory store for
+# Groups V2 (test-rig/groups) are built with the simulator as addon
+# modules. A copy that changed is copied again, which makes it newer than
+# the built dll and so rebuilds the simulator with it.
+build=no
+for module in money:RigMoney:RigMoneyModule groups:RigGroups:RigGroupsData; do
+    from=${module%%:*}; rest=${module#*:}; dir=${rest%%:*}; name=${rest#*:}
+    addon=$sim/addon-modules/$dir
+    mkdir -p "$addon"
+    for file in "$rig/$from"/*.cs "$rig/$from/prebuild.xml"; do
+        copy=$addon/$(basename "$file")
+        cmp -s "$file" "$copy" || cp "$file" "$copy"
+    done
+    dll=$sim/bin/$name.dll
+    if [ ! -f "$dll" ] || [ -n "$(find "$addon" -name '*.cs' -newer "$dll" -o -name prebuild.xml -newer "$dll")" ]; then
+        build=yes
+    fi
 done
-dll=$sim/bin/RigMoneyModule.dll
-if [ ! -f "$sim/bin/OpenSim.dll" ] || [ ! -f "$dll" ] \
-    || [ -n "$(find "$addon/RigMoneyModule.cs" "$addon/prebuild.xml" -newer "$dll")" ]; then
+if [ ! -f "$sim/bin/OpenSim.dll" ] || [ "$build" = yes ]; then
     (cd "$sim" && ./runprebuild.sh && dotnet build --configuration Release OpenSim.sln)
 fi
 
@@ -81,6 +89,20 @@ if [ ! -f "$bin/OpenSim.ini" ]; then
         -e 's|^ *; DefaultEstateOwnerPassword = .*|    DefaultEstateOwnerPassword = rigowner|' \
         -e 's|^ *; economymodule = BetaGridLikeMoneyModule|    economymodule = RigMoneyModule|' \
         "$bin/OpenSim.ini.example" > "$bin/OpenSim.ini"
+    # Groups V2 on the rig's store, with chat and notices. The groups
+    # service looks for the store of [GridUserService] there too, unless
+    # that section names its own.
+    sed -i -e '/^\[Groups\]/a\
+    Enabled = true\
+    Module = "Groups Module V2"\
+    StorageProvider = "RigGroupsData.dll"\
+    ServicesConnectorModule = "Groups Local Service Connector"\
+    LocalService = local\
+    MessagingEnabled = true\
+    MessagingModule = "Groups Messaging Module V2"\
+    MessageOnlineUsersOnly = true\
+    NoticesEnabled = true' "$bin/OpenSim.ini"
+    printf '\n[GridUserService]\n    StorageProvider = "OpenSim.Data.SQLite.dll"\n' >> "$bin/OpenSim.ini"
 fi
 if [ ! -f "$bin/config-include/StandaloneCommon.ini" ]; then
     # Logins that cannot be placed where they ask go to "Home"; the local

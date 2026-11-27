@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::config::Secret;
+use crate::control::GroupRequest;
 use crate::msglog::{Channel, Record};
 use std::io::{BufRead, BufReader};
 use std::sync::mpsc::Receiver;
@@ -46,6 +47,20 @@ fn main_loop(incoming: &Receiver<Event>) {
                         continue;
                     }
                     Request::Friends => Response::Ok(Some(format!("friends own: {own}"))),
+                    Request::Group(request @ (GroupRequest::List | GroupRequest::Invitations)) => {
+                        Response::Ok(Some(format!("{} own: {own}", request.name())))
+                    }
+                    // A line said in a group: its record, and the word that
+                    // the groups changed.
+                    Request::Group(GroupRequest::Chat { text, .. }) => {
+                        let line = crate::grouplog::GroupMessage {
+                            kind: crate::grouplog::Kind::ChatOut,
+                            ..crate::grouplog::tests::chat(&text)
+                        };
+                        hub.group(&line);
+                        hub.groups_changed();
+                        Response::Ok(None)
+                    }
                     Request::Scan(args) => Response::Ok(Some(format!("scan {} own: {own}", args.join(" ")))),
                     Request::Quit => {
                         hub.close();
@@ -673,12 +688,22 @@ fn only_the_two_listings_are_taken_as_the_pages_own() {
         body(&server.post("/api/command", &[], "scan\tavatars\tchat")),
         "ok\tscan avatars chat own: false\n"
     );
-    for line in ["say\thello", "scan\t20", "status", "quit"] {
+    assert_eq!(own("group\tlist"), "ok\tgroup list own: true\n");
+    assert_eq!(own("group\tinvitations"), "ok\tgroup invitations own: true\n");
+    for line in [
+        "say\thello",
+        "scan\t20",
+        "status",
+        "quit",
+        "group\tchat\tBuilders\thello",
+        "group\tinfo\tBuilders",
+    ] {
         let answer = own(line);
         assert!(
             answer.starts_with("error\t") && answer.contains("the page's own"),
             "{line}: {answer}"
         );
+        assert!(answer.contains("`group list` and `group invitations`"), "{answer}");
     }
     assert_eq!(server.stream("/api/events", &[]).opening(), [] as [&str; 0]);
 }
@@ -724,6 +749,30 @@ fn every_open_page_gets_what_is_recorded_as_it_happens() {
     assert_eq!(two.chat(), "hi all");
     // A quiet stream is kept alive with comments.
     assert_eq!(one.block(), ": \n");
+}
+
+#[test]
+fn group_messages_and_the_word_that_the_groups_changed_reach_the_page() {
+    let server = serving(None);
+    let mut page = server.stream("/api/events", &[]);
+    assert_eq!(page.opening(), [] as [&str; 0]);
+    assert_eq!(body(&server.post("/api/command", &[], "group\tchat\tBuilders\thi")), "ok\n");
+    let event = page.event();
+    let builders = crate::grouplog::tests::builders();
+    assert!(event.starts_with(&format!("event: group\nid: {START}-1\ndata: ")), "{event}");
+    assert!(
+        event.ends_with(&format!(
+            "\tchat_out\t{builders}\tBuilders\t{}\tJane Doe\tJD\t\t\t0\thi\n",
+            uuid::Uuid::from_bytes([0x33; 16])
+        )),
+        "{event}"
+    );
+    assert_eq!(page.event(), "event: groups\ndata: -\n");
+    // A page that opens later gets the line and not the word.
+    let mut later = server.stream("/api/events", &[]);
+    assert_eq!(later.event(), "event: reset\ndata: -\n");
+    assert!(later.event().starts_with("event: group\n"));
+    assert!(later.event().starts_with("event: status\n"));
 }
 
 #[test]

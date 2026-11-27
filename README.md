@@ -563,9 +563,11 @@ the [XMPP gateway](#xmpp-gateway), and answers instant messages by itself
 only with an [autoreply](#autoreplies) and when RLV `recvim` hides them
 (see [Restrictions](#restrictions)). The instant messages it sends on
 command are recorded too, as kind `im_out`, and those automatic answers as
-kind `im_auto`. Group chat, offers (teleport offers
-and requests included; those appear on standard error only), invitations
-and typing notifications are not recorded.
+kind `im_auto`. The chat and the notices of the avatar's groups are
+recorded apart, as [group messages](#group-chat-and-notices). Offers
+(teleport offers and requests included; those appear on standard error
+only), invitations, conferences and typing notifications are not
+recorded.
 
 The `[logs]` table names the files the bot appends to:
 
@@ -573,6 +575,7 @@ The `[logs]` table names the files the bot appends to:
 [logs]
 chat = "chat.tsv"
 im = "im.tsv"
+group = "group.tsv"
 transactions = "transactions.tsv"
 ```
 
@@ -580,8 +583,8 @@ With `chat` and/or `im` set, each message is also appended to that file as
 one tab-separated line (UTF-8). The file is created when missing and gets a
 header line when it is empty; relative paths are relative to the directory
 the bot is started in. A file that cannot be opened makes the bot exit with
-status 2 before it logs in. `transactions` is described
-[below](#transactions).
+status 2 before it logs in. `group` and `transactions` are described
+[below](#group-chat-and-notices).
 
 | Column | Content |
 |---|---|
@@ -623,6 +626,35 @@ viewer logging in as this avatar afterwards will not see them.
 The bot logs in with `agree_to_tos` set, so it accepts a grid's terms of
 service on the account's behalf, including changed terms, without showing
 them to anyone.
+
+### Group chat and notices
+
+Every line of chat in the session of a group the avatar is in, every line
+the bot says there with [`group chat`](#groups), and every group notice is
+a group message. Each one is written to standard error as one line, and,
+with `group` set under `[logs]`, appended to that file as a row of nine
+tab-separated columns, with the same time, escaping and header as the
+other files:
+
+```
+time	kind	group_name	group_uuid	avatar_name	display_name	subject	attachment	text
+```
+
+| Column | Content |
+|---|---|
+| `time` | UTC: when the bot received the message or said the line; for a notice stored while the avatar was offline, when it was sent |
+| `kind` | `chat` (heard), `chat_out` (said by the bot on command) or `notice` |
+| `group_name`, `group_uuid` | The group |
+| `avatar_name`, `display_name` | Who said or sent it; for `chat_out` the bot's own avatar. A notice that does not give its sender's UUID has no display name |
+| `subject`, `attachment` | A notice's subject and the name of the item attached to it; empty for chat |
+| `text` | The line, or the notice's text |
+
+A notice's attachment is named, never taken. A line the grid delivers back
+that the bot said itself is not recorded twice. Lines of conferences
+(ad-hoc sessions) are not recorded. The bot answers no group message by
+itself, and none is passed to the owners of the
+[XMPP gateway](#xmpp-gateway). Under [RLV](#restrictions) `recvim`, a
+line is recorded as `(blocked by RLV: recvim)`.
 
 ### Transactions
 
@@ -1222,6 +1254,86 @@ service, and after the 10 seconds otherwise. `profile` is not held to RLV
 restrictions, `shownames` included, and does not use up an
 [override](#override).
 
+### Groups
+
+```sh
+rslbot ctl group list
+rslbot ctl group activate Builders           # or: group activate none
+rslbot ctl group invite Builders "Jane Doe"
+rslbot ctl group chat "Night Owls" see you at eight
+rslbot ctl group info 01234567-9abc-defe-dcba-987654321000
+rslbot ctl group join 01234567-9abc-defe-dcba-987654321000 --pay 250
+rslbot ctl group leave Dancers
+rslbot ctl group invitations
+```
+
+The bot asks the grid for the avatar's groups after each login and
+follows every change the grid reports: a group joined, one the avatar was
+ejected from, the active group. `group list` prints one line per group,
+by name: the UUID, the flags `active` (the group whose tag the avatar
+wears), `invite` (the avatar may invite into it) and `notices` (it gets
+the group's notices), or `-`, and the name, separated by tabs. A command
+that comes right after a login, before the grid has told the groups,
+waits for them for up to 10 seconds.
+
+`GROUP` is one argument: the group's UUID, or the name of one of the
+avatar's groups in any letter case, as a whole. When two of the avatar's
+groups have that name the command does nothing and lists both with their
+UUIDs:
+
+```
+$ rslbot ctl group chat Friends hello
+error: the avatar is in 2 groups named "Friends"; give the UUID of one: 11111111-... "Friends", 22222222-... "Friends"
+```
+
+`group activate` makes a group the active one, and is answered when the
+grid says so (within 10 seconds) with the title the avatar wears there;
+the words of a name may be separate arguments. `group invite` invites an
+avatar, as `im` names one, into the group's role Everyone; the avatar
+needs the right to invite. Neither grid tells the inviter whether the
+invitation arrived, and the answer says so. `group chat` says a line in a
+group's chat; the first line after a login enters the group's session
+first, as a viewer does when its chat window opens, and fails with the
+grid's reason when the grid refuses that. `group info` prints a group's
+profile as `name: value` lines (`name`, `group`, `founder`, `fee`,
+`enrollment`, `members`, `roles`, `listed`, `mature`, `member`, `title`,
+`charter`), of any group by its UUID.
+
+`group join` joins a group by its UUID, when its enrollment is open. A
+group that costs L$ to join is joined only with `--pay` and a sum not
+below its fee; the fee, not the sum, is paid, and only as
+[Payments](#payments) allows: from an interface `payments.perms` lists,
+within the limit and the lists. Without `--pay`, or with too little,
+nothing is sent and the error names the fee:
+
+```
+$ rslbot ctl group join 01234567-9abc-defe-dcba-987654321000
+error: joining "Builders" <01234567-...> costs L$250; give `--pay 250` to pay it
+```
+
+The join is answered when the grid lists the group, within 15 seconds.
+
+`group leave` leaves a group, as a viewer's Leave does, and is answered
+when the grid says the avatar has left it (within 15 seconds); the words
+of a name may be separate arguments. Leaving the active group leaves
+none active. When a leave and a join of one group follow each other
+closely, the grid's lists can arrive out of order: for 5 seconds after a
+join or a leave is confirmed the bot keeps to it, and then asks the grid
+for the groups again. The bot does not check, as a viewer does, whether the
+avatar is the group's only owner: the grid refuses that, and the
+command fails with that refusal. Nothing is paid or refunded, and joining
+again may take an invitation or the fee once more. `setgroup` does not
+hold it back, as it does not in viewers.
+
+`group invitations` lists the [invitations that wait](#invitations-to-groups).
+`group list`, `group info` and `group invitations` only read: no RLV
+restriction applies to them, and they never use up an
+[override](#override). No group command moves the avatar.
+
+Not there: creating a group, ejecting members, roles and
+titles, sending notices, taking a notice's attachment, conferences,
+searching groups by name, and `@setgroup:NAME=force` and `@getgroup`.
+
 ### Inventory
 
 ```sh
@@ -1582,9 +1694,10 @@ These restrictions have an effect:
 | `chatshout`, `chatwhisper`, `chatnormal` | On channel 0 a shout, or a whisper, is said at normal volume; with `chatnormal` everything is whispered. The command succeeds and its answer says what was changed |
 | `redirchat:CHANNEL`, `rediremote:CHANNEL` | Text, or an emote, for channel 0 is said on that channel instead |
 | `sendchannel`, `sendchannel_sec`, `sendchannel_except:CHANNEL` | Chat on other channels than 0 is refused, except on a channel that `sendchannel:CHANNEL` names; or on the one channel named. The bot's own replies to RLV queries always go out |
-| `sendim`, `sendim_sec`, `sendimto:UUID` | `im` is refused, for everyone but those `sendim:UUID` names, or for the one avatar |
+| `sendim`, `sendim_sec`, `sendimto:UUID` | `im` is refused, for everyone but those `sendim:UUID` names, or for the one avatar. [`group chat`](#groups) is refused too, unless an exception names the group (`sendim:GROUP`, by its UUID or its name without `,` and `;`) or is `sendim:allgroups`; `sendimto:GROUP` and `sendimto:allgroups` refuse it for that group or all |
 | `startim`, `startimto:UUID` | `im` is refused to an avatar the bot has not exchanged an instant message with since the login |
-| `recvim`, `recvim_sec`, `recvimfrom:UUID` | An instant message from an avatar, from everyone but those `recvim:UUID` names or from the one avatar, is hidden: it is recorded, and passed to the XMPP owners, as `(blocked by RLV: recvim)`, and the sender gets the answer RLV viewers send, "The Resident you messaged is currently prevented from reading your instant messages at the moment, please try again later.", in place of any [autoreply](#autoreplies). A message stored while the avatar was offline is hidden too, but not answered. Messages from objects are not hidden |
+| `recvim`, `recvim_sec`, `recvimfrom:UUID` | An instant message from an avatar, from everyone but those `recvim:UUID` names or from the one avatar, is hidden: it is recorded, and passed to the XMPP owners, as `(blocked by RLV: recvim)`, and the sender gets the answer RLV viewers send, "The Resident you messaged is currently prevented from reading your instant messages at the moment, please try again later.", in place of any [autoreply](#autoreplies). A message stored while the avatar was offline is hidden too, but not answered. Messages from objects are not hidden. A line of group chat is hidden the same way, without an answer, unless an exception names the group or is `recvim:allgroups`, or names the speaker (and no `recvimfrom:UUID` does); `recvimfrom:GROUP` and `recvimfrom:allgroups` hide a group's lines. Group notices are never hidden |
+| `setgroup` | [`group activate`](#groups) is refused. The avatar's groups are still read, invitations accepted, joins made and groups left |
 | `unsit` | While the avatar sits: `stand`, `sit` (which leaves the seat), `tp` and `accept tp` are refused |
 | `sit` | `sit UUID` and `sit ground` are refused |
 | `sittp`, `sittp:DISTANCE` | `sit UUID` is refused when the object is farther than 1.5 m, or the distance given, from the avatar |
@@ -1640,7 +1753,7 @@ effect: `rlv status` marks them `(no effect)`. They are about what a viewer
 shows its user, or about things the bot does not do: `recvchat`,
 `recvemote` and their variants, `showloc`, the world map, hovertext
 and the other camera restrictions, `fly`, `edit`, `rez`, `share`, `sendgesture`,
-`tplm`, `standtp`, `defaultwear`, `setgroup`, `setdebug`, `setenv`, and
+`tplm`, `standtp`, `defaultwear`, `setdebug`, `setenv`, and
 everything about the shared `#RLV` folder. Apart from what `recvim` hides,
 the message log, `status`, `friends` and `profile` are yours and are never
 censored; the name restrictions hide names from the two scans only. A restriction the API does not have,
@@ -1838,6 +1951,7 @@ has one or more kinds:
 | `attach` | A script asks for permission to attach its object to the avatar |
 | `controls` | A script asks for permission to take the avatar's controls |
 | `camera` | A script asks for permission to track or control the camera |
+| `group` | A member of a group invites the avatar into it |
 
 A script may ask for several permissions at once, and such a request has
 all their kinds. A script that asks for anything else (to take money from
@@ -1880,6 +1994,7 @@ word) or a UUID:
 | An avatar (teleport offer, inventory offer) | that avatar | that avatar |
 | An object that gives inventory | its owner | its owner |
 | An object whose script asks for permissions | its owner | the object, or its owner |
+| A member who invites into a group | the inviter | the group, or the inviter |
 
 So an avatar's name or UUID stands for the avatar and for everything it
 owns, and an object's UUID for that object. Names are compared, in any
@@ -1918,6 +2033,44 @@ What accepting does:
 * A script's request: the script is granted every permission it asked for.
 
 Neither of the last two moves the avatar or changes what the bot holds.
+
+#### Invitations to groups
+
+An invitation names its group by UUID and its inviter by name only. Before
+the rules decide it, the bot asks the grid for the group's profile, for
+its name, and looks the inviter's name up for the UUID; it waits for both
+for up to 10 seconds and then decides with what it has. A group's name
+matches no entry: enter a group in a rule by its UUID. An invitation into
+a group that costs L$ to join is never accepted by itself, also under
+`all`; it waits, and the log gives the command with `--pay`:
+
+```
+invitation from Jane Doe <uuid> into "Builders" <uuid>, which costs L$250 to join: waits, as joining costs L$250; `rslbot ctl accept group <uuid> --pay 250` accepts it
+```
+
+Accepting answers the invitation as a viewer's Join does; the bot takes
+it as accepted when the grid lists the group. No RLV restriction applies
+to an invitation. The latest invitation into each group waits, at most
+100 of them; one is forgotten when a newer one into its group comes, when
+it is answered, when the avatar joins the group another way, and with the
+session.
+
+```sh
+rslbot ctl group invitations                 # group, fee, inviter's UUID or ?, inviter, group's name or ?
+rslbot ctl accept group Builders             # by the group's name or UUID,
+rslbot ctl accept group "Jane Doe"           # or by the inviter
+rslbot ctl accept group Builders --pay 250   # one with a fee
+rslbot ctl decline group Builders
+```
+
+Unlike the other kinds, `accept group` and `decline group` take the one
+invitation that `WHO` names: when it names two, or `WHO` is left out while
+two wait, the command answers nothing and lists them with their groups'
+UUIDs. An acceptance joins a group and may cost money, so the latest is
+not good enough. `accept group` is answered when the grid lists the group
+(within 15 seconds); a fee is paid as for `group join`, and one the bot
+refuses to pay leaves the invitation waiting. `decline` takes `group`
+only.
 
 #### Requests that wait
 
@@ -1978,6 +2131,7 @@ anim: all except 01234567-9abc-defe-dcba-987654321000
 attach: none
 controls: none
 camera: none
+group: none
 waiting: tp from John Roe <uuid>
 ```
 
@@ -2167,7 +2321,37 @@ warns when `web` may pay and the `[web]` table has no `password`.
 
 None of the three commands moves the avatar or touches the place the bot
 holds, no RLV restriction applies to them, and `rlv mode override` is not
-used up by them. Not there: paying groups, buying objects, land or
+used up by them.
+
+#### Fees for joining a group
+
+The fee of a group, paid with [`group join --pay`](#groups) or
+[`accept group --pay`](#invitations-to-groups), is a payment of the fee
+to the group: the interface has to be in `perms`, the lists are matched
+against the group's UUID only (neither its name nor the inviter's matches
+an entry), the balance and the limit are checked, and it is the one
+payment that may be under way. The grid takes the fee when it gets the
+join or the acceptance; the bot sends no payment of its own. The fee
+counts against the limit from the moment the join is sent. The bot then
+waits up to 15 seconds for two things: the grid's word that the avatar is
+in the group, which answers the command, and the grid's report of the
+fee, which settles the transaction:
+
+| Within 15 seconds the grid | The fee | The command |
+|---|---|---|
+| reports the fee and lists the group | `paid`, counts | succeeds, with the new balance when the report came first |
+| lists the group, reports no fee | `unconfirmed`, counts | succeeds, saying the fee was not reported and counts as paid |
+| reports the fee, does not list the group | `paid`, counts | fails when the time is up, saying the fee was paid |
+| refuses the join, or reports the fee as failed | `failed`, stops counting | fails with the grid's reason |
+| says nothing, or the session is lost | `unconfirmed`, counts | fails, saying the join was sent and the fee counts as paid |
+
+The record has the group's UUID as `party_uuid`, type 1004, and the grid's
+text or `Fee to join` and the group's name. Should the fee change between
+the profile and the join, the grid takes what it takes: the bot's record
+says `unconfirmed` for the fee it knew and the grid's report is recorded
+as `spent`.
+
+Not there: paying a group other than its fee, buying objects, land or
 passes, a description with a payment to an object, letting a script take money from the
 avatar (always refused), the transaction history of the Second Life web
 site, transactions over XMPP, and changing the limit or the lists while
@@ -2452,6 +2636,21 @@ online, and a click on a friend opens the conversation. Objects cannot be
 answered. A conversation with an avatar has "Pay", which shows the Money
 tab with that avatar as the payee.
 
+**Groups.** On top, the invitations that wait, each with its group, the
+inviter, the fee, "Accept" and "Reject"; one with a fee is confirmed in
+the dialog of the Money tab first, and has no "Accept" while the web
+interface may not pay. Below, the avatar's groups, the active one marked,
+each with the number of messages you have not seen, and the chosen
+group's chat and notices in one list. A notice stands out on its own
+background, with its subject, its sender and the name of what is attached
+to it, which the page cannot take. The box says a line in the group;
+"Activate", "Invite" (for a group you may invite into: a name, a UUID or a
+friend), "Info" and "Leave" do what `group activate`, `group invite`,
+`group info` and `group leave` do; "Leave" asks first, in a dialog that
+names the group, with "Cancel" chosen. A group you have messages of and are no longer in stays in the
+list, set apart. The tab's label is marked while an invitation waits or a
+group has new messages.
+
 **Inventory.** My Inventory as a tree. A folder is read when you open it,
 so a large inventory costs nothing until you look into it. An object has
 "Attach", and once attached "Detach" and "Touch"; clothing has "Wear" and
@@ -2503,17 +2702,18 @@ tab; an error stays until you dismiss it.
 
 ### What the page keeps
 
-The bot keeps the newest 500 lines of local chat and the newest 500
-instant messages in memory, from the moment it starts, so that a page you
+The bot keeps the newest 500 lines of local chat, the newest 500
+instant messages and the newest 500 group messages in memory, from the moment it starts, so that a page you
 open later, or open again, has them. A page that lost its connection gets
 what it missed when it is back, and says meanwhile that it cannot reach
 the bot. Nothing of this is written to disk for the page: after a restart
 of the bot the IM tab is empty. `log_chat` and `log_im` are the record
 that lasts (see [Chat and IM logs](#chat-and-im-logs)).
 
-The lists the page keeps up to date by itself, the avatars in chat range
-and the friends, are ordinary `scan avatars chat` and `friends` commands,
-with two differences: they get no line in the bot's log, and they never
+The lists the page keeps up to date by itself, the avatars in chat range,
+the friends, and the groups and invitations of the Groups tab, are
+ordinary `scan avatars chat`, `friends`, `group list` and `group
+invitations` commands, with two differences: they get no line in the bot's log, and they never
 use up an RLV [override](#override), which stays for the next command you
 give yourself. Their "Refresh" buttons are commands of yours like any
 other.
@@ -2523,6 +2723,7 @@ page says that the bot cannot be reached until one of the others is
 closed.
 
 Not there yet: a panel for the teleport offers and permission requests
-that wait (the console has `perms status` and `accept`), group chats,
+that wait (the console has `perms status` and `accept`; invitations to
+groups are on the Groups tab), conferences,
 pictures, a map, history from before the bot started, several accounts or
 read-only access, browser notifications, and TLS in the bot itself.

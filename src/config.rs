@@ -162,6 +162,7 @@ pub struct LogPath {
 pub struct LogPaths {
     pub chat: Option<LogPath>,
     pub im: Option<LogPath>,
+    pub group: Option<LogPath>,
     pub transactions: Option<LogPath>,
 }
 
@@ -314,7 +315,7 @@ fn log_path(value: Option<toml::Value>, key: &'static str) -> Result<Option<LogP
     }
 }
 
-const LOGS_KEYS: &str = "`chat`, `im` and `transactions`";
+const LOGS_KEYS: &str = "`chat`, `im`, `group` and `transactions`";
 
 /// The `[logs]` table and the deprecated `log_chat` and `log_im`, with the
 /// note for each deprecated key the config has.
@@ -324,7 +325,7 @@ fn logs(
     log_im: Option<toml::Value>,
     deprecated: &mut Vec<String>,
 ) -> Result<LogPaths, ConfigError> {
-    let (mut chat, mut im, mut transactions) = (None, None, None);
+    let (mut chat, mut im, mut group, mut transactions) = (None, None, None, None);
     if let Some(value) = table {
         let toml::Value::Table(table) = value else {
             return err(format!("`logs` must be a table with the keys {LOGS_KEYS}"));
@@ -333,6 +334,7 @@ fn logs(
             match key.as_str() {
                 "chat" => chat = log_path(Some(value), "logs.chat")?,
                 "im" => im = log_path(Some(value), "logs.im")?,
+                "group" => group = log_path(Some(value), "logs.group")?,
                 "transactions" => transactions = log_path(Some(value), "logs.transactions")?,
                 _ => return err(format!("`logs.{key}` is not a key of `logs`; its keys are {LOGS_KEYS}")),
             }
@@ -359,6 +361,7 @@ fn logs(
     Ok(LogPaths {
         chat: chat.or(old_chat),
         im: im.or(old_im),
+        group,
         transactions,
     })
 }
@@ -1541,10 +1544,56 @@ mod tests {
             LogPaths {
                 chat: log("chat.tsv", "logs.chat"),
                 im: log("im.tsv", "logs.im"),
+                group: None,
                 transactions: log("transactions.tsv", "logs.transactions"),
             }
         );
         assert!(cfg.deprecated.is_empty());
+    }
+
+    #[test]
+    fn all_four_log_files() {
+        let text = base() + "[logs]\nchat = \"chat.tsv\"\nim = \"im.tsv\"\ngroup = \"group.tsv\"\ntransactions = \"transactions.tsv\"\n";
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(
+            cfg.logs,
+            LogPaths {
+                chat: log("chat.tsv", "logs.chat"),
+                im: log("im.tsv", "logs.im"),
+                group: log("group.tsv", "logs.group"),
+                transactions: log("transactions.tsv", "logs.transactions"),
+            }
+        );
+    }
+
+    #[test]
+    fn group_log_only() {
+        let cfg = Config::parse(&(base() + "[logs]\ngroup = \"group.tsv\"\n")).unwrap();
+        assert_eq!(
+            cfg.logs,
+            LogPaths {
+                group: log("group.tsv", "logs.group"),
+                ..LogPaths::default()
+            }
+        );
+        for text in ["[logs]\ngroup = \"\"\n", "[logs]\ngroup = 1\n"] {
+            assert!(rejected(&(base() + text)).contains("`logs.group`"), "{text}");
+        }
+    }
+
+    #[test]
+    fn invitations_in_the_deprecated_table() {
+        let text = base() + "[perms.autoaccept]\ngroup = [\"Jane Doe\", \"11111111-2222-3333-4444-555555555555\"]\n";
+        let cfg = Config::parse(&text).unwrap();
+        let wanted = Rule::List(vec![
+            Entry::parse("Jane Doe").unwrap(),
+            Entry::parse("11111111-2222-3333-4444-555555555555").unwrap(),
+        ]);
+        assert_eq!(*cfg.perms.rule(Kind::Group), wanted);
+        let said = notes("[perms.autoaccept]\ngroup = [\"Jane Doe\", \"11111111-2222-3333-4444-555555555555\"]\n");
+        let command = "perms autoaccept group \"Jane Doe\" 11111111-2222-3333-4444-555555555555";
+        assert!(said[0].contains(&format!("`{command}`")), "{}", said[0]);
+        assert!(startup::parse(command).is_ok());
     }
 
     #[test]
@@ -1600,6 +1649,7 @@ mod tests {
     fn rejects_unknown_keys_in_the_logs_table() {
         let error = rejected(&(base() + "[logs]\npayments = \"pay.tsv\"\n"));
         assert!(error.contains("`logs.payments`") && error.contains(LOGS_KEYS), "{error}");
+        assert!(error.contains("`chat`, `im`, `group` and `transactions`"), "{error}");
     }
 
     #[test]
@@ -1868,6 +1918,7 @@ mod tests {
                 "perms autoaccept anim all",
                 "perms revoke anim 01234567-9abc-defe-dcba-987654321000",
                 "perms autoaccept attach all",
+                "perms autoaccept group \"Jane Doe\"",
                 "autoreply message Hello, I'm bot. I won't respond to you in next 2 hours",
                 "autoreply pause 2h",
                 "persist cur cfg",
@@ -1956,7 +2007,7 @@ mod tests {
         let unknown = rejected("[perms.autoaccept]\nmoney = \"all\"\n");
         assert!(unknown.contains("`perms.autoaccept.money` is no kind of request"), "{unknown}");
         assert!(
-            unknown.contains("`tp`, `inventory`, `anim`, `attach`, `controls` and `camera`"),
+            unknown.contains("`tp`, `inventory`, `anim`, `attach`, `controls`, `camera` and `group`"),
             "{unknown}"
         );
         assert!(rejected("[perms.except]\nmoney = []\n").contains("`perms.except.money` is no kind"));
@@ -2345,6 +2396,7 @@ mod tests {
             LogPaths {
                 chat: log("chat.tsv", "logs.chat"),
                 im: log("im.tsv", "logs.im"),
+                group: log("group.tsv", "logs.group"),
                 transactions: log("transactions.tsv", "logs.transactions"),
             }
         );

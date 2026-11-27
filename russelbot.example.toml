@@ -105,10 +105,13 @@ sit = "00000000-0000-0000-0000-000000000000"
 #                               without these every request waits for
 #                               `rslbot ctl accept KIND`. KIND is `tp` (an
 #                               avatar's teleport offer), `inventory` (an
-#                               inventory offer), or what a script asks for:
-#                               `anim`, `attach`, `controls`, `camera`. WHO
+#                               inventory offer), what a script asks for:
+#                               `anim`, `attach`, `controls`, `camera`, or
+#                               `group` (an invitation into a group). WHO
 #                               is `all`, or avatar names and UUIDs; an
-#                               avatar stands for every object it owns too.
+#                               avatar stands for every object it owns too,
+#                               and a group's UUID for its invitations. An
+#                               invitation that costs L$ always waits.
 #   perms revoke KIND WHO       After `perms autoaccept KIND all`: who is
 #                               never accepted by itself.
 #   autoreply message TEXT      The bot answers an avatar that sends it an
@@ -138,6 +141,7 @@ sit = "00000000-0000-0000-0000-000000000000"
 # perms autoaccept anim all
 # perms revoke anim 01234567-9abc-defe-dcba-987654321000
 # perms autoaccept attach all
+# perms autoaccept group "Jane Doe"
 # autoreply message Hello, I'm bot. I won't respond to you in next 2 hours
 # autoreply pause 2h
 # # The rest: once the avatar is in place.
@@ -203,8 +207,9 @@ sit = "00000000-0000-0000-0000-000000000000"
 # Optional: log files. Every message and every transaction is also written
 # to standard error. The files are tab-separated, appended to, and created
 # when missing; relative paths are relative to the working directory.
-# `chat` receives local chat, `im` instant messages, and `transactions` the
-# avatar's L$ transactions: the payments the bot makes and what the grid
+# `chat` receives local chat, `im` instant messages, `group` the chat and the
+# notices of the avatar's groups, and `transactions` the avatar's L$
+# transactions: the payments the bot makes and what the grid
 # reports while the avatar is online. The transactions file is also the
 # record of the spending limit of `[payments]`: the bot reads it when it
 # starts, so moving or editing it renews the limit. This is a table: like
@@ -212,6 +217,7 @@ sit = "00000000-0000-0000-0000-000000000000"
 # [logs]
 # chat = "chat.tsv"
 # im = "im.tsv"
+# group = "group.tsv"
 # transactions = "transactions.tsv"
 
 # Optional: payments. Without this table the bot pays nothing. With it,

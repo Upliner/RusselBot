@@ -4,6 +4,7 @@
 //! for. No sockets and no clock here.
 
 use crate::escape::escape;
+use crate::grouplog::GroupMessage;
 use crate::msglog::{Channel, Record};
 use crate::txlog::Transaction;
 use std::collections::VecDeque;
@@ -48,6 +49,8 @@ pub struct Hub {
     last: u64,
     chat: Ring,
     im: Ring,
+    /// Group chat and notices.
+    group: Ring,
     /// The transactions, while the web interface may pay; otherwise none
     /// is kept or sent.
     money: Option<Ring>,
@@ -84,6 +87,30 @@ fn message_event(id: &str, record: &Record) -> String {
     format!("event: {kind}\nid: {id}\ndata: {}\n\n", data(&fields))
 }
 
+/// A recorded group message as an event: its eleven fields.
+fn group_event(id: &str, message: &GroupMessage) -> String {
+    let (time, group) = (message.time.to_string(), message.group.to_string());
+    let avatar = message.avatar.map(|id| id.to_string()).unwrap_or_default();
+    let fields: [&str; 11] = [
+        &time,
+        message.kind.name(),
+        &group,
+        &message.group_name,
+        &avatar,
+        &message.avatar_name,
+        &message.display_name,
+        &message.subject,
+        &message.attachment,
+        if message.offline { "1" } else { "0" },
+        &message.text,
+    ];
+    format!("event: group\nid: {id}\ndata: {}\n\n", data(&fields))
+}
+
+/// The event that says the groups or the invitations changed: it carries
+/// nothing, and is not kept.
+const GROUPS_CHANGED: &str = "event: groups\ndata: -\n\n";
+
 /// A recorded transaction as an event: the twelve fields of its row.
 fn money_event(id: &str, transaction: &Transaction) -> String {
     let fields = transaction.fields();
@@ -103,6 +130,7 @@ impl Hub {
             last: 0,
             chat: Ring::default(),
             im: Ring::default(),
+            group: Ring::default(),
             money: None,
             subscribers: Vec::new(),
             status: None,
@@ -151,13 +179,29 @@ impl Hub {
         self.publish(&event);
     }
 
+    /// A group message was recorded: it is kept, and sent to every page.
+    pub fn group(&mut self, message: &GroupMessage) {
+        self.last += 1;
+        let id = format!("{}-{}", self.start, self.last);
+        let event: Arc<str> = group_event(&id, message).into();
+        self.group.push(self.last, event.clone());
+        self.publish(&event);
+    }
+
+    /// The avatar's groups or the waiting invitations changed: every page
+    /// is told, so that it asks for them again.
+    pub fn groups_changed(&mut self) {
+        let event: Arc<str> = GROUPS_CHANGED.into();
+        self.publish(&event);
+    }
+
     /// The number a page goes on after, when `last` is the id of an event
     /// of this run and nothing after it was dropped.
     fn after(&self, last: Option<&str>) -> Option<u64> {
         let (start, number) = last?.split_once('-')?;
         let (start, number) = (start.parse::<u64>().ok()?, number.parse::<u64>().ok()?);
         let money = self.money.as_ref().map_or(0, |ring| ring.dropped);
-        let kept = number >= self.chat.dropped && number >= self.im.dropped && number >= money;
+        let kept = number >= self.chat.dropped && number >= self.im.dropped && number >= self.group.dropped && number >= money;
         (start == self.start && number <= self.last && kept).then_some(number)
     }
 
@@ -175,7 +219,14 @@ impl Hub {
         let after = after.unwrap_or(0);
         // Each ring is in order; merged, they are in the order of recording.
         let money = self.money.iter().flat_map(|ring| ring.events.iter());
-        let mut events: Vec<&(u64, Arc<str>)> = self.chat.events.iter().chain(&self.im.events).chain(money).collect();
+        let mut events: Vec<&(u64, Arc<str>)> = self
+            .chat
+            .events
+            .iter()
+            .chain(&self.im.events)
+            .chain(&self.group.events)
+            .chain(money)
+            .collect();
         events.sort_by_key(|(number, _)| *number);
         for (number, event) in events {
             if *number > after {
@@ -341,6 +392,90 @@ mod tests {
             status_event("connected: yes\nregion: Target\nmode: holding"),
             "event: status\ndata: connected: yes\\nregion: Target\\nmode: holding\n\n"
         );
+    }
+
+    fn group_line(text: &str) -> GroupMessage {
+        crate::grouplog::tests::chat(text)
+    }
+
+    /// The texts of the group messages in what a page was sent, in order.
+    fn group_texts(sent: &str) -> Vec<String> {
+        let lines = sent
+            .lines()
+            .filter(|line| line.starts_with("data: ") && line.matches('\t').count() == 10);
+        lines.map(|line| line.rsplit('\t').next().unwrap_or_default().to_string()).collect()
+    }
+
+    #[test]
+    fn a_group_message_is_an_event_of_eleven_fields() {
+        let builders = crate::grouplog::tests::builders();
+        let jane = id(0x33);
+        assert_eq!(
+            group_event("1700000000-7", &group_line("hello")),
+            format!("event: group\nid: 1700000000-7\ndata: 1796126400\tchat\t{builders}\tBuilders\t{jane}\tJane Doe\tJD\t\t\t0\thello\n\n")
+        );
+        let notice = GroupMessage {
+            kind: crate::grouplog::Kind::Notice,
+            avatar: None,
+            subject: "Meeting".into(),
+            attachment: "Agenda".into(),
+            offline: true,
+            ..group_line("Tonight\nat eight")
+        };
+        let event = group_event("1-1", &notice);
+        assert_eq!(event.lines().count(), 4, "three lines and the blank one");
+        assert!(
+            event.contains(&format!(
+                "\tnotice\t{builders}\tBuilders\t\tJane Doe\tJD\tMeeting\tAgenda\t1\tTonight\\nat eight\n"
+            )),
+            "{event}"
+        );
+        let blocked = group_line("(blocked by RLV: recvim)");
+        assert!(group_event("1-1", &blocked).ends_with("\t(blocked by RLV: recvim)\n\n"));
+    }
+
+    #[test]
+    fn group_messages_are_sent_and_kept_apart() {
+        let mut hub = Hub::new(START);
+        let (sender, page) = page();
+        hub.subscribe(None, sender, "s");
+        got(&page);
+        hub.group(&group_line("live"));
+        let sent = got(&page);
+        assert_eq!(group_texts(&sent), ["live"]);
+        assert_eq!(last_id(&sent), format!("{START}-1"));
+        for n in 0..2000 {
+            hub.group(&group_line(&format!("line {n}")));
+            if n % 700 == 0 {
+                hub.record(&im(&format!("im at {n}")));
+            }
+        }
+        let (sender, later) = self::page();
+        hub.subscribe(None, sender, "s");
+        let sent = got(&later);
+        let lines = group_texts(&sent);
+        assert_eq!(lines.len(), KEPT);
+        assert_eq!(lines[0], "line 1500");
+        assert_eq!(texts(&sent), ["im at 0", "im at 700", "im at 1400"]);
+        // The order of recording across rings.
+        assert!(sent.find("im at 1400").unwrap() < sent.find("line 1500").unwrap());
+        // A page that missed dropped group lines starts over.
+        let (sender, gap) = self::page();
+        hub.subscribe(Some(&format!("{START}-5")), sender, "s");
+        assert!(got(&gap).starts_with(RESET));
+    }
+
+    #[test]
+    fn a_change_of_the_groups_is_sent_and_not_kept() {
+        let mut hub = Hub::new(START);
+        let (sender, page) = page();
+        hub.subscribe(None, sender, "s");
+        got(&page);
+        hub.groups_changed();
+        assert_eq!(got(&page), "event: groups\ndata: -\n\n");
+        let (sender, later) = self::page();
+        hub.subscribe(None, sender, "s");
+        assert!(!got(&later).contains("event: groups"));
     }
 
     #[test]

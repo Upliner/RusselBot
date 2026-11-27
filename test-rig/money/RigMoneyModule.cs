@@ -288,7 +288,26 @@ namespace RusselBot.TestRig
         public int GetBalance(UUID agentID) { return Balance(agentID); }
         public bool UploadCovered(UUID agentID, int amount) { return Balance(agentID) >= amount; }
         public bool AmountCovered(UUID agentID, int amount) { return Balance(agentID) >= amount; }
-        public void ApplyCharge(UUID agentID, int amount, MoneyTransactionType type, string extraData = "") { }
+        /// A charge the simulator itself makes, such as a group's fee when
+        /// Groups V2 has let the agent join: taken from the balance and
+        /// reported with the type it was given and the agent as the payer.
+        /// One the agent cannot pay is reported as failed and not taken.
+        public void ApplyCharge(UUID agentID, int amount, MoneyTransactionType type, string extraData = "")
+        {
+            if (amount <= 0)
+                return;
+            int balance, unused;
+            bool paid = Move(agentID, UUID.Zero, amount, out balance, out unused);
+            string what = type == MoneyTransactionType.GroupJoin
+                ? string.Format("to join the group {0}", extraData)
+                : string.Format("for {0} {1}", type, extraData).TrimEnd();
+            string description = paid
+                ? string.Format("You paid L${0} {1}.", amount, what)
+                : "Insufficient funds";
+            m_log.InfoFormat("[RIG MONEY]: charge of L${0} to {1} (type {2}) {3}: balance L${4}",
+                amount, AgentName(agentID), (int)type, paid ? "taken" : "refused", balance);
+            Tell(agentID, UUID.Random(), paid, description, balance, (int)type, agentID, UUID.Zero, amount, extraData ?? string.Empty);
+        }
         public void ApplyUploadCharge(UUID agentID, int amount, string text) { }
 
         public void MoveMoney(UUID fromUser, UUID toUser, int amount, string text)
