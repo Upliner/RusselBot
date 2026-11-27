@@ -479,7 +479,7 @@ fn group_join_of_a_free_open_group() {
     // The grid's yes comes before the list with the group: the command
     // waits for the list, so that one naming the group right after the
     // answer finds it.
-    rig.commands.joined(dancers(), true);
+    rig.commands.joined(dancers(), true, rig.now);
     waits(&answer);
     rig.list(vec![member(builders(), "Builders", 0, true), member(dancers(), "Dancers", 0, true)]);
     assert!(ok(&answer).unwrap().contains("joined \"Dancers\""));
@@ -509,8 +509,20 @@ fn a_join_refused_or_unconfirmed_is_an_error() {
     rig.list(vec![]);
     let answer = rig.line(&format!("group join {}", dancers()));
     rig.profile(profile(dancers(), "Dancers", 0, true));
-    rig.commands.joined(dancers(), false);
-    assert!(error(&answer).contains("refused"));
+    rig.commands.joined(dancers(), false, rig.now);
+    // The list is asked for, and decides: the avatar is not in it.
+    waits(&answer);
+    rig.advance(0);
+    assert_eq!(rig.calls(), [Call::GroupProfile(dancers()), Call::Join(dancers()), Call::AskGroups]);
+    rig.list(vec![]);
+    let reason = error(&answer);
+    assert!(reason.contains("refused") && reason.contains("Dancers"), "{reason}");
+    // Without the list, the refusal after 10 seconds.
+    let answer = rig.line(&format!("group join {}", dancers()));
+    rig.commands.joined(dancers(), false, rig.now);
+    rig.advance(10);
+    let reason = error(&answer);
+    assert!(reason.contains("refused") && reason.contains("has not told"), "{reason}");
     let answer = rig.line(&format!("group join {}", dancers()));
     rig.advance(14);
     waits(&answer);
@@ -519,7 +531,7 @@ fn a_join_refused_or_unconfirmed_is_an_error() {
     assert!(reason.contains("has not confirmed") && !reason.contains("accepted"), "{reason}");
     // The grid said yes and never listed the group.
     let answer = rig.line(&format!("group join {}", dancers()));
-    rig.commands.joined(dancers(), true);
+    rig.commands.joined(dancers(), true, rig.now);
     rig.advance(15);
     let reason = error(&answer);
     assert!(
@@ -535,8 +547,86 @@ fn group_join_is_refused_for_a_closed_group_or_a_member() {
     let answer = rig.line(&format!("group join {other}"));
     rig.profile(profile(other, "Club", 0, false));
     assert!(error(&answer).contains("takes an invitation"));
-    assert!(error(&rig.line(&format!("group join {}", builders()))).contains("already"));
-    assert_eq!(rig.calls(), [Call::GroupProfile(other)]);
+    // A member by what the bot holds: the grid is asked first.
+    let answer = rig.line(&format!("group join {}", builders()));
+    waits(&answer);
+    rig.advance(0);
+    assert_eq!(rig.calls(), [Call::GroupProfile(other), Call::AskGroups]);
+    rig.list(usual());
+    assert!(error(&answer).contains("already"));
+    assert_eq!(rig.calls(), []);
+}
+
+// ------------------------------------------- groups the grid did not drop
+
+/// What Second Life does: the avatar is ejected from `Dancers` and the bot
+/// is told nothing but an IM.
+fn ejected_unsaid() -> Vec<Membership> {
+    usual().into_iter().filter(|group| group.id != dancers()).collect()
+}
+
+#[test]
+fn a_leave_refused_for_a_group_the_avatar_was_ejected_from_succeeds() {
+    let mut rig = Rig::listed();
+    let answer = rig.line("group leave Dancers");
+    rig.commands.left(dancers(), false, rig.now);
+    waits(&answer);
+    rig.advance(0);
+    assert_eq!(rig.calls(), [Call::Leave(dancers()), Call::AskGroups]);
+    rig.list(ejected_unsaid());
+    let text = ok(&answer).unwrap();
+    assert!(text.contains("not in \"Dancers\"") && text.contains("any more"), "{text}");
+    assert!(!ok(&rig.group(GroupRequest::List)).unwrap().contains("Dancers"));
+    let told = rig.told();
+    assert!(
+        told.iter().any(|line| line.contains("no longer in") && line.contains("Dancers")),
+        "{told:?}"
+    );
+    assert!(
+        told.iter().any(|line| line.contains("group leave") && line.contains("confirmed")),
+        "{told:?}"
+    );
+}
+
+#[test]
+fn a_join_into_a_group_the_avatar_was_ejected_from_asks_first() {
+    let mut rig = Rig::listed();
+    let answer = rig.line(&format!("group join {}", dancers()));
+    waits(&answer);
+    rig.advance(0);
+    assert_eq!(rig.calls(), [Call::AskGroups]);
+    rig.list(ejected_unsaid());
+    // Not a member: the join goes on, with the profile.
+    assert_eq!(rig.calls(), [Call::GroupProfile(dancers())]);
+    rig.profile(profile(dancers(), "Dancers", 0, true));
+    assert_eq!(rig.calls(), [Call::Join(dancers())]);
+    rig.list(usual());
+    assert!(ok(&answer).unwrap().contains("joined \"Dancers\""));
+    // No answer to the question: the command fails as an early one does.
+    let answer = rig.line(&format!("group join {}", builders()));
+    rig.advance(0);
+    assert_eq!(rig.calls(), [Call::AskGroups]);
+    rig.advance(10);
+    assert!(error(&answer).contains("has not told"));
+}
+
+#[test]
+fn a_join_refused_for_a_group_the_avatar_is_in_succeeds() {
+    let mut rig = Rig::paying(config());
+    rig.list(usual());
+    // The bot holds the avatar out of Fishers; the grid knows better.
+    let answer = join_with_fee(&mut rig, Interface::Ctl, "250");
+    rig.commands.joined(fishers(), false, rig.now);
+    rig.advance(0);
+    assert_eq!(rig.calls(), [Call::GroupProfile(fishers()), Call::Join(fishers()), Call::AskGroups]);
+    rig.list(with_fishers());
+    let text = ok(&answer).unwrap();
+    assert!(
+        text.contains("already") && text.contains("Fishers") && text.contains("was not paid"),
+        "{text}"
+    );
+    let records = rig.commands.take_transactions();
+    assert_eq!((records[0].kind, records[0].counted), (TxKind::Failed, 0));
 }
 
 // --------------------------------------------------------------- leave
@@ -623,6 +713,11 @@ fn a_leave_refused_or_unconfirmed_is_an_error() {
     let mut rig = Rig::listed();
     let answer = rig.line("group leave Builders");
     rig.commands.left(builders(), false, rig.now);
+    // The list is asked for, and decides: the avatar is still in it.
+    waits(&answer);
+    rig.advance(0);
+    assert_eq!(rig.calls(), [Call::Leave(builders()), Call::AskGroups]);
+    rig.list(usual());
     let reason = error(&answer);
     assert!(reason.contains("refused") && reason.contains("Builders"), "{reason}");
     assert!(ok(&rig.group(GroupRequest::List)).unwrap().contains("Builders"));
@@ -668,7 +763,7 @@ fn left_and_joined_again(rig: &mut Rig) {
     ok(&answer);
     let answer = rig.line(&format!("group join {}", dancers()));
     rig.profile(profile(dancers(), "Dancers", 0, true));
-    rig.commands.joined(dancers(), true);
+    rig.commands.joined(dancers(), true, rig.now);
     rig.list(usual());
     ok(&answer);
     assert_eq!(
@@ -770,7 +865,7 @@ fn a_sum_for_a_free_group_pays_nothing() {
     let answer = rig.line(&format!("group join {} --pay 100", dancers()));
     rig.profile(profile(dancers(), "Dancers", 0, true));
     assert_eq!(rig.calls(), [Call::GroupProfile(dancers()), Call::Join(dancers())]);
-    rig.commands.joined(dancers(), true);
+    rig.commands.joined(dancers(), true, rig.now);
     rig.list(vec![member(dancers(), "Dancers", 0, true)]);
     ok(&answer);
     assert!(rig.commands.take_transactions().is_empty());
@@ -805,7 +900,8 @@ fn report(rig: &mut Rig, success: bool, amount: i32, balance: i32) {
     };
     let description = if success { "" } else { "Insufficient funds" };
     let own = rig.grid.own;
-    rig.commands.money_report(balance, success, description, Some(&info), own);
+    rig.commands
+        .money_report(Uuid::nil(), balance, success, description, Some(&info), own);
 }
 
 #[test]
@@ -814,7 +910,7 @@ fn a_fee_is_paid_by_joining_with_pay() {
     let answer = join_with_fee(&mut rig, Interface::Ctl, "300");
     assert_eq!(rig.calls(), [Call::GroupProfile(fishers()), Call::Join(fishers())]);
     report(&mut rig, true, 250, 750);
-    rig.commands.joined(fishers(), true);
+    rig.commands.joined(fishers(), true, rig.now);
     waits(&answer);
     rig.list(with_fishers());
     let text = ok(&answer).unwrap();
@@ -836,6 +932,36 @@ fn a_fee_is_paid_by_joining_with_pay() {
     );
     assert_eq!(records[0].text, "Fee to join Fishers");
     assert!(rig.commands.limit_text().contains("750"), "{}", rig.commands.limit_text());
+}
+
+#[test]
+fn a_fee_reported_twice_is_recorded_once() {
+    // Second Life sends the report of a fee twice, with one transaction id.
+    let mut rig = Rig::paying(config());
+    let answer = join_with_fee(&mut rig, Interface::Ctl, "250");
+    rig.calls();
+    let info = crate::udp::messages::TransactionInfo {
+        kind: 1004,
+        source: rig.grid.own,
+        source_group: false,
+        dest: fishers(),
+        dest_group: true,
+        amount: 250,
+        item: String::new(),
+    };
+    let (own, id) = (rig.grid.own, Uuid::from_bytes([0x7A; 16]));
+    let text = "You paid Fishers L$250.";
+    rig.commands.money_report(id, 750, true, text, Some(&info), own);
+    rig.commands.money_report(id, 750, true, text, Some(&info), own);
+    rig.list(with_fishers());
+    assert!(ok(&answer).unwrap().contains("L$750"));
+    let records = rig.commands.take_transactions();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!((records[0].kind, records[0].counted), (TxKind::Paid, 250));
+    // Another transaction is recorded.
+    rig.commands
+        .money_report(Uuid::from_bytes([0x7B; 16]), 740, true, text, Some(&info), own);
+    assert_eq!(rig.commands.take_transactions().len(), 1);
 }
 
 #[test]
@@ -897,7 +1023,7 @@ fn a_fee_is_held_to_the_lists_the_limit_and_the_balance() {
 
 fn report_balance(rig: &mut Rig, balance: i32) {
     let own = rig.grid.own;
-    rig.commands.money_report(balance, true, "", None, own);
+    rig.commands.money_report(Uuid::nil(), balance, true, "", None, own);
 }
 
 #[test]
@@ -909,7 +1035,7 @@ fn one_payment_at_a_time_with_fees() {
     let reason = error(&pay);
     assert!(reason.contains("under way") && reason.contains("Fishers"), "{reason}");
     // Even once the join is confirmed, until the report comes.
-    rig.commands.joined(fishers(), true);
+    rig.commands.joined(fishers(), true, rig.now);
     rig.list(with_fishers());
     let text = ok(&first).unwrap();
     assert!(text.contains("counts as paid"), "{text}");
@@ -942,7 +1068,8 @@ fn a_fee_reported_and_no_join_is_an_error_when_the_time_is_up() {
 fn a_refused_join_or_a_failed_fee_stops_counting() {
     let mut rig = Rig::paying(config());
     let answer = join_with_fee(&mut rig, Interface::Ctl, "250");
-    rig.commands.joined(fishers(), false);
+    rig.commands.joined(fishers(), false, rig.now);
+    rig.list(usual());
     assert!(error(&answer).contains("refused"));
     let records = rig.commands.take_transactions();
     assert_eq!((records[0].kind, records[0].counted), (TxKind::Failed, 0));
@@ -1426,7 +1553,7 @@ fn accept_group_pays_the_fee_of_an_invitation() {
     };
     let own = rig.grid.own;
     rig.commands
-        .money_report(750, true, "You paid L$250 to join a group.", Some(&info), own);
+        .money_report(Uuid::nil(), 750, true, "You paid L$250 to join a group.", Some(&info), own);
     rig.list(vec![member(builders(), "Builders", 0, true)]);
     let text = ok(&answer).unwrap();
     assert!(text.contains("Builders") && text.contains("L$250"), "{text}");

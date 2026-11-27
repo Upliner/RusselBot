@@ -1940,13 +1940,15 @@ impl Bot {
                 self.commands.pay_price(object, default, &buttons, live.as_mut(), now);
             }
             SessionEvent::Money {
+                transaction,
                 balance,
                 success,
                 description,
                 info,
             } => {
                 let own = self.inventory.agent;
-                self.commands.money_report(balance, success, &description, info.as_ref(), own);
+                self.commands
+                    .money_report(transaction, balance, success, &description, info.as_ref(), own);
                 self.take_transactions(now);
             }
             SessionEvent::TeleportRequested { from, name, text } => {
@@ -2069,7 +2071,7 @@ impl Bot {
             SessionEvent::GroupDropped(group) => commands.group_dropped(group, now),
             SessionEvent::ActiveGroup { group, title, name } => commands.active_group(group, &title, &name),
             SessionEvent::GroupProfile(profile) => commands.group_profile(profile, grid, now),
-            SessionEvent::Joined { group, success } => commands.joined(group, success),
+            SessionEvent::Joined { group, success } => commands.joined(group, success, now),
             SessionEvent::Left { group, success } => commands.left(group, success, now),
             SessionEvent::GroupInvitation {
                 group,
@@ -5647,6 +5649,7 @@ mod tests {
             hear(
                 bot,
                 SessionEvent::Money {
+                    transaction: Uuid::nil(),
                     balance,
                     success: true,
                     description: String::new(),
@@ -6519,6 +6522,7 @@ mod tests {
             hear(
                 &mut rig.bot,
                 SessionEvent::Money {
+                    transaction: Uuid::nil(),
                     balance: 975,
                     success: true,
                     description: "You paid Jane Doe L$25.".into(),
@@ -6574,6 +6578,7 @@ mod tests {
             hear(
                 &mut rig.bot,
                 SessionEvent::Money {
+                    transaction: Uuid::nil(),
                     balance: 1050,
                     success: true,
                     description: String::new(),

@@ -990,6 +990,9 @@ fn attach_item(name_values: &[u8]) -> Option<Uuid> {
 /// A MoneyBalanceReply: the balance and, for a transaction, what it was.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MoneyReport {
+    /// The grid's id of the transaction; Second Life sends some reports
+    /// twice with one id.
+    pub transaction: Uuid,
     pub success: bool,
     pub balance: i32,
     pub description: String,
@@ -1549,7 +1552,8 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
         // BOOL, DestID, IsDestGroup BOOL, Amount S32, ItemDescription
         // Variable 1 }, which older simulators leave out.
         MONEY_BALANCE_REPLY => {
-            r.skip(32)?;
+            r.skip(16)?;
+            let transaction = r.uuid()?;
             let success = r.u8()? != 0;
             let balance = r.u32()? as i32;
             r.skip(8)?;
@@ -1567,6 +1571,7 @@ pub fn decode(id: MessageId, body: &[u8]) -> Decoded<Incoming> {
                 }),
             };
             Incoming::MoneyBalanceReply(MoneyReport {
+                transaction,
                 success,
                 balance,
                 description,
@@ -4181,6 +4186,7 @@ mod tests {
         assert_eq!(
             decode(low(314), &body),
             Ok(Incoming::MoneyBalanceReply(MoneyReport {
+                transaction: Uuid::from_bytes([0x7A; 16]),
                 success: true,
                 balance: 975,
                 description: "You paid Jane Doe L$25.".into(),
@@ -4192,6 +4198,7 @@ mod tests {
         assert_eq!(
             decode(low(314), &body),
             Ok(Incoming::MoneyBalanceReply(MoneyReport {
+                transaction: Uuid::from_bytes([0x7A; 16]),
                 success: false,
                 balance: -3,
                 description: String::new(),
@@ -4329,6 +4336,7 @@ mod tests {
         assert_eq!(
             paid,
             MoneyReport {
+                transaction: uuid("abc4bff1-9eb9-4b8b-9632-2ac345caf40e"),
                 success: true,
                 balance: 750,
                 description: "You paid Payee box (Rig Owner) L$250.".into(),

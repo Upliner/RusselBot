@@ -92,6 +92,10 @@ OpenSim answers a leave with `LeaveGroupReply`, `AgentDropGroup` and a list, and
 
 Alternative considered: ordering the lists by the event queue's ids. They order the delivery, not the moment the simulator made each list, which is what goes wrong.
 
+### Ejections the grid does not report
+
+Second Life tells an ejected avatar by an instant message from the officer and nothing else: no `AgentDropGroup`, no list (seen in `test/mvf`, 2026-11-27). The bot then holds a membership the grid no longer has; a leave is refused ("Ejectee is not in the group") and a join is refused by the bot as "already". So a refusal is not an answer: `LeaveGroupReply` or `JoinGroupReply` with `Success` false marks the waiting `Leaving` or `Joining` as `refused`, gives it 10 more seconds, and sets `refresh`, which `groups_due` turns into `AgentDataUpdateRequest`; the list that comes confirms a refused leave whose group it lacks (answered as "not in the group any more") and a refused join whose group it has ("in the group already"), and fails the others with the refusal. A `group join` for a group the bot holds the avatar in is parked as an early command and `refresh` set; the list re-runs it with `fresh` set, so that it decides on that list and does not ask again. Reading the instant message was not chosen: its text is the grid's and in the officer's language.
+
 ### Leaving
 
 `group leave` names the group as every `<group>` is named, sends `LeaveGroupRequest` through `Grid::leave_group(group)`, and parks a `Leaving { group, reply, deadline }` in `Commands::leaving` for 15 seconds, the time a join gets. A `SessionEvent::Left { group, ok: true }` is taken as the drop, as the viewer takes it: OpenSim sends it before `AgentDropGroup` and the list, and a `group list` right after the answer must not list the group. The drop, by that reply, by `AgentDropGroup` or by a list without the group, whichever comes first, ends the wait with success, and the later ones find the group gone and change nothing; `Left` with `ok == false` ends it with the refusal. The bot does not check for an only owner as the viewer does: it would need the member list, and the grid refuses on its own.
@@ -142,4 +146,8 @@ What the rig cannot show, because Groups V2 does not do it: an invitation with a
 
 ## Open Questions
 
-- Whether Second Life delivers the avatar's own group line back, in which form it names the inviter (`First Last` or `first.last`), and which transaction type and party it reports for a fee. None changes the design (own lines are dropped either way, both forms of a name are read, the report is matched by payer and amount); they settle the wording of the README and are tried in the last task group.
+Settled on Second Life (2026-11-27, `docs/test-rig.md` items 344 to 356):
+
+- The inviter is named by the username, `annanovykova99`: neither `First Last` nor `first.last`. The name lookup finds the UUID from it.
+- A fee is reported as type 1004 with the group's UUID as the party and the text `You paid <group> L$<fee>.`, so `from_report` matches it as designed. Second Life sends the report twice with one `TransactionID`, which viewers handle by showing a report whose id is among the last 30 once (`process_money_balance_reply`); `MoneyReport` now carries the id, and `Commands::money_report` keeps the last 30 that are not nil and drops a repeat after taking its balance.
+- The avatar's own group line is, by all signs, delivered back: an instant message arrived right after the bot's line and was not recorded. The debug log does not name what it dropped, so this rests on its size and timing; the design drops own lines either way.

@@ -20,3 +20,18 @@ A fee the avatar pays to join a group on the bot's command (see `payments`, "Fee
 #### Scenario: Free join
 - **WHEN** the bot joins a group without a fee
 - **THEN** no transaction is recorded
+
+#### Scenario: Fee reported twice
+- **WHEN** the bot joins `Builders` for L$250 on Second Life, which reports the fee twice with one transaction id
+- **THEN** exactly one transaction is recorded, of kind `paid`
+
+### Requirement: A transaction the grid reports twice
+A report of a transaction whose transaction id is not nil and is one of the 30 the grid reported last SHALL NOT be recorded again, as a viewer shows such a report once; the balance it gives SHALL be taken as any report's. Reports with a nil transaction id SHALL each be recorded.
+
+#### Scenario: Same id
+- **WHEN** the grid reports that Jane Doe paid the avatar L$50 and sends the same report again with the same transaction id
+- **THEN** one transaction of kind `received` is recorded
+
+#### Scenario: No id
+- **WHEN** the grid sends two reports with a nil transaction id
+- **THEN** each is recorded as the requirements above say

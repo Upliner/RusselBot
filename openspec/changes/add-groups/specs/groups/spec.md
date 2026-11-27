@@ -7,7 +7,7 @@ The groups of the bot's avatar: learning from the grid which groups the avatar i
 ## ADDED Requirements
 
 ### Requirement: The avatar's groups
-While connected, the bot SHALL know the groups the avatar is in, each with its UUID, its name, whether the avatar may invite into it and whether the avatar gets its notices, and which of them, if any, is the active group. It SHALL ask the grid for them once after each login, as a viewer does, SHALL take them in whichever of the two ways the grid sends them, as a message of the simulator connection or as an event of the simulator's event queue, and SHALL follow every later word of the grid about them: a new list, a group the avatar was dropped from, and a change of the active group. For 5 seconds after the grid has confirmed that the avatar joined or left a group, a list or a drop that says otherwise about that group SHALL be taken as one the grid made before, and SHALL NOT change what the bot knows of that group, unless the bot is joining or leaving it again; when those 5 seconds are over the bot SHALL ask the grid for the groups again and take its answer. What the bot knows of the groups SHALL be forgotten when the session ends.
+While connected, the bot SHALL know the groups the avatar is in, each with its UUID, its name, whether the avatar may invite into it and whether the avatar gets its notices, and which of them, if any, is the active group. It SHALL ask the grid for them once after each login, as a viewer does, SHALL take them in whichever of the two ways the grid sends them, as a message of the simulator connection or as an event of the simulator's event queue, and SHALL follow every later word of the grid about them: a new list, a group the avatar was dropped from, and a change of the active group. For 5 seconds after the grid has confirmed that the avatar joined or left a group, a list or a drop that says otherwise about that group SHALL be taken as one the grid made before, and SHALL NOT change what the bot knows of that group, unless the bot is joining or leaving it again; when those 5 seconds are over the bot SHALL ask the grid for the groups again and take its answer. A grid may not tell the avatar that it was ejected, as Second Life does not (it sends an instant message only), so what the bot holds can be out of date: where a requirement below says that the bot asks the grid for the groups, it SHALL ask as after a login and SHALL decide on the list that comes. What the bot knows of the groups SHALL be forgotten when the session ends.
 
 #### Scenario: After login
 - **WHEN** the avatar is in the groups `Builders` and `Dancers`, `Builders` being active, and the bot has logged in
@@ -131,7 +131,7 @@ For `group info`, for `group join` and for an invitation (see `permission-reques
 - **THEN** the join is decided on the answer the bot has, without a second request for the profile
 
 ### Requirement: Group join command
-`group join <uuid>` SHALL make the avatar a member of the group with that UUID, as a viewer's Join does, and SHALL take the group by its UUID only. Before it sends anything it SHALL ask for the group's profile (see "Asking the grid for a group's profile") and SHALL refuse the command with an error, sending nothing, when the avatar is in that group already, and when the group is not open to join, saying that joining it takes an invitation. A group without a fee SHALL be joined whether or not the config has a `[payments]` table. The command SHALL be answered with success, naming the group, when the grid lists the group among the avatar's (see "The avatar's groups"), so that a command naming the group right after the answer finds it; with an error holding the grid's reason, when it gives one, when the grid refuses; and with an error saying that the grid has not confirmed the join when the grid has said neither within 15 seconds.
+`group join <uuid>` SHALL make the avatar a member of the group with that UUID, as a viewer's Join does, and SHALL take the group by its UUID only. Before it sends anything it SHALL ask for the group's profile (see "Asking the grid for a group's profile") and SHALL refuse the command with an error, sending nothing, when the avatar is in that group already, and when the group is not open to join, saying that joining it takes an invitation. Whether the avatar is in the group already SHALL be decided on a list the grid sent for the command: when the bot holds the avatar to be in the group, it SHALL first ask the grid for the groups, waiting for them as "Group commands need the avatar in a region" says. A group without a fee SHALL be joined whether or not the config has a `[payments]` table. The command SHALL be answered with success, naming the group, when the grid lists the group among the avatar's (see "The avatar's groups"), so that a command naming the group right after the answer finds it; and with an error saying that the grid has not confirmed the join when the grid has said neither within 15 seconds. When the grid refuses the join, the bot SHALL ask the grid for the groups and SHALL answer with success, saying that the avatar is in the group already, when the list has the group, and with an error saying that the grid refused, when it does not or has not come within 10 seconds.
 
 #### Scenario: Free group
 - **WHEN** `rslbot ctl group join <uuid>` names the open group `Dancers`, which has no fee
@@ -147,7 +147,15 @@ For `group info`, for `group join` and for an invitation (see `permission-reques
 
 #### Scenario: Already a member
 - **WHEN** `rslbot ctl group join <uuid>` names a group the avatar is in
-- **THEN** the command exits with status 1 saying so
+- **THEN** the bot asks the grid for the groups, and the command exits with status 1 saying that the avatar is in the group already
+
+#### Scenario: Ejected without a word
+- **WHEN** the avatar was ejected from `Dancers` on a grid that did not tell it so, and `rslbot ctl group join <uuid of Dancers>` is run
+- **THEN** the bot asks the grid for the groups, finds `Dancers` gone, and joins it
+
+#### Scenario: Member without the bot knowing
+- **WHEN** the bot holds the avatar out of `Dancers`, `group join <uuid of Dancers>` is run, and the grid refuses the join as the avatar is a member
+- **THEN** the bot asks the grid for the groups, and the command exits with status 0 saying that the avatar is in `Dancers` already
 
 ### Requirement: Joining a group with a fee
 `group join` SHALL take `--pay <sum>` after the UUID, where `<sum>` is a whole number of L$ from 0 to 2147483647 written in digits only; any other sum SHALL be refused with an error naming it. A group whose profile gives a fee greater than zero SHALL be joined only when `--pay` is given with a sum that is not less than the fee; otherwise the command SHALL be refused with an error that names the fee and `--pay`, and nothing SHALL be sent. The fee, not the sum, is what the avatar pays, and it SHALL be paid as `payments`, "Fee for joining a group", says: only from an interface that may pay, within the limit and the lists, and with its outcome as a payment's. `--pay` given for a group without a fee SHALL have no effect.
@@ -173,7 +181,7 @@ For `group info`, for `group join` and for an invitation (see `permission-reques
 - **THEN** the avatar joins and pays nothing
 
 ### Requirement: Group leave command
-`group leave <group>` SHALL make the avatar leave that group, as a viewer's Leave does. The words of a name MAY be given as separate arguments and SHALL then be joined by single spaces. The command SHALL be answered with success, naming the group, when the grid says that the avatar has left it or sends a list of the avatar's groups without it; with an error saying that the grid refused, when the grid refuses; and with an error saying that the grid has not confirmed it when neither has happened within 15 seconds. Nothing SHALL be paid or refunded. When the group left was the active one, the active group SHALL be the one the grid then says. Once the avatar has left a group, its chat and notices are no longer recorded (see `group-chat`) and the bot's session of its chat SHALL be forgotten.
+`group leave <group>` SHALL make the avatar leave that group, as a viewer's Leave does. The words of a name MAY be given as separate arguments and SHALL then be joined by single spaces. The command SHALL be answered with success, naming the group, when the grid says that the avatar has left it or sends a list of the avatar's groups without it; when the grid refuses, after asking the grid for the groups: with success, saying that the avatar is not in the group any more, when the list no longer has it, and with an error saying that the grid refused, when it does or has not come within 10 seconds; and with an error saying that the grid has not confirmed it when neither has happened within 15 seconds. Nothing SHALL be paid or refunded. When the group left was the active one, the active group SHALL be the one the grid then says. Once the avatar has left a group, its chat and notices are no longer recorded (see `group-chat`) and the bot's session of its chat SHALL be forgotten.
 
 #### Scenario: Leave
 - **WHEN** the avatar is in `Dancers` and `rslbot ctl group leave Dancers` is run
@@ -189,7 +197,11 @@ For `group info`, for `group join` and for an invitation (see `permission-reques
 
 #### Scenario: Refused
 - **WHEN** the grid refuses to let the avatar leave `Builders`, as it does for a group's only owner
-- **THEN** the command exits with status 1 saying that the grid refused, and `group list` still lists `Builders`
+- **THEN** the bot asks the grid for the groups, the command exits with status 1 saying that the grid refused, and `group list` still lists `Builders`
+
+#### Scenario: Ejected without a word
+- **WHEN** the avatar was ejected from `Dancers` on a grid that did not tell it so, and `rslbot ctl group leave Dancers` is run
+- **THEN** the grid refuses, the bot asks it for the groups, `Dancers` is gone from `group list`, and the command exits with status 0 saying that the avatar is not in `Dancers` any more
 
 ### Requirement: Group commands leave the placement alone
 No `group` command SHALL move the avatar or change the bot's placement mode or the held placement. `group list`, `group info` and `group invitations` SHALL only read: no RLV restriction SHALL be applied to them, and none of them SHALL be the exempt command of an RLV override (see `rlv-restrictions`, "Override exempts one command"). No RLV restriction SHALL be applied to `group invite`, `group join` or `group leave`. What RLV does to `group activate` and `group chat` is said in `rlv-restrictions`.

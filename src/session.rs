@@ -188,6 +188,7 @@ pub enum SessionEvent {
     /// The grid reported the avatar's balance, alone or with one of its
     /// transactions. The session keeps none of it.
     Money {
+        transaction: Uuid,
         balance: i32,
         success: bool,
         description: String,
@@ -2109,6 +2110,7 @@ impl<N: Net> Session<N> {
             Incoming::KickUser { reason } => self.lose(format!("kicked: {reason}")),
             Incoming::Alert { message } => self.events.push(SessionEvent::Alert(message)),
             Incoming::MoneyBalanceReply(report) => self.events.push(SessionEvent::Money {
+                transaction: report.transaction,
                 balance: report.balance,
                 success: report.success,
                 description: report.description,
@@ -4277,6 +4279,7 @@ mod tests {
         assert_eq!(
             rig.events(),
             [SessionEvent::Money {
+                transaction: Uuid::from_bytes([0x7A; 16]),
                 balance: 1250,
                 success: true,
                 description: "Jane Doe paid you L$50.".into(),

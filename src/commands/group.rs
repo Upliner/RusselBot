@@ -106,6 +106,9 @@ struct Joining {
     /// The grid answered the `JoinGroupRequest` with success; the join is
     /// confirmed by the list that follows.
     granted: bool,
+    /// The grid refused the join; the list asked for since says whether
+    /// the avatar is in the group all the same.
+    refused: bool,
     deadline: Instant,
 }
 
@@ -124,6 +127,9 @@ struct Leaving {
     words: String,
     origin: Origin,
     reply: Sender<Response>,
+    /// The grid refused the leave; the list asked for since says whether
+    /// the avatar is still in the group.
+    refused: bool,
     deadline: Instant,
 }
 
@@ -166,6 +172,12 @@ pub(super) struct GroupState {
     settled: Vec<Settled>,
     /// When to ask the grid for the list again, having held one back.
     ask_again: Option<Instant>,
+    /// When to ask the grid for the list, as what the bot holds may be
+    /// out of date: a grid that ejects the avatar may not say so.
+    refresh: Option<Instant>,
+    /// The list has just come: the commands that waited for it decide on
+    /// it without asking again.
+    fresh: bool,
     sessions: HashMap<Uuid, Chat>,
     inviting: Vec<Inviting>,
     /// Group messages for the message log to take.
@@ -254,7 +266,21 @@ impl Commands {
             }
             GroupRequest::Join { group, pay } => {
                 if let Some(member) = groups.get(group) {
-                    return Err(format!("the avatar is in {} already", member.words()));
+                    if self.group.fresh {
+                        return Err(format!("the avatar is in {} already", member.words()));
+                    }
+                    // The grid may have ejected the avatar without saying
+                    // so: the list decides.
+                    crate::debug!("asking the grid whether the avatar is still in {}", member.words());
+                    self.group.early.push(Early {
+                        request: GroupRequest::Join { group, pay },
+                        origin: self.origin,
+                        via: self.via,
+                        reply: reply.clone(),
+                        deadline: now + GROUPS_LIMIT,
+                    });
+                    self.group.refresh = Some(now);
+                    return Ok(Done::Parked);
                 }
                 let then = ForProfile::Join {
                     origin: self.origin,
@@ -276,6 +302,7 @@ impl Commands {
                     words,
                     origin: self.origin,
                     reply: reply.clone(),
+                    refused: false,
                     deadline: now + LEAVE_LIMIT,
                 });
                 Ok(Done::Parked)
@@ -542,6 +569,7 @@ impl Commands {
             fee: (fee > 0).then_some(fee),
             report: Report::Pending,
             granted: false,
+            refused: false,
             deadline: now + JOIN_LIMIT,
         });
         Ok(Done::Parked)
@@ -551,7 +579,11 @@ impl Commands {
     /// command: the grid sends it before the list with the group, and a
     /// command naming the group right after the answer would not find it.
     /// The list that follows, which the session asks for, confirms it.
-    pub fn joined(&mut self, group: Uuid, success: bool) {
+    ///
+    /// A refusal is not the answer either: a grid refuses a join into a
+    /// group the avatar is in, which the bot may not know, so the list is
+    /// asked for and decides.
+    pub fn joined(&mut self, group: Uuid, success: bool, now: Instant) {
         match success {
             true => {
                 for join in self.group.joining.iter_mut().filter(|join| join.group == group) {
@@ -559,15 +591,15 @@ impl Commands {
                 }
             }
             false => {
-                let reason = "the grid refused the join".to_string();
-                self.fee_refused(group, &reason);
-                let (refused, waiting) = std::mem::take(&mut self.group.joining)
-                    .into_iter()
-                    .partition(|join| join.group == group && join.command == "group join");
-                self.group.joining = waiting;
-                for join in refused {
-                    let error = format!("the grid refused to let the avatar join {}", join_words(&join));
-                    self.join_ended(join, Err(error));
+                self.fee_refused(group, "the grid refused the join");
+                let mut any = false;
+                for join in self.group.joining.iter_mut().filter(|join| join.group == group) {
+                    join.refused = true;
+                    join.deadline = now + GROUPS_LIMIT;
+                    any = true;
+                }
+                if any {
+                    self.group.refresh = Some(now);
                 }
             }
         }
@@ -582,6 +614,17 @@ impl Commands {
         self.group.joining = waiting;
         for join in done {
             self.settle_group(join.group, true, now);
+            if join.refused {
+                let mut answer = format!(
+                    "the avatar is in {} already: the grid refused the join, and lists the group",
+                    join.words
+                );
+                if let Some(fee) = join.fee {
+                    answer.push_str(&format!("; the fee of L${fee} was not paid"));
+                }
+                self.join_ended(join, Ok(answer));
+                continue;
+            }
             let mut answer = format!("joined {}", join.words);
             if let Some(inviter) = &join.inviter {
                 answer.push_str(&format!(", invited by {inviter}"));
@@ -657,17 +700,22 @@ impl Commands {
     /// drop it is, as a viewer takes it: the grid may answer before it
     /// sends the drop, and a `group list` right after the answer would
     /// still list the group.
+    ///
+    /// A refusal is not the answer: a grid refuses to let the avatar leave
+    /// a group it was ejected from without saying so, so the list is asked
+    /// for and decides.
     pub fn left(&mut self, group: Uuid, success: bool, now: Instant) {
         match success {
             true => self.group_dropped(group, now),
             false => {
-                let (refused, waiting) = std::mem::take(&mut self.group.leaving)
-                    .into_iter()
-                    .partition(|leave| leave.group == group);
-                self.group.leaving = waiting;
-                for leave in refused {
-                    let error = format!("the grid refused to let the avatar leave {}", leave.words);
-                    self.leave_ended(leave, Err(error));
+                let mut any = false;
+                for leave in self.group.leaving.iter_mut().filter(|leave| leave.group == group) {
+                    leave.refused = true;
+                    leave.deadline = now + GROUPS_LIMIT;
+                    any = true;
+                }
+                if any {
+                    self.group.refresh = Some(now);
                 }
             }
         }
@@ -682,7 +730,13 @@ impl Commands {
         self.group.leaving = waiting;
         for leave in done {
             self.settle_group(leave.group, false, now);
-            let answer = format!("left {}", leave.words);
+            let answer = match leave.refused {
+                true => format!(
+                    "the avatar is not in {} any more: the grid refused the leave, and no longer lists the group",
+                    leave.words
+                ),
+                false => format!("left {}", leave.words),
+            };
             self.leave_ended(leave, Ok(answer));
         }
     }
@@ -799,7 +853,25 @@ impl Commands {
         });
         self.confirm_joins(&ids, now);
         self.confirm_leaves(|group| !ids.contains(&group), now);
-        // The commands that came too early.
+        // What the grid refused and the list bears out.
+        let (refused, joining) = std::mem::take(&mut self.group.joining)
+            .into_iter()
+            .partition(|join| join.refused && !ids.contains(&join.group));
+        self.group.joining = joining;
+        for join in refused {
+            let error = format!("the grid refused to let the avatar join {}", join.words);
+            self.join_ended(join, Err(error));
+        }
+        let (refused, leaving) = std::mem::take(&mut self.group.leaving)
+            .into_iter()
+            .partition(|leave| leave.refused && ids.contains(&leave.group));
+        self.group.leaving = leaving;
+        for leave in refused {
+            let error = format!("the grid refused to let the avatar leave {}", leave.words);
+            self.leave_ended(leave, Err(error));
+        }
+        // The commands that came too early, or waited for the list.
+        self.group.fresh = true;
         for early in std::mem::take(&mut self.group.early) {
             let command = early.request.name();
             self.origin = early.origin;
@@ -812,6 +884,7 @@ impl Commands {
             self.via = Interface::Ctl;
             finish(early.origin, command, done, &early.reply);
         }
+        self.group.fresh = false;
     }
 
     /// The grid says the avatar is no longer in `group`.
@@ -1131,6 +1204,7 @@ impl Commands {
             fee: None,
             report: Report::Pending,
             granted: false,
+            refused: false,
             deadline: now + JOIN_LIMIT,
         });
         Ok(Done::Answer(None))
@@ -1219,6 +1293,7 @@ impl Commands {
             fee: request.fee(),
             report: Report::Pending,
             granted: false,
+            refused: false,
             deadline: now + JOIN_LIMIT,
         });
         Ok(Done::Parked)
@@ -1269,8 +1344,13 @@ impl Commands {
 
     /// Answers what waited for the grid too long.
     pub fn groups_due<G: Grid>(&mut self, mut grid: Option<&mut G>, now: Instant) {
-        if self.group.ask_again.is_some_and(|at| now >= at) {
-            self.group.ask_again = None;
+        let again = self.group.ask_again.is_some_and(|at| now >= at);
+        let refresh = self.group.refresh.is_some_and(|at| now >= at);
+        if again || refresh {
+            if again {
+                self.group.ask_again = None;
+            }
+            self.group.refresh = None;
             if let Some(grid) = grid.as_deref_mut() {
                 if let Err(reason) = grid.ask_groups(now) {
                     crate::debug!("could not ask for the avatar's groups again: {reason}");
@@ -1344,9 +1424,13 @@ impl Commands {
                 ),
                 (None, _) => format!("the grid has not confirmed within {limit} s that the avatar is in {}", join.words),
             };
-            let error = match join.granted {
-                true => format!("{error}; it accepted the join, and has not listed the group since"),
-                false => error,
+            let error = match (join.refused, join.granted) {
+                (true, _) => format!(
+                    "the grid refused to let the avatar join {}, and has not told the avatar's groups since",
+                    join.words
+                ),
+                (false, true) => format!("{error}; it accepted the join, and has not listed the group since"),
+                (false, false) => error,
             };
             self.join_ended(join, Err(error));
         }
@@ -1354,11 +1438,17 @@ impl Commands {
             match now >= leave.deadline {
                 false => self.group.leaving.push(leave),
                 true => {
-                    let error = format!(
-                        "the grid has not confirmed within {} s that the avatar left {}",
-                        LEAVE_LIMIT.as_secs(),
-                        leave.words
-                    );
+                    let error = match leave.refused {
+                        true => format!(
+                            "the grid refused to let the avatar leave {}, and has not told the avatar's groups since",
+                            leave.words
+                        ),
+                        false => format!(
+                            "the grid has not confirmed within {} s that the avatar left {}",
+                            LEAVE_LIMIT.as_secs(),
+                            leave.words
+                        ),
+                    };
                     self.leave_ended(leave, Err(error));
                 }
             }
@@ -1410,6 +1500,7 @@ impl Commands {
         });
         early
             .chain(group.ask_again)
+            .chain(group.refresh)
             .chain(activating)
             .chain(profiles)
             .chain(infos)
@@ -1470,15 +1561,12 @@ impl Commands {
         self.group.inviting.clear();
         self.group.settled.clear();
         self.group.ask_again = None;
+        self.group.refresh = None;
         self.group.profiles.clear();
         self.group.asked.clear();
         self.group.groups.clear();
         self.group.session_changed = true;
     }
-}
-
-fn join_words(join: &Joining) -> &str {
-    &join.words
 }
 
 #[cfg(test)]

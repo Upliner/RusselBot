@@ -47,7 +47,13 @@ pub struct Money {
     not_avatars: HashSet<Uuid>,
     /// Transactions recorded here, for the message log to take.
     records: Vec<Transaction>,
+    /// The ids of the transactions the grid reported last, newest last.
+    reported: std::collections::VecDeque<Uuid>,
 }
+
+/// How many transaction ids are kept to tell a repeated report, as a
+/// viewer keeps them.
+const REPORTS_KEPT: usize = 30;
 
 impl Default for Money {
     fn default() -> Money {
@@ -62,6 +68,7 @@ impl Default for Money {
             payees: Vec::new(),
             not_avatars: HashSet::new(),
             records: Vec::new(),
+            reported: std::collections::VecDeque::new(),
         }
     }
 }
@@ -993,8 +1000,28 @@ impl Commands {
     /// The grid reported the avatar's balance, alone or with a
     /// transaction. Answers the payment it confirms or refuses, and
     /// records what is a transaction.
-    pub fn money_report(&mut self, balance: i32, success: bool, description: &str, info: Option<&TransactionInfo>, own: Uuid) {
+    pub fn money_report(
+        &mut self,
+        transaction: Uuid,
+        balance: i32,
+        success: bool,
+        description: &str,
+        info: Option<&TransactionInfo>,
+        own: Uuid,
+    ) {
         self.money.balance = Some(i64::from(balance));
+        // Second Life reports a group's fee twice with one transaction id;
+        // a viewer shows such a report once, and the bot records it once.
+        if !transaction.is_nil() {
+            if self.money.reported.contains(&transaction) {
+                crate::debug!("the grid reported the transaction {transaction} again; it is recorded once");
+                return;
+            }
+            if self.money.reported.len() >= REPORTS_KEPT {
+                self.money.reported.pop_front();
+            }
+            self.money.reported.push_back(transaction);
+        }
         let wall = (self.money.clock)();
         let in_flight = match self.money.pay.as_ref().map(|wait| &wait.stage) {
             Some(Stage::Sent(in_flight)) => Some(in_flight.clone()),

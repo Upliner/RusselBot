@@ -111,7 +111,8 @@ impl Rig {
 
     fn report(&mut self, balance: i32, success: bool, description: &str, info: Option<TransactionInfo>) {
         let own = self.grid.own;
-        self.commands.money_report(balance, success, description, info.as_ref(), own);
+        self.commands
+            .money_report(Uuid::nil(), balance, success, description, info.as_ref(), own);
     }
 
     /// The grid's confirmation of a payment of the bot.
@@ -774,6 +775,31 @@ fn received_payments_are_recorded() {
     let records = rig.commands.take_transactions();
     assert_eq!((records[0].kind, records[0].party), (Kind::Received, Some(jane())));
     assert_eq!(rig.commands.balance(), Some(1250));
+}
+
+#[test]
+fn a_transaction_reported_again_is_recorded_once() {
+    let mut rig = Rig::new(config());
+    let own = rig.grid.own;
+    let info = gift(jane(), own, 50);
+    let text = "Jane Doe paid you L$50.";
+    let report = |rig: &mut Rig, id: Uuid, balance: i32| {
+        rig.commands.money_report(id, balance, true, text, Some(&info), own);
+        rig.commands.take_transactions().len()
+    };
+    assert_eq!(report(&mut rig, id(0x01), 1250), 1);
+    // Again: not recorded, the balance taken.
+    assert_eq!(report(&mut rig, id(0x01), 1260), 0);
+    assert_eq!(rig.commands.balance(), Some(1260));
+    // Reports without an id are never taken for one another.
+    assert_eq!(report(&mut rig, Uuid::nil(), 1300), 1);
+    assert_eq!(report(&mut rig, Uuid::nil(), 1350), 1);
+    // The 30 ids reported last are kept.
+    for byte in 0x02..=0x1F {
+        assert_eq!(report(&mut rig, id(byte), 1400), 1);
+    }
+    assert_eq!(report(&mut rig, id(0x02), 1400), 0);
+    assert_eq!(report(&mut rig, id(0x01), 1400), 1);
 }
 
 // ------------------------------------------------- description of a payment

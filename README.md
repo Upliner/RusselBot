@@ -650,7 +650,8 @@ time	kind	group_name	group_uuid	avatar_name	display_name	subject	attachment	text
 | `text` | The line, or the notice's text |
 
 A notice's attachment is named, never taken. A line the grid delivers back
-that the bot said itself is not recorded twice. Lines of conferences
+that the bot said itself, as OpenSim and, by all signs, Second Life do, is
+not recorded twice. Lines of conferences
 (ad-hoc sessions) are not recorded. The bot answers no group message by
 itself, and none is passed to the owners of the
 [XMPP gateway](#xmpp-gateway). Under [RLV](#restrictions) `recvim`, a
@@ -1319,7 +1320,12 @@ of a name may be separate arguments. Leaving the active group leaves
 none active. When a leave and a join of one group follow each other
 closely, the grid's lists can arrive out of order: for 5 seconds after a
 join or a leave is confirmed the bot keeps to it, and then asks the grid
-for the groups again. The bot does not check, as a viewer does, whether the
+for the groups again. Second Life tells an avatar it ejected only by an
+instant message, so the bot may still hold it in the group: when the grid
+refuses a leave or a join, the bot asks for the groups and answers by
+them (a leave from a group no longer listed succeeds, saying the avatar
+was not in it any more), and `group join` of a group the bot holds the
+avatar in asks the grid before it refuses. The bot does not check, as a viewer does, whether the
 avatar is the group's only owner: the grid refuses that, and the
 command fails with that refusal. Nothing is paid or refunded, and joining
 again may take an invitation or the fee once more. `setgroup` does not
@@ -2036,7 +2042,8 @@ Neither of the last two moves the avatar or changes what the bot holds.
 
 #### Invitations to groups
 
-An invitation names its group by UUID and its inviter by name only. Before
+An invitation names its group by UUID and its inviter by name only (on
+Second Life the username, such as `annanovykova99`). Before
 the rules decide it, the bot asks the grid for the group's profile, for
 its name, and looks the inviter's name up for the UUID; it waits for both
 for up to 10 seconds and then decides with what it has. A group's name
@@ -2346,7 +2353,10 @@ fee, which settles the transaction:
 | says nothing, or the session is lost | `unconfirmed`, counts | fails, saying the join was sent and the fee counts as paid |
 
 The record has the group's UUID as `party_uuid`, type 1004, and the grid's
-text or `Fee to join` and the group's name. Should the fee change between
+text (on Second Life `You paid <group> L$<fee>.`) or `Fee to join` and the
+group's name. Second Life reports a fee twice, with one transaction id;
+as a viewer shows such a report once, the bot records any transaction
+whose id it saw among the last 30 once. Should the fee change between
 the profile and the join, the grid takes what it takes: the bot's record
 says `unconfirmed` for the fee it knew and the grid's report is recorded
 as `spent`.
