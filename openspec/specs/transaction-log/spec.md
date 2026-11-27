@@ -145,3 +145,37 @@ A row of the transactions file that does not have twelve fields, or whose `time`
 #### Scenario: Damaged row
 - **WHEN** one row of the file was cut short by a crash
 - **THEN** the bot starts, counts the other rows, and standard error says that one row was skipped
+
+### Requirement: Record of a group fee
+A fee the avatar pays to join a group on the bot's command (see `payments`, "Fee for joining a group") SHALL be recorded as one transaction, as "A payment of the bot is one record" says of a payment: of kind `paid` when the grid reported it as made, `failed` when the grid reported it as failed or refused the join, and `unconfirmed` when the grid reported no transaction in time, whether or not the avatar joined. Its `party_uuid` SHALL be the group's UUID; its `avatar_name`, `display_name`, `object_name` and `object_uuid` SHALL be empty; its `type` SHALL be the grid's number from the report, or 1004, the number of a fee for joining a group, when there is no report; its `counted` SHALL be as for any payment; and its `text` SHALL be the grid's description, or, when the grid gave none, `Fee to join ` and the group's name, with the grid's reason after `: ` for a join it refused. A fee the grid takes for a join the bot did not send, such as one made from a viewer on the same account, SHALL be recorded as any other reported transaction, of kind `spent`.
+
+#### Scenario: Fee that was reported
+- **WHEN** the bot joins `Builders` for L$250 and the grid reports that the avatar paid L$250 to join a group, leaving L$750
+- **THEN** exactly one transaction is recorded, of kind `paid`, with amount 250, balance 750, type 1004, the UUID of `Builders` as the party, empty names and the grid's description
+
+#### Scenario: Fee that was not reported
+- **WHEN** the bot joins `Builders` for L$250 on a grid that reports nothing about money
+- **THEN** one transaction of kind `unconfirmed` is recorded with amount 250, counted 250, an empty balance, type 1004 and the text `Fee to join Builders`
+
+#### Scenario: Join refused
+- **WHEN** the grid refuses a join with a fee of L$250
+- **THEN** one transaction of kind `failed` is recorded with counted 0
+
+#### Scenario: Free join
+- **WHEN** the bot joins a group without a fee
+- **THEN** no transaction is recorded
+
+#### Scenario: Fee reported twice
+- **WHEN** the bot joins `Builders` for L$250 on Second Life, which reports the fee twice with one transaction id
+- **THEN** exactly one transaction is recorded, of kind `paid`
+
+### Requirement: A transaction the grid reports twice
+A report of a transaction whose transaction id is not nil and is one of the 30 the grid reported last SHALL NOT be recorded again, as a viewer shows such a report once; the balance it gives SHALL be taken as any report's. Reports with a nil transaction id SHALL each be recorded.
+
+#### Scenario: Same id
+- **WHEN** the grid reports that Jane Doe paid the avatar L$50 and sends the same report again with the same transaction id
+- **THEN** one transaction of kind `received` is recorded
+
+#### Scenario: No id
+- **WHEN** the grid sends two reports with a nil transaction id
+- **THEN** each is recorded as the requirements above say

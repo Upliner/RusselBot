@@ -22,7 +22,7 @@ While connected, the bot SHALL record every local chat message the simulator del
 - **THEN** nothing is recorded
 
 ### Requirement: Read instant messages
-While connected, the bot SHALL record every instant message sent to the avatar by another avatar (kind `im`) and every instant message sent to it by an object (kind `object`). Other instant-message traffic — typing notifications, group and conference sessions, offers, invitations, notices and automatic responses — SHALL NOT be recorded.
+While connected, the bot SHALL record every instant message sent to the avatar by another avatar (kind `im`) and every instant message sent to it by an object (kind `object`). Other instant-message traffic — typing notifications, group and conference sessions, offers, invitations, notices and automatic responses — SHALL NOT be recorded as an instant message and SHALL NOT be written to the IM file. Of these, the chat and the notices of the avatar's groups are recorded as group messages, as `group-chat` says, and invitations to groups are requests (see `permission-requests`).
 
 #### Scenario: IM from an avatar
 - **WHEN** another avatar sends the bot's avatar the instant message `are you there?`
@@ -35,6 +35,10 @@ While connected, the bot SHALL record every instant message sent to the avatar b
 #### Scenario: Inventory offer
 - **WHEN** another avatar offers the bot's avatar an inventory item
 - **THEN** nothing is recorded
+
+#### Scenario: Group chat
+- **WHEN** `im` is set under `[logs]` and Jane Doe says `hello` in the chat of a group the avatar is in
+- **THEN** no instant message is recorded and the IM file gains no row; the line is a group message
 
 ### Requirement: Fetch offline instant messages on request
 When `fetch_offline_im` is true, the bot SHALL ask the grid once after each successful login for the instant messages stored while the avatar was offline, and SHALL record the ones it receives like any other instant message. When `fetch_offline_im` is false or absent the bot SHALL NOT ask for them.
